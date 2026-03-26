@@ -848,10 +848,6 @@ impl SecurityPolicy {
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
-        if !self.is_command_allowed(command) {
-            return Err(format!("Command not allowed by security policy: {command}"));
-        }
-
         let risk = self.command_risk_level(command);
 
         // When the operator has set `allowed_commands = ["*"]` AND explicitly
@@ -861,6 +857,10 @@ impl SecurityPolicy {
         let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
         if has_wildcard && !self.block_high_risk_commands {
             return Ok(risk);
+        }
+
+        if !self.is_command_allowed(command) {
+            return Err(format!("Command not allowed by security policy: {command}"));
         }
 
         if risk == CommandRiskLevel::High {
