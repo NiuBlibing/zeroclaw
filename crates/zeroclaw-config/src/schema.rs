@@ -11982,10 +11982,12 @@ pub struct RuntimeConfig {
     /// Applies only to `runtime.kind = "native"`; other runtimes ignore it.
     /// When unset or `null`, the system default `sh` is used.
     ///
-    /// **Unix:** the shell is invoked as `<shell> -c "<command>"`, so it must be
-    /// a POSIX-compatible shell binary. Accepted forms:
+    /// **Unix:** the shell is invoked as `<shell> -c "<command>"`. Accepted forms:
     /// - a bare command name resolved via `PATH` (e.g. `"bash"`), or
     /// - an absolute path (e.g. `"/bin/bash"`, `"/usr/bin/zsh"`).
+    ///
+    /// `powershell` and `pwsh` select the PowerShell policy dialect on every
+    /// host; other Unix interpreters are treated as POSIX-compatible shells.
     ///
     /// The value is validated when the native runtime is constructed, so a bad
     /// value is reported up front rather than failing on the first shell
@@ -12019,7 +12021,7 @@ pub struct RuntimeConfig {
     /// [runtime]
     /// shell = "bash" # Unix: resolves via PATH
     /// shell = "/bin/zsh" # Unix: absolute path
-    /// shell = "pwsh" # Windows: PowerShell 7+
+    /// shell = "pwsh" # PowerShell 7+ (Windows, Linux, or macOS)
     /// shell = "powershell" # Windows: Windows PowerShell 5.x
     /// ```
     #[serde(default)]

@@ -36,9 +36,12 @@ pub trait RuntimeAdapter: Send + Sync {
 
     /// Report whether this runtime supports shell command execution.
     ///
-    /// When `false`, the agent disables shell-based tools. Serverless and
-    /// edge runtimes typically return `false`.
-    fn has_shell_access(&self) -> bool;
+    /// Shell capability is derived from [`Self::shell_dialect`] so adapters
+    /// cannot report a shell while omitting the language that policy must
+    /// validate (or report a language while disabling shell tools).
+    fn has_shell_access(&self) -> bool {
+        self.shell_dialect() != ShellDialect::None
+    }
 
     /// Report whether this runtime supports filesystem read/write.
     ///
@@ -70,11 +73,9 @@ pub trait RuntimeAdapter: Send + Sync {
 
     /// Return the shell language accepted by [`Self::build_shell_command`].
     ///
-    /// Implementations with shell access must override the fail-closed default
-    /// and report the language they actually execute.
-    fn shell_dialect(&self) -> ShellDialect {
-        ShellDialect::None
-    }
+    /// This is the source of truth for both shell capability and command
+    /// policy. Adapters without shell access must return [`ShellDialect::None`].
+    fn shell_dialect(&self) -> ShellDialect;
 
     /// Build a shell command process configured for this runtime.
     ///
@@ -103,10 +104,6 @@ mod tests {
     impl RuntimeAdapter for DummyRuntime {
         fn name(&self) -> &str {
             "dummy-runtime"
-        }
-
-        fn has_shell_access(&self) -> bool {
-            true
         }
 
         fn has_filesystem_access(&self) -> bool {

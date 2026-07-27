@@ -264,11 +264,6 @@ impl RuntimeAdapter for WasmRuntime {
         "wasm"
     }
 
-    fn has_shell_access(&self) -> bool {
-        // WASM sandbox does NOT provide shell access — that's the point
-        false
-    }
-
     fn has_filesystem_access(&self) -> bool {
         self.config.allow_workspace_read || self.config.allow_workspace_write
     }

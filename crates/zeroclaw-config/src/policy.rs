@@ -275,12 +275,6 @@ pub(crate) fn default_allowed_commands() -> Vec<String> {
         "npm".into(),
         "cargo".into(),
         "echo".into(),
-        // PowerShell-native read-only commands used by the default Windows
-        // shell examples. Mutating cmdlets remain opt-in.
-        "write-output".into(),
-        "get-date".into(),
-        "get-childitem".into(),
-        "get-location".into(),
         // Windows-native equivalents
         "dir".into(),
         "type".into(),
@@ -1201,7 +1195,7 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
 /// escapes. This parser intentionally accepts only a bounded command grammar:
 /// bare command invocations, quoted/plain arguments, simple variable reads,
 /// and pipelines. Everything else fails closed.
-fn split_simple_powershell_pipeline(command: &str) -> Option<Vec<String>> {
+fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = QuoteState::None;
@@ -1219,7 +1213,8 @@ fn split_simple_powershell_pipeline(command: &str) -> Option<Vec<String>> {
                 if ch == '\'' {
                     if chars.peek() == Some(&'\'') {
                         current.push(ch);
-                        current.push(chars.next().unwrap());
+                        chars.next();
+                        current.push(ch);
                         continue;
                     }
                     quote = QuoteState::None;
@@ -1230,7 +1225,8 @@ fn split_simple_powershell_pipeline(command: &str) -> Option<Vec<String>> {
                 if ch == '"' {
                     if chars.peek() == Some(&'"') {
                         current.push(ch);
-                        current.push(chars.next().unwrap());
+                        chars.next();
+                        current.push(ch);
                         continue;
                     }
                     quote = QuoteState::None;
@@ -1278,6 +1274,11 @@ fn split_simple_powershell_pipeline(command: &str) -> Option<Vec<String>> {
     }
     segments.push(segment.to_string());
 
+    Some(segments)
+}
+
+fn split_simple_powershell_pipeline(command: &str) -> Option<Vec<String>> {
+    let segments = split_powershell_pipeline_syntax(command)?;
     powershell_variables_are_simple(command).then_some(segments)
 }
 
@@ -1340,6 +1341,9 @@ fn powershell_variables_are_simple(command: &str) -> bool {
         i += 1;
         while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
             i += 1;
+        }
+        if chars.get(i) == Some(&':') {
+            return false;
         }
         while chars.get(i) == Some(&'.') {
             i += 1;
@@ -1428,6 +1432,189 @@ fn is_known_read_only_powershell_command(base: &str) -> bool {
     )
 }
 
+fn powershell_named_risk(base: &str) -> Option<CommandRiskLevel> {
+    if is_known_read_only_powershell_command(base) {
+        return Some(CommandRiskLevel::Low);
+    }
+
+    if matches!(
+        base,
+        "remove-item"
+            | "clear-content"
+            | "set-content"
+            | "add-content"
+            | "out-file"
+            | "start-process"
+            | "stop-process"
+            | "invoke-webrequest"
+            | "invoke-restmethod"
+            | "invoke-expression"
+            | "invoke-command"
+            | "ac"
+            | "clc"
+            | "del"
+            | "erase"
+            | "rd"
+            | "ri"
+            | "rm"
+            | "rmdir"
+            | "sc"
+            | "saps"
+            | "start"
+            | "kill"
+            | "spps"
+            | "curl"
+            | "wget"
+            | "iwr"
+            | "irm"
+            | "iex"
+            | "icm"
+    ) {
+        return Some(CommandRiskLevel::High);
+    }
+
+    if matches!(
+        base,
+        "new-item"
+            | "copy-item"
+            | "move-item"
+            | "rename-item"
+            | "ni"
+            | "copy"
+            | "cp"
+            | "cpi"
+            | "move"
+            | "mv"
+            | "mi"
+            | "ren"
+            | "rni"
+            | "mkdir"
+            | "md"
+    ) {
+        return Some(CommandRiskLevel::Medium);
+    }
+
+    None
+}
+
+fn generic_segment_risk(
+    base: &str,
+    args: &[String],
+    joined_segment: &str,
+) -> Option<CommandRiskLevel> {
+    if matches!(
+        base,
+        "rm" | "mkfs"
+            | "dd"
+            | "shutdown"
+            | "reboot"
+            | "halt"
+            | "poweroff"
+            | "sudo"
+            | "su"
+            | "chown"
+            | "chmod"
+            | "useradd"
+            | "userdel"
+            | "usermod"
+            | "passwd"
+            | "mount"
+            | "umount"
+            | "iptables"
+            | "ufw"
+            | "firewall-cmd"
+            | "curl"
+            | "wget"
+            | "nc"
+            | "ncat"
+            | "netcat"
+            | "scp"
+            | "ssh"
+            | "ftp"
+            | "telnet"
+            // Windows-specific high-risk commands retained from the existing
+            // cross-platform compatibility policy.
+            | "del"
+            | "rmdir"
+            | "format"
+            | "reg"
+            | "net"
+            | "runas"
+            | "icacls"
+            | "takeown"
+            | "powershell"
+            | "pwsh"
+            | "wmic"
+            | "sc"
+            | "netsh"
+    ) {
+        return Some(CommandRiskLevel::High);
+    }
+
+    if joined_segment.contains("rm -rf /")
+        || joined_segment.contains("rm -fr /")
+        || joined_segment.contains(":(){:|:&};:")
+        || joined_segment.contains("del /s /q")
+        || joined_segment.contains("rmdir /s /q")
+        || joined_segment.contains("format c:")
+    {
+        return Some(CommandRiskLevel::High);
+    }
+
+    match base {
+        "git" => Some(
+            if args.first().is_some_and(|verb| {
+                matches!(
+                    verb.as_str(),
+                    "commit"
+                        | "push"
+                        | "reset"
+                        | "clean"
+                        | "rebase"
+                        | "merge"
+                        | "cherry-pick"
+                        | "revert"
+                        | "branch"
+                        | "checkout"
+                        | "switch"
+                        | "tag"
+                )
+            }) {
+                CommandRiskLevel::Medium
+            } else {
+                CommandRiskLevel::Low
+            },
+        ),
+        "npm" | "pnpm" | "yarn" => Some(
+            if args.first().is_some_and(|verb| {
+                matches!(
+                    verb.as_str(),
+                    "install" | "add" | "remove" | "uninstall" | "update" | "publish"
+                )
+            }) {
+                CommandRiskLevel::Medium
+            } else {
+                CommandRiskLevel::Low
+            },
+        ),
+        "cargo" => Some(
+            if args.first().is_some_and(|verb| {
+                matches!(
+                    verb.as_str(),
+                    "add" | "remove" | "install" | "clean" | "publish"
+                )
+            }) {
+                CommandRiskLevel::Medium
+            } else {
+                CommandRiskLevel::Low
+            },
+        ),
+        "touch" | "mkdir" | "mv" | "cp" | "ln" | "copy" | "xcopy" | "robocopy" | "move" | "ren"
+        | "rename" | "mklink" => Some(CommandRiskLevel::Medium),
+        _ => None,
+    }
+}
+
 impl SecurityPolicy {
     // ── Risk Classification ──────────────────────────────────────────────
     // Risk is assessed per-segment (split on shell operators), and the
@@ -1451,131 +1638,11 @@ impl SecurityPolicy {
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
 
-            // High-risk commands (Unix and Windows)
-            if matches!(
-                base,
-                "rm" | "mkfs"
-                    | "dd"
-                    | "shutdown"
-                    | "reboot"
-                    | "halt"
-                    | "poweroff"
-                    | "sudo"
-                    | "su"
-                    | "chown"
-                    | "chmod"
-                    | "useradd"
-                    | "userdel"
-                    | "usermod"
-                    | "passwd"
-                    | "mount"
-                    | "umount"
-                    | "iptables"
-                    | "ufw"
-                    | "firewall-cmd"
-                    | "curl"
-                    | "wget"
-                    | "nc"
-                    | "ncat"
-                    | "netcat"
-                    | "scp"
-                    | "ssh"
-                    | "ftp"
-                    | "telnet"
-                    // Windows-specific high-risk commands
-                    | "del"
-                    | "rmdir"
-                    | "format"
-                    | "reg"
-                    | "net"
-                    | "runas"
-                    | "icacls"
-                    | "takeown"
-                    | "powershell"
-                    | "pwsh"
-                    | "wmic"
-                    | "sc"
-                    | "netsh"
-                    // PowerShell-native destructive, process, and network commands.
-                    | "remove-item"
-                    | "clear-content"
-                    | "set-content"
-                    | "add-content"
-                    | "out-file"
-                    | "start-process"
-                    | "stop-process"
-                    | "invoke-webrequest"
-                    | "invoke-restmethod"
-                    | "invoke-expression"
-                    | "invoke-command"
-                    // Common aliases for the commands above. Aliases already
-                    // covered by the cross-platform table are not repeated.
-                    | "erase"
-                    | "rd"
-                    | "ri"
-                    | "saps"
-                    | "start"
-                    | "spps"
-                    | "kill"
-                    | "iwr"
-                    | "irm"
-                    | "iex"
-            ) {
-                return CommandRiskLevel::High;
+            match generic_segment_risk(base, &args, &joined_segment) {
+                Some(CommandRiskLevel::High) => return CommandRiskLevel::High,
+                Some(CommandRiskLevel::Medium) => saw_medium = true,
+                Some(CommandRiskLevel::Low) | None => {}
             }
-
-            if joined_segment.contains("rm -rf /")
-                || joined_segment.contains("rm -fr /")
-                || joined_segment.contains(":(){:|:&};:")
-                // Windows destructive patterns
-                || joined_segment.contains("del /s /q")
-                || joined_segment.contains("rmdir /s /q")
-                || joined_segment.contains("format c:")
-            {
-                return CommandRiskLevel::High;
-            }
-
-            // Medium-risk commands (state-changing, but not inherently destructive)
-            let medium = match base {
-                "git" => args.first().is_some_and(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "commit"
-                            | "push"
-                            | "reset"
-                            | "clean"
-                            | "rebase"
-                            | "merge"
-                            | "cherry-pick"
-                            | "revert"
-                            | "branch"
-                            | "checkout"
-                            | "switch"
-                            | "tag"
-                    )
-                }),
-                "npm" | "pnpm" | "yarn" => args.first().is_some_and(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "install" | "add" | "remove" | "uninstall" | "update" | "publish"
-                    )
-                }),
-                "cargo" => args.first().is_some_and(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "add" | "remove" | "install" | "clean" | "publish"
-                    )
-                }),
-                "touch" | "mkdir" | "mv" | "cp" | "ln"
-                // Windows medium-risk equivalents
-                | "copy" | "xcopy" | "robocopy" | "move" | "ren" | "rename" | "mklink"
-                // PowerShell-native mutation commands and common aliases
-                | "new-item" | "copy-item" | "move-item" | "rename-item"
-                | "ni" | "cpi" | "mi" | "rni" | "md" => true,
-                _ => false,
-            };
-
-            saw_medium |= medium;
         }
 
         if saw_medium {
@@ -1591,8 +1658,12 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
     ) -> CommandRiskLevel {
-        if dialect != ShellDialect::PowerShell {
-            return self.command_risk_level(command);
+        match dialect {
+            ShellDialect::Posix | ShellDialect::WindowsCmd => {
+                return self.command_risk_level(command);
+            }
+            ShellDialect::None => return CommandRiskLevel::High,
+            ShellDialect::PowerShell => {}
         }
 
         let Some(segments) = split_simple_powershell_pipeline(command) else {
@@ -1609,6 +1680,10 @@ impl SecurityPolicy {
             let base_owned = command_basename(base_raw).to_ascii_lowercase();
             let base = strip_powershell_executable_suffix(&base_owned);
             let arguments: Vec<&str> = words.collect();
+            let arguments_lower: Vec<String> = arguments
+                .iter()
+                .map(|argument| argument.to_ascii_lowercase())
+                .collect();
             if arguments
                 .iter()
                 .any(|argument| is_powershell_provider_argument(argument))
@@ -1617,7 +1692,6 @@ impl SecurityPolicy {
             {
                 return CommandRiskLevel::High;
             }
-            let generic_risk = self.command_risk_level(&segment);
 
             if base_owned.ends_with(".ps1")
                 || base_owned.ends_with(".psm1")
@@ -1632,24 +1706,32 @@ impl SecurityPolicy {
                         | "bash"
                         | "zsh"
                         | "fish"
+                        | "wsl"
                 )
             {
                 return CommandRiskLevel::High;
             }
 
-            if generic_risk == CommandRiskLevel::High {
-                return CommandRiskLevel::High;
-            }
-            if generic_risk == CommandRiskLevel::Medium {
-                saw_medium = true;
-                continue;
+            match powershell_named_risk(base) {
+                Some(CommandRiskLevel::High) => return CommandRiskLevel::High,
+                Some(CommandRiskLevel::Medium) => {
+                    saw_medium = true;
+                    continue;
+                }
+                Some(CommandRiskLevel::Low) => continue,
+                None => {}
             }
 
-            // PowerShell cmdlets follow Verb-Noun naming. Unknown cmdlets are
-            // high risk by default because aliases and modules can introduce
-            // new code-evaluation or mutation surfaces at runtime.
-            if base.contains('-') && !is_known_read_only_powershell_command(base) {
-                return CommandRiskLevel::High;
+            match generic_segment_risk(base, &arguments_lower, &segment.to_ascii_lowercase()) {
+                Some(CommandRiskLevel::High) => return CommandRiskLevel::High,
+                Some(CommandRiskLevel::Medium) => saw_medium = true,
+                Some(CommandRiskLevel::Low) => {}
+                // PowerShell resolves bare names through aliases, functions,
+                // cmdlets, scripts, and applications. If none of the known
+                // command families above recognizes the name, treating it as
+                // low risk would let a mutable alias or function hide behind
+                // the wildcard allowlist.
+                None => return CommandRiskLevel::High,
             }
         }
 
@@ -1720,7 +1802,7 @@ impl SecurityPolicy {
     ) -> bool {
         match dialect {
             ShellDialect::PowerShell => {
-                let Some(segments) = split_simple_powershell_pipeline(command) else {
+                let Some(segments) = split_powershell_pipeline_syntax(command) else {
                     return false;
                 };
                 segments.iter().all(|segment| {
@@ -1812,15 +1894,14 @@ impl SecurityPolicy {
         }
 
         let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
-        if has_wildcard && !self.block_high_risk_commands {
+        if has_wildcard {
             return true;
         }
 
-        let Some(segments) = split_simple_powershell_pipeline(command) else {
+        let Some(segments) = split_powershell_pipeline_syntax(command) else {
             return false;
         };
 
-        let has_pipeline = segments.len() > 1;
         for segment in &segments {
             let mut words = segment.split_whitespace();
             let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
@@ -1842,15 +1923,6 @@ impl SecurityPolicy {
             }
 
             let args_cased: Vec<String> = words.map(str::to_string).collect();
-            if args_cased
-                .iter()
-                .any(|argument| is_powershell_provider_argument(argument))
-            {
-                return false;
-            }
-            if segment.contains('$') && (has_pipeline || !matches!(base, "write-output" | "echo")) {
-                return false;
-            }
             let args: Vec<String> = args_cased
                 .iter()
                 .map(|word| word.to_ascii_lowercase())
@@ -3397,9 +3469,12 @@ mod tests {
             "Invoke-WebRequest https://example.com",
             "ri important.txt",
             "iwr https://example.com",
+            "ac output.txt value",
+            "clc output.txt",
+            "wsl.exe --exec rm important.txt",
         ] {
             assert_eq!(
-                p.command_risk_level(command),
+                p.command_risk_level_for_shell(command, ShellDialect::PowerShell),
                 CommandRiskLevel::High,
                 "PowerShell-native command should be high risk: {command}"
             );
@@ -3411,7 +3486,7 @@ mod tests {
             "ni output.txt",
         ] {
             assert_eq!(
-                p.command_risk_level(command),
+                p.command_risk_level_for_shell(command, ShellDialect::PowerShell),
                 CommandRiskLevel::Medium,
                 "PowerShell-native mutation should be medium risk: {command}"
             );
@@ -3419,9 +3494,33 @@ mod tests {
 
         for command in ["Write-Output safe", "Get-Date", "Get-ChildItem"] {
             assert_eq!(
-                p.command_risk_level(command),
+                p.command_risk_level_for_shell(command, ShellDialect::PowerShell),
                 CommandRiskLevel::Low,
                 "read-only PowerShell command should stay low risk: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_only_names_do_not_change_other_shell_dialects() {
+        let p = default_policy();
+
+        for command in [
+            "ri file.txt",
+            "iwr example.test",
+            "ni file.txt",
+            "md output",
+            "start app",
+        ] {
+            assert_eq!(
+                p.command_risk_level_for_shell(command, ShellDialect::Posix),
+                CommandRiskLevel::Low,
+                "PowerShell risk names must not leak into POSIX: {command}"
+            );
+            assert_eq!(
+                p.command_risk_level_for_shell(command, ShellDialect::WindowsCmd),
+                CommandRiskLevel::Low,
+                "PowerShell risk names must not leak into cmd.exe: {command}"
             );
         }
     }
@@ -3436,7 +3535,11 @@ mod tests {
         };
 
         let error = p
-            .validate_command_execution("Remove-Item important.txt", true)
+            .validate_command_execution_for_shell(
+                "Remove-Item important.txt",
+                true,
+                ShellDialect::PowerShell,
+            )
             .expect_err("PowerShell-native high-risk commands must be blocked");
         assert!(error.contains("high-risk"));
     }
@@ -3451,7 +3554,11 @@ mod tests {
         };
 
         let risk = p
-            .validate_command_execution("Write-Output safe", false)
+            .validate_command_execution_for_shell(
+                "Write-Output safe",
+                false,
+                ShellDialect::PowerShell,
+            )
             .expect("low-risk PowerShell commands should not require approval");
         assert_eq!(risk, CommandRiskLevel::Low);
     }

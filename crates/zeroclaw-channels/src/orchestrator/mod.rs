@@ -15754,9 +15754,6 @@ BTC is currently around $65,000 based on latest tool output."#
         fn name(&self) -> &str {
             "fingerprint-test-runtime"
         }
-        fn has_shell_access(&self) -> bool {
-            true
-        }
         fn has_filesystem_access(&self) -> bool {
             true
         }

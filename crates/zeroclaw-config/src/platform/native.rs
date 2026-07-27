@@ -7,37 +7,17 @@ pub fn windows_cmd_shell_raw_arg(command: &str) -> String {
     format!("\"{command}\"")
 }
 
-/// How a configured `runtime.shell` value is invoked on Windows.
-///
-/// `cmd.exe` and PowerShell have incompatible command-line conventions, so the
-/// runtime must know which family a configured shell belongs to before building
-/// the process. Classification is a pure function of the configured string
-/// (see [`windows_shell_kind`]) and is defined on every platform so it can be
-/// unit-tested off Windows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WindowsShellKind {
-    /// `cmd.exe /C "<command>"`. The default, and what the cross-platform
-    /// default `sh` (and any unrecognised value) maps to.
-    Cmd,
-    /// PowerShell — Windows PowerShell (`powershell`, 5.x) or PowerShell 7+
-    /// (`pwsh`): `<interpreter> -NoProfile -NonInteractive -Command <command>`.
-    PowerShell,
-}
-
-/// Classify a configured `runtime.shell` value into its Windows invocation
-/// convention.
+/// Return whether `runtime.shell` names a PowerShell interpreter.
 ///
 /// Matching is on the file name stem, case-insensitively, so `powershell`,
 /// `PowerShell.exe`, `pwsh`, and `C:\Program Files\PowerShell\7\pwsh.exe` all
-/// resolve to [`WindowsShellKind::PowerShell`]. Every other value — including
-/// the cross-platform default `sh` and an explicit `cmd` — maps to
-/// [`WindowsShellKind::Cmd`], preserving the historical Windows behaviour where
-/// commands always ran through `cmd.exe`.
+/// match. Every other value, including the cross-platform default `sh` and an
+/// explicit `cmd`, does not.
 ///
 /// Both `/` and `\` are treated as path separators regardless of the host OS
 /// (so the classification is stable and unit-testable off Windows), and a
 /// trailing `.exe`/`.cmd`/`.bat` extension is stripped before matching.
-pub fn windows_shell_kind(shell: &str) -> WindowsShellKind {
+fn is_powershell_interpreter(shell: &str) -> bool {
     let file = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
     let stem = match file.rsplit_once('.') {
         Some((stem, ext)) if matches!(ext.to_ascii_lowercase().as_str(), "exe" | "cmd" | "bat") => {
@@ -45,10 +25,7 @@ pub fn windows_shell_kind(shell: &str) -> WindowsShellKind {
         }
         _ => file,
     };
-    match stem.to_ascii_lowercase().as_str() {
-        "powershell" | "pwsh" => WindowsShellKind::PowerShell,
-        _ => WindowsShellKind::Cmd,
-    }
+    matches!(stem.to_ascii_lowercase().as_str(), "powershell" | "pwsh")
 }
 
 #[cfg(target_os = "windows")]
@@ -77,9 +54,9 @@ pub fn windows_tokio_cmd_shell_command(command: &str) -> tokio::process::Command
 ///
 /// `-NoProfile` skips user/host profile scripts for a predictable, faster
 /// startup; `-NonInteractive` prevents the shell from blocking on prompts; and
-/// `-Command` consumes the remainder of the command line as the script text.
-/// The command is passed as a single verbatim `raw_arg`, so operators, quotes,
-/// and `$(...)` subexpressions reach PowerShell exactly as written.
+/// `-Command` consumes the final argument as script text. Ordinary `arg`
+/// handling keeps the entire script in one Windows process argument and
+/// preserves its internal PowerShell quoting.
 #[cfg(target_os = "windows")]
 pub fn windows_tokio_powershell_command(
     interpreter: &str,
@@ -87,23 +64,12 @@ pub fn windows_tokio_powershell_command(
 ) -> tokio::process::Command {
     let mut process = tokio::process::Command::new(interpreter);
     process
-        .raw_arg("-NoProfile")
-        .raw_arg("-NonInteractive")
-        .raw_arg("-Command")
-        .raw_arg(command)
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(command)
         .creation_flags(CREATE_NO_WINDOW);
     process
-}
-
-/// Build the Windows process for `command`, dispatching on the configured
-/// `shell`: `cmd.exe /C` for [`WindowsShellKind::Cmd`], or PowerShell for
-/// [`WindowsShellKind::PowerShell`].
-#[cfg(target_os = "windows")]
-pub fn windows_tokio_shell_command(shell: &str, command: &str) -> tokio::process::Command {
-    match windows_shell_kind(shell) {
-        WindowsShellKind::Cmd => windows_tokio_cmd_shell_command(command),
-        WindowsShellKind::PowerShell => windows_tokio_powershell_command(shell, command),
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -125,7 +91,7 @@ pub struct NativeRuntime {
     /// Unix: the interpreter invoked as `<shell> -c "<command>"` (e.g. `"sh"`,
     /// `"bash"`, `"/bin/zsh"`).
     ///
-    /// Windows: classified by [`windows_shell_kind`] to pick the invocation
+    /// Windows: [`RuntimeAdapter::shell_dialect`] selects the invocation
     /// convention — `cmd.exe /C` (default, and for the cross-platform default
     /// `sh`) or PowerShell (`powershell`/`pwsh`).
     shell: String,
@@ -161,10 +127,6 @@ impl RuntimeAdapter for NativeRuntime {
         "native"
     }
 
-    fn has_shell_access(&self) -> bool {
-        true
-    }
-
     fn has_filesystem_access(&self) -> bool {
         true
     }
@@ -186,7 +148,7 @@ impl RuntimeAdapter for NativeRuntime {
             return ShellDialect::Posix;
         }
 
-        if windows_shell_kind(&self.shell) == WindowsShellKind::PowerShell {
+        if is_powershell_interpreter(&self.shell) {
             return ShellDialect::PowerShell;
         }
 
@@ -222,7 +184,11 @@ impl RuntimeAdapter for NativeRuntime {
 
         #[cfg(target_os = "windows")]
         {
-            let mut process = windows_tokio_shell_command(&self.shell, command);
+            let mut process = if self.shell_dialect() == ShellDialect::PowerShell {
+                windows_tokio_powershell_command(&self.shell, command)
+            } else {
+                windows_tokio_cmd_shell_command(command)
+            };
             process.current_dir(workspace_dir);
             Ok(process)
         }
@@ -569,74 +535,61 @@ mod tests {
         }
     }
 
-    // ── Windows shell classification (runs on every platform) ────
+    // ── PowerShell interpreter recognition (runs on every platform) ────
 
     #[test]
-    fn windows_shell_kind_defaults_to_cmd() {
-        assert_eq!(windows_shell_kind("sh"), WindowsShellKind::Cmd);
-        assert_eq!(windows_shell_kind("cmd"), WindowsShellKind::Cmd);
-        assert_eq!(windows_shell_kind("cmd.exe"), WindowsShellKind::Cmd);
-        assert_eq!(windows_shell_kind("bash"), WindowsShellKind::Cmd);
+    fn non_powershell_interpreters_do_not_match() {
+        assert!(!is_powershell_interpreter("sh"));
+        assert!(!is_powershell_interpreter("cmd"));
+        assert!(!is_powershell_interpreter("cmd.exe"));
+        assert!(!is_powershell_interpreter("bash"));
     }
 
     #[test]
-    fn windows_shell_kind_detects_powershell() {
-        assert_eq!(
-            windows_shell_kind("powershell"),
-            WindowsShellKind::PowerShell
-        );
-        assert_eq!(windows_shell_kind("pwsh"), WindowsShellKind::PowerShell);
+    fn powershell_interpreter_names_match() {
+        assert!(is_powershell_interpreter("powershell"));
+        assert!(is_powershell_interpreter("pwsh"));
     }
 
     #[test]
-    fn windows_shell_kind_is_case_insensitive() {
-        assert_eq!(
-            windows_shell_kind("PowerShell.exe"),
-            WindowsShellKind::PowerShell
-        );
-        assert_eq!(windows_shell_kind("PWSH.EXE"), WindowsShellKind::PowerShell);
+    fn powershell_interpreter_match_is_case_insensitive() {
+        assert!(is_powershell_interpreter("PowerShell.exe"));
+        assert!(is_powershell_interpreter("PWSH.EXE"));
     }
 
     #[test]
-    fn windows_shell_kind_strips_only_executable_suffixes() {
-        assert_eq!(
-            windows_shell_kind("powershell.cmd"),
-            WindowsShellKind::PowerShell
-        );
-        assert_eq!(windows_shell_kind("pwsh.bat"), WindowsShellKind::PowerShell);
-        assert_eq!(windows_shell_kind("pwsh.txt"), WindowsShellKind::Cmd);
-        assert_eq!(windows_shell_kind("powershell.com"), WindowsShellKind::Cmd);
+    fn powershell_interpreter_strips_only_executable_suffixes() {
+        assert!(is_powershell_interpreter("powershell.cmd"));
+        assert!(is_powershell_interpreter("pwsh.bat"));
+        assert!(!is_powershell_interpreter("pwsh.txt"));
+        assert!(!is_powershell_interpreter("powershell.com"));
     }
 
     #[test]
-    fn windows_shell_kind_handles_absolute_paths() {
-        assert_eq!(
-            windows_shell_kind(r"C:\Program Files\PowerShell\7\pwsh.exe"),
-            WindowsShellKind::PowerShell
-        );
-        assert_eq!(
-            windows_shell_kind(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
-            WindowsShellKind::PowerShell
-        );
-        assert_eq!(
-            windows_shell_kind(r"C:\Windows\System32\cmd.exe"),
-            WindowsShellKind::Cmd
-        );
+    fn powershell_interpreter_handles_absolute_paths() {
+        assert!(is_powershell_interpreter(
+            r"C:\Program Files\PowerShell\7\pwsh.exe"
+        ));
+        assert!(is_powershell_interpreter(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+        assert!(!is_powershell_interpreter(r"C:\Windows\System32\cmd.exe"));
     }
 
     #[test]
-    fn windows_shell_kind_empty_is_cmd() {
+    fn empty_interpreter_is_not_powershell() {
         // Empty/whitespace is rejected at construction; classification is total
-        // and falls back to Cmd for anything unrecognised.
-        assert_eq!(windows_shell_kind(""), WindowsShellKind::Cmd);
+        // and treats anything unrecognised as a non-PowerShell interpreter.
+        assert!(!is_powershell_interpreter(""));
     }
 
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_powershell_shell_builds_powershell_command() {
+        let script = r#"Write-Output "quoted safe value" | Select-Object -First 1"#;
         let cwd = std::env::temp_dir();
         let cmd = NativeRuntime::with_shell("pwsh".into())
-            .build_shell_command("echo hi", &cwd)
+            .build_shell_command(script, &cwd)
             .unwrap();
         let debug = format!("{cmd:?}");
         assert!(
@@ -646,6 +599,10 @@ mod tests {
         assert!(
             debug.contains("-Command"),
             "PowerShell invocation must use -Command, got: {debug}"
+        );
+        assert!(
+            debug.contains("quoted safe value"),
+            "PowerShell invocation must contain the script argument, got: {debug}"
         );
         assert!(
             debug.contains("-NoProfile"),
@@ -662,7 +619,10 @@ mod tests {
     async fn windows_powershell_executes_command() {
         let cwd = std::env::temp_dir();
         let output = NativeRuntime::with_shell("powershell".into())
-            .build_shell_command("Write-Output 'hello from ps'", &cwd)
+            .build_shell_command(
+                r#"Write-Output "quoted safe value" | Select-Object -First 1"#,
+                &cwd,
+            )
             .unwrap()
             .output()
             .await
@@ -670,9 +630,6 @@ mod tests {
 
         assert!(output.status.success(), "powershell must exit 0");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("hello from ps"),
-            "PowerShell output mismatch, got: {stdout}"
-        );
+        assert_eq!(stdout.trim(), "quoted safe value");
     }
 }

@@ -1,5 +1,6 @@
 use crate::security::SecurityPolicy;
 use anyhow::{Result, bail};
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::Config;
 
 mod schedule;
@@ -55,18 +56,18 @@ pub fn validate_shell_command(
     approved: bool,
 ) -> Result<()> {
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
-    validate_shell_command_with_security(config, &security, command, approved)
+    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    validate_shell_command_with_security(runtime.as_ref(), &security, command, approved)
 }
 
 /// Validate a shell command using an existing `SecurityPolicy` instance.
 /// Preferred when the caller already holds a `SecurityPolicy` (e.g. scheduler).
 pub fn validate_shell_command_with_security(
-    config: &Config,
+    runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
     command: &str,
     approved: bool,
 ) -> Result<()> {
-    let runtime = crate::platform::create_runtime(&config.runtime)?;
     security
         .validate_command_execution_for_shell(command, approved, runtime.shell_dialect())
         .map(|_| ())
@@ -82,14 +83,20 @@ pub fn validate_shell_command_with_security(
         })
 }
 
-/// Build a cron shell command from the configured runtime without spawning it.
-pub(crate) fn build_configured_shell_command(
+pub(crate) fn add_shell_job_with_runtime(
     config: &Config,
+    runtime: &dyn RuntimeAdapter,
+    security: &SecurityPolicy,
+    agent_alias: &str,
+    name: Option<String>,
+    schedule: Schedule,
     command: &str,
-    workspace_dir: &std::path::Path,
-) -> Result<tokio::process::Command> {
-    let runtime = crate::platform::create_runtime(&config.runtime)?;
-    runtime.build_shell_command(command, workspace_dir)
+    delivery: Option<DeliveryConfig>,
+    approved: bool,
+) -> Result<CronJob> {
+    validate_shell_command_with_security(runtime, security, command, approved)?;
+    validate_delivery_config(delivery.as_ref())?;
+    store::add_shell_job(config, agent_alias, name, schedule, command, delivery)
 }
 
 pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()> {
@@ -130,9 +137,19 @@ pub fn add_shell_job_with_approval(
     delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
-    validate_shell_command(config, agent_alias, command, approved)?;
-    validate_delivery_config(delivery.as_ref())?;
-    store::add_shell_job(config, agent_alias, name, schedule, command, delivery)
+    let security = SecurityPolicy::for_agent(config, agent_alias)?;
+    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    add_shell_job_with_runtime(
+        config,
+        runtime.as_ref(),
+        &security,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        delivery,
+        approved,
+    )
 }
 
 /// Update a shell job's command with security validation.
@@ -145,8 +162,21 @@ pub fn update_shell_job_with_approval(
     patch: CronJobPatch,
     approved: bool,
 ) -> Result<CronJob> {
+    let security = SecurityPolicy::for_agent(config, agent_alias)?;
+    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    update_shell_job_with_runtime(config, runtime.as_ref(), &security, job_id, patch, approved)
+}
+
+pub(crate) fn update_shell_job_with_runtime(
+    config: &Config,
+    runtime: &dyn RuntimeAdapter,
+    security: &SecurityPolicy,
+    job_id: &str,
+    patch: CronJobPatch,
+    approved: bool,
+) -> Result<CronJob> {
     if let Some(command) = patch.command.as_deref() {
-        validate_shell_command(config, agent_alias, command, approved)?;
+        validate_shell_command_with_security(runtime, security, command, approved)?;
     }
     update_job(config, job_id, patch)
 }
@@ -159,9 +189,39 @@ pub fn add_once_validated(
     command: &str,
     approved: bool,
 ) -> Result<CronJob> {
+    let security = SecurityPolicy::for_agent(config, agent_alias)?;
+    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    add_once_validated_with_runtime(
+        config,
+        runtime.as_ref(),
+        &security,
+        agent_alias,
+        delay,
+        command,
+        approved,
+    )
+}
+
+pub(crate) fn add_once_validated_with_runtime(
+    config: &Config,
+    runtime: &dyn RuntimeAdapter,
+    security: &SecurityPolicy,
+    agent_alias: &str,
+    delay: &str,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
     let duration = parse_delay(delay)?;
     let at = chrono::Utc::now() + duration;
-    add_once_at_validated(config, agent_alias, at, command, approved)
+    add_once_at_validated_with_runtime(
+        config,
+        runtime,
+        security,
+        agent_alias,
+        at,
+        command,
+        approved,
+    )
 }
 
 /// Create a one-shot validated shell job at an absolute timestamp.
@@ -172,8 +232,40 @@ pub fn add_once_at_validated(
     command: &str,
     approved: bool,
 ) -> Result<CronJob> {
+    let security = SecurityPolicy::for_agent(config, agent_alias)?;
+    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    add_once_at_validated_with_runtime(
+        config,
+        runtime.as_ref(),
+        &security,
+        agent_alias,
+        at,
+        command,
+        approved,
+    )
+}
+
+pub(crate) fn add_once_at_validated_with_runtime(
+    config: &Config,
+    runtime: &dyn RuntimeAdapter,
+    security: &SecurityPolicy,
+    agent_alias: &str,
+    at: chrono::DateTime<chrono::Utc>,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job_with_approval(config, agent_alias, None, schedule, command, None, approved)
+    add_shell_job_with_runtime(
+        config,
+        runtime,
+        security,
+        agent_alias,
+        None,
+        schedule,
+        command,
+        None,
+        approved,
+    )
 }
 
 // Convenience wrappers for CLI paths (default approved=false).
@@ -690,9 +782,10 @@ mod tests {
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             &config.data_dir,
         );
+        let runtime = crate::platform::create_runtime(&config.runtime).unwrap();
         // Simulate scheduler validation path
         let result = validate_shell_command_with_security(
-            &Config::default(),
+            runtime.as_ref(),
             &security,
             "curl https://example.com",
             false,

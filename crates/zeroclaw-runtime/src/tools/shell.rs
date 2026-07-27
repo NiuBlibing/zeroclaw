@@ -763,7 +763,8 @@ mod tests {
             block_high_risk_commands: true,
             ..SecurityPolicy::default()
         });
-        let tool = ShellTool::new(security, test_runtime());
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = ShellTool::new(security, runtime);
 
         let result = tool
             .execute(json!({"command": "Remove-Item important.txt"}))
@@ -779,6 +780,46 @@ mod tests {
             "PowerShell-native operation must be blocked before spawn: {:?}",
             result.error
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn powershell_agent_shell_executes_safe_pipeline_and_rejects_dangerous_alias() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let safe = tool
+            .execute(json!({
+                    "command": "Write-Output \"quoted safe value\" | Select-Object -First 1"
+            }))
+            .await
+            .expect("safe PowerShell pipeline should return a tool result");
+        assert!(safe.success, "{:?}", safe.error);
+        assert!(safe.output.contains("quoted safe value"), "{}", safe.output);
+
+        let dangerous = tool
+            .execute(json!({"command": "ac .\\blocked.txt value", "approved": true}))
+            .await
+            .expect("dangerous PowerShell alias should return a policy result");
+        assert!(!dangerous.success);
+        assert!(
+            dangerous
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("high-risk")),
+            "{:?}",
+            dangerous.error
+        );
+        assert!(!workspace.path().join("blocked.txt").exists());
     }
 
     #[tokio::test]

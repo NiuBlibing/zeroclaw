@@ -57,10 +57,6 @@ impl RuntimeAdapter for DockerRuntime {
         "docker"
     }
 
-    fn has_shell_access(&self) -> bool {
-        true
-    }
-
     fn has_filesystem_access(&self) -> bool {
         self.config.mount_workspace
     }

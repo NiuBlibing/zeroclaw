@@ -2943,10 +2943,6 @@ mod tests {
             "delegate-test-runtime"
         }
 
-        fn has_shell_access(&self) -> bool {
-            true
-        }
-
         fn has_filesystem_access(&self) -> bool {
             true
         }
