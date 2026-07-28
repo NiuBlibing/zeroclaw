@@ -1894,11 +1894,16 @@ impl SecurityPolicy {
         }
 
         let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
-        if has_wildcard {
+        // Preserve the existing trusted-environment escape hatch shared with
+        // POSIX/cmd policy: wildcard plus disabled high-risk blocking opts out
+        // of command-level syntax restrictions. In every other configuration,
+        // apply the complete bounded PowerShell grammar before a named command
+        // can qualify for an allowlist or high-risk exemption.
+        if has_wildcard && !self.block_high_risk_commands {
             return true;
         }
 
-        let Some(segments) = split_powershell_pipeline_syntax(command) else {
+        let Some(segments) = split_simple_powershell_pipeline(command) else {
             return false;
         };
 
@@ -1923,6 +1928,12 @@ impl SecurityPolicy {
             }
 
             let args_cased: Vec<String> = words.map(str::to_string).collect();
+            if args_cased
+                .iter()
+                .any(|argument| is_powershell_provider_argument(argument))
+            {
+                return false;
+            }
             let args: Vec<String> = args_cased
                 .iter()
                 .map(|word| word.to_ascii_lowercase())

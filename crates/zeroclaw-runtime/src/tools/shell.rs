@@ -708,6 +708,88 @@ mod tests {
         assert!(schema["properties"]["approved"].is_object());
     }
 
+    #[cfg(all(any(unix, windows), not(target_os = "android")))]
+    #[tokio::test]
+    async fn rebuilt_shell_tool_adopts_reloaded_runtime_shell_dialect() {
+        use crate::platform::{ShellDialect, create_runtime};
+        use zeroclaw_config::schema::Config;
+
+        let mut config = Config::default();
+        #[cfg(target_os = "windows")]
+        {
+            config.runtime.shell = Some("cmd".into());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            config.runtime.shell = Some("sh".into());
+        }
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let build_shell_tool = |config: &Config| {
+            let runtime: Arc<dyn RuntimeAdapter> =
+                Arc::from(create_runtime(&config.runtime).expect("runtime should rebuild"));
+            ShellTool::new(security.clone(), runtime)
+        };
+
+        let before_reload = build_shell_tool(&config);
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            before_reload.runtime.shell_dialect(),
+            ShellDialect::WindowsCmd
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(before_reload.runtime.shell_dialect(), ShellDialect::Posix);
+        let before_result = before_reload
+            .execute(json!({"command": "echo Env:NAME"}))
+            .await
+            .expect("pre-reload shell should return a tool result");
+        assert!(
+            before_result.success,
+            "the pre-reload non-PowerShell policy should accept the probe: {before_result:?}"
+        );
+
+        // A daemon reload re-reads Config and rebuilds the subsystem graph.
+        // Use an executable shim named `pwsh` on Unix so the real runtime
+        // factory validates the reloaded value without requiring PowerShell to
+        // be installed; policy rejection occurs before the shim can spawn.
+        #[cfg(unix)]
+        let powershell_dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let powershell = powershell_dir.path().join("pwsh");
+            std::fs::write(&powershell, "#!/bin/sh\nexit 99\n").unwrap();
+            std::fs::set_permissions(&powershell, std::fs::Permissions::from_mode(0o755)).unwrap();
+            config.runtime.shell = Some(powershell.to_string_lossy().into_owned());
+        }
+        #[cfg(target_os = "windows")]
+        {
+            config.runtime.shell = Some("powershell".into());
+        }
+
+        let after_reload = build_shell_tool(&config);
+        assert_eq!(
+            after_reload.runtime.shell_dialect(),
+            ShellDialect::PowerShell
+        );
+        let after_result = after_reload
+            .execute(json!({"command": "echo Env:NAME", "approved": true}))
+            .await
+            .expect("reloaded shell should return a policy result");
+        assert!(!after_result.success);
+        assert!(
+            after_result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed")),
+            "the rebuilt PowerShell path must apply provider-aware validation: {after_result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn shell_stdin_is_eof_not_the_terminal() {
         let security = Arc::new(SecurityPolicy {

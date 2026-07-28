@@ -40,6 +40,52 @@ fn powershell_expressions_hidden_behind_allowed_commands_fail_closed() {
 }
 
 #[test]
+fn strict_powershell_grammar_precedes_named_allowlist_exemptions() {
+    let policy = SecurityPolicy::default();
+
+    for command in [
+        "echo \"$([System.IO.File]::Delete('important.txt'))\"",
+        "echo \"$env:NAME\"",
+        "echo Env:NAME",
+    ] {
+        assert_eq!(
+            policy.command_risk_level_for_shell(command, ShellDialect::PowerShell),
+            CommandRiskLevel::High,
+            "unsupported PowerShell syntax must remain high risk: {command:?}"
+        );
+        let error = policy
+            .validate_command_execution_for_shell(command, true, ShellDialect::PowerShell)
+            .expect_err("named allowlist entries must not exempt unsupported PowerShell grammar");
+        assert!(
+            error.contains("not allowed"),
+            "unsupported PowerShell grammar must fail at the structural allowlist gate: {error}"
+        );
+    }
+}
+
+#[test]
+fn disabled_high_risk_blocking_does_not_relax_named_allowlist_grammar() {
+    let policy = SecurityPolicy {
+        allowed_commands: vec!["echo".into()],
+        block_high_risk_commands: false,
+        ..SecurityPolicy::default()
+    };
+
+    for command in [
+        "echo \"$([System.IO.File]::Delete('important.txt'))\"",
+        "echo \"$env:NAME\"",
+        "echo Env:NAME",
+    ] {
+        assert!(
+            policy
+                .validate_command_execution_for_shell(command, true, ShellDialect::PowerShell)
+                .is_err(),
+            "only wildcard plus disabled high-risk blocking may opt out of structural guards"
+        );
+    }
+}
+
+#[test]
 fn documented_read_only_powershell_commands_pass_default_risk_gates() {
     let policy = powershell_policy();
 
@@ -182,6 +228,8 @@ fn wildcard_and_risk_flags_keep_their_existing_approval_semantics() {
         "ac output.txt value",
         "wsl.exe --exec echo unsafe",
         "Write-Output $env:NAME",
+        "echo \"$([System.IO.File]::Delete('important.txt'))\"",
+        "echo Env:NAME",
     ] {
         assert!(
             supervised
