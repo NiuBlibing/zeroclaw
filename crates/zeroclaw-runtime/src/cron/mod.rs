@@ -162,6 +162,10 @@ pub fn update_shell_job_with_approval(
     patch: CronJobPatch,
     approved: bool,
 ) -> Result<CronJob> {
+    if patch.command.is_none() {
+        return update_job(config, job_id, patch);
+    }
+
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
     let runtime = crate::platform::create_runtime(&config.runtime)?;
     update_shell_job_with_runtime(config, runtime.as_ref(), &security, job_id, patch, approved)
