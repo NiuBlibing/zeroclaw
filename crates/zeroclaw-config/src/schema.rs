@@ -3351,11 +3351,18 @@ pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
     pub max_history_messages: usize,
-    /// Token budget for preemptive context/history trimming (from runtime profile).
+    /// Optional operator cost ceiling from `runtime_profiles.<name>.max_context_tokens`.
+    /// `None` (the default) means the preemptive-trim threshold tracks the model
+    /// window alone; `Some(n)` clamps that threshold down to `n`. Never raises it.
     /// NOT the provider `max_tokens` output limit.
-    pub max_context_tokens: usize,
+    pub max_context_tokens: Option<usize>,
     /// Model's context window (max input tokens) — from provider config.
+    /// Primary driver of the preemptive-trim threshold (× `context_compact_ratio`).
     pub model_context_window: usize,
+    /// Fraction of `model_context_window` at which preemptive trimming triggers.
+    /// Resolved from the runtime profile (default `DEFAULT_CONTEXT_COMPACT_RATIO`),
+    /// clamped to `(0.0, 1.0]`.
+    pub context_compact_ratio: f64,
     pub parallel_tools: bool,
     pub tool_dispatcher: String,
     pub strict_tool_parsing: bool,
@@ -3373,17 +3380,42 @@ pub struct ResolvedRuntime {
     pub prompt_injection_mode: SkillsPromptInjectionMode,
 }
 
+/// Default fraction of the model context window at which preemptive history
+/// trimming triggers when a runtime profile does not set `context_compact_ratio`.
+pub const DEFAULT_CONTEXT_COMPACT_RATIO: f64 = 0.9;
+
 impl ResolvedRuntime {
     /// Effective token budget for preemptive whole-turn history trimming.
-    /// When `history_pruning.enabled` is set, an explicit `max_tokens` floor
-    /// trims earlier than the hard context ceiling; otherwise the ceiling is
-    /// the only trigger. Reuses the existing `history_pruning.*` idents.
+    ///
+    /// The threshold is anchored to the model's context window
+    /// (× `context_compact_ratio`, default 0.9) rather than a fixed operator
+    /// value, so it scales with whatever model the agent actually runs on and
+    /// stays below the provider's hard limit (the reactive overflow-recovery
+    /// path uses a comparable 90% figure). An enabled `history_pruning.max_tokens`
+    /// and an explicit `max_context_tokens` cost ceiling can each pull it *down*
+    /// (never up) for operators who want to trim earlier. When `max_context_tokens`
+    /// is `None` the model window governs alone — this is the default, so
+    /// operators get sensible per-model behavior without configuring anything.
+    ///
+    /// When no provider `context_window` is configured, `model_context_window`
+    /// falls back to 32k, giving a ~28.8k threshold at the default ratio — close
+    /// to the historical default, so unconfigured deployments see no meaningful
+    /// regression.
     pub fn effective_context_budget(&self) -> usize {
-        if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
-            self.max_context_tokens.min(self.history_pruning.max_tokens)
+        let ratio = if self.context_compact_ratio > 0.0 && self.context_compact_ratio <= 1.0 {
+            self.context_compact_ratio
         } else {
-            self.max_context_tokens
+            DEFAULT_CONTEXT_COMPACT_RATIO
+        };
+        // f64 math on token counts that fit well within exact-integer range.
+        let mut budget = (self.model_context_window as f64 * ratio) as usize;
+        if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
+            budget = budget.min(self.history_pruning.max_tokens);
         }
+        if let Some(ceiling) = self.max_context_tokens {
+            budget = budget.min(ceiling);
+        }
+        budget.max(1)
     }
 }
 
@@ -3393,8 +3425,9 @@ impl Default for ResolvedRuntime {
             compact_context: true,
             max_tool_iterations: 10,
             max_history_messages: 50,
-            max_context_tokens: 32_000,
+            max_context_tokens: None,
             model_context_window: 32_000,
+            context_compact_ratio: DEFAULT_CONTEXT_COMPACT_RATIO,
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             strict_tool_parsing: false,
@@ -4028,12 +4061,25 @@ impl Config {
     }
 
     #[must_use]
-    pub fn effective_max_context_tokens(&self, agent_alias: &str) -> usize {
-        // Token budget for preemptive context/history trimming (runtime profile override).
-        // This is NOT the provider max_tokens output limit and NOT the model's context window.
+    pub fn effective_max_context_tokens(&self, agent_alias: &str) -> Option<usize> {
+        // Optional operator cost ceiling from the runtime profile. `None` means
+        // no explicit ceiling, so the preemptive-trim threshold tracks the model
+        // window alone (see `ResolvedRuntime::effective_context_budget`); `Some(n)`
+        // clamps that threshold down. No longer the context-meter denominator —
+        // that is the model window (see `effective_model_context_window`).
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_context_tokens)
-            .unwrap_or(32_000)
+    }
+
+    /// Fraction of the model context window at which preemptive trimming fires.
+    /// Runtime-profile `context_compact_ratio`, clamped to `(0.0, 1.0]`, with a
+    /// `DEFAULT_CONTEXT_COMPACT_RATIO` (0.9) fallback for unset/invalid values.
+    #[must_use]
+    pub fn effective_context_compact_ratio(&self, agent_alias: &str) -> f64 {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.context_compact_ratio)
+            .filter(|r| *r > 0.0 && *r <= 1.0)
+            .unwrap_or(DEFAULT_CONTEXT_COMPACT_RATIO)
     }
 
     /// Returns the model's context window size (max input tokens).
@@ -4129,10 +4175,12 @@ impl Config {
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
-            // Token budget for context/history trimming — from runtime profile
+            // Optional operator cost ceiling — clamps the model-derived trim
+            // threshold down when set (see `effective_context_budget`).
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
             // Model's context window (max input tokens) — from provider config
             model_context_window: self.effective_model_context_window(agent_alias),
+            context_compact_ratio: self.effective_context_compact_ratio(agent_alias),
             compact_context: self.effective_compact_context(agent_alias),
             parallel_tools: self.effective_parallel_tools(agent_alias),
             tool_dispatcher: self.effective_tool_dispatcher(agent_alias),
@@ -11797,8 +11845,15 @@ pub struct RuntimeProfileConfig {
     // ── Per-agent runtime tunables (also live on AliasedAgentConfig) ─
     /// Maximum conversation history messages retained per session. `None` inherits.
     pub max_history_messages: Option<usize>,
-    /// Maximum estimated tokens for context before compaction. `None` inherits.
+    /// Legacy context-token budget. No longer drives preemptive compaction
+    /// (that threshold is now the model's `context_window` × 0.9); trim earlier
+    /// via `history_pruning.max_tokens`. Retained for config compatibility and
+    /// as the resolved `ResolvedRuntime::max_context_tokens` value. `None` inherits.
     pub max_context_tokens: Option<usize>,
+    /// Fraction of the model's context window at which preemptive history
+    /// trimming triggers (e.g. `0.9` = trim at 90%). `None` inherits the
+    /// default 0.9. Clamped to `(0.0, 1.0]`.
+    pub context_compact_ratio: Option<f64>,
     /// Use compact bootstrap (6000 chars / 2 RAG chunks). `None` inherits.
     pub compact_context: Option<bool>,
     /// Enable parallel tool execution per iteration. `None` inherits.
@@ -11853,6 +11908,7 @@ impl Default for RuntimeProfileConfig {
             agentic_timeout_secs: None,
             max_history_messages: None,
             max_context_tokens: None,
+            context_compact_ratio: None,
             compact_context: None,
             parallel_tools: None,
             tool_dispatcher: None,
@@ -22490,6 +22546,42 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[::core::prelude::v1::test]
+    fn effective_context_budget_tracks_model_window_ratio() {
+        use super::ResolvedRuntime;
+
+        // Default ratio (0.9) against a 200k window.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 180_000);
+
+        // Custom ratio pulls the threshold to 80%.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            context_compact_ratio: 0.8,
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 160_000);
+
+        // Explicit max_context_tokens ceiling clamps below the ratio result.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            max_context_tokens: Some(50_000),
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 50_000);
+
+        // Out-of-range ratio falls back to the 0.9 default.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            context_compact_ratio: 0.0,
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 180_000);
+    }
 
     #[::core::prelude::v1::test]
     fn todotracker_config_defaults() {

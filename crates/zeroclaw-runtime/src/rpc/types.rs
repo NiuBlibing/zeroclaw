@@ -1345,8 +1345,8 @@ pub enum SessionUpdateEvent {
         timeout_secs: u64,
     },
     /// Per-LLM-call token usage. `input_tokens` is the cumulative context size
-    /// for this turn; `max_context_tokens` is the runtime-profile context
-    /// budget (`[runtime_profiles.<name>] max_context_tokens`). Both may be
+    /// for this turn; `max_context_tokens` is the model's full context window
+    /// (provider `context_window`), the meter denominator. Both may be
     /// absent when the provider doesn't report usage.
     ContextUsage {
         session_id: String,

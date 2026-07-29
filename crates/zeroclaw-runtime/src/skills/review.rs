@@ -37,7 +37,7 @@ pub async fn maybe_run_skill_review(
     multimodal: &MultimodalConfig,
     pacing: &PacingConfig,
     max_tool_result_chars: usize,
-    max_context_tokens: usize,
+    context_token_budget: usize,
     cancellation_token: Option<&CancellationToken>,
     agent_alias: Option<&str>,
 ) {
@@ -111,7 +111,7 @@ pub async fn maybe_run_skill_review(
                         parallel_tools: false,
                         // sequential for the mutation-capable fork
                         max_tool_result_chars,
-                        context_token_budget: max_context_tokens,
+                        context_token_budget,
                         knobs: &crate::agent::loop_::LoopKnobs::default(),
                     },
                 ),

@@ -2105,7 +2105,7 @@ pub async fn run(
                             &config.multimodal,
                             &config.pacing,
                             agent.resolved.max_tool_result_chars,
-                            agent.resolved.max_context_tokens,
+                            agent.resolved.effective_context_budget(),
                             None, // cancellation_token — no parent token in single-shot run
                             Some(agent_alias),
                         ),
@@ -3294,7 +3294,7 @@ pub async fn process_message(
                     agent.resolved.strict_tool_parsing,
                     agent.resolved.parallel_tools,
                     agent.resolved.max_tool_result_chars,
-                    agent.resolved.max_context_tokens,
+                    agent.resolved.effective_context_budget(),
                     // Cross-channel HITL: a route-only approval bridge when the
                     // profile sets `approval_route` and channels are live, else
                     // `None` (today's channel-less auto-deny). See above.
