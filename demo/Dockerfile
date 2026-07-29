@@ -9,8 +9,8 @@
 # to both. Simulator runs by default on :8080; use run-zeroclaw.sh for the agent.
 
 # ─── Stage 1: build ────────────────────────────────────────────────────────
-# Matches the workspace `rust-version = "1.96.1"` MSRV declared in Cargo.toml.
-FROM rust:1.96-slim-bookworm AS builder
+# Matches the workspace `rust-version = "1.97.1"` MSRV declared in Cargo.toml.
+FROM rust:1.97-slim-bookworm AS builder
 
 WORKDIR /build
 
