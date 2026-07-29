@@ -16,13 +16,14 @@ pub fn windows_cmd_shell_raw_arg(command: &str) -> String {
 ///
 /// Both `/` and `\` are treated as path separators regardless of the host OS
 /// (so the classification is stable and unit-testable off Windows), and a
-/// trailing `.exe`/`.cmd`/`.bat` extension is stripped before matching.
+/// trailing `.exe` extension is stripped before matching. Batch files are not
+/// PowerShell interpreters: Windows launches `.cmd`/`.bat` files through
+/// `cmd.exe`, so classifying them as PowerShell would make validation and
+/// execution use different shell languages.
 fn is_powershell_interpreter(shell: &str) -> bool {
     let file = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
     let stem = match file.rsplit_once('.') {
-        Some((stem, ext)) if matches!(ext.to_ascii_lowercase().as_str(), "exe" | "cmd" | "bat") => {
-            stem
-        }
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") => stem,
         _ => file,
     };
     matches!(stem.to_ascii_lowercase().as_str(), "powershell" | "pwsh")
@@ -558,9 +559,11 @@ mod tests {
     }
 
     #[test]
-    fn powershell_interpreter_strips_only_executable_suffixes() {
-        assert!(is_powershell_interpreter("powershell.cmd"));
-        assert!(is_powershell_interpreter("pwsh.bat"));
+    fn powershell_interpreter_strips_only_exe_suffix() {
+        assert!(is_powershell_interpreter("powershell.exe"));
+        assert!(is_powershell_interpreter("pwsh.exe"));
+        assert!(!is_powershell_interpreter("powershell.cmd"));
+        assert!(!is_powershell_interpreter("pwsh.bat"));
         assert!(!is_powershell_interpreter("pwsh.txt"));
         assert!(!is_powershell_interpreter("powershell.com"));
     }
@@ -572,6 +575,12 @@ mod tests {
         ));
         assert!(is_powershell_interpreter(
             r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+        assert!(!is_powershell_interpreter(
+            r"C:\Program Files\PowerShell\7\pwsh.bat"
+        ));
+        assert!(!is_powershell_interpreter(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.cmd"
         ));
         assert!(!is_powershell_interpreter(r"C:\Windows\System32\cmd.exe"));
     }
@@ -612,6 +621,29 @@ mod tests {
             !debug.contains("cmd.exe"),
             "PowerShell shell must not fall back to cmd.exe, got: {debug}"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_batch_shell_names_use_cmd_boundary() {
+        let cwd = std::env::temp_dir();
+
+        for shell in ["pwsh.bat", "powershell.cmd"] {
+            let runtime = NativeRuntime::with_shell(shell.into());
+            assert_eq!(runtime.shell_dialect(), ShellDialect::WindowsCmd);
+
+            let cmd = runtime.build_shell_command("echo safe", &cwd).unwrap();
+            let debug = format!("{cmd:?}");
+            assert!(
+                debug.contains(WINDOWS_COMMAND_INTERPRETER)
+                    && debug.contains(WINDOWS_COMMAND_EXECUTE_ARG),
+                "batch shell name must use cmd.exe /C, got: {debug}"
+            );
+            assert!(
+                !debug.contains(shell),
+                "batch shell name must not be spawned as PowerShell, got: {debug}"
+            );
+        }
     }
 
     #[tokio::test]

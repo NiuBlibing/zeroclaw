@@ -151,6 +151,58 @@ fn unknown_powershell_cmdlets_are_high_risk_by_default() {
 }
 
 #[test]
+fn powershell_batch_files_do_not_inherit_native_command_policy() {
+    use zeroclaw_config::policy::AutonomyLevel;
+
+    for (allowed, command) in [
+        ("git", r".\git.bat status"),
+        ("git", r".\git.cmd status"),
+        ("git.bat", "git.bat status"),
+        (r".\git.cmd", r".\git.cmd status"),
+        ("*", r".\git.bat status"),
+    ] {
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec![allowed.into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert_eq!(
+            policy.command_risk_level_for_shell(command, ShellDialect::PowerShell),
+            CommandRiskLevel::High,
+            "batch file must not inherit the native command's risk: {command:?}"
+        );
+        let error = policy
+            .validate_command_execution_for_shell(command, true, ShellDialect::PowerShell)
+            .expect_err("bounded PowerShell grammar must reject batch files");
+        assert!(
+            error.contains("not allowed"),
+            "batch file must fail at the structural allowlist gate: {error}"
+        );
+    }
+}
+
+#[test]
+fn powershell_exe_application_still_matches_native_allowlist_entry() {
+    let policy = SecurityPolicy {
+        allowed_commands: vec!["git".into()],
+        ..SecurityPolicy::default()
+    };
+
+    assert_eq!(
+        policy
+            .validate_command_execution_for_shell(
+                "git.exe status",
+                false,
+                ShellDialect::PowerShell,
+            )
+            .unwrap(),
+        CommandRiskLevel::Low
+    );
+}
+
+#[test]
 fn mutation_aliases_and_scoped_variables_are_high_risk() {
     let policy = SecurityPolicy {
         autonomy: zeroclaw_config::policy::AutonomyLevel::Full,
@@ -227,6 +279,7 @@ fn wildcard_and_risk_flags_keep_their_existing_approval_semantics() {
     for command in [
         "ac output.txt value",
         "wsl.exe --exec echo unsafe",
+        r".\git.bat status",
         "Write-Output $env:NAME",
         "echo \"$([System.IO.File]::Delete('important.txt'))\"",
         "echo Env:NAME",

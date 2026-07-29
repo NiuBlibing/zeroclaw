@@ -1382,10 +1382,13 @@ fn is_powershell_allowlist_entry_match(
 }
 
 fn strip_powershell_executable_suffix(name: &str) -> &str {
-    name.strip_suffix(".exe")
-        .or_else(|| name.strip_suffix(".cmd"))
-        .or_else(|| name.strip_suffix(".bat"))
-        .unwrap_or(name)
+    name.strip_suffix(".exe").unwrap_or(name)
+}
+
+fn is_powershell_batch_file(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(_, extension)| {
+        extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+    })
 }
 
 fn is_powershell_provider_argument(argument: &str) -> bool {
@@ -1681,6 +1684,9 @@ impl SecurityPolicy {
                 return CommandRiskLevel::High;
             };
             let base_owned = command_basename(base_raw).to_ascii_lowercase();
+            if is_powershell_batch_file(&base_owned) {
+                return CommandRiskLevel::High;
+            }
             let base = strip_powershell_executable_suffix(&base_owned);
             let arguments: Vec<&str> = words.collect();
             let arguments_lower: Vec<String> = arguments
@@ -1815,6 +1821,7 @@ impl SecurityPolicy {
                     let base_owned = command_basename(raw_executable).to_ascii_lowercase();
                     let base = strip_powershell_executable_suffix(&base_owned);
                     !base.is_empty()
+                        && !is_powershell_batch_file(&base_owned)
                         && self.allowed_commands.iter().any(|allowed| {
                             allowed.trim() != "*"
                                 && is_powershell_allowlist_entry_match(
@@ -1921,6 +1928,9 @@ impl SecurityPolicy {
             }
 
             let base_owned = command_basename(raw_executable).to_ascii_lowercase();
+            if is_powershell_batch_file(&base_owned) {
+                return false;
+            }
             let base = strip_powershell_executable_suffix(&base_owned);
             if !self
                 .allowed_commands
