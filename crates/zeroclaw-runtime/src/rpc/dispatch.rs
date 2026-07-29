@@ -6609,7 +6609,9 @@ mod tests {
     /// Build a Config whose `coder` agent resolves to a provider entry with the
     /// given `context_window`, exercising the real `custom.<alias>` lookup path.
     #[cfg(test)]
-    fn cfg_with_provider_context_window(context_window: Option<usize>) -> zeroclaw_config::schema::Config {
+    fn cfg_with_provider_context_window(
+        context_window: Option<usize>,
+    ) -> zeroclaw_config::schema::Config {
         use std::collections::HashMap;
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
