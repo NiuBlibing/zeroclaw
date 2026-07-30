@@ -527,7 +527,7 @@ impl RpcDispatcher {
 
     async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
         if let Some(event) = event
-            && let Some(notification) = notification_for_turn_event(session_id, &event, None)
+            && let Some(notification) = notification_for_turn_event(session_id, &event, None, None)
         {
             let _ = self.rpc.send_raw(notification).await;
         }
@@ -1703,12 +1703,12 @@ impl RpcDispatcher {
             .chat_mode(sid)
             .await
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
-        // Capture live attribution fields and max_context_tokens for the turn span.
-        // Zerocode's context meter field is named `max_context_tokens` and must
-        // reflect the runtime-profile budget (`[runtime_profiles.<name>]
-        // max_context_tokens`), not the provider model-window helper (which
-        // falls back to 32_000 when `context_window` is unset).
-        let (agent_alias, model_provider, model, max_ctx) = {
+        // Capture live attribution fields plus the two context-meter values for
+        // the turn span. `max_ctx` is the preemptive-trim budget the meter fills
+        // toward (wire field `max_context_tokens`, original meaning); `model_win`
+        // is the model's full context window (wire field `model_context_window`),
+        // exposed distinctly so the client can show budget and capacity apart.
+        let (agent_alias, model_provider, model, max_ctx, model_win) = {
             let alias = self
                 .ctx
                 .sessions
@@ -1721,11 +1721,14 @@ impl RpcDispatcher {
             } else {
                 (String::new(), String::new())
             };
-            let max_ctx = {
+            let (max_ctx, model_win) = {
                 let cfg = self.ctx.config.read();
-                Some(context_usage_max_tokens(&cfg, &alias))
+                (
+                    Some(context_usage_max_tokens(&cfg, &alias)),
+                    Some(context_usage_model_window(&cfg, &alias)),
+                )
             };
-            (alias, mp, m, max_ctx)
+            (alias, mp, m, max_ctx, model_win)
         };
 
         let rpc = self.rpc.clone();
@@ -1790,7 +1793,7 @@ impl RpcDispatcher {
                     }
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
-                    if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
+                    if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx, model_win) {
                         let _ = rpc.send_raw(n).await;
                     }
                 }
@@ -4611,14 +4614,24 @@ fn truncate_memory_previews(
     entries
 }
 
-/// Resolve the denominator shown on Zerocode's context usage meter.
+/// Resolve the preemptive-trim budget shown on Zerocode's context usage meter.
 ///
-/// The wire field is (historically) named `max_context_tokens`, but it now
-/// reports the model's full context window (`providers.models.*.context_window`,
-/// falling back to 32_000 when unset) so the meter reflects usage against the
-/// real window. Preemptive trimming kicks in around 90% of this value; showing
-/// the full window lets the operator see that headroom directly.
+/// This is the value `input_tokens` fills toward before trimming triggers — the
+/// resolved `effective_context_budget` (model window × `context_compact_ratio`,
+/// clamped by any `history_pruning.max_tokens` / `max_context_tokens` cost
+/// ceiling). Falls back to the model window when the agent can't be resolved.
+/// Emitted on the wire as `max_context_tokens`, preserving that field's original
+/// "budget the meter fills toward" meaning.
 fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: &str) -> u64 {
+    cfg.resolved_agent_config(agent_alias)
+        .map(|a| a.resolved.effective_context_budget() as u64)
+        .unwrap_or_else(|| cfg.effective_model_context_window(agent_alias) as u64)
+}
+
+/// Resolve the model's full context window (provider `context_window`, 32_000
+/// fallback). Exposed on the wire as `model_context_window`, distinct from the
+/// trim budget, so a client can render capacity and budget separately.
+fn context_usage_model_window(cfg: &zeroclaw_config::schema::Config, agent_alias: &str) -> u64 {
     cfg.effective_model_context_window(agent_alias) as u64
 }
 
@@ -4696,13 +4709,14 @@ fn plan_replay_notification(
     let event = TurnEvent::Plan {
         entries: entries.to_vec(),
     };
-    notification_for_turn_event(session_id, &event, None)
+    notification_for_turn_event(session_id, &event, None, None)
 }
 
 fn notification_for_turn_event(
     session_id: &str,
     event: &TurnEvent,
     max_context_tokens: Option<u64>,
+    model_context_window: Option<u64>,
 ) -> Option<String> {
     let update = match event {
         TurnEvent::Chunk { delta } => SessionUpdateEvent::AgentMessageChunk {
@@ -4763,6 +4777,7 @@ fn notification_for_turn_event(
             session_id: session_id.to_string(),
             input_tokens: *input_tokens,
             max_context_tokens,
+            model_context_window,
         },
         TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
             session_id: session_id.to_string(),
@@ -6364,7 +6379,7 @@ mod tests {
         let event = TurnEvent::Chunk {
             delta: "hello".into(),
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["jsonrpc"], JSONRPC_VERSION);
         assert_eq!(v["method"], notification::SESSION_UPDATE);
@@ -6378,7 +6393,7 @@ mod tests {
         let event = TurnEvent::Thinking {
             delta: "hmm".into(),
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "agent_thought_chunk");
         assert_eq!(v["params"]["text"], "hmm");
@@ -6391,7 +6406,7 @@ mod tests {
             name: "bash".into(),
             args: json!({"cmd": "ls"}),
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "tool_call");
         assert_eq!(v["params"]["tool_call_id"], "tc_1");
@@ -6407,7 +6422,7 @@ mod tests {
             output: "file.txt".into(),
             artifact: None,
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "tool_result");
         assert_eq!(v["params"]["tool_call_id"], "tc_1");
@@ -6426,7 +6441,7 @@ mod tests {
                 active_form: Some("Analyzing codebase".to_string()),
             }],
         };
-        let json = notification_for_turn_event("sess-1", &event, None)
+        let json = notification_for_turn_event("sess-1", &event, None, None)
             .expect("plan yields a notification");
         let v = parse(&json);
         assert_eq!(v["method"], "session/update");
@@ -6444,8 +6459,8 @@ mod tests {
     #[test]
     fn empty_plan_turn_event_maps_to_empty_entries() {
         let event = TurnEvent::Plan { entries: vec![] };
-        let json =
-            notification_for_turn_event("sess-2", &event, None).expect("empty plan still notifies");
+        let json = notification_for_turn_event("sess-2", &event, None, None)
+            .expect("empty plan still notifies");
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "plan");
         assert!(v["params"]["entries"].as_array().unwrap().is_empty());
@@ -6560,7 +6575,7 @@ mod tests {
             arguments_summary: "rm -rf /".into(),
             timeout_secs: 30,
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "approval_request");
         assert_eq!(v["params"]["request_id"], "ar_1");
@@ -6575,7 +6590,7 @@ mod tests {
             kept_turns: 1,
             reason: "context token budget exceeded".into(),
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["method"], "session/update");
         assert_eq!(v["params"]["type"], "history_trimmed");
@@ -6593,7 +6608,8 @@ mod tests {
             output_tokens: Some(50),
             cost_usd: Some(0.01),
         };
-        let json = notification_for_turn_event("s1", &event, Some(200_000)).unwrap();
+        // budget = trim budget (fills toward), window = full model capacity.
+        let json = notification_for_turn_event("s1", &event, Some(180_000), Some(200_000)).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(v["params"]["session_id"], "s1");
@@ -6602,19 +6618,32 @@ mod tests {
         // cached_input_tokens is a *subset* of input_tokens per the
         // TokenUsage contract and must NOT be added (double-counts).
         assert_eq!(v["params"]["input_tokens"], 100);
-        // Denominator is the model's full context window, not a runtime budget.
-        assert_eq!(v["params"]["max_context_tokens"], 200_000);
+        // max_context_tokens keeps its original meaning: the trim budget the
+        // meter fills toward. model_context_window is the full capacity, distinct.
+        assert_eq!(v["params"]["max_context_tokens"], 180_000);
+        assert_eq!(v["params"]["model_context_window"], 200_000);
     }
 
     /// Build a Config whose `coder` agent resolves to a provider entry with the
-    /// given `context_window`, exercising the real `custom.<alias>` lookup path.
+    /// given `context_window`, and an optional runtime profile carrying a
+    /// `max_context_tokens` cost ceiling. Exercises the real `custom.<alias>`
+    /// provider lookup plus runtime-profile resolution.
     #[cfg(test)]
     fn cfg_with_provider_context_window(
         context_window: Option<usize>,
     ) -> zeroclaw_config::schema::Config {
+        cfg_with_window_and_cap(context_window, None)
+    }
+
+    #[cfg(test)]
+    fn cfg_with_window_and_cap(
+        context_window: Option<usize>,
+        max_context_tokens: Option<usize>,
+    ) -> zeroclaw_config::schema::Config {
         use std::collections::HashMap;
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+            RuntimeProfileConfig,
         };
 
         let mut custom = HashMap::new();
@@ -6628,69 +6657,109 @@ mod tests {
             },
         );
 
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
         let mut agents = HashMap::new();
         agents.insert(
             "coder".to_string(),
             AliasedAgentConfig {
                 enabled: true,
                 model_provider: zeroclaw_config::providers::ModelProviderRef::new("custom.default"),
+                runtime_profile: "coding".into(),
                 ..AliasedAgentConfig::default()
             },
         );
 
         let mut cfg = Config {
             agents,
+            runtime_profiles,
             ..Config::default()
         };
         cfg.providers.models.custom = custom;
         cfg
     }
 
-    /// Regression: Zerocode's context meter reports the model's full context
-    /// window (provider `context_window`), so the meter reflects usage against
-    /// the real window rather than a runtime budget.
+    /// Meter budget = trim budget = model window × 0.9 when no cost ceiling is set.
     #[test]
-    fn context_usage_max_tokens_uses_model_context_window() {
+    fn context_usage_max_tokens_is_trim_budget_from_window() {
         let cfg = cfg_with_provider_context_window(Some(200_000));
         assert_eq!(
             context_usage_max_tokens(&cfg, "coder"),
-            200_000,
-            "context meter must report the provider context_window"
+            180_000,
+            "budget must be model_context_window × default 0.9 ratio"
         );
     }
 
-    /// Fallback: with no provider `context_window`, the meter denominator falls
-    /// back to the 32k model-window default.
+    /// An explicit `max_context_tokens` cost ceiling clamps the budget below the
+    /// ratio result; the model-window helper is unaffected.
     #[test]
-    fn context_usage_max_tokens_falls_back_to_32k() {
-        let cfg = cfg_with_provider_context_window(None);
-        assert_eq!(context_usage_max_tokens(&cfg, "coder"), 32_000);
+    fn context_usage_max_tokens_clamped_by_explicit_cap() {
+        let cfg = cfg_with_window_and_cap(Some(200_000), Some(50_000));
+        assert_eq!(
+            context_usage_max_tokens(&cfg, "coder"),
+            50_000,
+            "explicit max_context_tokens must clamp the budget down"
+        );
+        assert_eq!(
+            context_usage_model_window(&cfg, "coder"),
+            200_000,
+            "model window is independent of the cost ceiling"
+        );
     }
 
-    /// Boundary regression: prove the model-window denominator survives the
-    /// *wire* path, not just the config helper. Threads
-    /// `context_usage_max_tokens(&cfg, alias)` through the exact
+    /// The model-window helper reports the provider `context_window` distinctly
+    /// from the trim budget.
+    #[test]
+    fn context_usage_model_window_reports_provider_window() {
+        let cfg = cfg_with_provider_context_window(Some(200_000));
+        assert_eq!(context_usage_model_window(&cfg, "coder"), 200_000);
+    }
+
+    /// Fallback: with no provider `context_window`, both the model-window helper
+    /// and the derived budget fall back to the 32k default (× 0.9 → 28.8k).
+    #[test]
+    fn context_usage_falls_back_to_32k_window() {
+        let cfg = cfg_with_provider_context_window(None);
+        assert_eq!(context_usage_model_window(&cfg, "coder"), 32_000);
+        assert_eq!(context_usage_max_tokens(&cfg, "coder"), 28_800);
+    }
+
+    /// Boundary regression: prove BOTH meter values survive the *wire* path, not
+    /// just the config helpers. Threads them through the exact
     /// `notification_for_turn_event` serialization the RPC dispatch emits.
     #[test]
-    fn context_usage_notification_wire_reports_model_context_window() {
-        let cfg = cfg_with_provider_context_window(Some(200_000));
+    fn context_usage_notification_wire_reports_budget_and_window() {
+        let cfg = cfg_with_window_and_cap(Some(200_000), Some(50_000));
 
-        // Resolve the denominator exactly as RPC dispatch does, then emit it
+        // Resolve both values exactly as RPC dispatch does, then emit them
         // through the real wire serializer.
         let max_ctx = context_usage_max_tokens(&cfg, "coder");
+        let model_win = context_usage_model_window(&cfg, "coder");
         let event = TurnEvent::Usage {
             input_tokens: Some(100),
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: Some(0.01),
         };
-        let json = notification_for_turn_event("s1", &event, Some(max_ctx)).unwrap();
+        let json =
+            notification_for_turn_event("s1", &event, Some(max_ctx), Some(model_win)).unwrap();
         let v = parse(&json);
 
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
-            v["params"]["max_context_tokens"], 200_000,
-            "emitted context_usage must carry the model context window"
+            v["params"]["max_context_tokens"], 50_000,
+            "wire max_context_tokens must carry the (clamped) trim budget"
+        );
+        assert_eq!(
+            v["params"]["model_context_window"], 200_000,
+            "wire model_context_window must carry the full model capacity"
         );
     }
 
@@ -6702,7 +6771,7 @@ mod tests {
             output_tokens: Some(50),
             cost_usd: None,
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "context_usage");
         // No input_tokens reported → field omitted (skip_serializing_if).
@@ -6720,7 +6789,7 @@ mod tests {
             output_tokens: Some(200),
             cost_usd: None,
         };
-        let json = notification_for_turn_event("s1", &event, Some(200_000)).unwrap();
+        let json = notification_for_turn_event("s1", &event, Some(200_000), None).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
@@ -6739,7 +6808,7 @@ mod tests {
             output_tokens: Some(100),
             cost_usd: None,
         };
-        let json = notification_for_turn_event("s1", &event, Some(100_000)).unwrap();
+        let json = notification_for_turn_event("s1", &event, Some(100_000), None).unwrap();
         let v = parse(&json);
         assert!(
             v["params"].get("input_tokens").is_none(),

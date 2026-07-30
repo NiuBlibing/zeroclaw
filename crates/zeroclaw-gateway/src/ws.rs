@@ -942,13 +942,21 @@ async fn process_chat_message(
         ))
     });
 
-    // Resolve the context-meter denominator for this agent. The wire field is
-    // (historically) named `max_context_tokens` but now carries the model's
-    // full context window (provider `context_window`, 32_000 fallback), matching
-    // the context_usage meter. Preemptive trimming triggers near 90% of this.
-    let max_context_tokens = {
+    // Resolve the two context-meter values for this agent. `max_context_tokens`
+    // is the preemptive-trim budget the meter fills toward (resolved
+    // `effective_context_budget`), preserving that wire field's original meaning;
+    // `model_context_window` is the model's full window (provider `context_window`,
+    // 32_000 fallback), exposed distinctly so the client can show budget and
+    // capacity apart. Preemptive trimming triggers near `context_compact_ratio`
+    // (default 90%) of the window.
+    let (max_context_tokens, model_context_window) = {
         let cfg = state.config.read();
-        cfg.effective_model_context_window(&turn_alias) as u64
+        let model_window = cfg.effective_model_context_window(&turn_alias) as u64;
+        let budget = cfg
+            .resolved_agent_config(&turn_alias)
+            .map(|a| a.resolved.effective_context_budget() as u64)
+            .unwrap_or(model_window);
+        (budget, model_window)
     };
 
     // Broadcast agent_start event
@@ -1382,6 +1390,7 @@ async fn process_chat_message(
                 "model": turn_model,
                 "provider": provider_label,
                 "max_context_tokens": max_context_tokens,
+                "model_context_window": model_context_window,
                 "last_input_tokens": last_input_tokens,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
