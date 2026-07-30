@@ -79,6 +79,7 @@ interface AgentContextValue {
   respondToApproval: (decision: ApprovalDecision) => void;
   // Context window tracking (from "done" WS frames). See #7311.
   contextMaxTokens: number | null;
+  contextModelWindow: number | null;
   contextInputTokens: number | null;
 }
 
@@ -133,6 +134,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   // Context window tracking (from "done" WS frames). See #7311.
   const [contextMaxTokens, setContextMaxTokens] = useState<number | null>(null);
+  const [contextModelWindow, setContextModelWindow] = useState<number | null>(null);
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
 
   const wsRef = useRef<WebSocketClient | null>(null);
@@ -293,6 +295,9 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         if (msg.type === 'done') {
           if (typeof msg.max_context_tokens === 'number') {
             setContextMaxTokens(msg.max_context_tokens);
+          }
+          if (typeof msg.model_context_window === 'number') {
+            setContextModelWindow(msg.model_context_window);
           }
           // Prefer last_input_tokens (accurate per-turn prompt size) over
           // accumulated input_tokens for context-bar rendering.
@@ -880,6 +885,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     respondToApproval,
     // Context window tracking (from "done" WS frames). See #7311.
     contextMaxTokens,
+    contextModelWindow,
     contextInputTokens,
   };
 

@@ -2499,10 +2499,15 @@ impl Chat {
         }
     }
 
-    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>) {
+    /// Returns `(input_tokens, trim_budget, model_window)` for the context bar.
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
         match &self.phase {
-            ChatPhase::Active(s) => (s.context_input_tokens, s.context_max_tokens),
-            _ => (None, None),
+            ChatPhase::Active(s) => (
+                s.context_input_tokens,
+                s.context_max_tokens,
+                s.context_model_window,
+            ),
+            _ => (None, None, None),
         }
     }
 
@@ -5191,8 +5196,11 @@ pub struct ChatState {
     /// provider (input + cached + output) is added on arrival. Cleared on
     /// session reset only.
     pub context_input_tokens: Option<u64>,
-    /// Configured context limit for this session's model.
+    /// Preemptive-trim budget for this session (the bar fills toward this).
     pub context_max_tokens: Option<u64>,
+    /// Model's full context window; when present, the bar denominator so the
+    /// trim budget shows as a marker rather than the 100% point.
+    pub context_model_window: Option<u64>,
     /// Outbound message queue; the front dispatches when the session is free.
     message_queue: VecDeque<QueuedMessage>,
     /// Monotonic id source for queued messages.
@@ -5278,6 +5286,7 @@ impl ChatState {
             cached_total_rows: 0,
             context_input_tokens: None,
             context_max_tokens: None,
+            context_model_window: None,
             message_queue: VecDeque::new(),
             next_queue_id: 0,
             queue_paused: false,
@@ -6130,6 +6139,7 @@ impl ChatState {
             SessionUpdate::ContextUsage {
                 input_tokens,
                 max_context_tokens,
+                model_context_window,
                 ..
             } => {
                 if input_tokens.is_some() {
@@ -6137,6 +6147,9 @@ impl ChatState {
                 }
                 if max_context_tokens.is_some() {
                     self.context_max_tokens = max_context_tokens;
+                }
+                if model_context_window.is_some() {
+                    self.context_model_window = model_context_window;
                 }
             }
             SessionUpdate::HistoryTrimmed {
@@ -6649,6 +6662,7 @@ impl ChatState {
         // ContextUsage event.
         self.context_input_tokens = None;
         self.context_max_tokens = None;
+        self.context_model_window = None;
         self.clear_queue();
     }
 }

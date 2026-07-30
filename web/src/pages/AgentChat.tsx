@@ -39,21 +39,37 @@ function fmtTokens(n: number): string {
 }
 
 /** Context bar component showing context window usage. */
-function ContextBar({ contextMaxTokens, contextInputTokens }: { 
-  contextMaxTokens: number | null; 
-  contextInputTokens: number | null; 
+function ContextBar({ contextMaxTokens, contextModelWindow, contextInputTokens }: {
+  contextMaxTokens: number | null;
+  contextModelWindow: number | null;
+  contextInputTokens: number | null;
 }) {
-  if (!contextMaxTokens) return null;
+  // Denominator preference: full model window, else the trim budget.
+  const denom = contextModelWindow ?? contextMaxTokens;
+  if (!denom) return null;
 
   const used = contextInputTokens ?? 0;
-  const max = contextMaxTokens;
-  const pct = max > 0 ? Math.min((used / max) * 100, 100) : 0;
+  const pct = denom > 0 ? Math.min((used / denom) * 100, 100) : 0;
   const barWidth = 16;
   const filled = Math.round((pct / 100) * barWidth);
   const empty = Math.max(0, barWidth - filled);
-  const bar = '█'.repeat(filled) + '░'.repeat(empty);
+  const cells = ('█'.repeat(filled) + '░'.repeat(empty)).split('');
+  // When a distinct trim budget sits below the window, mark where trimming triggers.
+  if (
+    contextModelWindow &&
+    contextMaxTokens &&
+    contextModelWindow > 0 &&
+    contextMaxTokens < contextModelWindow
+  ) {
+    const pos = Math.min(
+      Math.round((contextMaxTokens / contextModelWindow) * barWidth),
+      barWidth - 1,
+    );
+    cells[pos] = '│';
+  }
+  const bar = cells.join('');
 
-  const label = `ctx: ${fmtTokens(used).padStart(7)} / ${fmtTokens(max).padStart(7)}  [${bar}]  ${pct.toFixed(0)}%`;
+  const label = `ctx: ${fmtTokens(used).padStart(7)} / ${fmtTokens(denom).padStart(7)}  [${bar}]  ${pct.toFixed(0)}%`;
 
   return (
     <div className="px-4 py-1.5 border-b text-[11px] font-mono flex items-center gap-2" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
@@ -121,6 +137,7 @@ export function AgentChatInner({
     pendingApproval,
     respondToApproval,
     contextMaxTokens,
+    contextModelWindow,
     contextInputTokens,
   } = useAgent();
 
@@ -657,7 +674,7 @@ export function AgentChatInner({
                   : t('agent.disconnected_status')}
             </span>
           </div>
-          <ContextBar contextMaxTokens={contextMaxTokens} contextInputTokens={contextInputTokens} />
+          <ContextBar contextMaxTokens={contextMaxTokens} contextModelWindow={contextModelWindow} contextInputTokens={contextInputTokens} />
         </div>
       </div>
     </div>

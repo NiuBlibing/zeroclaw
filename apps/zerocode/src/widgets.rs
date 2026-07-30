@@ -105,14 +105,24 @@ use ratatui::{
 /// Returns `None` from `widget()` when there is nothing to show.
 pub struct CtxBar {
     pub input_tokens: Option<u64>,
+    /// Preemptive-trim budget: the point where history trimming triggers.
     pub max_tokens: Option<u64>,
+    /// Model's full context window. When present it is the bar denominator, and
+    /// `max_tokens` is drawn as a marker (`|`) inside the bar. When absent the
+    /// bar falls back to filling toward `max_tokens` (legacy behavior).
+    pub model_window: Option<u64>,
 }
 
 impl CtxBar {
-    pub fn new(input_tokens: Option<u64>, max_tokens: Option<u64>) -> Self {
+    pub fn new(
+        input_tokens: Option<u64>,
+        max_tokens: Option<u64>,
+        model_window: Option<u64>,
+    ) -> Self {
         Self {
             input_tokens,
             max_tokens,
+            model_window,
         }
     }
 
@@ -123,21 +133,37 @@ impl CtxBar {
 
     /// Build a `Paragraph` widget, or `None` if there is nothing to show.
     pub fn widget(&self) -> Option<Paragraph<'static>> {
-        let (text, pct_opt) = match (self.input_tokens, self.max_tokens) {
-            (Some(used), Some(max)) if max > 0 => {
-                let pct = (used as f64 / max as f64 * 100.0).min(100.0);
+        // Denominator preference: full model window, else the trim budget.
+        let denom = self.model_window.or(self.max_tokens);
+        let (text, pct_opt) = match (self.input_tokens, denom) {
+            (Some(used), Some(total)) if total > 0 => {
+                let pct = (used as f64 / total as f64 * 100.0).min(100.0);
                 let bar_width: usize = 16;
                 let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
                 let empty = bar_width.saturating_sub(filled);
-                let bar = format!(
-                    "[{}{}]",
-                    "\u{2588}".repeat(filled),
-                    "\u{2591}".repeat(empty)
-                );
+                // When a distinct trim budget sits below the window, mark its
+                // position in the bar so the user sees where trimming triggers.
+                let marker_pos = match (self.model_window, self.max_tokens) {
+                    (Some(win), Some(budget)) if win > 0 && budget < win => {
+                        Some(((budget as f64 / win as f64) * bar_width as f64).round() as usize)
+                    }
+                    _ => None,
+                };
+                let mut cells: Vec<char> = "\u{2588}"
+                    .repeat(filled)
+                    .chars()
+                    .chain("\u{2591}".repeat(empty).chars())
+                    .collect();
+                if let Some(pos) = marker_pos
+                    && let Some(cell) = cells.get_mut(pos.min(bar_width.saturating_sub(1)))
+                {
+                    *cell = '\u{2502}'; // │ trim-budget marker
+                }
+                let bar: String = cells.into_iter().collect();
                 let label = format!(
-                    " ctx: {:>7} / {:>7}  {}  {:.0}%",
+                    " ctx: {:>7} / {:>7}  [{}]  {:.0}%",
                     fmt_tokens(used),
-                    fmt_tokens(max),
+                    fmt_tokens(total),
                     bar,
                     pct,
                 );
