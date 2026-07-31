@@ -87,6 +87,14 @@ impl Tool for ReadSkillTool {
             });
         };
 
+        if let Some(source) = crate::skills::builtin_skill_source(skill) {
+            return Ok(ToolResult {
+                success: true,
+                output: source.into(),
+                error: None,
+            });
+        }
+
         let Some(location) = skill.location.as_ref() else {
             return Ok(ToolResult {
                 success: false,
@@ -206,8 +214,29 @@ description = "Ship safely"
         assert!(!result.success);
         assert_eq!(
             result.error.as_deref(),
-            Some("Unknown skill 'calendar'. Available skills: weather")
+            Some("Unknown skill 'calendar'. Available skills: weather, zeroclaw-docs")
         );
+    }
+
+    #[tokio::test]
+    async fn reads_builtin_skill_without_a_filesystem_copy() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_for_tmp(&tmp);
+        let copied_path = agent_workspace(&config, "default").join("skills/zeroclaw-docs/SKILL.md");
+
+        let result = make_tool(config)
+            .execute(json!({ "name": "zeroclaw-docs" }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("name: zeroclaw-docs"));
+        assert!(
+            result
+                .output
+                .contains("# ZeroClaw self-knowledge and operation")
+        );
+        assert!(!copied_path.exists());
     }
 
     #[tokio::test]

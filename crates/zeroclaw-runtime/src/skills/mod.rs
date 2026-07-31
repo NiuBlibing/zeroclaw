@@ -50,7 +50,12 @@ const SKILLS_REGISTRY_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24;
 /// clone/pull/sync machinery as the default skills registry.
 const EXTRA_REGISTRY_DIR_PREFIX: &str = "extra-registry-";
 
-/// A skill is a user-defined or community-built capability.
+/// Canonical sources for skills shipped with the runtime. They stay embedded
+/// in the binary instead of being copied into workspaces, so upgrading
+/// ZeroClaw cannot leave stale generated skill files behind.
+const BUILTIN_SKILL_SOURCES: &[&str] = &[include_str!("assets/zeroclaw-docs/SKILL.md")];
+
+/// A skill is a bundled, user-defined, or community-built capability.
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
 /// and can include tool definitions, prompts, and automation scripts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -611,9 +616,11 @@ pub fn load_skills_for_agent_audited(
     let (mut skills, mut dropped) = load_skills_with_config_audited(workspace_dir, config);
     let mut shadows: Vec<ShadowedSkill> = Vec::new();
     let Some(agent) = config.agent(agent_alias) else {
+        append_missing_builtin_skills(&mut skills);
         return (skills, dropped, shadows);
     };
     if agent.skill_bundles.is_empty() {
+        append_missing_builtin_skills(&mut skills);
         return (skills, dropped, shadows);
     }
     let install_root = config.install_root_dir();
@@ -669,6 +676,10 @@ pub fn load_skills_for_agent_audited(
             }
         }
     }
+
+    // Built-ins have the lowest precedence: an operator-provided skill with
+    // the same name remains an intentional override.
+    append_missing_builtin_skills(&mut skills);
     (skills, dropped, shadows)
 }
 
@@ -1328,15 +1339,28 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
 /// Load a skill from a SKILL.md file (simpler format)
 fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
-    let parsed = parse_skill_markdown(&content);
-    let name = dir
+    let mut parsed = parse_skill_markdown(&content);
+    let fallback_name = dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
+    let name = parsed.meta.name.take().unwrap_or(fallback_name);
 
-    Ok(Skill {
-        name: parsed.meta.name.unwrap_or(name),
+    Ok(skill_from_parsed_markdown(
+        parsed,
+        name,
+        Some(path.to_path_buf()),
+    ))
+}
+
+fn skill_from_parsed_markdown(
+    parsed: ParsedSkillMarkdown,
+    name: String,
+    location: Option<PathBuf>,
+) -> Skill {
+    Skill {
+        name,
         description: parsed
             .meta
             .description
@@ -1350,8 +1374,55 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         slash_options: parsed.meta.slash_options,
-        location: Some(path.to_path_buf()),
+        location,
+    }
+}
+
+fn load_builtin_skill(source: &'static str) -> Option<Skill> {
+    let mut parsed = parse_skill_markdown(source);
+    let name = parsed
+        .meta
+        .name
+        .take()
+        .filter(|value| !value.trim().is_empty())?;
+
+    // The source is embedded in the binary and read through
+    // `builtin_skill_source`; it has no filesystem location.
+    Some(skill_from_parsed_markdown(parsed, name, None))
+}
+
+fn append_missing_builtin_skills(skills: &mut Vec<Skill>) {
+    for source in BUILTIN_SKILL_SOURCES {
+        let Some(skill) = load_builtin_skill(source) else {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "built-in skill source is missing a non-empty name"
+            );
+            continue;
+        };
+        if !skills.iter().any(|loaded| loaded.name == skill.name) {
+            skills.push(skill);
+        }
+    }
+}
+
+pub(crate) fn builtin_skill_source(skill: &Skill) -> Option<&'static str> {
+    if skill.location.is_some() {
+        return None;
+    }
+
+    BUILTIN_SKILL_SOURCES.iter().copied().find(|source| {
+        parse_skill_markdown(source)
+            .meta
+            .name
+            .is_some_and(|name| name == skill.name)
     })
+}
+
+pub(crate) fn is_builtin_skill(skill: &Skill) -> bool {
+    builtin_skill_source(skill).is_some()
 }
 
 fn load_open_skill_md(path: &Path) -> Result<Skill> {
@@ -1564,6 +1635,9 @@ fn resolve_skill_location(skill: &Skill, workspace_dir: &Path) -> PathBuf {
 }
 
 fn render_skill_location(skill: &Skill, workspace_dir: &Path, prefer_relative: bool) -> String {
+    if is_builtin_skill(skill) {
+        return format!("builtin://{}/SKILL.md", skill.name);
+    }
     let location = resolve_skill_location(skill, workspace_dir);
     if prefer_relative && let Ok(relative) = location.strip_prefix(workspace_dir) {
         return display_skill_location(relative);
@@ -4398,5 +4472,83 @@ version = "0.1.0"
             names.contains(&skill_name),
             "with empty skill_bundles, workspace skills must still load; got: {names:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod builtin_skill_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn config_for(workspace: &Path) -> zeroclaw_config::schema::Config {
+        zeroclaw_config::schema::Config {
+            config_path: workspace.join("config.toml"),
+            data_dir: workspace.join("data"),
+            skills: zeroclaw_config::schema::SkillsConfig {
+                open_skills_enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn zeroclaw_docs_is_loaded_from_the_embedded_source() {
+        let workspace = TempDir::new().unwrap();
+        let config = config_for(workspace.path());
+
+        let skills = load_skills_for_agent(workspace.path(), &config, "default");
+        let skill = skills
+            .iter()
+            .find(|skill| skill.name == "zeroclaw-docs")
+            .expect("built-in zeroclaw-docs skill must load");
+
+        assert!(is_builtin_skill(skill));
+        assert!(skill.location.is_none());
+        assert!(skill.description.contains("current ZeroClaw installation"));
+        assert!(skill.prompts[0].contains("## Source priority"));
+        assert!(
+            builtin_skill_source(skill)
+                .expect("built-in source must be readable")
+                .starts_with("---\nname: zeroclaw-docs")
+        );
+    }
+
+    #[test]
+    fn operator_skill_with_the_same_name_overrides_the_builtin() {
+        let workspace = TempDir::new().unwrap();
+        let skill_dir = workspace.path().join("skills/zeroclaw-docs");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: zeroclaw-docs\ndescription: Operator override\n---\n\n# Override\n",
+        )
+        .unwrap();
+        let config = config_for(workspace.path());
+
+        let matches: Vec<_> = load_skills_for_agent(workspace.path(), &config, "default")
+            .into_iter()
+            .filter(|skill| skill.name == "zeroclaw-docs")
+            .collect();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].description, "Operator override");
+        assert!(!is_builtin_skill(&matches[0]));
+        assert!(matches[0].location.is_some());
+    }
+
+    #[test]
+    fn compact_prompt_advertises_a_virtual_builtin_location() {
+        let skill = load_builtin_skill(BUILTIN_SKILL_SOURCES[0])
+            .expect("bundled skill source must have a name");
+        let prompt = skills_to_prompt_with_mode(
+            &[skill],
+            Path::new("/tmp/workspace"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+        );
+
+        assert!(prompt.contains("<name>zeroclaw-docs</name>"));
+        assert!(prompt.contains("<location>builtin://zeroclaw-docs/SKILL.md</location>"));
+        assert!(!prompt.contains("<instructions>"));
     }
 }
