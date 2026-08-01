@@ -23,6 +23,9 @@ use zeroclaw_providers::{
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
+type ContextLimitsResolver =
+    Arc<dyn Fn(&str, &str) -> zeroclaw_config::schema::ResolvedContextLimits + Send + Sync>;
+
 pub fn build_session_model_provider(
     config: &Config,
     model_provider_ref: &str,
@@ -290,9 +293,7 @@ pub struct Agent {
     structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
     /// Resolves limits from canonical config for the provider/model route that
     /// is active when a turn starts. The route itself remains the source of truth.
-    context_limits_resolver: Option<
-        Arc<dyn Fn(&str, &str) -> zeroclaw_config::schema::ResolvedContextLimits + Send + Sync>,
-    >,
+    context_limits_resolver: Option<ContextLimitsResolver>,
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
     model_provider_name: String,
@@ -455,9 +456,7 @@ pub struct AgentBuilder {
     memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
     structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
-    context_limits_resolver: Option<
-        Arc<dyn Fn(&str, &str) -> zeroclaw_config::schema::ResolvedContextLimits + Send + Sync>,
-    >,
+    context_limits_resolver: Option<ContextLimitsResolver>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
     model_provider_name: Option<String>,
@@ -596,12 +595,7 @@ impl AgentBuilder {
         self
     }
 
-    fn context_limits_resolver(
-        mut self,
-        resolver: Arc<
-            dyn Fn(&str, &str) -> zeroclaw_config::schema::ResolvedContextLimits + Send + Sync,
-        >,
-    ) -> Self {
+    fn context_limits_resolver(mut self, resolver: ContextLimitsResolver) -> Self {
         self.context_limits_resolver = Some(resolver);
         self
     }
@@ -1667,28 +1661,27 @@ impl Agent {
             ApprovalManager::for_non_interactive(risk_profile)
         };
 
-        let context_limits_resolver: Arc<
-            dyn Fn(&str, &str) -> zeroclaw_config::schema::ResolvedContextLimits + Send + Sync,
-        > = if let Some(limit_config) = live_config.as_ref().map(Arc::clone) {
-            let limit_agent_alias = agent_alias.to_string();
-            Arc::new(move |provider_ref, model| {
-                limit_config.read().resolved_context_limits_for_route(
-                    &limit_agent_alias,
-                    provider_ref,
-                    model,
-                )
-            })
-        } else {
-            let limit_config = config.clone();
-            let limit_agent_alias = agent_alias.to_string();
-            Arc::new(move |provider_ref, model| {
-                limit_config.resolved_context_limits_for_route(
-                    &limit_agent_alias,
-                    provider_ref,
-                    model,
-                )
-            })
-        };
+        let context_limits_resolver: ContextLimitsResolver =
+            if let Some(limit_config) = live_config.as_ref().map(Arc::clone) {
+                let limit_agent_alias = agent_alias.to_string();
+                Arc::new(move |provider_ref, model| {
+                    limit_config.read().resolved_context_limits_for_route(
+                        &limit_agent_alias,
+                        provider_ref,
+                        model,
+                    )
+                })
+            } else {
+                let limit_config = config.clone();
+                let limit_agent_alias = agent_alias.to_string();
+                Arc::new(move |provider_ref, model| {
+                    limit_config.resolved_context_limits_for_route(
+                        &limit_agent_alias,
+                        provider_ref,
+                        model,
+                    )
+                })
+            };
 
         let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
             if let Some(cap_config) = live_config {
