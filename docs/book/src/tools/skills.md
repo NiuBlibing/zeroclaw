@@ -15,6 +15,13 @@ assigned-bundle skill with the same name intentionally overrides the built-in
 skill for that agent. Built-ins are served directly from the running binary;
 ZeroClaw does not copy them into agent workspaces.
 
+The built-in `zeroclaw-docs` skill uses progressive disclosure: every agent
+receives its name and description, while `read_skill` loads the full
+instructions only when they are relevant. This applies even when the effective
+prompt-injection mode is `full`; other skills keep the configured behavior. An
+operator-provided skill named `zeroclaw-docs` overrides the built-in and follows
+the configured mode like any other operator skill.
+
 Use bundles for skills an agent should load during runtime. A bundle is configured under `[skill_bundles.<alias>]`; when its `directory` is omitted, ZeroClaw resolves it to `<install>/shared/skills/<alias>/`.
 
 ```text

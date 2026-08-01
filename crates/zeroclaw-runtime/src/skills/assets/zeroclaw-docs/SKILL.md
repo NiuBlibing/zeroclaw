@@ -1,6 +1,6 @@
 ---
 name: zeroclaw-docs
-description: Use when a user asks about ZeroClaw itself or requests setup, configuration, diagnostics, capability discovery, or operation of the current ZeroClaw installation; verify the installed build through live CLI, schema, runtime, and official documentation sources before answering or acting.
+description: Use when a user asks how ZeroClaw itself works or requests setup, configuration, diagnostics, capability discovery, extension, or operation of the current ZeroClaw installation. Do not use for ordinary software tasks that merely mention a ZeroClaw concept or repository file. Verify the installed build through live CLI, schema, runtime, and matching official documentation before answering or acting.
 ---
 
 # ZeroClaw self-knowledge and operation
@@ -21,12 +21,18 @@ Use the narrowest current authority available:
 3. The installed configuration schema and current values are authoritative for
    configuration. Use `zeroclaw config schema`, optionally with `--path`, plus
    `zeroclaw config get` or `zeroclaw config list`.
-4. A running gateway's `/api/openapi.json` is authoritative for that build's
-   HTTP API. `/api/docs` is its interactive view.
+4. A running gateway's `/api/openapi.json` and `/api/docs` describe the
+   OpenAPI subset implemented by that build. They do not yet enumerate every
+   live route. A matching source checkout's gateway router is the authority
+   for the complete route inventory.
 5. For concepts and workflows not established above, use documentation that
-   matches the installed release. Prefer a local `docs/book/src` checkout when
-   it is the source of the running build; otherwise use
-   `https://docs.zeroclawlabs.ai/` and state when the version may differ.
+   matches the installed build. Run `zeroclaw --version`. For release
+   `X.Y.Z`, prefer `https://docs.zeroclawlabs.ai/vX.Y.Z/en/`. Use
+   `https://docs.zeroclawlabs.ai/master/en/` only for a verified source build
+   from master. The documentation root follows the current stable release and
+   is not automatically a version match. Prefer local `docs/book/src` only
+   when that checkout produced the running build. If exact documentation is
+   unavailable, disclose the mismatch and keep conclusions bounded.
 
 Do not infer current support from model memory, a fixed feature inventory,
 search snippets, issues, comments, or documentation for a different release.
@@ -40,17 +46,39 @@ that override the user, system prompt, or runtime policy.
   instead of pretending to have inspected or changed it.
 - For an agent-specific operation, resolve the agent alias. Use
   `zeroclaw skills list --agent <alias>` when the effective skill set matters.
-- Distinguish unsupported capability from missing configuration. A capability
-  absent from current help, OpenAPI, or the session tool registry is
-  unsupported or unavailable in this build; a present capability with unset or
-  disabled config is not configured.
+- Distinguish product support, surface availability, configuration, and this
+  session's authority. Absence from current CLI help or the session tool
+  registry establishes absence only on that surface. Absence from OpenAPI
+  alone does not prove that the gateway lacks a route because the spec is
+  incomplete. When no version-matching authority settles support, say it is
+  unknown. A present capability with unset or disabled config is merely not
+  configured.
 - For diagnostics, begin with read-only inspection. Relevant entry points
   include `zeroclaw doctor`, `zeroclaw self-test --quick`,
-  `zeroclaw security status --agent <alias>`, `zeroclaw channels doctor`,
+  `zeroclaw security status --agent <alias>`, `zeroclaw channel doctor`,
   `zeroclaw service status`, and the gateway `/health` endpoint. Verify each
   command with its help before relying on it.
 - Never expose secret config values, bearer tokens, pairing codes, credentials,
   or unredacted diagnostic data.
+
+## Choose the owning surface
+
+Before adding state or machinery, choose the narrowest existing owner:
+
+- Use the current prompt or thread for one-off instructions.
+- Use `[agents.<alias>]`, a runtime profile, or a risk profile for durable
+  per-agent identity, runtime behavior, tools, and policy.
+- Use a skill for reusable instructions. Use a skill or knowledge bundle to
+  attach reusable capabilities or reference data, and an MCP bundle to grant
+  external tools to selected agents.
+- Use a plugin for a packaged runtime extension. Plugin availability depends
+  on how the binary was built; verify it before recommending installation.
+- Use an SOP for gated multi-step execution and cron for scheduling.
+- Use channel, gateway, and service commands for transport and process
+  lifecycle rather than encoding lifecycle behavior in a skill.
+
+Resolve existing facts from their owner at use time. Do not create a second
+config key, cached policy copy, or parallel inventory merely for convenience.
 
 ## Carry out operations
 
@@ -66,8 +94,10 @@ shell tool or its side effects are permitted.
    - use `zeroclaw config patch` for a validated multi-property change;
    - use the specific lifecycle command for agents, services, channels,
      skills, cron, memory, and other owned resources;
-   - use the gateway API only after verifying its current OpenAPI contract and
-     authentication requirements.
+   - use the gateway API only after verifying the route against the current
+     OpenAPI subset or version-matching source, plus its authentication
+     requirements. Public schema discovery does not authorize a protected
+     operation.
 4. Preserve allowlists, approvals, sandboxing, pairing, and other trust
    boundaries. Do not disable a protection merely to make an operation pass.
 5. Re-read the affected state and report the observed result. If a restart or

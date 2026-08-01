@@ -4,7 +4,7 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
-/// Compact-mode helper for loading a skill's source file on demand.
+/// Helper for loading an available skill's source file on demand.
 /// Supports workspace skills, open-skills, agent-bound skill bundles, and plugin skills.
 pub struct ReadSkillTool {
     config: Arc<Config>,
@@ -27,7 +27,7 @@ impl Tool for ReadSkillTool {
     }
 
     fn description(&self) -> &str {
-        "Read the full source file for an available skill by name. Use this in compact skills mode when you need the complete skill instructions without remembering file paths."
+        "Read the full source file for an available skill by name. Use this when its prompt entry says the instructions load on demand."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
