@@ -3,7 +3,7 @@ import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
+import { getProp, putProp, resolveAliasSource, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
@@ -601,16 +601,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         setCurrentModel(activeRef ?? activeModel);
 
         // Available switch targets = every configured provider ref
-        // (`providers.models.<family>.<alias>`), discovered via config/list.
+        // (`providers.models.<family>.<alias>`), resolved and sorted by the
+        // config layer's canonical alias-source resolver.
         try {
-          const list = await listProps('providers.models');
+          const { values } = await resolveAliasSource('model_providers');
           if (cancelled) return;
-          const refs = (list.entries ?? [])
-            .map((e) => e.path)
-            .filter((p) => /^providers\.models\.[^.]+\.[^.]+\.model$/.test(p))
-            .map((p) => p.replace(/^providers\.models\./, '').replace(/\.model$/, ''));
-          const unique = Array.from(new Set(refs));
-          setAvailableModels(unique.length > 0 ? unique : activeRef ? [activeRef] : []);
+          setAvailableModels(values.length > 0 ? values : activeRef ? [activeRef] : []);
         } catch {
           setAvailableModels(activeRef ? [activeRef] : []);
         }
