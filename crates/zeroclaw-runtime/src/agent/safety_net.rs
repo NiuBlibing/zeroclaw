@@ -1099,7 +1099,7 @@ async fn safety_net_turn_survives_in_loop_history_pruning() {
     let filler = "x".repeat(400);
     let runtime = zeroclaw_config::schema::ResolvedRuntime {
         // ~40 seeded messages × (100 tokens content + 4 framing) ≫ 500.
-        // Explicit cost ceiling clamps the model-derived budget down to 500.
+        // Explicit absolute budget keeps proactive trimming at 500.
         max_context_tokens: Some(500),
         ..zeroclaw_config::schema::ResolvedRuntime::default()
     };

@@ -144,7 +144,7 @@ impl CtxBar {
                 // When a distinct trim budget sits below the window, mark its
                 // position in the bar so the user sees where trimming triggers.
                 let marker_pos = match (self.model_window, self.max_tokens) {
-                    (Some(win), Some(budget)) if win > 0 && budget < win => {
+                    (Some(win), Some(budget)) if win > 0 && budget > 0 && budget < win => {
                         Some(((budget as f64 / win as f64) * bar_width as f64).round() as usize)
                     }
                     _ => None,
@@ -199,6 +199,39 @@ fn fmt_tokens(n: u64) -> String {
         out.push(ch);
     }
     out.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod context_bar_tests {
+    use super::*;
+    use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+    fn render(bar: CtxBar) -> String {
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buffer = Buffer::empty(area);
+        bar.widget()
+            .expect("context bar should render")
+            .render(area, &mut buffer);
+        (0..area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn model_window_is_denominator_and_budget_is_marker() {
+        let rendered = render(CtxBar::new(Some(100_000), Some(180_000), Some(200_000)));
+        assert!(rendered.contains("100,000 / 200,000"));
+        assert!(rendered.contains('│'));
+        assert!(rendered.contains("50%"));
+    }
+
+    #[test]
+    fn missing_model_window_keeps_legacy_budget_denominator() {
+        let rendered = render(CtxBar::new(Some(16_000), Some(32_000), None));
+        assert!(rendered.contains("16,000 /  32,000"));
+        assert!(!rendered.contains('│'));
+        assert!(rendered.contains("50%"));
+    }
 }
 
 // ── InfoBar ─────────────────────────────────────────────────────────────────

@@ -111,7 +111,20 @@ pub async fn maybe_run_skill_review(
                         parallel_tools: false,
                         // sequential for the mutation-capable fork
                         max_tool_result_chars,
-                        context_token_budget,
+                        context_limits: full_config.zip(agent_alias).map_or_else(
+                            || zeroclaw_config::schema::ResolvedContextLimits {
+                                model_context_window:
+                                    zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET,
+                                context_token_budget,
+                            },
+                            |(config, alias)| {
+                                config.resolved_context_limits_for_route(
+                                    alias,
+                                    provider_name,
+                                    model_name,
+                                )
+                            },
+                        ),
                         knobs: &crate::agent::loop_::LoopKnobs::default(),
                     },
                 ),

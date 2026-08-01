@@ -8,12 +8,13 @@ use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
-use zeroclaw_config::schema::PacingConfig;
+use zeroclaw_config::schema::{PacingConfig, ResolvedContextLimits};
 
 pub(crate) struct TurnCtx<'a> {
     pub(crate) observer: &'a dyn Observer,
     pub(crate) provider_name: &'a str,
     pub(crate) model: &'a str,
+    pub(crate) context_limits: ResolvedContextLimits,
     pub(crate) temperature: Option<f64>,
     pub(crate) approval: Option<&'a ApprovalManager>,
     pub(crate) channel_name: &'a str,

@@ -168,6 +168,8 @@ pub(crate) async fn interpret_chat_response(
                 cached_input_tokens: usage.cached_input_tokens,
                 output_tokens: usage.output_tokens,
                 cost_usd: call_cost_usd,
+                context_token_budget: Some(ctx.context_limits.context_token_budget as u64),
+                model_context_window: Some(ctx.context_limits.model_context_window as u64),
             })
             .await;
     }
@@ -462,6 +464,10 @@ mod cost_usd_regression_tests {
             observer: &crate::observability::NoopObserver,
             provider_name: provider,
             model,
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 32_000,
+                context_token_budget: 32_000,
+            },
             temperature: None,
             approval: None,
             channel_name: "",

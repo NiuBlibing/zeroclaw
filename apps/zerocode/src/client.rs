@@ -3760,6 +3760,27 @@ mod notification_tests {
         assert!(matches!(update, SessionUpdate::ApprovalRequest { .. }));
     }
 
+    #[test]
+    fn parse_context_usage_keeps_budget_and_model_window_distinct() {
+        let params = serde_json::json!({
+            "type": "context_usage",
+            "session_id": "s-context",
+            "input_tokens": 100_000,
+            "max_context_tokens": 180_000,
+            "model_context_window": 200_000
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::ContextUsage {
+                session_id,
+                input_tokens: Some(100_000),
+                max_context_tokens: Some(180_000),
+                model_context_window: Some(200_000),
+            }) if session_id == "s-context"
+        ));
+    }
+
     #[tokio::test]
     async fn router_converts_session_update_notifications() {
         let (bcast_tx, bcast_rx) = broadcast::channel::<RpcNotification>(16);

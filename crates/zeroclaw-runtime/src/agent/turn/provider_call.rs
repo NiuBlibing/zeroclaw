@@ -338,6 +338,10 @@ mod payload_capture_tests {
             observer,
             provider_name: "stub",
             model: "stub-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 32_000,
+                context_token_budget: 32_000,
+            },
             temperature: None,
             approval: None,
             channel_name: "test",

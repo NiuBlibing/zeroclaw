@@ -115,6 +115,11 @@ pub enum TurnEvent {
         cached_input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
+        /// Proactive trim threshold resolved for the provider/model route that
+        /// produced this usage sample. Zero means proactive trimming is disabled.
+        context_token_budget: Option<u64>,
+        /// Full context capacity resolved for that same provider/model route.
+        model_context_window: Option<u64>,
     },
 }
 

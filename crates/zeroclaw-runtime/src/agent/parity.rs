@@ -175,7 +175,10 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
-                context_token_budget: 100_000,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                    model_context_window: 100_000,
+                    context_token_budget: 100_000,
+                },
                 knobs: &LoopKnobs::default(),
             },
         ),

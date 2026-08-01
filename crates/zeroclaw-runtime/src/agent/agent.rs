@@ -76,7 +76,7 @@ pub fn build_session_model_provider(
         &model_provider_runtime_options,
     )?;
 
-    Ok((model_provider, model_provider_name, model_name))
+    Ok((model_provider, model_provider_ref.to_string(), model_name))
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -288,6 +288,11 @@ pub struct Agent {
     /// Daemon-backed sessions capture the shared live config handle so reloads
     /// affect existing sessions without duplicating config-derived state.
     structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    /// Resolves limits from canonical config for the provider/model route that
+    /// is active when a turn starts. The route itself remains the source of truth.
+    context_limits_resolver: Option<
+        Arc<dyn Fn(&str, &str) -> zeroclaw_config::schema::ResolvedContextLimits + Send + Sync>,
+    >,
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
     model_provider_name: String,
@@ -450,6 +455,9 @@ pub struct AgentBuilder {
     memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
     structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    context_limits_resolver: Option<
+        Arc<dyn Fn(&str, &str) -> zeroclaw_config::schema::ResolvedContextLimits + Send + Sync>,
+    >,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
     model_provider_name: Option<String>,
@@ -500,6 +508,7 @@ impl AgentBuilder {
             memory_inject_cfg: None,
             config: None,
             structured_history_cap_resolver: None,
+            context_limits_resolver: None,
             multimodal_config: None,
             model_name: None,
             model_provider_name: None,
@@ -584,6 +593,16 @@ impl AgentBuilder {
         resolver: Arc<dyn Fn() -> usize + Send + Sync>,
     ) -> Self {
         self.structured_history_cap_resolver = Some(resolver);
+        self
+    }
+
+    fn context_limits_resolver(
+        mut self,
+        resolver: Arc<
+            dyn Fn(&str, &str) -> zeroclaw_config::schema::ResolvedContextLimits + Send + Sync,
+        >,
+    ) -> Self {
+        self.context_limits_resolver = Some(resolver);
         self
     }
 
@@ -846,6 +865,7 @@ impl AgentBuilder {
             }),
             config,
             structured_history_cap_resolver: self.structured_history_cap_resolver,
+            context_limits_resolver: self.context_limits_resolver,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
             model_provider_name: self
@@ -980,6 +1000,16 @@ impl Agent {
             self.agent_alias.clone(),
             self.model_provider_name.clone(),
             self.model_name.clone(),
+        )
+    }
+
+    /// Capacity and proactive-trim budget for the currently selected route.
+    /// This is resolved on demand so a model/provider switch cannot leave a
+    /// stale snapshot in a long-lived session.
+    pub fn context_limits(&self) -> zeroclaw_config::schema::ResolvedContextLimits {
+        self.context_limits_resolver.as_ref().map_or_else(
+            || self.config.resolved.context_limits(),
+            |resolve| resolve(&self.model_provider_name, &self.model_name),
         )
     }
 
@@ -1637,6 +1667,29 @@ impl Agent {
             ApprovalManager::for_non_interactive(risk_profile)
         };
 
+        let context_limits_resolver: Arc<
+            dyn Fn(&str, &str) -> zeroclaw_config::schema::ResolvedContextLimits + Send + Sync,
+        > = if let Some(limit_config) = live_config.as_ref().map(Arc::clone) {
+            let limit_agent_alias = agent_alias.to_string();
+            Arc::new(move |provider_ref, model| {
+                limit_config.read().resolved_context_limits_for_route(
+                    &limit_agent_alias,
+                    provider_ref,
+                    model,
+                )
+            })
+        } else {
+            let limit_config = config.clone();
+            let limit_agent_alias = agent_alias.to_string();
+            Arc::new(move |provider_ref, model| {
+                limit_config.resolved_context_limits_for_route(
+                    &limit_agent_alias,
+                    provider_ref,
+                    model,
+                )
+            })
+        };
+
         let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
             if let Some(cap_config) = live_config {
                 let cap_agent_alias = agent_alias.to_string();
@@ -1670,10 +1723,11 @@ impl Agent {
                     .unwrap_or_else(|| agent_cfg.clone()),
             )
             .structured_history_cap_resolver(structured_history_cap_resolver)
+            .context_limits_resolver(context_limits_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
-            .model_provider_name(provider_name.to_string())
+            .model_provider_name(provider_ref)
             .temperature(agent_model_provider.and_then(|e| e.temperature))
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
@@ -2349,10 +2403,7 @@ impl Agent {
                                 strict_tool_parsing: self.config.resolved.strict_tool_parsing,
                                 parallel_tools: self.config.resolved.parallel_tools,
                                 max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                context_token_budget: self
-                                    .config
-                                    .resolved
-                                    .effective_context_budget(),
+                                context_limits: self.context_limits(),
                                 knobs: &knobs,
                             },
                         ),
@@ -2727,10 +2778,7 @@ impl Agent {
                                 strict_tool_parsing: self.config.resolved.strict_tool_parsing,
                                 parallel_tools: self.config.resolved.parallel_tools,
                                 max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                context_token_budget: self
-                                    .config
-                                    .resolved
-                                    .effective_context_budget(),
+                                context_limits: self.context_limits(),
                                 knobs: &knobs,
                             },
                         ),
@@ -9124,6 +9172,46 @@ mod tests {
             "provider_name must update on a provider-only switch"
         );
         assert_eq!(agent.model_name, "shared-name");
+    }
+
+    #[test]
+    fn model_switch_re_resolves_context_limits_for_new_route() {
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(std::sync::Arc::new(
+                zeroclaw_config::schema::Config::default(),
+            )),
+        };
+        let mut agent = build_test_agent("ollama.large", "large", Some(switch_cfg));
+        agent.context_limits_resolver = Some(Arc::new(|provider_ref, model| {
+            match (provider_ref, model) {
+                ("ollama.large", "large") => zeroclaw_config::schema::ResolvedContextLimits {
+                    model_context_window: 200_000,
+                    context_token_budget: 180_000,
+                },
+                ("ollama.small", "small") => zeroclaw_config::schema::ResolvedContextLimits {
+                    model_context_window: 8_000,
+                    context_token_budget: 7_200,
+                },
+                _ => zeroclaw_config::schema::ResolvedContextLimits {
+                    model_context_window: 32_000,
+                    context_token_budget: 32_000,
+                },
+            }
+        }));
+
+        assert_eq!(agent.context_limits().context_token_budget, 180_000);
+        let switched =
+            agent.try_apply_model_switch("large", "ollama.small".to_string(), "small".to_string());
+
+        assert_eq!(switched.as_deref(), Some("small"));
+        assert_eq!(
+            agent.context_limits(),
+            zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 8_000,
+                context_token_budget: 7_200,
+            },
+            "provider/model and their limits must change as one session state transition"
+        );
     }
 
     #[test]

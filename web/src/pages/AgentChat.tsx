@@ -19,6 +19,7 @@ import ChatWorkspace from '@/pages/ChatWorkspace';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
+import { resolveContextBarState } from '@/lib/contextBar';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
 
@@ -44,32 +45,14 @@ function ContextBar({ contextMaxTokens, contextModelWindow, contextInputTokens }
   contextModelWindow: number | null;
   contextInputTokens: number | null;
 }) {
-  // Denominator preference: full model window, else the trim budget.
-  const denom = contextModelWindow ?? contextMaxTokens;
-  if (!denom) return null;
+  const state = resolveContextBarState(
+    contextMaxTokens,
+    contextModelWindow,
+    contextInputTokens,
+  );
+  if (!state) return null;
 
-  const used = contextInputTokens ?? 0;
-  const pct = denom > 0 ? Math.min((used / denom) * 100, 100) : 0;
-  const barWidth = 16;
-  const filled = Math.round((pct / 100) * barWidth);
-  const empty = Math.max(0, barWidth - filled);
-  const cells = ('█'.repeat(filled) + '░'.repeat(empty)).split('');
-  // When a distinct trim budget sits below the window, mark where trimming triggers.
-  if (
-    contextModelWindow &&
-    contextMaxTokens &&
-    contextModelWindow > 0 &&
-    contextMaxTokens < contextModelWindow
-  ) {
-    const pos = Math.min(
-      Math.round((contextMaxTokens / contextModelWindow) * barWidth),
-      barWidth - 1,
-    );
-    cells[pos] = '│';
-  }
-  const bar = cells.join('');
-
-  const label = `ctx: ${fmtTokens(used).padStart(7)} / ${fmtTokens(denom).padStart(7)}  [${bar}]  ${pct.toFixed(0)}%`;
+  const label = `${t('agent.context_usage')}: ${fmtTokens(state.used).padStart(7)} / ${fmtTokens(state.denominator).padStart(7)}  [${state.cells}]  ${state.percent.toFixed(0)}%`;
 
   return (
     <div className="px-4 py-1.5 border-b text-[11px] font-mono flex items-center gap-2" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>

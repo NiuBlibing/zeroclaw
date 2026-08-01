@@ -903,6 +903,17 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
 }
 
+fn resolve_done_context_limits(
+    usage_budget: Option<u64>,
+    usage_model_window: Option<u64>,
+    active_limits: zeroclaw_config::schema::ResolvedContextLimits,
+) -> (u64, u64) {
+    (
+        usage_budget.unwrap_or(active_limits.context_token_budget as u64),
+        usage_model_window.unwrap_or(active_limits.model_context_window as u64),
+    )
+}
+
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
@@ -942,22 +953,11 @@ async fn process_chat_message(
         ))
     });
 
-    // Resolve the two context-meter values for this agent. `max_context_tokens`
-    // is the preemptive-trim budget the meter fills toward (resolved
-    // `effective_context_budget`), preserving that wire field's original meaning;
-    // `model_context_window` is the model's full window (provider `context_window`,
-    // 32_000 fallback), exposed distinctly so the client can show budget and
-    // capacity apart. Preemptive trimming triggers near `context_compact_ratio`
-    // (default 90%) of the window.
-    let (max_context_tokens, model_context_window) = {
-        let cfg = state.config.read();
-        let model_window = cfg.effective_model_context_window(&turn_alias) as u64;
-        let budget = cfg
-            .resolved_agent_config(&turn_alias)
-            .map(|a| a.resolved.effective_context_budget() as u64)
-            .unwrap_or(model_window);
-        (budget, model_window)
-    };
+    // Filled from the usage event produced by the active provider/model route.
+    // They intentionally are not snapshotted before the turn because a model
+    // switch can change both values while the session remains alive.
+    let mut max_context_tokens = None;
+    let mut model_context_window = None;
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
@@ -1163,7 +1163,11 @@ async fn process_chat_message(
                             cached_input_tokens: _,
                             output_tokens,
                             cost_usd: _,
+                            context_token_budget,
+                            model_context_window: usage_model_context_window,
                         } => {
+                            max_context_tokens = context_token_budget;
+                            model_context_window = usage_model_context_window;
                             if let Some(it) = input_tokens {
                                 total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
                                 last_input_tokens = Some(it);
@@ -1380,6 +1384,13 @@ async fn process_chat_message(
                 .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0)
                 .map(|usage| usage.cost_usd);
 
+            let (_, active_provider, active_model) = agent.attribution_fields();
+            let active_limits = agent.context_limits();
+            let (max_context_tokens, model_context_window) = resolve_done_context_limits(
+                max_context_tokens,
+                model_context_window,
+                active_limits,
+            );
             let done = serde_json::json!({
                 "type": "done",
                 "full_response": outcome.response,
@@ -1387,8 +1398,8 @@ async fn process_chat_message(
                 "output_tokens": total_output_tokens,
                 "tokens_used": total_tokens,
                 "cost_usd": cost_usd,
-                "model": turn_model,
-                "provider": provider_label,
+                "model": active_model,
+                "provider": active_provider,
                 "max_context_tokens": max_context_tokens,
                 "model_context_window": model_context_window,
                 "last_input_tokens": last_input_tokens,
@@ -1498,6 +1509,31 @@ async fn process_chat_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn done_context_limits_prefer_active_usage_route() {
+        let stale_startup_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 200_000,
+            context_token_budget: 180_000,
+        };
+        assert_eq!(
+            resolve_done_context_limits(Some(7_200), Some(8_000), stale_startup_limits),
+            (7_200, 8_000),
+            "the done frame must report the route that produced the usage event"
+        );
+    }
+
+    #[test]
+    fn done_context_limits_fall_back_to_agent_active_route_without_usage() {
+        let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 8_000,
+            context_token_budget: 0,
+        };
+        assert_eq!(
+            resolve_done_context_limits(None, None, active_limits),
+            (0, 8_000),
+        );
+    }
     use axum::http::HeaderMap;
 
     #[test]

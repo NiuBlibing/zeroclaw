@@ -98,7 +98,8 @@ pub struct ResolvedAgentExecution<'a> {
     pub parallel_tools: bool,
     /// Truncation limit for tool outputs.
     pub max_tool_result_chars: usize,
-    /// History-pruning token threshold.
+    /// Proactive-trim budget resolved for the selected route. The paired
+    /// capacity is resolved from `config` and the route when the turn starts.
     pub context_token_budget: usize,
     /// Tool-receipt tracer; `None` when receipts are off.
     pub receipt_generator: Option<&'a ReceiptGenerator>,
@@ -135,7 +136,7 @@ pub struct ResolvedRuntimeKnobs<'a> {
     pub strict_tool_parsing: bool,
     pub parallel_tools: bool,
     pub max_tool_result_chars: usize,
-    pub context_token_budget: usize,
+    pub context_limits: zeroclaw_config::schema::ResolvedContextLimits,
     pub knobs: &'a LoopKnobs,
 }
 
@@ -163,7 +164,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             strict_tool_parsing: runtime.strict_tool_parsing,
             parallel_tools: runtime.parallel_tools,
             max_tool_result_chars: runtime.max_tool_result_chars,
-            context_token_budget: runtime.context_token_budget,
+            context_token_budget: runtime.context_limits.context_token_budget,
             receipt_generator: io.receipt_generator,
             knobs: runtime.knobs,
         }

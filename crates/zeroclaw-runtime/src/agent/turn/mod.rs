@@ -232,6 +232,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         receipt_generator,
         knobs,
     } = exec;
+    let model_context_window = config.map_or(
+        zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET,
+        |config| config.effective_model_context_window_for_route(provider_name, model),
+    );
+    let context_limits = zeroclaw_config::schema::ResolvedContextLimits {
+        model_context_window,
+        context_token_budget,
+    };
 
     let ingress_policy_cfg = IngressPolicy::default();
     let p1_text = history
@@ -334,6 +342,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         observer,
         provider_name,
         model,
+        context_limits,
         temperature,
         approval,
         channel_name,
@@ -679,7 +688,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     iteration,
                     event_tx.as_ref(),
                     observer,
-                    context_token_budget,
+                    context_limits,
                 )
                 .await;
                 if recovered {
@@ -1705,7 +1714,7 @@ async fn drive_live_sop_actions(
                             eff_strict_tool_parsing,
                             eff_parallel_tools,
                             eff_max_tool_result_chars,
-                            eff_context_token_budget,
+                            eff_context_limits,
                             eff_dedup_exempt_tools,
                             eff_pacing,
                         ) = match owned {
@@ -1715,7 +1724,7 @@ async fn drive_live_sop_actions(
                                 o.agent.resolved.strict_tool_parsing,
                                 o.agent.resolved.parallel_tools,
                                 o.agent.resolved.max_tool_result_chars,
-                                o.agent.resolved.effective_context_budget(),
+                                o.agent.resolved.context_limits(),
                                 o.agent.resolved.tool_call_dedup_exempt.as_slice(),
                                 &sop_reassembly
                                     .expect("owned implies a reassembly handle")
@@ -1728,7 +1737,18 @@ async fn drive_live_sop_actions(
                                 strict_tool_parsing,
                                 parallel_tools,
                                 max_tool_result_chars,
-                                context_token_budget,
+                                zeroclaw_config::schema::ResolvedContextLimits {
+                                    model_context_window: config.map_or(
+                                        zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET,
+                                        |config| {
+                                            config.effective_model_context_window_for_route(
+                                                provider_name,
+                                                model,
+                                            )
+                                        },
+                                    ),
+                                    context_token_budget,
+                                },
                                 dedup_exempt_tools,
                                 pacing,
                             ),
@@ -1850,7 +1870,7 @@ async fn drive_live_sop_actions(
                                             strict_tool_parsing: eff_strict_tool_parsing,
                                             parallel_tools: eff_parallel_tools,
                                             max_tool_result_chars: eff_max_tool_result_chars,
-                                            context_token_budget: eff_context_token_budget,
+                                            context_limits: eff_context_limits,
                                             knobs,
                                         },
                                     ),

@@ -900,7 +900,7 @@ impl DelegateTool {
                 .context_compact_ratio
                 .filter(|r| *r > 0.0 && *r <= 1.0)
             {
-                resolved.context_compact_ratio = ratio;
+                resolved.context_compact_ratio = Some(ratio);
             }
             if let Some(parallel_tools) = profile.parallel_tools {
                 resolved.parallel_tools = parallel_tools;
@@ -2635,7 +2635,7 @@ impl DelegateTool {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider,
-                        provider_name: provider_type,
+                        provider_name: agent_config.model_provider.as_str(),
                         model,
                         temperature,
                     },
@@ -2668,9 +2668,18 @@ impl DelegateTool {
                         strict_tool_parsing: loop_runtime.strict_tool_parsing,
                         parallel_tools: loop_runtime.parallel_tools,
                         max_tool_result_chars: loop_runtime.max_tool_result_chars,
-                        // Keep delegate subagent context pruning aligned with top-level
-                        // agents instead of preserving the old disabled-by-zero path.
-                        context_token_budget: loop_runtime.effective_context_budget(),
+                        // Resolve from the target's provider alias and model, not the
+                        // delegating agent's route.
+                        context_limits: self.root_config.as_deref().map_or_else(
+                            || loop_runtime.context_limits(),
+                            |config| {
+                                config.resolved_context_limits_for_route(
+                                    agent_name,
+                                    &agent_config.model_provider,
+                                    model,
+                                )
+                            },
+                        ),
                         knobs: &LoopKnobs::default(),
                     },
                 ),

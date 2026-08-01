@@ -285,6 +285,21 @@ struct ChannelRouteSelection {
     api_key: Option<String>,
 }
 
+fn resolve_channel_context_limits(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    route: &ChannelRouteSelection,
+    legacy_budget: usize,
+) -> zeroclaw_config::schema::ResolvedContextLimits {
+    if agent_alias.is_empty() {
+        return zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET,
+            context_token_budget: legacy_budget,
+        };
+    }
+    config.resolved_context_limits_for_route(agent_alias, &route.model_provider, &route.model)
+}
+
 /// Selectable scope for a session-only `/model` override. The absence of any
 /// stored entry is the implicit "default" (config) tier, so it is not a variant.
 /// Precedence at resolution time is `User > Agent` (above the per-sender
@@ -4720,6 +4735,13 @@ async fn process_channel_message_body(
         };
     }
 
+    let mut context_limits = resolve_channel_context_limits(
+        runtime_defaults.config.as_ref(),
+        ctx.agent_alias.as_str(),
+        &route,
+        ctx.context_token_budget,
+    );
+
     let mut active_model_provider = match get_or_create_provider(
         ctx.as_ref(),
         &route.model_provider,
@@ -5380,7 +5402,7 @@ async fn process_channel_message_body(
                         strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
                         parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
                         max_tool_result_chars: ctx.max_tool_result_chars,
-                        context_token_budget: ctx.context_token_budget,
+                        context_limits,
                         knobs: &loop_knobs,
                     },
                 ),
@@ -5510,6 +5532,12 @@ async fn process_channel_message_body(
                         route.model_provider = resolved_model_provider;
                         route.model = new_model;
                         route.api_key = resolved_api_key;
+                        context_limits = resolve_channel_context_limits(
+                            runtime_defaults.config.as_ref(),
+                            ctx.agent_alias.as_str(),
+                            &route,
+                            ctx.context_token_budget,
+                        );
                         // Persist the route override so subsequent messages
                         // from this sender continue using the switched model.
                         set_route_selection(
@@ -20709,6 +20737,77 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             get_route_selection(&ctx, &msg, &sender_key, &snapshot).model,
             "user-model"
+        );
+    }
+
+    #[test]
+    fn channel_route_switch_re_resolves_context_limits() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+            RuntimeProfileConfig,
+        };
+
+        let mut cfg = Config::default();
+        for (alias, model, context_window) in [
+            ("large", "large-model", 200_000),
+            ("small", "small-model", 8_000),
+        ] {
+            cfg.providers.models.custom.insert(
+                alias.to_string(),
+                CustomModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        context_window: Some(context_window),
+                        ..ModelProviderConfig::default()
+                    },
+                },
+            );
+        }
+        cfg.runtime_profiles.insert(
+            "ratio".to_string(),
+            RuntimeProfileConfig {
+                context_compact_ratio: Some(0.9),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        cfg.agents.insert(
+            "router".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: zeroclaw_config::providers::ModelProviderRef::new("custom.large"),
+                runtime_profile: "ratio".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let large = resolve_channel_context_limits(
+            &cfg,
+            "router",
+            &ChannelRouteSelection {
+                model_provider: "custom.large".to_string(),
+                model: "large-model".to_string(),
+                api_key: None,
+            },
+            0,
+        );
+        let small = resolve_channel_context_limits(
+            &cfg,
+            "router",
+            &ChannelRouteSelection {
+                model_provider: "custom.small".to_string(),
+                model: "small-model".to_string(),
+                api_key: None,
+            },
+            0,
+        );
+
+        assert_eq!(
+            (large.model_context_window, large.context_token_budget),
+            (200_000, 180_000)
+        );
+        assert_eq!(
+            (small.model_context_window, small.context_token_budget),
+            (8_000, 7_200)
         );
     }
 

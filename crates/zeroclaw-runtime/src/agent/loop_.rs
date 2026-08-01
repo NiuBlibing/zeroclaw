@@ -871,6 +871,13 @@ async fn agent_turn_with_sop_reassembly(
         agent_alias.map(str::to_string),
         Some(turn_id.clone()),
     );
+    let context_limits = zeroclaw_config::schema::ResolvedContextLimits {
+        model_context_window: config.map_or(
+            zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET,
+            |config| config.effective_model_context_window_for_route(provider_name, model),
+        ),
+        context_token_budget,
+    };
     let result = run_tool_call_loop(ToolLoop {
         sop_reassembly,
         exec: ResolvedAgentExecution::resolve(
@@ -900,7 +907,7 @@ async fn agent_turn_with_sop_reassembly(
                 strict_tool_parsing,
                 parallel_tools,
                 max_tool_result_chars,
-                context_token_budget,
+                context_limits,
                 knobs: &LoopKnobs::default(),
             },
         ),
@@ -1190,7 +1197,6 @@ pub async fn run(
         let eff_max_history_messages = agent.resolved.max_history_messages;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
-        let eff_model_context_window = agent.resolved.model_context_window;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
@@ -1409,6 +1415,8 @@ pub async fn run(
              [providers.models.{provider_name}.<alias>].model is unset and --model was not passed"
             ),
         };
+        let mut context_limits =
+            config.resolved_context_limits_for_route(agent_alias, &provider_name, &model_name);
 
         {
             let span = zeroclaw_log::Span::current();
@@ -1905,9 +1913,7 @@ pub async fn run(
                                         strict_tool_parsing: agent.resolved.strict_tool_parsing,
                                         parallel_tools: agent.resolved.parallel_tools,
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
-                                        context_token_budget: agent
-                                            .resolved
-                                            .effective_context_budget(),
+                                        context_limits,
                                         knobs: &LoopKnobs::default(),
                                     },
                                 ),
@@ -1994,6 +2000,11 @@ pub async fn run(
 
                             provider_name = new_model_provider;
                             model_name = new_model;
+                            context_limits = config.resolved_context_limits_for_route(
+                                agent_alias,
+                                &provider_name,
+                                &model_name,
+                            );
 
                             turn_guard.set_model_route(provider_name.clone(), model_name.clone());
 
@@ -2453,9 +2464,7 @@ pub async fn run(
                                             max_tool_result_chars: agent
                                                 .resolved
                                                 .max_tool_result_chars,
-                                            context_token_budget: agent
-                                                .resolved
-                                                .effective_context_budget(),
+                                            context_limits,
                                             knobs: &LoopKnobs::default(),
                                         },
                                     ),
@@ -2544,6 +2553,11 @@ pub async fn run(
 
                                 provider_name = new_model_provider;
                                 model_name = new_model;
+                                context_limits = config.resolved_context_limits_for_route(
+                                    agent_alias,
+                                    &provider_name,
+                                    &model_name,
+                                );
 
                                 turn_guard
                                     .set_model_route(provider_name.clone(), model_name.clone());
@@ -2563,7 +2577,11 @@ pub async fn run(
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
                                 let taken = std::mem::take(&mut history);
-                                let recovery_budget = eff_model_context_window * 9 / 10;
+                                let recovery_budget = if context_limits.context_token_budget > 0 {
+                                    context_limits.context_token_budget
+                                } else {
+                                    context_limits.model_context_window * 9 / 10
+                                };
                                 let result = crate::agent::history_trim::trim_to_recent_turns(
                                     taken,
                                     recovery_budget,
@@ -2606,9 +2624,7 @@ pub async fn run(
                                 history = result.history;
                                 let system_floor =
                                     crate::agent::history::estimate_system_floor_tokens(&history);
-                                let context_token_budget =
-                                    agent.resolved.effective_context_budget();
-                                let floor_exceeds_budget = system_floor >= context_token_budget;
+                                let floor_exceeds_budget = system_floor >= recovery_budget;
                                 {
                                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                                         target: "zeroclaw_log_internal_scope",
@@ -2628,12 +2644,12 @@ pub async fn run(
                                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                                             .with_attrs(::serde_json::json!({
                                                 "system_floor": system_floor,
-                                                "budget": context_token_budget,
+                                                "budget": recovery_budget,
                                                 "error_key": "context_floor_exceeds_budget",
                                             })),
                                             crate::agent::history::context_floor_remediation(
                                                 system_floor,
-                                                context_token_budget,
+                                                recovery_budget,
                                             )
                                         );
                                     } else {
@@ -2655,7 +2671,7 @@ pub async fn run(
                                         "\nError: {e}\n{}\n",
                                         crate::agent::history::context_floor_remediation(
                                             system_floor,
-                                            context_token_budget,
+                                            recovery_budget,
                                         )
                                     );
                                     break String::new();
@@ -2691,7 +2707,7 @@ pub async fn run(
                     let usage = ctx.snapshot_turn_usage();
                     let effective_input_tokens = usage.last_input_tokens;
                     if effective_input_tokens > 0 || usage.output_tokens > 0 {
-                        let max_ctx = eff_model_context_window as u64;
+                        let max_ctx = context_limits.model_context_window as u64;
                         let pct = if max_ctx > 0 {
                             (effective_input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
                         } else {
@@ -2985,10 +3001,11 @@ pub async fn process_message(
             provider_name,
             provider_alias.as_str(),
         );
+        let model_provider_ref = format!("{provider_name}.{provider_alias}");
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
                 &config,
-                &format!("{provider_name}.{provider_alias}"),
+                &model_provider_ref,
                 agent_model_provider
                     .as_ref()
                     .and_then(|e| e.api_key.as_deref()),
@@ -3278,7 +3295,7 @@ pub async fn process_message(
                     &mut history,
                     &tools_registry,
                     observer.as_ref(),
-                    provider_name,
+                    &model_provider_ref,
                     &model_name,
                     effective_temperature,
                     true,
@@ -3294,7 +3311,13 @@ pub async fn process_message(
                     agent.resolved.strict_tool_parsing,
                     agent.resolved.parallel_tools,
                     agent.resolved.max_tool_result_chars,
-                    agent.resolved.effective_context_budget(),
+                    config
+                        .resolved_context_limits_for_route(
+                            agent_alias,
+                            &model_provider_ref,
+                            &model_name,
+                        )
+                        .context_token_budget,
                     // Cross-channel HITL: a route-only approval bridge when the
                     // profile sets `approval_route` and channels are live, else
                     // `None` (today's channel-less auto-deny). See above.

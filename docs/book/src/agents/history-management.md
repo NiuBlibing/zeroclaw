@@ -34,18 +34,22 @@ shape are left unchanged.
 
 The token budget comes from `ResolvedRuntime::effective_context_budget()`:
 
-- The budget is the model's context window (provider `context_window`, or a
-  32,000 fallback when unset) multiplied by the runtime profile's
-  `context_compact_ratio` (default `0.9`, clamped to `(0.0, 1.0]`). Anchoring the
-  threshold to the real window keeps trimming below the provider's hard limit
-  regardless of which model the agent runs on. The reactive overflow-recovery
-  path uses a comparable 90% figure.
+- Existing profiles remain on the historical 32,000-token budget when neither
+  `max_context_tokens` nor `context_compact_ratio` is set.
+- `max_context_tokens` remains an absolute budget. An explicit value of `0`
+  disables proactive token-budget trimming.
+- Setting `context_compact_ratio` opts into a model-relative budget: the
+  selected provider alias/model's `context_window` (or a 32,000 fallback when
+  its capacity is unknown) multiplied by the ratio. Values outside `(0.0, 1.0]`
+  are treated as unset. When both settings are present, `max_context_tokens`
+  is a downward cap on the ratio-derived budget.
 - When `history_pruning.enabled` is set with a positive
   `history_pruning.max_tokens`, that value pulls the budget down (never up),
   letting operators trim earlier.
 
-The runtime-profile `max_context_tokens` setting no longer drives this
-threshold; use `history_pruning.max_tokens` to trim earlier than 90%.
+Capacity and budget are resolved together for the active provider/model route.
+If a session switches route, the next model call, overflow recovery, and client
+context meter all use the newly resolved pair.
 
 Token counts are estimated by `history::estimate_history_tokens`: roughly four
 characters per token plus four framing tokens per message. This is a heuristic,
