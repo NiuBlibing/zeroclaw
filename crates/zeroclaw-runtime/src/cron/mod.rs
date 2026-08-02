@@ -1,7 +1,7 @@
 use crate::security::SecurityPolicy;
 use anyhow::{Result, bail};
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 mod schedule;
 mod store;
@@ -94,9 +94,43 @@ pub(crate) fn add_shell_job_with_runtime(
     delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
+    add_shell_job_with_runtime_and_format(
+        config,
+        runtime,
+        security,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        delivery,
+        approved,
+        CronShellOutputFormat::default(),
+    )
+}
+
+fn add_shell_job_with_runtime_and_format(
+    config: &Config,
+    runtime: &dyn RuntimeAdapter,
+    security: &SecurityPolicy,
+    agent_alias: &str,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+    approved: bool,
+    shell_output_format: CronShellOutputFormat,
+) -> Result<CronJob> {
     validate_shell_command_with_security(runtime, security, command, approved)?;
     validate_delivery_config(delivery.as_ref())?;
-    store::add_shell_job(config, agent_alias, name, schedule, command, delivery)
+    store::add_shell_job_with_format(
+        config,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        delivery,
+        shell_output_format,
+    )
 }
 
 pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()> {
@@ -137,9 +171,32 @@ pub fn add_shell_job_with_approval(
     delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
+    add_shell_job_with_approval_and_format(
+        config,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        delivery,
+        approved,
+        CronShellOutputFormat::default(),
+    )
+}
+
+/// Like `add_shell_job_with_approval` but with an explicit shell output format.
+pub fn add_shell_job_with_approval_and_format(
+    config: &Config,
+    agent_alias: &str,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+    approved: bool,
+    shell_output_format: CronShellOutputFormat,
+) -> Result<CronJob> {
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
     let runtime = crate::platform::create_runtime(&config.runtime)?;
-    add_shell_job_with_runtime(
+    add_shell_job_with_runtime_and_format(
         config,
         runtime.as_ref(),
         &security,
@@ -149,6 +206,7 @@ pub fn add_shell_job_with_approval(
         command,
         delivery,
         approved,
+        shell_output_format,
     )
 }
 
@@ -281,7 +339,16 @@ pub fn add_shell_job(
     schedule: Schedule,
     command: &str,
 ) -> Result<CronJob> {
-    add_shell_job_with_approval(config, agent_alias, name, schedule, command, None, false)
+    add_shell_job_with_approval_and_format(
+        config,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        None,
+        false,
+        CronShellOutputFormat::default(),
+    )
 }
 
 pub fn add_job(
