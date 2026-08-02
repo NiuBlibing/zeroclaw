@@ -5393,6 +5393,7 @@ async fn process_channel_message_body(
                         model_provider: active_model_provider.as_ref(),
                         provider_name: route.model_provider.as_str(),
                         model: route.model.as_str(),
+                        dispatch_model: route.model.as_str(),
                         temperature: thinking.effective_temperature,
                     },
                     ResolvedIo {
