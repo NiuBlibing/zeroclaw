@@ -75,8 +75,7 @@ pub(crate) async fn try_recover_context_overflow(
         // forced below the current size. Never splits a tool_use/tool_result
         // pair, never silently shrinks a result. Whole turns or nothing.
         let tokens_now = estimate_history_tokens(history);
-        // Preserve the established reactive policy in this proactive-budget
-        // slice. Model-window-aware recovery remains owned by #9083.
+        // Preserve the established reactive policy after a context overflow.
         let budget = tokens_now.saturating_mul(2) / 3;
         let owned = std::mem::take(history);
         let result = trim_to_recent_turns(owned, budget);
