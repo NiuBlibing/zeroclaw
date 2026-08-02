@@ -56,7 +56,7 @@ By default, the native runtime invokes commands via `/bin/sh`. Set `[runtime].sh
 shell = "bash"      # resolves through PATH, or use an absolute path
 ```
 
-On Unix the shell is called as `<shell> -c "<command>"`. POSIX-compatible shells work, and `powershell`/`pwsh` select PowerShell syntax and policy on every host. The value must be either a bare command name found on `PATH` (e.g. `"bash"` or `"pwsh"`) or an absolute path to an executable (e.g. `"/bin/bash"`); relative paths with separators (e.g. `"./sh"`, `"bin/sh"`) are rejected. It is validated when the runtime starts, so an empty, missing, non-executable, or malformed shell fails fast with a clear error instead of breaking the first command. Defaults to `"sh"` when unset.
+On Unix, POSIX-compatible shells are called as `<shell> -c "<command>"`. `powershell`/`pwsh` select PowerShell syntax and policy on every supported desktop host and run as `<interpreter> -NoProfile -NonInteractive -Command <command>`, so profile scripts cannot redefine commands behind policy's back and prompts cannot block execution. The value must be either a bare command name found on `PATH` (e.g. `"bash"` or `"pwsh"`) or an absolute path to an executable (e.g. `"/bin/bash"`); relative paths with separators (e.g. `"./sh"`, `"bin/sh"`) are rejected. It is validated when the runtime starts, so an empty, missing, non-executable, or malformed shell fails fast with a clear error instead of breaking the first command. Defaults to `"sh"` when unset.
 
 On **Windows**, the value selects the interpreter family by its file name:
 

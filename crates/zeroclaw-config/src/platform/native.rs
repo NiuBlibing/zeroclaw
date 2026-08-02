@@ -47,7 +47,7 @@ pub fn windows_tokio_cmd_shell_command(command: &str) -> tokio::process::Command
 }
 
 /// Build a PowerShell process (`powershell` 5.x or `pwsh` 7+) that runs
-/// `command`.
+/// `command` without loading profiles or prompting interactively.
 ///
 /// `interpreter` is the configured shell string used verbatim as the
 /// executable, so a bare name (`powershell`, `pwsh`) resolves via `PATH` while
@@ -56,20 +56,25 @@ pub fn windows_tokio_cmd_shell_command(command: &str) -> tokio::process::Command
 /// `-NoProfile` skips user/host profile scripts for a predictable, faster
 /// startup; `-NonInteractive` prevents the shell from blocking on prompts; and
 /// `-Command` consumes the final argument as script text. Ordinary `arg`
-/// handling keeps the entire script in one Windows process argument and
-/// preserves its internal PowerShell quoting.
-#[cfg(target_os = "windows")]
-pub fn windows_tokio_powershell_command(
-    interpreter: &str,
-    command: &str,
-) -> tokio::process::Command {
+/// handling keeps the entire script in one process argument and preserves its
+/// internal PowerShell quoting.
+fn tokio_powershell_command(interpreter: &str, command: &str) -> tokio::process::Command {
     let mut process = tokio::process::Command::new(interpreter);
     process
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-Command")
-        .arg(command)
-        .creation_flags(CREATE_NO_WINDOW);
+        .arg(command);
+    process
+}
+
+#[cfg(target_os = "windows")]
+pub fn windows_tokio_powershell_command(
+    interpreter: &str,
+    command: &str,
+) -> tokio::process::Command {
+    let mut process = tokio_powershell_command(interpreter, command);
+    process.creation_flags(CREATE_NO_WINDOW);
     process
 }
 
@@ -89,8 +94,9 @@ pub fn windows_std_cmd_shell_command(command: &str) -> std::process::Command {
 pub struct NativeRuntime {
     /// Shell binary to invoke for command execution.
     ///
-    /// Unix: the interpreter invoked as `<shell> -c "<command>"` (e.g. `"sh"`,
-    /// `"bash"`, `"/bin/zsh"`).
+    /// Unix: POSIX interpreters are invoked as `<shell> -c "<command>"` (e.g.
+    /// `"sh"`, `"bash"`, `"/bin/zsh"`). PowerShell interpreters use
+    /// `-NoProfile -NonInteractive -Command` on every supported desktop host.
     ///
     /// Windows: [`RuntimeAdapter::shell_dialect`] selects the invocation
     /// convention — `cmd.exe /C` (default, and for the cross-platform default
@@ -113,7 +119,8 @@ impl NativeRuntime {
     /// Create a native runtime that uses a specific shell binary.
     ///
     /// Unix: `shell` is a path or name resolvable via `PATH`, e.g. `"bash"`,
-    /// `"/bin/zsh"`, `"/usr/bin/fish"`.
+    /// `"/bin/zsh"`, `"/usr/bin/fish"`, or `"pwsh"`. PowerShell names use
+    /// the PowerShell invocation convention; other names use `-c`.
     ///
     /// Windows: `shell` selects the invocation convention — `powershell` or
     /// `pwsh` (bare name or absolute path) run through PowerShell; every other
@@ -178,8 +185,14 @@ impl RuntimeAdapter for NativeRuntime {
             } else {
                 &self.shell
             };
-            let mut process = tokio::process::Command::new(shell);
-            process.arg("-c").arg(command).current_dir(workspace_dir);
+            let mut process = if self.shell_dialect() == ShellDialect::PowerShell {
+                tokio_powershell_command(shell, command)
+            } else {
+                let mut process = tokio::process::Command::new(shell);
+                process.arg("-c").arg(command);
+                process
+            };
+            process.current_dir(workspace_dir);
             Ok(process)
         }
 
@@ -240,6 +253,29 @@ mod tests {
             NativeRuntime::with_shell("pwsh".into()).shell_dialect(),
             ShellDialect::PowerShell
         );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn unix_powershell_shell_uses_safe_invocation_args() {
+        use std::ffi::OsStr;
+
+        let script = r#"Write-Output "quoted safe value" | Select-Object -First 1"#;
+        let cwd = std::env::temp_dir();
+        let command = NativeRuntime::with_shell("pwsh".into())
+            .build_shell_command(script, &cwd)
+            .unwrap();
+        let command = command.as_std();
+
+        assert_eq!(command.get_program(), OsStr::new("pwsh"));
+        let args: Vec<_> = command.get_args().collect();
+        let expected = [
+            OsStr::new("-NoProfile"),
+            OsStr::new("-NonInteractive"),
+            OsStr::new("-Command"),
+            OsStr::new(script),
+        ];
+        assert_eq!(args.as_slice(), expected.as_slice());
     }
 
     #[test]
