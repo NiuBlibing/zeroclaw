@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
-use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
+use zeroclaw_config::schema::{MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{LoopKnobs, ModelSwitchCallback};
@@ -19,8 +19,13 @@ use crate::tools::{ActivatedToolSet, Tool};
 /// unchanged after destructuring.
 pub struct ResolvedModelAccess<'a> {
     pub model_provider: &'a dyn ModelProvider,
+    /// Provider profile that actually serves this request.
     pub provider_name: &'a str,
+    /// Model that actually serves this request.
     pub model: &'a str,
+    /// Selector sent to `model_provider`. Routed providers may require a
+    /// `hint:<name>` selector even though `model` records the resolved model.
+    pub dispatch_model: &'a str,
     pub temperature: Option<f64>,
 }
 
@@ -48,7 +53,7 @@ impl ResolvedModelAccess<'_> {
             thinking,
         };
         let resp = ProviderDispatch::from_ref(self.model_provider)
-            .chat(request, self.model, self.temperature)
+            .chat(request, self.dispatch_model, self.temperature)
             .await?;
         // Record spend immediately after the call (before any caller-side output
         // validation) so a downstream failure still counts the provider usage.
@@ -98,9 +103,9 @@ pub struct ResolvedAgentExecution<'a> {
     pub parallel_tools: bool,
     /// Truncation limit for tool outputs.
     pub max_tool_result_chars: usize,
-    /// Proactive-trim budget resolved for the selected route. The paired
-    /// capacity is resolved from `config` and the route when the turn starts.
-    pub context_token_budget: usize,
+    /// Capacity and proactive-trim budget resolved together for the selected
+    /// route at the turn boundary.
+    pub context_limits: ResolvedContextLimits,
     /// Tool-receipt tracer; `None` when receipts are off.
     pub receipt_generator: Option<&'a ReceiptGenerator>,
     /// Fine-grained loop behavior flags.
@@ -136,7 +141,7 @@ pub struct ResolvedRuntimeKnobs<'a> {
     pub strict_tool_parsing: bool,
     pub parallel_tools: bool,
     pub max_tool_result_chars: usize,
-    pub context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+    pub context_limits: ResolvedContextLimits,
     pub knobs: &'a LoopKnobs,
 }
 
@@ -164,7 +169,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             strict_tool_parsing: runtime.strict_tool_parsing,
             parallel_tools: runtime.parallel_tools,
             max_tool_result_chars: runtime.max_tool_result_chars,
-            context_token_budget: runtime.context_limits.context_token_budget,
+            context_limits: runtime.context_limits,
             receipt_generator: io.receipt_generator,
             knobs: runtime.knobs,
         }
@@ -233,6 +238,7 @@ mod run_model_query_tests {
             model_provider: provider,
             provider_name: "custom",
             model: "test-model",
+            dispatch_model: "test-model",
             temperature: None,
         }
     }

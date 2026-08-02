@@ -153,6 +153,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 model_provider: &provider,
                 provider_name: "mock",
                 model: "mock-model",
+                dispatch_model: "mock-model",
                 temperature: None,
             },
             ResolvedIo {
@@ -178,6 +179,8 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 100_000,
                     context_token_budget: 100_000,
+                    model_context_window_source:
+                        zeroclaw_config::schema::ModelContextWindowSource::Configured,
                 },
                 knobs: &LoopKnobs::default(),
             },

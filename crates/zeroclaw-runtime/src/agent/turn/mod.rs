@@ -307,6 +307,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 model_provider,
                 provider_name,
                 model,
+                dispatch_model,
                 temperature,
             },
         tools_registry,
@@ -325,18 +326,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         strict_tool_parsing,
         parallel_tools,
         max_tool_result_chars,
-        context_token_budget,
+        context_limits,
         receipt_generator,
         knobs,
     } = exec;
-    let model_context_window = config.map_or(
-        zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET,
-        |config| config.effective_model_context_window_for_route(provider_name, model),
-    );
-    let context_limits = zeroclaw_config::schema::ResolvedContextLimits {
-        model_context_window,
-        context_token_budget,
-    };
+    let context_token_budget = context_limits.context_token_budget;
 
     let mut turn_state = TurnState::new(raw_history, raw_canonical);
 
@@ -641,21 +635,25 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             multimodal_config,
             provider_name,
             model,
+            dispatch_model,
         )?;
 
-        let (active_model_provider, active_model_provider_name, active_model): (
-            &dyn ModelProvider,
-            &str,
-            &str,
-        ) = if let Some(ref resolved) = vision_model_provider_box {
-            (
-                resolved.provider.as_ref(),
-                resolved.provider_name.as_str(),
-                resolved.model.as_str(),
-            )
-        } else {
-            (model_provider, provider_name, model)
-        };
+        let (
+            active_model_provider,
+            active_model_provider_name,
+            active_model,
+            active_dispatch_model,
+        ): (&dyn ModelProvider, &str, &str, &str) =
+            if let Some(ref resolved) = vision_model_provider_box {
+                (
+                    resolved.provider.as_ref(),
+                    resolved.provider_name.as_str(),
+                    resolved.model.as_str(),
+                    resolved.model.as_str(),
+                )
+            } else {
+                (model_provider, provider_name, model, dispatch_model)
+            };
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
         let IterationToolSpecs {
             ref tool_specs,
@@ -730,7 +728,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } = call_provider(
             &ctx,
             active_model_provider,
-            active_model,
+            active_dispatch_model,
             &prepared_messages.messages,
             request_tools,
             should_consume_provider_stream,
@@ -1162,6 +1160,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 model_provider,
                 provider_name,
                 model,
+                dispatch_model,
                 temperature,
                 tools_registry,
                 observer,
@@ -1179,7 +1178,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 strict_tool_parsing,
                 parallel_tools,
                 max_tool_result_chars,
-                context_token_budget,
+                context_limits,
                 receipt_generator,
                 knobs,
                 channel_name,
@@ -1218,6 +1217,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_state.history,
         provider_name,
         model,
+        dispatch_model,
         temperature,
         pacing,
         cancellation_token.as_ref(),
@@ -1599,6 +1599,7 @@ async fn drive_live_sop_actions(
     model_provider: &dyn ModelProvider,
     provider_name: &str,
     model: &str,
+    dispatch_model: &str,
     temperature: Option<f64>,
     tools_registry: &[Box<dyn crate::tools::Tool>],
     observer: &dyn crate::observability::Observer,
@@ -1628,7 +1629,7 @@ async fn drive_live_sop_actions(
     strict_tool_parsing: bool,
     parallel_tools: bool,
     max_tool_result_chars: usize,
-    context_token_budget: usize,
+    context_limits: zeroclaw_config::schema::ResolvedContextLimits,
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     knobs: &LoopKnobs,
     channel_name: &str,
@@ -1759,6 +1760,7 @@ async fn drive_live_sop_actions(
                             eff_model_provider,
                             eff_provider_name,
                             eff_model,
+                            eff_dispatch_model,
                             eff_registry,
                             eff_approval,
                             eff_activated,
@@ -1766,6 +1768,7 @@ async fn drive_live_sop_actions(
                             Some(o) => (
                                 o.model_provider.as_ref(),
                                 o.provider_name.as_str(),
+                                o.model.as_str(),
                                 o.model.as_str(),
                                 o.tools_registry.as_slice(),
                                 Some(&o.approval),
@@ -1775,6 +1778,7 @@ async fn drive_live_sop_actions(
                                 model_provider,
                                 provider_name,
                                 model,
+                                dispatch_model,
                                 tools_registry,
                                 approval,
                                 activated_tools,
@@ -1815,18 +1819,7 @@ async fn drive_live_sop_actions(
                                 strict_tool_parsing,
                                 parallel_tools,
                                 max_tool_result_chars,
-                                zeroclaw_config::schema::ResolvedContextLimits {
-                                    model_context_window: config.map_or(
-                                        zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET,
-                                        |config| {
-                                            config.effective_model_context_window_for_route(
-                                                provider_name,
-                                                model,
-                                            )
-                                        },
-                                    ),
-                                    context_token_budget,
-                                },
+                                context_limits,
                                 dedup_exempt_tools,
                                 pacing,
                             ),
@@ -1908,6 +1901,7 @@ async fn drive_live_sop_actions(
                                             model_provider: eff_model_provider,
                                             provider_name: eff_provider_name,
                                             model: eff_model,
+                                            dispatch_model: eff_dispatch_model,
                                             temperature: eff_temperature,
                                         },
                                         ResolvedIo {
@@ -2942,6 +2936,7 @@ mod sop_step_reassembly_tests {
             parent_provider,
             "mock",
             "mock-model",
+            "mock-model",
             None,
             parent_tools,
             observer,
@@ -2959,7 +2954,12 @@ mod sop_step_reassembly_tests {
             false,
             false,
             30_000,
-            100_000,
+            zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 100_000,
+                context_token_budget: 100_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            },
             None,
             &LoopKnobs::default(),
             "cli",

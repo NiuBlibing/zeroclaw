@@ -3354,11 +3354,15 @@ pub struct ResolvedRuntime {
     /// Optional operator context budget from `runtime_profiles.<name>.max_context_tokens`.
     /// Without an opt-in ratio, `None` preserves the legacy 32,000-token budget.
     /// With a ratio, `Some(n)` clamps the model-relative threshold down to `n`.
+    /// Every positive result is also capped by the selected model capacity.
     /// `Some(0)` disables proactive token-budget trimming.
     /// NOT the provider `max_tokens` output limit.
     pub max_context_tokens: Option<usize>,
     /// Model's context window (max input tokens) — from provider config.
     pub model_context_window: usize,
+    /// Whether `model_context_window` came from the selected provider profile
+    /// or from the compatibility fallback for unknown/unconfigured capacity.
+    pub model_context_window_source: ModelContextWindowSource,
     /// Opt-in fraction of `model_context_window` at which proactive trimming
     /// triggers. `None` preserves the legacy absolute-budget behavior.
     pub context_compact_ratio: Option<f64>,
@@ -3383,6 +3387,22 @@ pub struct ResolvedRuntime {
 /// absolute budget nor the opt-in model-relative ratio.
 pub const LEGACY_DEFAULT_CONTEXT_BUDGET: usize = 32_000;
 
+/// Provenance of the model capacity used for one route. The compatibility
+/// fallback remains usable for internal safety calculations, but callers can
+/// avoid presenting it as configured model truth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModelContextWindowSource {
+    Configured,
+    #[default]
+    CompatibilityFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedModelContextWindow {
+    pub tokens: usize,
+    pub source: ModelContextWindowSource,
+}
+
 /// Capacity and proactive-trim budget resolved together for one selected
 /// provider alias and model. This is a per-route materialized view, not a new
 /// configuration source: model capacity remains owned by provider config and
@@ -3390,7 +3410,19 @@ pub const LEGACY_DEFAULT_CONTEXT_BUDGET: usize = 32_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedContextLimits {
     pub model_context_window: usize,
+    pub model_context_window_source: ModelContextWindowSource,
     pub context_token_budget: usize,
+}
+
+impl ResolvedContextLimits {
+    /// Return capacity only when it is configured for the selected route.
+    /// Wire/UI consumers use absence to distinguish the 32k compatibility
+    /// fallback from known model capacity.
+    #[must_use]
+    pub fn configured_model_context_window(self) -> Option<usize> {
+        (self.model_context_window_source == ModelContextWindowSource::Configured)
+            .then_some(self.model_context_window)
+    }
 }
 
 impl ResolvedRuntime {
@@ -3417,6 +3449,7 @@ impl ResolvedRuntime {
         if self.max_context_tokens == Some(0) {
             return ResolvedContextLimits {
                 model_context_window,
+                model_context_window_source: self.model_context_window_source,
                 context_token_budget: 0,
             };
         }
@@ -3441,8 +3474,12 @@ impl ResolvedRuntime {
         if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
             context_token_budget = context_token_budget.min(self.history_pruning.max_tokens);
         }
+        // Capacity is a hard invariant for every positive effective budget.
+        // Preserve zero as the explicit proactive-trimming disable sentinel.
+        context_token_budget = context_token_budget.min(model_context_window);
         ResolvedContextLimits {
             model_context_window,
+            model_context_window_source: self.model_context_window_source,
             context_token_budget,
         }
     }
@@ -3461,6 +3498,7 @@ impl Default for ResolvedRuntime {
             max_history_messages: 50,
             max_context_tokens: None,
             model_context_window: 32_000,
+            model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
             context_compact_ratio: None,
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
@@ -4117,14 +4155,25 @@ impl Config {
     /// Does NOT check runtime profile (that's for output budget).
     #[must_use]
     pub fn effective_model_context_window(&self, agent_alias: &str) -> usize {
+        self.resolved_model_context_window(agent_alias).tokens
+    }
+
+    /// Resolve model capacity and its provenance for an agent's configured
+    /// route. Unknown agents and unconfigured capacities retain the numeric
+    /// compatibility fallback while remaining explicitly identifiable.
+    #[must_use]
+    pub fn resolved_model_context_window(&self, agent_alias: &str) -> ResolvedModelContextWindow {
         let Some(agent) = self.agents.get(agent_alias) else {
-            return LEGACY_DEFAULT_CONTEXT_BUDGET;
+            return ResolvedModelContextWindow {
+                tokens: LEGACY_DEFAULT_CONTEXT_BUDGET,
+                source: ModelContextWindowSource::CompatibilityFallback,
+            };
         };
         let model = self
             .model_provider_for_agent(agent_alias)
             .and_then(|provider| provider.model.as_deref())
             .unwrap_or_default();
-        self.effective_model_context_window_for_route(agent.model_provider.as_str(), model)
+        self.resolved_model_context_window_for_route(agent.model_provider.as_str(), model)
     }
 
     /// Resolve model capacity for the provider alias and model selected for a
@@ -4137,6 +4186,19 @@ impl Config {
         model_provider_ref: &str,
         selected_model: &str,
     ) -> usize {
+        self.resolved_model_context_window_for_route(model_provider_ref, selected_model)
+            .tokens
+    }
+
+    /// Resolve capacity for exactly the selected provider profile and model.
+    /// A model mismatch or missing positive `context_window` is an explicit
+    /// compatibility fallback, never borrowed metadata from another model.
+    #[must_use]
+    pub fn resolved_model_context_window_for_route(
+        &self,
+        model_provider_ref: &str,
+        selected_model: &str,
+    ) -> ResolvedModelContextWindow {
         let configured =
             model_provider_ref
                 .split_once('.')
@@ -4149,15 +4211,25 @@ impl Config {
             .map(str::trim)
             .filter(|model| !model.is_empty());
 
-        configured
+        let configured_window = configured
             .filter(|_| {
                 selected_model.is_empty()
                     || configured_model.is_none()
                     || configured_model == Some(selected_model)
             })
             .and_then(|provider| provider.context_window)
-            .filter(|window| *window > 0)
-            .unwrap_or(LEGACY_DEFAULT_CONTEXT_BUDGET)
+            .filter(|window| *window > 0);
+
+        configured_window.map_or(
+            ResolvedModelContextWindow {
+                tokens: LEGACY_DEFAULT_CONTEXT_BUDGET,
+                source: ModelContextWindowSource::CompatibilityFallback,
+            },
+            |tokens| ResolvedModelContextWindow {
+                tokens,
+                source: ModelContextWindowSource::Configured,
+            },
+        )
     }
 
     /// Resolve one route's capacity and proactive budget from their canonical
@@ -4170,10 +4242,11 @@ impl Config {
         selected_model: &str,
     ) -> ResolvedContextLimits {
         let model_context_window =
-            self.effective_model_context_window_for_route(model_provider_ref, selected_model);
+            self.resolved_model_context_window_for_route(model_provider_ref, selected_model);
         let mut runtime = ResolvedRuntime {
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
-            model_context_window,
+            model_context_window: model_context_window.tokens,
+            model_context_window_source: model_context_window.source,
             context_compact_ratio: self.effective_context_compact_ratio(agent_alias),
             ..ResolvedRuntime::default()
         };
@@ -4258,6 +4331,7 @@ impl Config {
     #[must_use]
     pub fn resolved_agent_config(&self, agent_alias: &str) -> Option<AliasedAgentConfig> {
         let mut out = self.agents.get(agent_alias)?.clone();
+        let model_context_window = self.resolved_model_context_window(agent_alias);
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
@@ -4265,7 +4339,8 @@ impl Config {
             // model-derived threshold (see `effective_context_budget`).
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
             // Model's context window (max input tokens) — from provider config
-            model_context_window: self.effective_model_context_window(agent_alias),
+            model_context_window: model_context_window.tokens,
+            model_context_window_source: model_context_window.source,
             context_compact_ratio: self.effective_context_compact_ratio(agent_alias),
             compact_context: self.effective_compact_context(agent_alias),
             parallel_tools: self.effective_parallel_tools(agent_alias),
@@ -12057,7 +12132,8 @@ pub struct RuntimeProfileConfig {
     pub max_history_messages: Option<usize>,
     /// Maximum estimated tokens before proactive history trimming. `None`
     /// preserves the legacy 32,000-token default when `context_compact_ratio`
-    /// is unset. In ratio mode this remains an optional downward cap. `0`
+    /// is unset. In ratio mode this remains an optional downward cap. Every
+    /// positive effective value is capped by the selected model capacity. `0`
     /// disables proactive token-budget trimming.
     pub max_context_tokens: Option<usize>,
     /// Opt-in fraction of the selected model's context window at which
@@ -23157,7 +23233,7 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn effective_context_budget_preserves_legacy_default_and_zero_sentinel() {
-        use super::ResolvedRuntime;
+        use super::{ModelContextWindowSource, ResolvedRuntime};
 
         // Ratio is opt-in: a large model keeps the established 32k default.
         let r = ResolvedRuntime {
@@ -23200,22 +23276,38 @@ mod tests {
         };
         assert_eq!(r.effective_context_budget(), 0);
 
-        // Capacity remains a distinct fact: without ratio opt-in, even a small
-        // model preserves the historical absolute budget.
+        // The historical 32k input budget is clamped to the selected model's
+        // smaller capacity.
         let r = ResolvedRuntime {
             model_context_window: 8_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
             ..ResolvedRuntime::default()
         };
-        assert_eq!(r.effective_context_budget(), 32_000);
+        assert_eq!(r.effective_context_budget(), 8_000);
 
-        // Existing explicit absolute budgets are not silently reinterpreted as
-        // provider capacity metadata when ratio mode is off.
+        // An explicit absolute budget is also bounded by capacity when ratio
+        // mode is off.
         let r = ResolvedRuntime {
             model_context_window: 8_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
             max_context_tokens: Some(128_000),
             ..ResolvedRuntime::default()
         };
-        assert_eq!(r.effective_context_budget(), 128_000);
+        assert_eq!(r.effective_context_budget(), 8_000);
+
+        // A pruning threshold remains a downward cap and can never raise the
+        // effective budget above model capacity.
+        let r = ResolvedRuntime {
+            model_context_window: 8_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
+            history_pruning: crate::scattered_types::HistoryPrunerConfig {
+                enabled: true,
+                max_tokens: 12_000,
+                ..crate::scattered_types::HistoryPrunerConfig::default()
+            },
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 8_000);
     }
 
     #[::core::prelude::v1::test]
@@ -23264,6 +23356,10 @@ mod tests {
 
         let large = cfg.resolved_context_limits_for_route("coder", "custom.large", "large-model");
         assert_eq!(large.model_context_window, 200_000);
+        assert_eq!(
+            large.model_context_window_source,
+            super::ModelContextWindowSource::Configured
+        );
         assert_eq!(large.context_token_budget, 180_000);
 
         let small = cfg.resolved_context_limits_for_route("coder", "custom.small", "small-model");
@@ -23273,6 +23369,10 @@ mod tests {
         let unknown_override =
             cfg.resolved_context_limits_for_route("coder", "custom.large", "different-model");
         assert_eq!(unknown_override.model_context_window, 32_000);
+        assert_eq!(
+            unknown_override.model_context_window_source,
+            super::ModelContextWindowSource::CompatibilityFallback
+        );
         assert_eq!(unknown_override.context_token_budget, 28_800);
     }
 

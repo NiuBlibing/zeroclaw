@@ -294,7 +294,13 @@ fn resolve_channel_context_limits(
     if agent_alias.is_empty() {
         return zeroclaw_config::schema::ResolvedContextLimits {
             model_context_window: zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET,
-            context_token_budget: legacy_budget,
+            context_token_budget: if legacy_budget == 0 {
+                0
+            } else {
+                legacy_budget.min(zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET)
+            },
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
         };
     }
     config.resolved_context_limits_for_route(agent_alias, &route.model_provider, &route.model)

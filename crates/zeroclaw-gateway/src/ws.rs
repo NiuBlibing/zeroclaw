@@ -925,10 +925,14 @@ fn resolve_done_context_limits(
     usage_budget: Option<u64>,
     usage_model_window: Option<u64>,
     active_limits: zeroclaw_config::schema::ResolvedContextLimits,
-) -> (u64, u64) {
+) -> (u64, Option<u64>) {
     (
         usage_budget.unwrap_or(active_limits.context_token_budget as u64),
-        usage_model_window.unwrap_or(active_limits.model_context_window as u64),
+        usage_model_window.or_else(|| {
+            active_limits
+                .configured_model_context_window()
+                .map(|tokens| tokens as u64)
+        }),
     )
 }
 
@@ -1402,8 +1406,9 @@ async fn process_chat_message(
                 .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0)
                 .map(|usage| usage.cost_usd);
 
-            let (_, active_provider, active_model) = agent.attribution_fields();
-            let active_limits = agent.context_limits();
+            let active_provider = outcome.provider_name.clone();
+            let active_model = outcome.model.clone();
+            let active_limits = agent.context_limits_for_route(&active_provider, &active_model);
             let (max_context_tokens, model_context_window) = resolve_done_context_limits(
                 max_context_tokens,
                 model_context_window,
@@ -1533,10 +1538,12 @@ mod tests {
         let stale_startup_limits = zeroclaw_config::schema::ResolvedContextLimits {
             model_context_window: 200_000,
             context_token_budget: 180_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
         };
         assert_eq!(
             resolve_done_context_limits(Some(7_200), Some(8_000), stale_startup_limits),
-            (7_200, 8_000),
+            (7_200, Some(8_000)),
             "the done frame must report the route that produced the usage event"
         );
     }
@@ -1546,10 +1553,26 @@ mod tests {
         let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
             model_context_window: 8_000,
             context_token_budget: 0,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
         };
         assert_eq!(
             resolve_done_context_limits(None, None, active_limits),
-            (0, 8_000),
+            (0, Some(8_000)),
+        );
+    }
+
+    #[test]
+    fn done_context_limits_omit_unknown_compatibility_capacity() {
+        let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET,
+            context_token_budget: 16_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+        };
+        assert_eq!(
+            resolve_done_context_limits(None, None, active_limits),
+            (16_000, None),
         );
     }
     use axum::http::HeaderMap;

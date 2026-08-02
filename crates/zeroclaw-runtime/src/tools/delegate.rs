@@ -2637,6 +2637,7 @@ impl DelegateTool {
                         model_provider,
                         provider_name: agent_config.model_provider.as_str(),
                         model,
+                        dispatch_model: model,
                         temperature,
                     },
                     ResolvedIo {

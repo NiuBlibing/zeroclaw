@@ -314,8 +314,9 @@ pub struct Agent {
     /// by this Agent. User text is never inferred to be synthetic by content.
     history_has_trim_breadcrumb: bool,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
-    available_hints: Vec<String>,
-    route_model_by_hint: HashMap<String, String>,
+    /// The exact immutable route table used by `model_provider` for hint
+    /// dispatch. It is replaced atomically with the provider on model switch.
+    model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     /// Pre-rendered security policy summary injected into the system prompt
     /// so the LLM knows the concrete constraints before making tool calls.
@@ -378,6 +379,10 @@ impl Drop for Agent {
 pub struct StreamedTurnSuccess {
     pub response: String,
     pub new_messages: Vec<ConversationMessage>,
+    /// Provider profile that served the final round.
+    pub provider_name: String,
+    /// Model that served the final round.
+    pub model: String,
 }
 
 #[derive(Debug)]
@@ -469,8 +474,7 @@ pub struct AgentBuilder {
     auto_save: Option<bool>,
     memory_session_id: Option<String>,
     classification_config: Option<zeroclaw_config::schema::QueryClassificationConfig>,
-    available_hints: Option<Vec<String>>,
-    route_model_by_hint: Option<HashMap<String, String>>,
+    model_route_resolver: Option<Arc<zeroclaw_providers::router::ModelRouteResolver>>,
     allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     security_summary: Option<String>,
@@ -520,8 +524,7 @@ impl AgentBuilder {
             auto_save: None,
             memory_session_id: None,
             classification_config: None,
-            available_hints: None,
-            route_model_by_hint: None,
+            model_route_resolver: None,
             allowed_tools: None,
             response_cache: None,
             security_summary: None,
@@ -677,13 +680,11 @@ impl AgentBuilder {
         self
     }
 
-    pub fn available_hints(mut self, available_hints: Vec<String>) -> Self {
-        self.available_hints = Some(available_hints);
-        self
-    }
-
-    pub fn route_model_by_hint(mut self, route_model_by_hint: HashMap<String, String>) -> Self {
-        self.route_model_by_hint = Some(route_model_by_hint);
+    pub fn model_route_resolver(
+        mut self,
+        model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
+    ) -> Self {
+        self.model_route_resolver = Some(model_route_resolver);
         self
     }
 
@@ -814,6 +815,17 @@ impl AgentBuilder {
             })?
         };
         let config = self.config.unwrap_or_default();
+        let model_name = self.model_name.unwrap_or_else(|| "<unconfigured>".into());
+        let model_provider_name = self
+            .model_provider_name
+            .unwrap_or_else(|| "<unconfigured>".into());
+        let model_route_resolver = self.model_route_resolver.unwrap_or_else(|| {
+            Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+                Vec::new(),
+                model_provider_name.clone(),
+                model_name.clone(),
+            ))
+        });
 
         Ok(Agent {
             model_provider: self.model_provider.ok_or_else(|| {
@@ -861,10 +873,8 @@ impl AgentBuilder {
             structured_history_cap_resolver: self.structured_history_cap_resolver,
             context_limits_resolver: self.context_limits_resolver,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
-            model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
-            model_provider_name: self
-                .model_provider_name
-                .unwrap_or_else(|| "<unconfigured>".into()),
+            model_name,
+            model_provider_name,
             temperature: self.temperature,
             // Default for test callers that don't call workspace_dir().
             workspace_dir: self
@@ -888,8 +898,7 @@ impl AgentBuilder {
             history: Vec::new(),
             history_has_trim_breadcrumb: false,
             classification_config: self.classification_config.unwrap_or_default(),
-            available_hints: self.available_hints.unwrap_or_default(),
-            route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
+            model_route_resolver,
             response_cache: self.response_cache,
             security_summary: self.security_summary,
             approval_route: self.approval_route,
@@ -1001,9 +1010,19 @@ impl Agent {
     /// This is resolved on demand so a model/provider switch cannot leave a
     /// stale snapshot in a long-lived session.
     pub fn context_limits(&self) -> zeroclaw_config::schema::ResolvedContextLimits {
+        self.context_limits_for_route(&self.model_provider_name, &self.model_name)
+    }
+
+    /// Resolve capacity and proactive budget for a route selected for the
+    /// current turn, including values supplied by a live-config resolver.
+    pub fn context_limits_for_route(
+        &self,
+        provider_name: &str,
+        model: &str,
+    ) -> zeroclaw_config::schema::ResolvedContextLimits {
         self.context_limits_resolver.as_ref().map_or_else(
             || self.config.resolved.context_limits(),
-            |resolve| resolve(&self.model_provider_name, &self.model_name),
+            |resolve| resolve(provider_name, model),
         )
     }
 
@@ -1621,8 +1640,8 @@ impl Agent {
             provider_alias,
         );
 
-        let model_provider: Box<dyn ModelProvider> =
-            zeroclaw_providers::create_routed_model_provider_with_options(
+        let (model_provider, model_route_resolver) =
+            zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
                 config,
                 &provider_ref,
                 agent_model_provider.and_then(|e| e.api_key.as_deref()),
@@ -1634,13 +1653,6 @@ impl Agent {
             )?;
 
         let tool_dispatcher = tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref());
-
-        let route_model_by_hint: HashMap<String, String> = config
-            .model_routes
-            .iter()
-            .map(|route| (route.hint.clone(), route.model.clone()))
-            .collect();
-        let available_hints: Vec<String> = route_model_by_hint.keys().cloned().collect();
 
         let response_cache = if config.memory.response_cache_enabled {
             zeroclaw_memory::response_cache::ResponseCache::with_hot_cache(
@@ -1725,8 +1737,7 @@ impl Agent {
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
             .classification_config(config.query_classification.clone())
-            .available_hints(available_hints)
-            .route_model_by_hint(route_model_by_hint)
+            .model_route_resolver(model_route_resolver)
             .identity_config(agent_cfg.identity.clone())
             .skills(skills)
             .skills_prompt_mode(config.effective_skills_prompt_mode(agent_alias))
@@ -1996,7 +2007,10 @@ impl Agent {
             )
         );
 
-        let switch_outcome: anyhow::Result<Box<dyn ModelProvider>> = match self
+        let switch_outcome: anyhow::Result<(
+            Box<dyn ModelProvider>,
+            Arc<zeroclaw_providers::router::ModelRouteResolver>,
+        )> = match self
             .provider_switch_config
             .as_ref()
             .and_then(|cfg| cfg.config.as_ref())
@@ -2032,7 +2046,7 @@ impl Agent {
                     })
                     .unwrap_or_default();
 
-                zeroclaw_providers::create_routed_model_provider_with_options(
+                zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
                     full_config.as_ref(),
                     &new_model_provider,
                     api_key,
@@ -2050,10 +2064,11 @@ impl Agent {
         };
 
         match switch_outcome {
-            Ok(new_prov) => {
+            Ok((new_prov, new_route_resolver)) => {
                 // Commit state only after the provider was built
                 // successfully.
                 self.model_provider = new_prov;
+                self.model_route_resolver = new_route_resolver;
                 self.model_provider_name = new_model_provider;
                 self.model_name = new_model.clone();
                 Some(new_model)
@@ -2077,12 +2092,11 @@ impl Agent {
     fn classify_model(&self, user_message: &str) -> String {
         if let Some(decision) =
             super::classifier::classify_with_decision(&self.classification_config, user_message)
-            && self.available_hints.contains(&decision.hint)
+            && self.model_route_resolver.has_hint(&decision.hint)
         {
             let resolved_model = self
-                .route_model_by_hint
-                .get(&decision.hint)
-                .map(String::as_str)
+                .model_route_resolver
+                .configured_model_for_hint(&decision.hint)
                 .unwrap_or("unknown");
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": decision.hint.as_str(), "model": resolved_model, "rule_priority": decision.priority, "message_length": user_message.len()})), "Classified message route");
             return format!("hint:{}", decision.hint);
@@ -2092,7 +2106,7 @@ impl Agent {
         if let Some(ref ac) = self.config.resolved.auto_classify {
             let tier = super::eval::estimate_complexity(user_message);
             if let Some(hint) = ac.hint_for(tier)
-                && self.available_hints.contains(&hint.to_string())
+                && self.model_route_resolver.has_hint(hint)
             {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": hint, "complexity": format!("{:?}", tier), "message_length": user_message.len()})), "Auto-classified by complexity");
                 return format!("hint:{hint}");
@@ -2234,13 +2248,16 @@ impl Agent {
         }
 
         let effective_model = self.classify_model(user_message);
+        let selected_route = self.model_route_resolver.resolve(&effective_model);
+        let context_limits =
+            self.context_limits_for_route(&selected_route.provider_name, &selected_route.model);
 
         let turn_id = Self::new_turn_id();
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
             turn_observer.as_ref(),
-            self.model_provider_name.clone(),
-            effective_model.clone(),
+            selected_route.provider_name.clone(),
+            selected_route.model.clone(),
             Some(self.channel_name.clone()),
             self.observer_agent_alias(),
             Some(turn_id.clone()),
@@ -2290,7 +2307,8 @@ impl Agent {
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
-                    &self.model_provider_name,
+                    &selected_route.provider_name,
+                    &selected_route.model,
                     &effective_model,
                 ) {
                     Ok(resolved) => resolved,
@@ -2373,8 +2391,9 @@ impl Agent {
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
-                                provider_name: &self.model_provider_name,
-                                model: &effective_model,
+                                provider_name: &selected_route.provider_name,
+                                model: &selected_route.model,
+                                dispatch_model: &effective_model,
                                 temperature: self.temperature,
                             },
                             crate::agent::loop_::ResolvedIo {
@@ -2404,7 +2423,7 @@ impl Agent {
                                 strict_tool_parsing: self.config.resolved.strict_tool_parsing,
                                 parallel_tools: self.config.resolved.parallel_tools,
                                 max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                context_limits: self.context_limits(),
+                                context_limits,
                                 knobs: &knobs,
                             },
                         ),
@@ -2581,6 +2600,7 @@ impl Agent {
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_model_switch`) can rebind it for later rounds
         let mut effective_model = self.classify_model(user_message);
+        let mut selected_route = self.model_route_resolver.resolve(&effective_model);
         let turn_id = Self::new_turn_id();
         let mut committed_response = String::new();
         // Requested-vs-served divergence for THIS turn. Source of truth is the
@@ -2592,8 +2612,8 @@ impl Agent {
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
             turn_observer.as_ref(),
-            self.model_provider_name.clone(),
-            effective_model.clone(),
+            selected_route.provider_name.clone(),
+            selected_route.model.clone(),
             Some(self.channel_name.clone()),
             self.observer_agent_alias(),
             Some(turn_id.clone()),
@@ -2609,7 +2629,8 @@ impl Agent {
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
-                    &self.model_provider_name,
+                    &selected_route.provider_name,
+                    &selected_route.model,
                     &effective_model,
                 ) {
                     Ok(resolved) => resolved,
@@ -2659,6 +2680,8 @@ impl Agent {
                 return Ok(StreamedTurnSuccess {
                     response: committed_response,
                     new_messages: new_msgs,
+                    provider_name: selected_route.provider_name.clone(),
+                    model: selected_route.model.clone(),
                 });
             }
             self.observer.record_event(&ObserverEvent::CacheMiss {
@@ -2772,8 +2795,9 @@ impl Agent {
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
-                                provider_name: &self.model_provider_name,
-                                model: &effective_model,
+                                provider_name: &selected_route.provider_name,
+                                model: &selected_route.model,
+                                dispatch_model: &effective_model,
                                 temperature: self.temperature,
                             },
                             crate::agent::loop_::ResolvedIo {
@@ -2809,7 +2833,10 @@ impl Agent {
                                 strict_tool_parsing: self.config.resolved.strict_tool_parsing,
                                 parallel_tools: self.config.resolved.parallel_tools,
                                 max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                context_limits: self.context_limits(),
+                                context_limits: self.context_limits_for_route(
+                                    &selected_route.provider_name,
+                                    &selected_route.model,
+                                ),
                                 knobs: &knobs,
                             },
                         ),
@@ -2941,6 +2968,8 @@ impl Agent {
                     return Ok(StreamedTurnSuccess {
                         response: committed_response,
                         new_messages: new_msgs,
+                        provider_name: selected_route.provider_name.clone(),
+                        model: selected_route.model.clone(),
                     });
                 }
                 Err(error) => {
@@ -2964,6 +2993,7 @@ impl Agent {
                         let notice = self.trim_history(Some(&turn_id));
                         forward_history_trim_notice(&event_tx, notice).await;
                         effective_model = new_effective_model;
+                        selected_route = self.model_route_resolver.resolve(&effective_model);
                         continue;
                     }
                     // Rebuild the committed text from the failed round's plain
@@ -4782,7 +4812,11 @@ mod tests {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
                 text: Some("classified".into()),
                 tool_calls: vec![],
-                usage: None,
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(100),
+                    cached_input_tokens: None,
+                    output_tokens: Some(20),
+                }),
                 reasoning_content: None,
             }]),
             seen_models: seen_models.clone(),
@@ -4798,8 +4832,17 @@ mod tests {
         );
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut route_model_by_hint = HashMap::new();
-        route_model_by_hint.insert("fast".to_string(), "anthropic/claude-haiku-4-5".to_string());
+        let model_route_resolver = Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+            vec![(
+                "fast".to_string(),
+                zeroclaw_providers::router::Route {
+                    provider_name: "anthropic.fast".to_string(),
+                    model: "anthropic/claude-haiku-4-5".to_string(),
+                },
+            )],
+            "custom.default".to_string(),
+            "default-model".to_string(),
+        ));
         let mut agent = Agent::builder()
             .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
@@ -4818,15 +4861,51 @@ mod tests {
                     priority: 10,
                 }],
             })
-            .available_hints(vec!["fast".to_string()])
-            .route_model_by_hint(route_model_by_hint)
+            .model_route_resolver(model_route_resolver)
             .build()
             .expect("agent builder should succeed with valid config");
+        let resolved_routes = Arc::new(Mutex::new(Vec::new()));
+        let resolved_routes_capture = Arc::clone(&resolved_routes);
+        agent.context_limits_resolver = Some(Arc::new(move |provider, model| {
+            resolved_routes_capture
+                .lock()
+                .push((provider.to_string(), model.to_string()));
+            zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 200_000,
+                context_token_budget: 160_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            }
+        }));
 
-        let response = agent.turn("quick summary please").await.unwrap();
-        assert_eq!(response, "classified");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let outcome = agent
+            .turn_streamed_with_steering_state("quick summary please", event_tx, None, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.response, "classified");
+        assert_eq!(outcome.provider_name, "anthropic.fast");
+        assert_eq!(outcome.model, "anthropic/claude-haiku-4-5");
         let seen = seen_models.lock();
         assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
+        assert_eq!(
+            resolved_routes.lock().as_slice(),
+            &[(
+                "anthropic.fast".to_string(),
+                "anthropic/claude-haiku-4-5".to_string(),
+            )]
+        );
+        let usage = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .find(|event| matches!(event, TurnEvent::Usage { .. }))
+            .expect("the routed call should emit usage");
+        assert!(matches!(
+            usage,
+            TurnEvent::Usage {
+                context_token_budget: Some(160_000),
+                model_context_window: Some(200_000),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -9225,14 +9304,20 @@ mod tests {
                 ("ollama.large", "large") => zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 200_000,
                     context_token_budget: 180_000,
+                    model_context_window_source:
+                        zeroclaw_config::schema::ModelContextWindowSource::Configured,
                 },
                 ("ollama.small", "small") => zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 8_000,
                     context_token_budget: 7_200,
+                    model_context_window_source:
+                        zeroclaw_config::schema::ModelContextWindowSource::Configured,
                 },
                 _ => zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 32_000,
                     context_token_budget: 32_000,
+                    model_context_window_source:
+                        zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
                 },
             }
         }));
@@ -9242,11 +9327,16 @@ mod tests {
             agent.try_apply_model_switch("large", "ollama.small".to_string(), "small".to_string());
 
         assert_eq!(switched.as_deref(), Some("small"));
+        let selected = agent.model_route_resolver.resolve("small");
+        assert_eq!(selected.provider_name, "ollama.small");
+        assert_eq!(selected.model, "small");
         assert_eq!(
             agent.context_limits(),
             zeroclaw_config::schema::ResolvedContextLimits {
                 model_context_window: 8_000,
                 context_token_budget: 7_200,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
             },
             "provider/model and their limits must change as one session state transition"
         );
