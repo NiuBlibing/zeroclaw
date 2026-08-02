@@ -660,7 +660,8 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
         _workspace: workspace,
     };
 
-    let handle: tools::PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let handle: tools::PerToolChannelHandle =
+        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     agent.channel_handles.ask_user = Some(Arc::clone(&handle));
     agent.channel_handles().register_channel(
         "edit-channel",
@@ -1797,7 +1798,7 @@ fn approval_agent(
     let mut agent = builder.build().expect("agent builder should succeed");
     if let Some(ch) = channel {
         let handle: tools::PerToolChannelHandle =
-            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
         agent.channel_handles.ask_user = Some(handle);
         agent.channel_handles().register_channel("acp", ch);
     }
