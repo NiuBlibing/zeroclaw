@@ -14,6 +14,10 @@ import {
   type TurnStreamState,
 } from '@/contexts/turnStream.logic';
 import {
+  EMPTY_CONTEXT_LIMITS,
+  contextLimitsFromDoneFrame,
+} from '@/contexts/contextLimits.logic';
+import {
   loadChatHistory,
   mapServerMessagesToPersisted,
   persistedToUiMessages,
@@ -133,8 +137,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const [modelInfoVersion, setModelInfoVersion] = useState(0);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   // Context window tracking (from "done" WS frames). See #7311.
-  const [contextMaxTokens, setContextMaxTokens] = useState<number | null>(null);
-  const [contextModelWindow, setContextModelWindow] = useState<number | null>(null);
+  const [contextLimits, setContextLimits] = useState(EMPTY_CONTEXT_LIMITS);
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
 
   const wsRef = useRef<WebSocketClient | null>(null);
@@ -293,12 +296,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         }
         // Extract context window info from "done" frame (sent by gateway). See #7311.
         if (msg.type === 'done') {
-          if (typeof msg.max_context_tokens === 'number') {
-            setContextMaxTokens(msg.max_context_tokens);
-          }
-          if (typeof msg.model_context_window === 'number') {
-            setContextModelWindow(msg.model_context_window);
-          }
+          setContextLimits(contextLimitsFromDoneFrame(msg));
           // Prefer last_input_tokens (accurate per-turn prompt size) over
           // accumulated input_tokens for context-bar rendering.
           if (typeof msg.last_input_tokens === 'number') {
@@ -884,8 +882,8 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     pendingApproval,
     respondToApproval,
     // Context window tracking (from "done" WS frames). See #7311.
-    contextMaxTokens,
-    contextModelWindow,
+    contextMaxTokens: contextLimits.maxTokens,
+    contextModelWindow: contextLimits.modelWindow,
     contextInputTokens,
   };
 

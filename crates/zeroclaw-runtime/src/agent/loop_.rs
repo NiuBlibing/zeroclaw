@@ -158,6 +158,12 @@ pub use super::history::{
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+fn interactive_context_recovery_budget(
+    context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+) -> usize {
+    context_limits.model_context_window.saturating_mul(9) / 10
+}
+
 pub(crate) const MAX_INTERACTIVE_INPUT_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// Result of [`read_capped_line`].
@@ -2591,11 +2597,8 @@ pub async fn run(
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
                                 let taken = std::mem::take(&mut history);
-                                let recovery_budget = if context_limits.context_token_budget > 0 {
-                                    context_limits.context_token_budget
-                                } else {
-                                    context_limits.model_context_window * 9 / 10
-                                };
+                                let recovery_budget =
+                                    interactive_context_recovery_budget(context_limits);
                                 let result = crate::agent::history_trim::trim_to_recent_turns(
                                     taken,
                                     recovery_budget,
@@ -14090,11 +14093,21 @@ Let me check the result."#;
     }
 
     #[test]
-    fn cli_outer_recovery_trims_below_model_window_with_headroom() {
+    fn cli_outer_recovery_uses_capacity_headroom_not_proactive_budget() {
         use crate::agent::history_trim::trim_to_recent_turns;
 
-        let model_context_window: usize = 32_000;
-        let recovery_budget = model_context_window * 9 / 10; // 28_800
+        let context_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 32_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            context_token_budget: 7_200,
+        };
+        let recovery_budget = interactive_context_recovery_budget(context_limits);
+        assert_eq!(recovery_budget, 28_800);
+        assert_ne!(
+            recovery_budget, context_limits.context_token_budget,
+            "reactive recovery must not reuse the positive proactive trim budget"
+        );
 
         let big = "x".repeat(4000);
         let mut history = vec![ChatMessage::system("sys")];
@@ -14104,7 +14117,7 @@ Let me check the result."#;
         }
         let tokens_before = super::estimate_history_tokens(&history);
         assert!(
-            tokens_before > model_context_window,
+            tokens_before > context_limits.model_context_window,
             "fixture must overflow the window: got {tokens_before}"
         );
 
@@ -14122,7 +14135,7 @@ Let me check the result."#;
         // Headroom must leave us strictly below the model's true window,
         // so the retried request has room for the reply + next user turn.
         assert!(
-            result.tokens_after < model_context_window,
+            result.tokens_after < context_limits.model_context_window,
             "headroom must leave us strictly below the model window: got {}",
             result.tokens_after
         );

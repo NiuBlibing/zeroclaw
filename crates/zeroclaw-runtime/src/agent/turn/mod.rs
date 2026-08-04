@@ -175,6 +175,21 @@ async fn enforce_reported_budget(
     }
 }
 
+fn resolve_context_limits_for_call(
+    config: Option<&zeroclaw_config::schema::Config>,
+    agent_alias: Option<&str>,
+    provider_name: &str,
+    model: &str,
+    fallback: zeroclaw_config::schema::ResolvedContextLimits,
+) -> zeroclaw_config::schema::ResolvedContextLimits {
+    config
+        .zip(agent_alias)
+        .map(|(config, agent_alias)| {
+            config.resolved_context_limits_for_route(agent_alias, provider_name, model)
+        })
+        .unwrap_or(fallback)
+}
+
 /// Per-invocation turn state: owns the provider-visible transcript and
 /// the canonical current-turn buffer during one `run_tool_call_loop` call.
 ///
@@ -330,8 +345,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         receipt_generator,
         knobs,
     } = exec;
-    let context_token_budget = context_limits.context_token_budget;
-
     let mut turn_state = TurnState::new(raw_history, raw_canonical);
 
     turn_state.sync_pending();
@@ -434,7 +447,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
     // `turn.context.TurnCtx`).
-    let ctx = TurnCtx {
+    let base_ctx = TurnCtx {
         observer,
         provider_name,
         model,
@@ -513,6 +526,69 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         preflight_history_maintenance(turn_state.history);
 
+        // Check if model switch was requested via model_switch tool before
+        // constructing this iteration's provider route.
+        if let Some(ref callback) = model_switch_callback
+            && let Ok(guard) = callback.lock()
+            && let Some((new_model_provider, new_model)) = guard.as_ref()
+            && (new_model_provider != provider_name || new_model != model)
+        {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Migrate)
+                    .with_category(::zeroclaw_log::EventCategory::Provider),
+                &format!(
+                    "Model switch detected: {} {} -> {} {}",
+                    provider_name, model, new_model_provider, new_model
+                )
+            );
+            return Err(ModelSwitchRequested {
+                model_provider: new_model_provider.clone(),
+                model: new_model.clone(),
+            }
+            .into());
+        }
+
+        let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
+            config,
+            model_provider,
+            turn_state.history,
+            multimodal_config,
+            provider_name,
+            model,
+            dispatch_model,
+        )?;
+
+        let (
+            active_model_provider,
+            active_model_provider_name,
+            active_model,
+            active_dispatch_model,
+        ): (&dyn ModelProvider, &str, &str, &str) =
+            if let Some(ref resolved) = vision_model_provider_box {
+                (
+                    resolved.provider.as_ref(),
+                    resolved.provider_name.as_str(),
+                    resolved.model.as_str(),
+                    resolved.model.as_str(),
+                )
+            } else {
+                (model_provider, provider_name, model, dispatch_model)
+            };
+        let active_context_limits = resolve_context_limits_for_call(
+            config,
+            agent_alias,
+            active_model_provider_name,
+            active_model,
+            context_limits,
+        );
+        let context_token_budget = active_context_limits.context_token_budget;
+        let ctx = base_ctx.for_route(
+            active_model_provider_name,
+            active_model,
+            active_context_limits,
+        );
+
         if iteration == 0 && context_token_budget > 0 {
             let system_floor =
                 crate::agent::history::estimate_system_floor_tokens(turn_state.history);
@@ -520,8 +596,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 let __zc_floor_span = ::zeroclaw_log::info_span!(
                     target: "zeroclaw_log_internal_scope",
                     "zeroclaw_scope",
-                    model = %model,
-                    model_provider = %provider_name,
+                    model = %active_model,
+                    model_provider = %active_model_provider_name,
                 );
                 let _zc_floor_guard = __zc_floor_span.entered();
                 ::zeroclaw_log::record!(
@@ -546,8 +622,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                         target: "zeroclaw_log_internal_scope",
                         "zeroclaw_scope",
-                        model = %model,
-                        model_provider = %provider_name,
+                        model = %active_model,
+                        model_provider = %active_model_provider_name,
                     );
                     let _zc_trim_guard = __zc_trim_span.entered();
                     ::zeroclaw_log::record!(
@@ -599,28 +675,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         }
 
-        // Check if model switch was requested via model_switch tool
-        if let Some(ref callback) = model_switch_callback
-            && let Ok(guard) = callback.lock()
-            && let Some((new_model_provider, new_model)) = guard.as_ref()
-            && (new_model_provider != provider_name || new_model != model)
-        {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Migrate)
-                    .with_category(::zeroclaw_log::EventCategory::Provider),
-                &format!(
-                    "Model switch detected: {} {} -> {} {}",
-                    provider_name, model, new_model_provider, new_model
-                )
-            );
-            return Err(ModelSwitchRequested {
-                model_provider: new_model_provider.clone(),
-                model: new_model.clone(),
-            }
-            .into());
-        }
-
         let mut iteration_tool_specs = build_iteration_tool_specs(
             model_provider,
             tools_registry,
@@ -628,32 +682,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
-        let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
-            config,
-            model_provider,
-            turn_state.history,
-            multimodal_config,
-            provider_name,
-            model,
-            dispatch_model,
-        )?;
-
-        let (
-            active_model_provider,
-            active_model_provider_name,
-            active_model,
-            active_dispatch_model,
-        ): (&dyn ModelProvider, &str, &str, &str) =
-            if let Some(ref resolved) = vision_model_provider_box {
-                (
-                    resolved.provider.as_ref(),
-                    resolved.provider_name.as_str(),
-                    resolved.model.as_str(),
-                    resolved.model.as_str(),
-                )
-            } else {
-                (model_provider, provider_name, model, dispatch_model)
-            };
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
         let IterationToolSpecs {
             ref tool_specs,
@@ -785,7 +813,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     event_tx.as_ref(),
                     on_delta.as_ref(),
                     observer,
-                    context_limits,
+                    ctx.context_limits,
                 )
                 .await;
                 if recovered {
@@ -839,8 +867,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(serde_json::json!({
                         "channel": channel_name,
-                        "model_provider": provider_name,
-                        "model": model,
+                        "model_provider": active_model_provider_name,
+                        "model": active_model,
                         "trace_id": turn_id,
                         "error": "malformed internal tool protocol omitted from channel output",
                     })),
@@ -907,7 +935,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
-                        "model": model,
+                        "model": active_model,
                         "iteration": iteration + 1,
                         "text": scrub_credentials(&display_text),
                         "trace_id": turn_id,
@@ -939,7 +967,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 enforce_reported_budget(
                     turn_state.history,
                     reported as usize,
-                    context_token_budget,
+                    ctx.context_limits.context_token_budget,
                     event_tx.as_ref(),
                     observer,
                 )
@@ -1125,7 +1153,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &loop_ignore_tools,
             max_tool_result_chars,
             collected_receipts,
-            model,
+            active_model,
             iteration,
             turn_id,
         )?;
@@ -1137,7 +1165,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 pacing,
                 &mut consecutive_identical_outputs,
                 &mut last_tool_output_hash,
-                model,
+                active_model,
                 iteration,
                 turn_id,
             )?;
@@ -1210,7 +1238,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             enforce_reported_budget(
                 turn_state.history,
                 reported as usize,
-                context_token_budget,
+                ctx.context_limits.context_token_budget,
                 event_tx.as_ref(),
                 observer,
             )
@@ -2313,6 +2341,193 @@ mod reported_budget_tests {
         enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver).await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
+    }
+}
+
+#[cfg(test)]
+mod active_route_context_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+    use zeroclaw_api::observability_traits::{ObserverEvent, ObserverMetric};
+    use zeroclaw_config::schema::{
+        AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+        RuntimeProfileConfig,
+    };
+    use zeroclaw_providers::{ChatResponse, traits::TokenUsage};
+
+    #[derive(Default)]
+    struct RouteObserver {
+        responses: Mutex<Vec<(String, String)>>,
+    }
+
+    impl crate::observability::Observer for RouteObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            if let ObserverEvent::LlmResponse {
+                model_provider,
+                model,
+                ..
+            } = event
+            {
+                self.responses
+                    .lock()
+                    .expect("response lock")
+                    .push((model_provider.clone(), model.clone()));
+            }
+        }
+
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "route-observer"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn route_config() -> Config {
+        let providers = [
+            ("text", "text-model", 200_000),
+            ("vision", "vision-model", 8_000),
+        ]
+        .into_iter()
+        .map(|(alias, model, context_window)| {
+            (
+                alias.to_string(),
+                CustomModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        context_window: Some(context_window),
+                        ..ModelProviderConfig::default()
+                    },
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+        let mut config = Config::default();
+        config.providers.models.custom = providers;
+        config.runtime_profiles.insert(
+            "ratio".to_string(),
+            RuntimeProfileConfig {
+                context_compact_ratio: Some(0.9),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "ratio".to_string(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn selected_call_route_drives_trim_usage_and_response_attribution() {
+        let config = route_config();
+        let text_limits =
+            config.resolved_context_limits_for_route("coder", "custom.text", "text-model");
+        let vision_limits = resolve_context_limits_for_call(
+            Some(&config),
+            Some("coder"),
+            "custom.vision",
+            "vision-model",
+            text_limits,
+        );
+        assert_eq!(text_limits.context_token_budget, 180_000);
+        assert_eq!(vision_limits.model_context_window, 8_000);
+        assert_eq!(vision_limits.context_token_budget, 7_200);
+
+        let large = "x".repeat(20_000);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("old question {large}")),
+            ChatMessage::assistant(format!("old answer {large}")),
+            ChatMessage::user("inspect [IMAGE:/tmp/image.png]"),
+        ];
+        let tokens_before = crate::agent::history::estimate_history_tokens(&history);
+        assert!(tokens_before < text_limits.context_token_budget);
+        let trim =
+            TurnState::new(&mut history, None).trim_to_budget(vision_limits.context_token_budget);
+        assert!(
+            trim.trimmed,
+            "the selected vision route must trim history that the text route would retain"
+        );
+        assert!(trim.tokens_after <= vision_limits.context_token_budget);
+
+        let observer = RouteObserver::default();
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools = Vec::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        let base_ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "custom.text",
+            model: "text-model",
+            context_limits: text_limits,
+            temperature: None,
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&event_tx),
+            hooks: None,
+            dedup_exempt_tools: &dedup_exempt_tools,
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "vision-route-context",
+            agent_alias: Some("coder"),
+            parent_agent_alias: None,
+        };
+        let call_ctx = base_ctx.for_route("custom.vision", "vision-model", vision_limits);
+        let response = ChatResponse {
+            text: Some("done".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(TokenUsage {
+                input_tokens: Some(6_000),
+                output_tokens: Some(100),
+                cached_input_tokens: None,
+            }),
+            reasoning_content: None,
+        };
+        let specs = IterationToolSpecs {
+            tool_specs: Vec::new(),
+            known_tool_names: HashSet::new(),
+            use_native_tools: false,
+        };
+        interpret_chat_response(
+            &call_ctx,
+            response,
+            &history,
+            &specs,
+            false,
+            Instant::now(),
+            0,
+            false,
+        )
+        .await;
+
+        match event_rx.try_recv().expect("usage event") {
+            TurnEvent::Usage {
+                context_token_budget,
+                model_context_window,
+                ..
+            } => {
+                assert_eq!(context_token_budget, Some(7_200));
+                assert_eq!(model_context_window, Some(8_000));
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        assert_eq!(
+            observer.responses.lock().expect("response lock").as_slice(),
+            &[("custom.vision".to_string(), "vision-model".to_string())]
+        );
     }
 }
 

@@ -6175,12 +6175,12 @@ impl ChatState {
                 if input_tokens.is_some() {
                     self.context_input_tokens = input_tokens;
                 }
-                if max_context_tokens.is_some() {
-                    self.context_max_tokens = max_context_tokens;
-                }
-                if model_context_window.is_some() {
-                    self.context_model_window = model_context_window;
-                }
+                // Budget and capacity are one authoritative per-call snapshot.
+                // In particular, `None` capacity is meaningful: compatibility
+                // fallback routes omit it and must clear a prior configured
+                // route's denominator instead of retaining stale state.
+                self.context_max_tokens = max_context_tokens;
+                self.context_model_window = model_context_window;
             }
             SessionUpdate::HistoryTrimmed {
                 dropped_messages,
@@ -6806,6 +6806,32 @@ mod tests {
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    #[test]
+    fn context_usage_clears_stale_capacity_when_next_route_omits_it() {
+        let mut state = state();
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(100_000),
+            max_context_tokens: Some(180_000),
+            model_context_window: Some(200_000),
+        });
+        assert_eq!(state.context_max_tokens, Some(180_000));
+        assert_eq!(state.context_model_window, Some(200_000));
+
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(12_000),
+            max_context_tokens: Some(32_000),
+            model_context_window: None,
+        });
+        assert_eq!(state.context_input_tokens, Some(12_000));
+        assert_eq!(state.context_max_tokens, Some(32_000));
+        assert_eq!(
+            state.context_model_window, None,
+            "a compatibility-fallback frame must clear the prior route's capacity"
+        );
     }
 
     fn transcript_snapshot(area: Rect, rows: &[&str]) -> TranscriptSnapshot {
