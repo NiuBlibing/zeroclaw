@@ -2420,7 +2420,7 @@ mod active_route_context_tests {
             "coder".to_string(),
             AliasedAgentConfig {
                 enabled: true,
-                runtime_profile: "ratio".to_string(),
+                runtime_profile: "ratio".into(),
                 ..AliasedAgentConfig::default()
             },
         );
