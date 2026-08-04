@@ -9,7 +9,8 @@
 # to both. Simulator runs by default on :8080; use run-zeroclaw.sh for the agent.
 
 # ─── Stage 1: build ────────────────────────────────────────────────────────
-# Matches the workspace `rust-version = "1.97.1"` MSRV declared in Cargo.toml.
+# Follows the routine build toolchain (Rust 1.97.1), not the workspace MSRV
+# floor declared in Cargo.toml, which stays at the StageX-supported 1.96.0.
 FROM rust:1.97-slim-bookworm AS builder
 
 WORKDIR /build
