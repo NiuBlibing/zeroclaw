@@ -150,7 +150,9 @@ fn has_non_empty_value(value: Option<&str>) -> bool {
 ///   by the caller).
 /// - `chat_template_kwargs` is nested under its own `chat_template_kwargs` key,
 ///   matching what chat-template-aware backends (vLLM, SGLang, llama.cpp)
-///   expect.
+///   expect. Only object-shaped JSON is threaded through, mirroring
+///   `provider_extra`; other shapes are dropped here (and warned about by the
+///   caller).
 ///
 /// Returns `None` when neither source contributes anything, so the caller can
 /// skip setting `extra_body` entirely.
@@ -162,7 +164,7 @@ fn merge_extra_body(
     if let Some(obj) = provider_extra.and_then(serde_json::Value::as_object) {
         merged.extend(obj.clone());
     }
-    if let Some(kwargs) = chat_template_kwargs {
+    if let Some(kwargs) = chat_template_kwargs.filter(|v| v.is_object()) {
         merged.insert("chat_template_kwargs".to_string(), kwargs.clone());
     }
     (!merged.is_empty()).then_some(serde_json::Value::Object(merged))
@@ -228,6 +230,22 @@ pub fn apply_compat_options(
                 })),
             "provider_extra must be a JSON object (use TOML inline \
              table syntax, not a JSON string). Got: {extra}. Config path: {config_path}",
+        );
+    }
+    if let Some(kwargs) = &opts.chat_template_kwargs
+        && !kwargs.is_object()
+    {
+        let config_path = format!("[providers.models.{}].chat_template_kwargs", p.alias);
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "alias": p.alias,
+                    "config_path": &config_path,
+                })),
+            "chat_template_kwargs must be a JSON object (use TOML inline \
+             table syntax). Got: {kwargs}. Config path: {config_path}",
         );
     }
     Box::new(p)
@@ -1685,6 +1703,23 @@ mod tests {
             merge_extra_body(Some(&provider_extra), None).is_none(),
             "a non-object provider_extra with no chat_template_kwargs must yield None"
         );
+    }
+
+    #[test]
+    fn merge_extra_body_ignores_non_object_chat_template_kwargs() {
+        // Scalars, arrays, and null are not valid chat-template payloads; drop
+        // them the same way provider_extra drops non-object shapes.
+        for shape in [
+            serde_json::json!("max"),
+            serde_json::json!(true),
+            serde_json::json!(["a", "b"]),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                merge_extra_body(None, Some(&shape)).is_none(),
+                "a non-object chat_template_kwargs ({shape}) must be dropped, yielding None"
+            );
+        }
     }
 
     #[test]
