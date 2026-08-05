@@ -1528,7 +1528,7 @@ impl Agent {
         // build our own (CLI/standalone path) only when the gate is set.
         let (sop_engine, sop_audit) = match (sop_engine, sop_audit) {
             (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
-            (None, None) if config.sop.sops_dir.is_some() => {
+            (None, None) if config.sop.runtime_enabled() => {
                 let mem: Arc<dyn zeroclaw_memory::Memory> =
                     zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await?;
                 // CLI / standalone path: no channel map is wired here, so the route

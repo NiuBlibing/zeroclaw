@@ -4172,7 +4172,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
                 // SOP loading is gated on `[sop] sops_dir`: unset disables all
                 // SOP runtime behavior, matching the documented rollback path.
-                let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
+                let (sop_engine, sop_audit) = if current_config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
                         zeroclaw_memory::create_memory_from_config(&current_config, None)?,
                     );
@@ -4936,7 +4936,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+                let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
                     let sop_adapters = build_sop_adapters(&config);

@@ -1275,7 +1275,7 @@ pub async fn run(
         // available on this path (CLI agent run). No channel map is wired on this
         // path, so the approval route adapter is the no-op (log-only); the daemon
         // path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+        let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
@@ -2871,7 +2871,7 @@ pub async fn process_message(
         // available on this path (process_message CLI agent). No channel map is
         // wired here, so the approval route adapter is the no-op (log-only); the
         // daemon path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+        let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(

@@ -31,7 +31,7 @@ graph LR
 
 ## Getting started
 
-1. Set the SOP directory through the gateway, zerocode, or `zeroclaw config set` (required for runtime SOP loading):
+1. `sops_dir` defaults to `sops`, so runtime SOP loading is enabled out of the box against `<shared>/sops`. Override the directory through the gateway, zerocode, or `zeroclaw config set` only if you need a non-default location; set `sops_dir = ""` to disable runtime SOP loading entirely.
 
 2. Create a SOP directory, for example:
 

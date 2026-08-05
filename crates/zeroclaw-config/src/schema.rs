@@ -22916,6 +22916,22 @@ pub struct SopConfig {
     pub procedural_memory_enabled: bool,
 }
 
+impl SopConfig {
+    /// Whether the SOP runtime (engine, tools, maintenance tick, run store) is
+    /// active for this config. SOP loading is gated on a concrete definitions
+    /// directory: a non-empty `sops_dir` (the default `sops`) enables it; an
+    /// explicit empty string disables it, which is the supported rollback to a
+    /// SOP-free daemon. This is the single source of truth for activation, so
+    /// callers must not re-derive it from `sops_dir.is_some()` — that treats an
+    /// empty string as enabled and would break the disable path.
+    #[must_use]
+    pub fn runtime_enabled(&self) -> bool {
+        self.sops_dir
+            .as_deref()
+            .is_some_and(|dir| !dir.trim().is_empty())
+    }
+}
+
 fn default_sop_sops_dir() -> Option<String> {
     Some("sops".to_string())
 }
@@ -23871,6 +23887,41 @@ max_height = 8
         assert_eq!(config.untrusted_guard_sensitivity, 0.7);
         assert!(config.untrusted_frame_warning);
         assert!(config.untrusted_outbound_redact);
+    }
+
+    #[test]
+    async fn sop_sops_dir_defaults_to_sops_and_enables_runtime() {
+        // A fresh install (no [sop] sops_dir) defaults to `sops`, which turns the
+        // SOP runtime on. This is the default-on behavior the daemon and CLI gate
+        // on via `runtime_enabled()`.
+        let config: SopConfig = toml::from_str("").expect("empty SOP config should deserialize");
+
+        assert_eq!(config.sops_dir.as_deref(), Some("sops"));
+        assert!(config.runtime_enabled());
+
+        // SopConfig::default() must agree with the deserialized default.
+        assert_eq!(SopConfig::default().sops_dir.as_deref(), Some("sops"));
+        assert!(SopConfig::default().runtime_enabled());
+    }
+
+    #[test]
+    async fn sop_empty_sops_dir_disables_runtime() {
+        // The supported rollback: an explicit empty string disables the SOP
+        // runtime even though the value is `Some`. Whitespace-only is treated the
+        // same so a stray space cannot silently re-enable it.
+        let disabled: SopConfig =
+            toml::from_str(r#"sops_dir = """#).expect("empty sops_dir should deserialize");
+        assert_eq!(disabled.sops_dir.as_deref(), Some(""));
+        assert!(!disabled.runtime_enabled());
+
+        let whitespace: SopConfig =
+            toml::from_str(r#"sops_dir = "   ""#).expect("whitespace sops_dir should deserialize");
+        assert!(!whitespace.runtime_enabled());
+
+        // A non-default explicit path still enables the runtime.
+        let custom: SopConfig =
+            toml::from_str(r#"sops_dir = "my-sops""#).expect("custom sops_dir should deserialize");
+        assert!(custom.runtime_enabled());
     }
 
     #[test]

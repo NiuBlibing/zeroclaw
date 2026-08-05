@@ -1,6 +1,6 @@
 # SOP Syntax Reference
 
-SOP definitions are loaded from subdirectories under `sops_dir`. When `sops_dir` is omitted from config, CLI commands fall back to `<workspace>/sops` for offline inspection, but runtime SOP execution is disabled.
+SOP definitions are loaded from subdirectories under `sops_dir`, which defaults to `sops` (resolved against the shared workspace, i.e. `<shared>/sops`). Runtime SOP execution is enabled whenever `sops_dir` is non-empty, so a fresh install loads SOPs from `<shared>/sops` out of the box. To disable runtime SOP execution entirely (the rollback path), set `sops_dir = ""`; CLI commands still fall back to `<workspace>/sops` for offline inspection.
 
 ## 1. Directory Layout
 
