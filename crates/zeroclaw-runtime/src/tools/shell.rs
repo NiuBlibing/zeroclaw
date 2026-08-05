@@ -896,6 +896,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn wrapped_shell_blocks_windows_relative_path_for_powershell() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["cat".into()],
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = RateLimitedTool::new(
+            PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
+            security,
+        );
+
+        let result = tool
+            .execute(json!({"command": "cat ..\\secret.txt"}))
+            .await
+            .expect("path rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("forbidden path argument")),
+            "Windows-relative path must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn powershell_agent_shell_executes_safe_pipeline_and_rejects_dangerous_alias() {

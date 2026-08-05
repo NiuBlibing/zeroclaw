@@ -1063,6 +1063,38 @@ fn looks_like_path(candidate: &str) -> bool {
                 || candidate.starts_with("\\\\")))
 }
 
+fn shell_uses_windows_path_syntax(dialect: ShellDialect) -> bool {
+    matches!(dialect, ShellDialect::WindowsCmd | ShellDialect::PowerShell)
+}
+
+fn has_windows_drive_prefix(candidate: &str) -> bool {
+    let bytes = candidate.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn is_windows_drive_relative(candidate: &str) -> bool {
+    has_windows_drive_prefix(candidate)
+        && !candidate
+            .as_bytes()
+            .get(2)
+            .is_some_and(|separator| matches!(*separator, b'/' | b'\\'))
+}
+
+fn looks_like_path_for_shell(candidate: &str, dialect: ShellDialect) -> bool {
+    looks_like_path(candidate)
+        || (shell_uses_windows_path_syntax(dialect)
+            && (candidate.contains('\\') || has_windows_drive_prefix(candidate)))
+}
+
+fn shell_path_tokens_equal(left: &str, right: &str, dialect: ShellDialect) -> bool {
+    if shell_uses_windows_path_syntax(dialect) {
+        left.replace('\\', "/")
+            .eq_ignore_ascii_case(&right.replace('\\', "/"))
+    } else {
+        expand_user_path(left) == expand_user_path(right)
+    }
+}
+
 fn attached_short_option_value(token: &str) -> Option<&str> {
     // Examples:
     // -f/etc/passwd   -> /etc/passwd
@@ -1801,6 +1833,10 @@ impl SecurityPolicy {
             );
         }
 
+        if let Some(path) = self.forbidden_path_argument_for_shell(command, dialect) {
+            return Err(format!("Command blocked: forbidden path argument: {path}"));
+        }
+
         Ok(risk)
     }
 
@@ -2112,16 +2148,25 @@ impl SecurityPolicy {
         }
     }
 
-    /// Return the first path-like argument blocked by path policy.
-    /// This is best-effort token parsing for shell commands and is intended
-    /// as a safety gate before command execution.
-    pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
+    /// Return the first path-like executable or argument blocked by path policy.
+    ///
+    /// This is best-effort token parsing for shell commands and is intended as
+    /// a safety gate before command execution. The shell-aware form recognizes
+    /// Windows-relative paths for both cmd.exe and PowerShell, including
+    /// cross-platform PowerShell runtimes.
+    fn forbidden_path_argument_for_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> Option<String> {
         let forbidden_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {
                 return None;
             }
-            if looks_like_path(candidate) && !self.is_path_allowed(candidate) {
+            if looks_like_path_for_shell(candidate, dialect)
+                && !self.is_path_allowed_for_shell(candidate, dialect)
+            {
                 Some(candidate.to_string())
             } else {
                 None
@@ -2147,6 +2192,15 @@ impl SecurityPolicy {
             }
             forbidden_candidate(candidate)
         };
+        let executable_has_explicit_path_allowlist = |raw: &str| {
+            let executable = strip_wrapping_quotes(raw).trim();
+            self.allowed_commands.iter().any(|allowed| {
+                let allowed = strip_wrapping_quotes(allowed).trim();
+                allowed != "*"
+                    && looks_like_path_for_shell(allowed, dialect)
+                    && shell_path_tokens_equal(allowed, executable, dialect)
+            })
+        };
 
         for segment in split_unquoted_segments(command) {
             let cmd_part = skip_env_assignments(&segment);
@@ -2154,6 +2208,16 @@ impl SecurityPolicy {
             let Some(executable) = words.next() else {
                 continue;
             };
+
+            let executable_candidate = strip_wrapping_quotes(executable).trim();
+            let executable_without_redirect = executable_candidate
+                .find(['<', '>'])
+                .map_or(executable_candidate, |index| &executable_candidate[..index]);
+            if !executable_has_explicit_path_allowlist(executable_without_redirect)
+                && let Some(blocked) = forbidden_non_redirect_candidate(executable_without_redirect)
+            {
+                return Some(blocked);
+            }
 
             let executable_redirect = parse_redirection_argument(strip_wrapping_quotes(executable));
             let mut next_is_redirect_target = false;
@@ -2232,6 +2296,53 @@ impl SecurityPolicy {
         }
 
         None
+    }
+
+    /// Return the first path-like executable or argument blocked by path
+    /// policy using the host platform's default shell syntax.
+    pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
+        #[cfg(target_os = "windows")]
+        let dialect = ShellDialect::WindowsCmd;
+        #[cfg(not(target_os = "windows"))]
+        let dialect = ShellDialect::Posix;
+
+        self.forbidden_path_argument_for_shell(command, dialect)
+    }
+
+    fn is_path_allowed_for_shell(&self, path: &str, dialect: ShellDialect) -> bool {
+        if !shell_uses_windows_path_syntax(dialect) {
+            return self.is_path_allowed(path);
+        }
+
+        // `C:relative` resolves against a per-drive current directory on
+        // Windows rather than the configured workspace. There is no stable
+        // workspace-relative interpretation, so fail closed on every host.
+        if is_windows_drive_relative(path) {
+            return false;
+        }
+
+        // PowerShell accepts backslashes as path separators on every host.
+        // Normalize only for policy evaluation; the original command remains
+        // unchanged for process construction.
+        let normalized = path.replace('\\', "/");
+
+        // A drive-qualified path cannot name the Unix workspace. This matters
+        // for cross-platform PowerShell, where host-native `Path` parsing would
+        // otherwise treat `C:/outside` as an ordinary relative path.
+        #[cfg(not(target_os = "windows"))]
+        if self.workspace_only && has_windows_drive_prefix(&normalized) {
+            return false;
+        }
+
+        // On Windows, a leading slash without a drive is rooted on the current
+        // drive. It is not workspace-relative even though `Path::is_absolute`
+        // intentionally reports false for this form.
+        #[cfg(target_os = "windows")]
+        if self.workspace_only && normalized.starts_with('/') && !normalized.starts_with("//") {
+            return false;
+        }
+
+        self.is_path_allowed(&normalized)
     }
 
     /// Check if a file path is allowed (no path traversal, within workspace)
@@ -4438,6 +4549,64 @@ mod tests {
         assert_eq!(
             p.forbidden_path_argument("find .. -name '*.rs'"),
             Some("..".into())
+        );
+    }
+
+    #[test]
+    fn powershell_path_guard_blocks_windows_relative_and_executable_paths() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tp_ws(),
+            allowed_commands: vec!["cat".into(), "git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for (command, blocked_path) in [
+            ("cat ..\\secret.txt", "..\\secret.txt"),
+            ("cat .\\..\\secret.txt", ".\\..\\secret.txt"),
+            ("cat ~\\.ssh\\id_rsa", "~\\.ssh\\id_rsa"),
+            ("cat C:secret.txt", "C:secret.txt"),
+            ("..\\git.exe status", "..\\git.exe"),
+        ] {
+            assert_eq!(
+                p.forbidden_path_argument_for_shell(command, ShellDialect::PowerShell),
+                Some(blocked_path.to_string()),
+                "PowerShell path should be blocked: {command}"
+            );
+
+            let error = p
+                .validate_command_execution_for_shell(command, true, ShellDialect::PowerShell)
+                .expect_err("named allowlists must not bypass PowerShell path confinement");
+            assert!(
+                error.contains("forbidden path argument"),
+                "unexpected rejection for {command}: {error}"
+            );
+        }
+
+        assert_eq!(
+            p.forbidden_path_argument_for_shell("cat .\\src\\main.rs", ShellDialect::PowerShell),
+            None
+        );
+        assert_eq!(
+            p.forbidden_path_argument_for_shell(".\\git.exe status", ShellDialect::PowerShell),
+            None
+        );
+
+        let explicit_path_policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tp_ws(),
+            allowed_commands: vec!["/usr/bin/antigravity".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            explicit_path_policy
+                .validate_command_execution_for_shell(
+                    "/usr/bin/antigravity",
+                    true,
+                    ShellDialect::PowerShell,
+                )
+                .is_ok(),
+            "an exact executable-path allowlist must retain its existing meaning"
         );
     }
 

@@ -1906,6 +1906,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_job_command_blocks_windows_relative_path_for_powershell() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["cat".into()];
+        let job = test_job("cat ..\\secret.txt");
+        let security = test_security(&config);
+        let runtime = crate::platform::NativeRuntime::with_shell("pwsh".into());
+
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
+
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("..\\secret.txt"));
+    }
+
+    #[tokio::test]
     async fn run_job_command_blocks_forbidden_option_assignment_path_argument() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
