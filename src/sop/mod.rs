@@ -231,7 +231,7 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
             Ok(())
         }
         crate::SopCommands::Delete { name } => {
-            let dir = resolve_sops_dir(workspace_dir, config.sop.sops_dir.as_deref());
+            let dir = resolve_sops_dir(&workspace_dir, config.sop.sops_dir.as_deref());
             delete_sop(&dir, &name)?;
             println!(
                 "{}",
