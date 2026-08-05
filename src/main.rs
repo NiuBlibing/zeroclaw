@@ -4180,6 +4180,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
                         &current_config.data_dir,
+                        &current_config.shared_workspace_dir(),
                         mem,
                         sop_adapters,
                     );
@@ -4942,6 +4943,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         config.sop.clone(),
                         &config.data_dir,
+                        &config.shared_workspace_dir(),
                         mem,
                         sop_adapters,
                     );

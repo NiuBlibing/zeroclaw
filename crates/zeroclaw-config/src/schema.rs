@@ -22785,9 +22785,12 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[prefix = "sop"]
 pub struct SopConfig {
     /// Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).
-    /// Optional override. When omitted, the runtime and CLI both resolve the
-    /// default `<workspace>/sops`; SOPs load from there whenever it exists.
-    #[serde(default)]
+    /// A relative value (the default `sops`) resolves against the shared
+    /// workspace, so SOPs load from `<shared>/sops` — the same directory the
+    /// web/RPC SOP author writes to. An absolute or `~`-prefixed value is used
+    /// as-is. Defaults to `sops`; SOP runtime behavior activates whenever this
+    /// is set, so an explicit empty value disables SOP loading for a rollback.
+    #[serde(default = "default_sop_sops_dir")]
     pub sops_dir: Option<String>,
 
     /// Default execution mode for SOPs that omit `execution_mode`.
@@ -22911,6 +22914,10 @@ pub struct SopConfig {
     /// Experimental.
     #[serde(default)]
     pub procedural_memory_enabled: bool,
+}
+
+fn default_sop_sops_dir() -> Option<String> {
+    Some("sops".to_string())
 }
 
 fn default_sop_execution_mode() -> String {
@@ -23100,7 +23107,7 @@ fn default_sop_maintenance_interval_secs() -> u64 {
 impl Default for SopConfig {
     fn default() -> Self {
         Self {
-            sops_dir: None,
+            sops_dir: default_sop_sops_dir(),
             default_execution_mode: default_sop_execution_mode(),
             max_concurrent_total: default_sop_max_concurrent_total(),
             approval_timeout_secs: default_sop_approval_timeout_secs(),

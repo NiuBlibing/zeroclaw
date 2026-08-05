@@ -1537,6 +1537,7 @@ impl Agent {
                 let (engine, audit) = crate::sop::build_sop_engine(
                     config.sop.clone(),
                     &config.data_dir,
+                    &config.shared_workspace_dir(),
                     mem,
                     Default::default(),
                 );
