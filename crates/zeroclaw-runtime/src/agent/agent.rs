@@ -22,14 +22,21 @@ use zeroclaw_providers::{
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
-type ContextLimitsResolver =
-    Arc<dyn Fn(&str, &str) -> zeroclaw_config::schema::ResolvedContextLimits + Send + Sync>;
+/// The turn engine's single per-call limits authority. Aliased from the turn
+/// module so the `Agent`, its builder, and `run_tool_call_loop` all thread one
+/// type (see `crate::agent::turn::ContextLimitsResolver`).
+use crate::agent::loop_::ContextLimitsResolver;
 
 pub fn build_session_model_provider(
     config: &Config,
     model_provider_ref: &str,
     model_override: Option<&str>,
-) -> Result<(Box<dyn ModelProvider>, String, String)> {
+) -> Result<(
+    Box<dyn ModelProvider>,
+    String,
+    String,
+    Arc<zeroclaw_providers::router::ModelRouteResolver>,
+)> {
     let (model_provider_name, model_provider_alias) = model_provider_ref
         .split_once('.')
         .map(|(t, a)| (t.to_string(), a.to_string()))
@@ -67,18 +74,24 @@ pub fn build_session_model_provider(
         &model_provider_alias,
     );
 
-    let model_provider = zeroclaw_providers::create_routed_model_provider_with_options(
-        config,
-        model_provider_ref,
-        entry.and_then(|e| e.api_key.as_deref()),
-        entry.and_then(|e| e.uri.as_deref()),
-        &config.reliability,
-        &config.model_routes,
-        &model_name,
-        &model_provider_runtime_options,
-    )?;
+    let (model_provider, model_route_resolver) =
+        zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
+            config,
+            model_provider_ref,
+            entry.and_then(|e| e.api_key.as_deref()),
+            entry.and_then(|e| e.uri.as_deref()),
+            &config.reliability,
+            &config.model_routes,
+            &model_name,
+            &model_provider_runtime_options,
+        )?;
 
-    Ok((model_provider, model_provider_ref.to_string(), model_name))
+    Ok((
+        model_provider,
+        model_provider_ref.to_string(),
+        model_name,
+        model_route_resolver,
+    ))
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -423,6 +436,12 @@ pub struct StreamedTurnSuccess {
     pub provider_name: String,
     /// Model that served the final round.
     pub model: String,
+    /// Capacity + proactive-trim budget for the route that actually served the
+    /// final LLM call. Sourced from the loop's served-route sink so a per-call
+    /// vision switch is reflected here even when the provider returned no usage;
+    /// consumers publish the terminal context snapshot from this pair. `None`
+    /// only when no call was served (e.g. an immediate cache hit).
+    pub final_context_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
 }
 
 #[derive(Debug)]
@@ -1208,6 +1227,29 @@ impl Agent {
 
     pub fn set_model_provider_name(&mut self, model_provider_name: String) {
         self.model_provider_name = model_provider_name;
+    }
+
+    /// Install the route resolver that belongs to a newly swapped provider.
+    /// The resolver holds the hint→provider/model route table bound to a
+    /// specific provider set, so it MUST be replaced together with the provider
+    /// box (see `set_model_provider`); otherwise a routed hint resolves through
+    /// the previous provider's table while the new provider serves the call.
+    pub fn set_model_route_resolver(
+        &mut self,
+        model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
+    ) {
+        self.model_route_resolver = model_route_resolver;
+    }
+
+    /// Resolve a selector through the agent's CURRENT route resolver. Test-only
+    /// accessor so cross-module tests (e.g. RPC session refresh) can assert the
+    /// resolver was replaced together with the provider box.
+    #[cfg(test)]
+    pub(crate) fn resolved_route_for_test(
+        &self,
+        selector: &str,
+    ) -> zeroclaw_providers::router::ResolvedModelRoute {
+        self.model_route_resolver.resolve(selector)
     }
 
     pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
@@ -2464,6 +2506,7 @@ impl Agent {
                                 parallel_tools: self.config.resolved.parallel_tools,
                                 max_tool_result_chars: self.config.resolved.max_tool_result_chars,
                                 context_limits,
+                                context_limits_resolver: self.context_limits_resolver.clone(),
                                 knobs: &knobs,
                             },
                         ),
@@ -2494,6 +2537,10 @@ impl Agent {
                         agent_alias: agent_alias_for_loop.as_deref(),
                         parent_agent_alias: None,
                         turn_id: &turn_id,
+                        // Non-streamed `Agent::turn` returns text, not a
+                        // terminal `StreamedTurnSuccess`, so it publishes no
+                        // route snapshot.
+                        served_route_sink: None,
                         // Live-daemon SOP path: re-assemble a nested step's agent
                         // when it delegates elsewhere. Config survives only via
                         // `provider_switch_config`; with `None` (test builder) a
@@ -2722,6 +2769,10 @@ impl Agent {
                     new_messages: new_msgs,
                     provider_name: selected_route.provider_name.clone(),
                     model: selected_route.model.clone(),
+                    // Cache hit: no LLM call was served, so there is no
+                    // per-call route snapshot. The gateway falls back to
+                    // resolving limits from the selected route.
+                    final_context_limits: None,
                 });
             }
             self.observer.record_event(&ObserverEvent::CacheMiss {
@@ -2770,6 +2821,13 @@ impl Agent {
         );
 
         // ── Round loop: one tool-call-loop run per steering round ──────────
+        // Sink the loop writes the final serving route into each round, so the
+        // terminal `StreamedTurnSuccess` carries the route/limits that actually
+        // served the last call — including a per-call vision switch — even when
+        // the provider returned no usage. Carried across rounds; the last write
+        // wins.
+        let served_route_sink: crate::agent::loop_::ServedRouteSink =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
         for round in 0..self.config.resolved.max_tool_iterations {
             // Early exit if the caller cancelled this turn (e.g. user abort)
             if cancel_token
@@ -2877,6 +2935,7 @@ impl Agent {
                                     &selected_route.provider_name,
                                     &selected_route.model,
                                 ),
+                                context_limits_resolver: self.context_limits_resolver.clone(),
                                 knobs: &knobs,
                             },
                         ),
@@ -2907,6 +2966,7 @@ impl Agent {
                         agent_alias: agent_alias_for_loop.as_deref(),
                         parent_agent_alias: None,
                         turn_id: &turn_id,
+                        served_route_sink: Some(served_route_sink.clone()),
                         // Live-daemon SOP path: re-assemble a nested step's
                         // agent when it delegates elsewhere. Config survives
                         // only via `provider_switch_config`; with `None`
@@ -3005,11 +3065,49 @@ impl Agent {
                         &event_tx,
                     )
                     .await;
+                    // Prefer the route that actually served the final call
+                    // (a per-call vision switch differs from the selected text
+                    // route); fall back to the selected route when no call was
+                    // served this turn.
+                    let served = served_route_sink
+                        .lock()
+                        .expect("served-route sink lock")
+                        .clone();
+                    let (final_provider, final_model, final_limits) = match served {
+                        Some(route) => {
+                            (route.provider_name, route.model, Some(route.context_limits))
+                        }
+                        None => (
+                            selected_route.provider_name.clone(),
+                            selected_route.model.clone(),
+                            None,
+                        ),
+                    };
+                    // Publish one terminal context snapshot for the final served
+                    // route. A no-usage final call (e.g. a vision reply without
+                    // token usage) otherwise leaves the client meter on an
+                    // earlier route's numbers; this authoritative frame carries
+                    // the final route's budget/window even with no token counts.
+                    if let (Some(limits), Some(tx)) = (final_limits, event_tx.as_ref()) {
+                        let _ = tx
+                            .send(TurnEvent::Usage {
+                                input_tokens: None,
+                                cached_input_tokens: None,
+                                output_tokens: None,
+                                cost_usd: None,
+                                context_token_budget: Some(limits.context_token_budget as u64),
+                                model_context_window: limits
+                                    .configured_model_context_window()
+                                    .map(|t| t as u64),
+                            })
+                            .await;
+                    }
                     return Ok(StreamedTurnSuccess {
                         response: committed_response,
                         new_messages: new_msgs,
-                        provider_name: selected_route.provider_name.clone(),
-                        model: selected_route.model.clone(),
+                        provider_name: final_provider,
+                        model: final_model,
+                        final_context_limits: final_limits,
                     });
                 }
                 Err(error) => {
@@ -9210,6 +9308,77 @@ mod tests {
             "auto_save(true) must cause the streamed turn to emit a MemoryStore event"
         );
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
+    }
+
+    // B4: a streamed turn whose final (and only) provider call returns
+    // `usage: None` must still publish a terminal `TurnEvent::Usage` carrying the
+    // served route's budget/window, so the client meter reflects the final route
+    // instead of staying blank or stuck on an earlier snapshot.
+    #[tokio::test]
+    async fn streamed_turn_publishes_terminal_context_snapshot_without_usage() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        // Single response with no token usage.
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed_with_steering_state("hello", event_tx, None, None)
+            .await
+            .expect("streamed turn should succeed");
+
+        let mut terminal_usage = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                context_token_budget,
+                model_context_window,
+                ..
+            } = ev
+            {
+                // The terminal snapshot carries route limits but no token counts.
+                if input_tokens.is_none() && output_tokens.is_none() {
+                    terminal_usage = Some((context_token_budget, model_context_window));
+                }
+            }
+        }
+        let (budget, window) = terminal_usage
+            .expect("a terminal Usage snapshot must fire even without provider usage");
+        // Default builder has no configured capacity -> 32k compatibility
+        // fallback budget, and the window is omitted (not configured truth).
+        assert_eq!(
+            budget,
+            Some(zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET as u64)
+        );
+        assert_eq!(
+            window, None,
+            "compatibility-fallback capacity is omitted from the wire snapshot"
+        );
     }
 
     fn build_test_agent(

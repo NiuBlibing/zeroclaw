@@ -925,6 +925,7 @@ async fn agent_turn_with_sop_reassembly(
                 parallel_tools,
                 max_tool_result_chars,
                 context_limits,
+                context_limits_resolver: None,
                 knobs: &LoopKnobs::default(),
             },
         ),
@@ -981,18 +982,18 @@ async fn agent_turn_with_sop_reassembly(
 // file per step (run sheet in agent/turn/mod.rs). `crate::agent::loop_`
 // stays the canonical public path via these re-exports.
 pub(crate) use super::turn::StreamCancelledAfterOutput;
+pub use super::turn::{
+    ContextLimitsResolver, DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback,
+    ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, ResolvedAgentExecution,
+    ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs, ServedRoute, ServedRouteSink,
+    SopStepReassembly, StreamDelta, ToolLoop, ToolLoopCancelled, drain_steering_messages,
+    is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
+};
 #[cfg(test)]
 pub(crate) use super::turn::{
     DEFAULT_MAX_TOOL_ITERATIONS, MAX_MALFORMED_TOOL_PROTOCOL_RETRIES,
     build_native_assistant_history, consume_provider_streaming_response,
     maybe_inject_channel_delivery_defaults, resolve_display_text,
-};
-pub use super::turn::{
-    DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback, ModelSwitchRequested,
-    PROGRESS_MIN_INTERVAL_MS, ProgressEvent, ResolvedAgentExecution, ResolvedIo,
-    ResolvedModelAccess, ResolvedRuntimeKnobs, SopStepReassembly, StreamDelta, ToolLoop,
-    ToolLoopCancelled, drain_steering_messages, is_model_switch_requested, is_tool_loop_cancelled,
-    run_tool_call_loop, scrub_credentials,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1932,6 +1933,7 @@ pub async fn run(
                                         parallel_tools: agent.resolved.parallel_tools,
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
                                         context_limits,
+                                        context_limits_resolver: None,
                                         knobs: &LoopKnobs::default(),
                                     },
                                 ),
@@ -1964,6 +1966,7 @@ pub async fn run(
                                 agent_alias: Some(agent_alias),
                                 parent_agent_alias: None,
                                 turn_id: &turn_id,
+                                served_route_sink: None,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
                                 }),
@@ -2485,6 +2488,7 @@ pub async fn run(
                                                 .resolved
                                                 .max_tool_result_chars,
                                             context_limits,
+                                            context_limits_resolver: None,
                                             knobs: &LoopKnobs::default(),
                                         },
                                     ),
@@ -2517,6 +2521,7 @@ pub async fn run(
                                     agent_alias: Some(agent_alias),
                                     parent_agent_alias: None,
                                     turn_id: &turn_id,
+                                    served_route_sink: None,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
                                     }),
@@ -4925,6 +4930,7 @@ mod tests {
 
         let _ = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -4951,6 +4957,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -5266,6 +5273,7 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -5292,6 +5300,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -5344,6 +5353,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -5370,6 +5380,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -5429,6 +5440,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -5455,6 +5467,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -5519,6 +5532,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -5545,6 +5559,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -5594,6 +5609,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -5620,6 +5636,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -5672,6 +5689,7 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -5698,6 +5716,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -5751,6 +5770,7 @@ mod tests {
         // should succeed because there are no image markers to trigger routing.
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -5777,6 +5797,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -5817,6 +5838,7 @@ mod tests {
 
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
+                served_route_sink: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
@@ -5843,6 +5865,7 @@ mod tests {
                     parallel_tools: false,
                     max_tool_result_chars: 0,
                     context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
                 },
@@ -6004,6 +6027,7 @@ mod tests {
 
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
+                served_route_sink: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
@@ -6030,6 +6054,7 @@ mod tests {
                     parallel_tools: false,
                     max_tool_result_chars: 0,
                     context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
                 },
@@ -6130,6 +6155,7 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -6156,6 +6182,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6208,6 +6235,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -6234,6 +6262,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6285,6 +6314,7 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -6311,6 +6341,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6448,6 +6479,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -6474,6 +6506,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6590,6 +6623,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -6616,6 +6650,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6752,6 +6787,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -6778,6 +6814,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6871,6 +6908,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -6897,6 +6935,7 @@ mod tests {
                 parallel_tools: true,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7045,6 +7084,7 @@ mod tests {
 
         let _ = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -7071,6 +7111,7 @@ mod tests {
                 parallel_tools: true,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7155,6 +7196,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -7181,6 +7223,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7249,6 +7292,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -7275,6 +7319,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7335,6 +7380,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -7361,6 +7407,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7429,6 +7476,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -7455,6 +7503,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7526,6 +7575,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -7552,6 +7602,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7628,6 +7679,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -7654,6 +7706,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7723,6 +7776,7 @@ mod tests {
 
         let _ = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -7749,6 +7803,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7844,6 +7899,7 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -7870,6 +7926,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &knobs,
             },
@@ -7943,6 +8000,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -7969,6 +8027,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8047,6 +8106,7 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -8073,6 +8133,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8141,6 +8202,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -8167,6 +8229,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8239,6 +8302,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -8265,6 +8329,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8339,6 +8404,7 @@ mod tests {
 
         let _result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -8365,6 +8431,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8425,6 +8492,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -8451,6 +8519,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8515,6 +8584,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -8541,6 +8611,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8600,6 +8671,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -8626,6 +8698,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8683,6 +8756,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -8709,6 +8783,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8769,6 +8844,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -8795,6 +8871,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8852,6 +8929,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -8878,6 +8956,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8934,6 +9013,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -8960,6 +9040,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9008,6 +9089,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -9034,6 +9116,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9083,6 +9166,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -9109,6 +9193,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9158,6 +9243,7 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -9184,6 +9270,7 @@ mod tests {
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9235,6 +9322,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -9261,6 +9349,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9317,6 +9406,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -9343,6 +9433,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9411,6 +9502,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -9437,6 +9529,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9488,6 +9581,7 @@ Done."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -9514,6 +9608,7 @@ Done."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9568,6 +9663,7 @@ Done."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -9594,6 +9690,7 @@ Done."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9646,6 +9743,7 @@ Done."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -9672,6 +9770,7 @@ Done."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9725,6 +9824,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -9751,6 +9851,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9861,6 +9962,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -9887,6 +9989,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9948,6 +10051,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -9974,6 +10078,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10039,6 +10144,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -10065,6 +10171,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10153,6 +10260,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -10179,6 +10287,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10273,6 +10382,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -10299,6 +10409,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10366,6 +10477,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -10392,6 +10504,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10470,6 +10583,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -10496,6 +10610,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -11354,6 +11469,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -11380,6 +11496,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -11460,6 +11577,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -11486,6 +11604,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -11565,6 +11684,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -11591,6 +11711,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -11670,6 +11791,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -11696,6 +11818,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -11830,6 +11953,7 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -11856,6 +11980,7 @@ This is an example, not an invocation."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -14168,6 +14293,7 @@ Let me check the result."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -14194,6 +14320,7 @@ Let me check the result."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -14348,6 +14475,7 @@ Let me check the result."#;
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
+                    served_route_sink: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
@@ -14374,6 +14502,7 @@ Let me check the result."#;
                         parallel_tools: false,
                         max_tool_result_chars: 0,
                         context_limits: test_context_limits(0),
+                        context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },
@@ -14469,6 +14598,7 @@ Let me check the result."#;
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
+                    served_route_sink: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
@@ -14495,6 +14625,7 @@ Let me check the result."#;
                         parallel_tools: false,
                         max_tool_result_chars: 0,
                         context_limits: test_context_limits(0),
+                        context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },
@@ -14550,6 +14681,7 @@ Let me check the result."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -14576,6 +14708,7 @@ Let me check the result."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -14667,6 +14800,7 @@ Let me check the result."#;
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
+                    served_route_sink: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
@@ -14693,6 +14827,7 @@ Let me check the result."#;
                         parallel_tools: false,
                         max_tool_result_chars: 0,
                         context_limits: test_context_limits(0),
+                        context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },
@@ -14750,6 +14885,7 @@ Let me check the result."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -14776,6 +14912,7 @@ Let me check the result."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -14840,6 +14977,7 @@ Let me check the result."#;
 
         let _ = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -14866,6 +15004,7 @@ Let me check the result."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(50),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -16058,6 +16197,7 @@ Let me check the result."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -16084,6 +16224,7 @@ Let me check the result."#;
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },

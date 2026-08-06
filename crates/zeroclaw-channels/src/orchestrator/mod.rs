@@ -5558,6 +5558,7 @@ async fn process_channel_message_body(
                 // agent when it delegates to a different agent, so the step runs
                 // with that agent's own gated tools/policy/MCP scope rather than
                 // this turn's.
+                served_route_sink: None,
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
                 }),

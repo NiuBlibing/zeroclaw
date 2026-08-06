@@ -461,6 +461,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
         parent_agent_alias: None,
+        served_route_sink: None,
         sop_reassembly: None,
         exec: crate::agent::loop_::ResolvedAgentExecution {
             model_access: crate::agent::loop_::ResolvedModelAccess {
@@ -492,6 +493,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
             },
+            context_limits_resolver: None,
             receipt_generator: None,
             knobs: &crate::agent::loop_::LoopKnobs::default(),
         },
@@ -859,6 +861,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
         crate::agent::loop_::scope_session_key(Some("session-1".into()), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
                 parent_agent_alias: None,
+                served_route_sink: None,
                 sop_reassembly: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution {
                     model_access: crate::agent::loop_::ResolvedModelAccess {
@@ -890,6 +893,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                         model_context_window_source:
                             zeroclaw_config::schema::ModelContextWindowSource::Configured,
                     },
+                    context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &crate::agent::loop_::LoopKnobs::default(),
                 },

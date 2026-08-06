@@ -6,7 +6,7 @@ use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
-use super::{LoopKnobs, ModelSwitchCallback};
+use super::{ContextLimitsResolver, LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
@@ -106,6 +106,12 @@ pub struct ResolvedAgentExecution<'a> {
     /// Capacity and proactive-trim budget resolved together for the selected
     /// route at the turn boundary.
     pub context_limits: ResolvedContextLimits,
+    /// The turn engine's single authority for per-call `(provider, model)`
+    /// limits. Daemon-backed agents pass a closure reading the shared live
+    /// `Config`; configless (test) paths leave it `None` and the loop uses
+    /// `context_limits`. Prevents recomputing capacity from a stale config
+    /// snapshot when the active route or live config changes mid-turn.
+    pub context_limits_resolver: Option<ContextLimitsResolver>,
     /// Tool-receipt tracer; `None` when receipts are off.
     pub receipt_generator: Option<&'a ReceiptGenerator>,
     /// Fine-grained loop behavior flags.
@@ -142,6 +148,8 @@ pub struct ResolvedRuntimeKnobs<'a> {
     pub parallel_tools: bool,
     pub max_tool_result_chars: usize,
     pub context_limits: ResolvedContextLimits,
+    /// Single live limits authority; see [`ResolvedAgentExecution::context_limits_resolver`].
+    pub context_limits_resolver: Option<ContextLimitsResolver>,
     pub knobs: &'a LoopKnobs,
 }
 
@@ -170,6 +178,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             parallel_tools: runtime.parallel_tools,
             max_tool_result_chars: runtime.max_tool_result_chars,
             context_limits: runtime.context_limits,
+            context_limits_resolver: runtime.context_limits_resolver,
             receipt_generator: io.receipt_generator,
             knobs: runtime.knobs,
         }

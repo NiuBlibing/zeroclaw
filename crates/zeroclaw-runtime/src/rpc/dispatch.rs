@@ -999,6 +999,11 @@ impl RpcDispatcher {
         self.handle_session_messages(params).await
     }
 
+    #[cfg(test)]
+    pub async fn handle_session_configure_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_session_configure(params).await
+    }
+
     /// Drive a full JSON-RPC request line through the dispatcher from an
     /// external integration test, including notification emission on the
     /// outbound channel. Mirrors the transport `process_line` path.
@@ -2053,7 +2058,7 @@ impl RpcDispatcher {
                     .model_provider
                     .as_deref()
                     .unwrap_or_else(|| agent_cfg.model_provider.as_str());
-                let (model_provider, model_provider_name, model_name) =
+                let (model_provider, model_provider_name, model_name, model_route_resolver) =
                     crate::agent::agent::build_session_model_provider(
                         &config,
                         model_provider_ref,
@@ -2068,6 +2073,7 @@ impl RpcDispatcher {
                     model_provider,
                     model_provider_name,
                     model_name,
+                    model_route_resolver,
                     tool_dispatcher,
                 )
             };
@@ -2083,8 +2089,13 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        if let Some((model_provider, model_provider_name, model_name, tool_dispatcher)) =
-            built_model_provider
+        if let Some((
+            model_provider,
+            model_provider_name,
+            model_name,
+            model_route_resolver,
+            tool_dispatcher,
+        )) = built_model_provider
         {
             self.ctx
                 .sessions
@@ -2093,6 +2104,7 @@ impl RpcDispatcher {
                     model_provider,
                     model_provider_name,
                     model_name,
+                    model_route_resolver,
                     tool_dispatcher,
                 )
                 .await
@@ -2878,7 +2890,14 @@ impl RpcDispatcher {
                 continue;
             }
 
-            let (model_provider, model_provider_name, model_name, tool_dispatcher, temperature) = {
+            let (
+                model_provider,
+                model_provider_name,
+                model_name,
+                model_route_resolver,
+                tool_dispatcher,
+                temperature,
+            ) = {
                 let config = ctx.config.read();
                 let provider_temperature = model_provider_ref.split_once('.').and_then(
                     |(provider_type, provider_alias)| {
@@ -2911,7 +2930,7 @@ impl RpcDispatcher {
                     model_provider_ref,
                     overrides.model.as_deref(),
                 ) {
-                    Ok((model_provider, model_provider_name, model_name)) => {
+                    Ok((model_provider, model_provider_name, model_name, model_route_resolver)) => {
                         let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
                             &agent_cfg,
                             model_provider.as_ref(),
@@ -2920,6 +2939,7 @@ impl RpcDispatcher {
                             model_provider,
                             model_provider_name,
                             model_name,
+                            model_route_resolver,
                             tool_dispatcher,
                             overrides.temperature.or(provider_temperature),
                         )
@@ -2951,6 +2971,7 @@ impl RpcDispatcher {
                     model_provider,
                     model_provider_name,
                     model_name,
+                    model_route_resolver,
                     tool_dispatcher,
                 )
                 .await
@@ -5136,6 +5157,88 @@ mod tests {
         assert!(
             prompt.contains("remote__domains.list"),
             "system prompt must advertise the dotted `<server>__<tool>` stub; prompt: {prompt}"
+        );
+    }
+
+    // B2: a session/configure that switches the provider must install the new
+    // provider's route resolver in the SAME transition. Before the fix the
+    // resolver from the original provider was left in place, so a routed hint
+    // (and the Direct default) still resolved through the old provider while the
+    // new box served the call.
+    #[tokio::test]
+    async fn session_configure_swaps_route_resolver_with_provider() {
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        // Register a second, distinct provider the session can switch to.
+        {
+            let base = config
+                .providers
+                .models
+                .ensure("openai", "provider-b")
+                .expect("`openai` slot must exist");
+            base.api_key = Some("test-key-b".into());
+            base.model = Some("model-b".into());
+            base.uri = Some("http://127.0.0.1:2".into());
+        }
+        // Point the agent at provider A initially.
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let new_params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "cfg-resolver-swap-001"
+        });
+        dispatcher
+            .handle_session_new_for_test(&new_params)
+            .await
+            .expect("session/new should succeed");
+
+        // Before the switch the resolver resolves the default through provider A.
+        {
+            let agent = sessions
+                .get_agent("cfg-resolver-swap-001")
+                .await
+                .expect("session registered");
+            let agent = agent.lock().await;
+            assert_eq!(
+                agent.resolved_route_for_test("anything").provider_name,
+                "openai.test-provider",
+                "the initial resolver must resolve through provider A"
+            );
+        }
+
+        // Switch the session to provider B.
+        let cfg_params = json!({
+            "session_id": "cfg-resolver-swap-001",
+            "overrides": { "model_provider": "openai.provider-b" }
+        });
+        dispatcher
+            .handle_session_configure_for_test(&cfg_params)
+            .await
+            .expect("session/configure switching provider should succeed");
+
+        // After the switch the resolver must resolve through provider B — proving
+        // the resolver was replaced together with the provider box.
+        let agent = sessions
+            .get_agent("cfg-resolver-swap-001")
+            .await
+            .expect("session still registered");
+        let agent = agent.lock().await;
+        assert_eq!(
+            agent.resolved_route_for_test("anything").provider_name,
+            "openai.provider-b",
+            "session/configure must install the new provider's route resolver, not keep the old one"
         );
     }
 

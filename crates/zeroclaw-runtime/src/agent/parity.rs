@@ -147,6 +147,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = run_tool_call_loop(ToolLoop {
         parent_agent_alias: None,
+        served_route_sink: None,
         sop_reassembly: None,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
@@ -182,6 +183,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
                 },
+                context_limits_resolver: None,
                 knobs: &LoopKnobs::default(),
             },
         ),
