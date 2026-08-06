@@ -1611,7 +1611,7 @@ pub(crate) async fn assemble_owned_execution(
                 "SOP step agent '{alias}' has no resolved model provider"
             ))
         })?;
-    let (model_provider, provider_name, model) =
+    let (model_provider, provider_name, model, _model_route_resolver) =
         crate::agent::agent::build_session_model_provider(config, &provider_ref, None)?;
     // The step agent's own configured temperature — the same source the
     // headless driver reads for `crate::agent::run`.
