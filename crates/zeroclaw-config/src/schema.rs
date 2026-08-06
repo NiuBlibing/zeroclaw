@@ -3421,6 +3421,23 @@ pub struct ResolvedContextLimits {
 }
 
 impl ResolvedContextLimits {
+    /// Compatibility-fallback limits for paths that cannot resolve a route
+    /// (missing config or an empty agent alias): the legacy 32k window with the
+    /// caller's budget preserved — `0` stays `0` (proactive trimming disabled),
+    /// any positive value is clamped to the legacy window.
+    #[must_use]
+    pub fn legacy_fallback(budget: usize) -> Self {
+        Self {
+            model_context_window: LEGACY_DEFAULT_CONTEXT_BUDGET,
+            model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
+            context_token_budget: if budget == 0 {
+                0
+            } else {
+                budget.min(LEGACY_DEFAULT_CONTEXT_BUDGET)
+            },
+        }
+    }
+
     /// Return capacity only when it is configured for the selected route.
     /// Wire/UI consumers use absence to distinguish the 32k compatibility
     /// fallback from known model capacity.

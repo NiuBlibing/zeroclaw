@@ -27,16 +27,21 @@ pub use zeroclaw_api::agent::TurnEvent;
 /// type (see `crate::agent::turn::ContextLimitsResolver`).
 use crate::agent::loop_::ContextLimitsResolver;
 
-pub fn build_session_model_provider(
-    config: &Config,
-    model_provider_ref: &str,
-    model_override: Option<&str>,
-) -> Result<(
+/// Provider handle, its `<type>.<alias>` reference, the resolved model name,
+/// and the route resolver bound to that provider — the four values a session
+/// needs to swap a model provider while keeping route-aware limits correct.
+type SessionModelProvider = (
     Box<dyn ModelProvider>,
     String,
     String,
     Arc<zeroclaw_providers::router::ModelRouteResolver>,
-)> {
+);
+
+pub fn build_session_model_provider(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<SessionModelProvider> {
     let (model_provider_name, model_provider_alias) = model_provider_ref
         .split_once('.')
         .map(|(t, a)| (t.to_string(), a.to_string()))
@@ -3104,11 +3109,16 @@ impl Agent {
                         ),
                     };
                     // Publish one terminal context snapshot for the final served
-                    // route. A no-usage final call (e.g. a vision reply without
-                    // token usage) otherwise leaves the client meter on an
-                    // earlier route's numbers; this authoritative frame carries
-                    // the final route's budget/window even with no token counts.
-                    if let Some(limits) = final_limits {
+                    // route only when the turn emitted no usage-bearing frame of
+                    // its own. A no-usage turn (e.g. a vision reply without token
+                    // usage) otherwise leaves the client meter on an earlier
+                    // route's numbers; this authoritative frame carries the final
+                    // route's budget/window even with no token counts. When the
+                    // turn already reported usage, the per-call frames carry the
+                    // route limits and this snapshot would be a redundant event.
+                    let turn_reported_usage =
+                        usage.input_tokens > 0 || usage.output_tokens > 0;
+                    if let Some(limits) = final_limits.filter(|_| !turn_reported_usage) {
                         let _ = event_tx
                             .send(TurnEvent::Usage {
                                 input_tokens: None,
