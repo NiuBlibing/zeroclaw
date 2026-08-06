@@ -1454,7 +1454,7 @@ async fn process_chat_message(
                 model_context_window,
                 fallback_limits,
             );
-            let done = serde_json::json!({
+            let mut done = serde_json::json!({
                 "type": "done",
                 "full_response": outcome.response,
                 "input_tokens": total_input_tokens,
@@ -1464,9 +1464,16 @@ async fn process_chat_message(
                 "model": active_model,
                 "provider": active_provider,
                 "max_context_tokens": max_context_tokens,
-                "model_context_window": model_context_window,
                 "last_input_tokens": last_input_tokens,
             });
+            // Omit `model_context_window` when capacity is unresolved so the done
+            // frame matches the RPC `ContextUsage` contract (which skips the
+            // field on `None`) instead of emitting a JSON `null`.
+            if let Some(window) = model_context_window
+                && let Some(map) = done.as_object_mut()
+            {
+                map.insert("model_context_window".into(), window.into());
+            }
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
             // Set session state to idle

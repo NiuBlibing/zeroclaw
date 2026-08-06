@@ -290,7 +290,7 @@ export interface WsMessage {
   // `max_context_tokens` is the preemptive-trim budget the bar fills toward;
   // `model_context_window` is the model's full capacity (bar denominator when present).
   max_context_tokens?: number;
-  model_context_window?: number;
+  model_context_window?: number | null;
   input_tokens?: number;
   output_tokens?: number;
   last_input_tokens?: number;
