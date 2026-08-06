@@ -2956,10 +2956,12 @@ impl Agent {
                                 strict_tool_parsing: self.config.resolved.strict_tool_parsing,
                                 parallel_tools: self.config.resolved.parallel_tools,
                                 max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                context_limits: self.context_limits_for_route(
-                                    &selected_route.provider_name,
-                                    &selected_route.model,
-                                ),
+                                // Fallback pair for the loop when no resolver is
+                                // wired; when `context_limits_resolver` is set
+                                // the loop re-resolves per call, so seed with the
+                                // resolver-free config limits instead of invoking
+                                // the resolver a second time here.
+                                context_limits: self.config.resolved.context_limits(),
                                 context_limits_resolver: self.context_limits_resolver.clone(),
                                 knobs: &knobs,
                             },

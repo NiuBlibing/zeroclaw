@@ -89,7 +89,7 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// between turns is observed; configless (test) paths omit it and the loop
 /// falls back to the route pair resolved at the turn boundary. Keeping one
 /// resolver here prevents the loop from recomputing half the pair from a
-/// construction-time config snapshot (see PR #9535 review).
+/// construction-time config snapshot.
 pub type ContextLimitsResolver =
     Arc<dyn Fn(&str, &str) -> zeroclaw_config::schema::ResolvedContextLimits + Send + Sync>;
 
@@ -632,7 +632,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         // Record the route about to serve this iteration's call. The last write
         // is the final serving route, so a terminal snapshot is authoritative
-        // even when the provider returns no usage (see PR #9535 review).
+        // even when the provider returns no usage.
         if let Some(sink) = served_route_sink.as_ref() {
             *sink.lock().expect("served-route sink lock") = Some(outcome::ServedRoute {
                 provider_name: active_model_provider_name.to_string(),
