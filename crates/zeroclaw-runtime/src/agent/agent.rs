@@ -3116,8 +3116,7 @@ impl Agent {
                     // route's budget/window even with no token counts. When the
                     // turn already reported usage, the per-call frames carry the
                     // route limits and this snapshot would be a redundant event.
-                    let turn_reported_usage =
-                        usage.input_tokens > 0 || usage.output_tokens > 0;
+                    let turn_reported_usage = usage.input_tokens > 0 || usage.output_tokens > 0;
                     if let Some(limits) = final_limits.filter(|_| !turn_reported_usage) {
                         let _ = event_tx
                             .send(TurnEvent::Usage {
