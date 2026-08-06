@@ -3118,6 +3118,14 @@ impl Agent {
                     // route's budget/window even with no token counts. When the
                     // turn already reported usage, the per-call frames carry the
                     // route limits and this snapshot would be a redundant event.
+                    //
+                    // Known limitation: the gate keys on cumulative turn usage,
+                    // not the final call's. A multi-iteration turn whose earlier
+                    // call reported usage but whose final call switched route
+                    // (e.g. a usage-less vision reply) suppresses this frame, so
+                    // the meter can stay on the earlier route's window. Rare in
+                    // practice (mainstream providers report usage per call);
+                    // a final-call usage signal would close it.
                     let turn_reported_usage = usage.input_tokens > 0 || usage.output_tokens > 0;
                     if let Some(limits) = final_limits.filter(|_| !turn_reported_usage) {
                         let _ = event_tx
