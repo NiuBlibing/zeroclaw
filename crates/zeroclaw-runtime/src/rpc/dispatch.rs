@@ -5608,7 +5608,7 @@ mod tests {
     // The `sop list` create-hint tells users to author under `<shared>/sops`;
     // this locks the CLI scan root (sops_dir_and_mode) to that same path when
     // sops_dir is unset, so the hint can never drift from where we actually
-    // read. (Audacity88, regression for #9765)
+    // read.
     #[test]
     fn sops_list_scan_root_matches_shared_sops_create_hint() {
         use zeroclaw_config::schema::Config;
