@@ -16,6 +16,11 @@ pub struct ServedRoute {
     pub provider_name: String,
     pub model: String,
     pub context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+    /// Whether the call served by this route reported provider token usage. When
+    /// `false`, the per-call `TurnEvent::Usage` frame carried no route limits, so
+    /// a terminal snapshot must be published to update consumers to this route's
+    /// window; when `true`, that per-call frame already carried them.
+    pub reported_usage: bool,
 }
 
 /// Shared sink a caller hands the loop to observe the final serving route.

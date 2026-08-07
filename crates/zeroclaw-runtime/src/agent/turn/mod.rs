@@ -640,12 +640,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         // Record the route about to serve this iteration's call. The last write
         // is the final serving route, so a terminal snapshot is authoritative
-        // even when the provider returns no usage.
+        // even when the provider returns no usage. `reported_usage` is
+        // provisionally `false` and backfilled after the call once we know
+        // whether this call emitted a usage-bearing per-call frame.
         if let Some(sink) = served_route_sink.as_ref() {
             *sink.lock().expect("served-route sink lock") = Some(outcome::ServedRoute {
                 provider_name: active_model_provider_name.to_string(),
                 model: active_model.to_string(),
                 context_limits: active_context_limits,
+                reported_usage: false,
             });
         }
 
@@ -919,6 +922,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 return Err(e);
             }
         };
+
+        // Backfill the served-route sink now that we know whether this call
+        // reported provider usage. A usage-bearing call already emitted a
+        // per-call `TurnEvent::Usage` carrying this route's limits; a no-usage
+        // call did not, so the terminal snapshot must fire for it. The gate that
+        // consumes this keys on the FINAL call's usage, not the turn's total.
+        if let Some(sink) = served_route_sink.as_ref()
+            && let Some(served) = sink.lock().expect("served-route sink lock").as_mut()
+        {
+            served.reported_usage = reported_input_tokens.is_some();
+        }
 
         let display_text = resolve_display_text(
             &response_text,

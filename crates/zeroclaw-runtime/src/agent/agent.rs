@@ -3100,34 +3100,35 @@ impl Agent {
                         .lock()
                         .expect("served-route sink lock")
                         .clone();
-                    let (final_provider, final_model, final_limits) = match served {
-                        Some(route) => {
-                            (route.provider_name, route.model, Some(route.context_limits))
-                        }
-                        None => (
-                            selected_route.provider_name.clone(),
-                            selected_route.model.clone(),
-                            None,
-                        ),
-                    };
+                    let (final_provider, final_model, final_limits, final_reported_usage) =
+                        match served {
+                            Some(route) => (
+                                route.provider_name,
+                                route.model,
+                                Some(route.context_limits),
+                                route.reported_usage,
+                            ),
+                            None => (
+                                selected_route.provider_name.clone(),
+                                selected_route.model.clone(),
+                                None,
+                                false,
+                            ),
+                        };
                     // Publish one terminal context snapshot for the final served
-                    // route only when the turn emitted no usage-bearing frame of
-                    // its own. A no-usage turn (e.g. a vision reply without token
-                    // usage) otherwise leaves the client meter on an earlier
-                    // route's numbers; this authoritative frame carries the final
-                    // route's budget/window even with no token counts. When the
-                    // turn already reported usage, the per-call frames carry the
-                    // route limits and this snapshot would be a redundant event.
+                    // route only when that final call emitted no usage-bearing
+                    // frame of its own. A no-usage final call (e.g. a vision reply
+                    // without token usage) otherwise leaves the client meter on an
+                    // earlier route's numbers; this authoritative frame carries the
+                    // final route's budget/window even with no token counts. When
+                    // the final call already reported usage, its per-call frame
+                    // carried the route limits and this snapshot would be redundant.
                     //
-                    // Known limitation: the gate keys on cumulative turn usage,
-                    // not the final call's. A multi-iteration turn whose earlier
-                    // call reported usage but whose final call switched route
-                    // (e.g. a usage-less vision reply) suppresses this frame, so
-                    // the meter can stay on the earlier route's window. Rare in
-                    // practice (mainstream providers report usage per call);
-                    // a final-call usage signal would close it.
-                    let turn_reported_usage = usage.input_tokens > 0 || usage.output_tokens > 0;
-                    if let Some(limits) = final_limits.filter(|_| !turn_reported_usage) {
+                    // The gate keys on the FINAL served call's usage — not the
+                    // turn's cumulative usage — so a multi-iteration turn whose
+                    // earlier call reported usage but whose final call switched to
+                    // a usage-less route still publishes the final route's window.
+                    if let Some(limits) = final_limits.filter(|_| !final_reported_usage) {
                         let _ = event_tx
                             .send(TurnEvent::Usage {
                                 input_tokens: None,
@@ -9493,6 +9494,111 @@ mod tests {
         assert_eq!(
             window, None,
             "compatibility-fallback capacity is omitted from the wire snapshot"
+        );
+    }
+
+    // A multi-iteration turn whose earlier call reports usage but whose final
+    // call returns no usage must still publish a terminal snapshot for the final
+    // served route. The gate keys on the FINAL call's usage, not the turn's
+    // cumulative usage, so the earlier usage-bearing frame does not suppress the
+    // authoritative final-route window.
+    #[tokio::test]
+    async fn terminal_snapshot_fires_when_only_final_call_lacks_usage() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        // Call 1: a tool request WITH usage (drives iteration 2 and emits a
+        // usage-bearing per-call frame). Call 2: the final response WITHOUT usage.
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![
+                zeroclaw_providers::ChatResponse {
+                    text: Some("calling tool".into()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "tc1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(100),
+                        cached_input_tokens: None,
+                        output_tokens: Some(20),
+                    }),
+                    reasoning_content: None,
+                },
+                zeroclaw_providers::ChatResponse {
+                    text: Some("final answer".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
+            .build()
+            .expect("agent builder should succeed with valid config");
+        // A resolver so the served route carries a configured window distinct
+        // from the 32k compatibility fallback; the terminal frame must carry it.
+        agent.context_limits_resolver = Some(Arc::new(|_provider, _model| {
+            zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 200_000,
+                context_token_budget: 180_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            }
+        }));
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed_with_steering_state("hello", event_tx, None, None)
+            .await
+            .expect("streamed turn should succeed");
+
+        let mut usage_frames = 0usize;
+        let mut terminal_snapshot = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                context_token_budget,
+                model_context_window,
+                ..
+            } = ev
+            {
+                usage_frames += 1;
+                // The terminal snapshot carries route limits but no token counts.
+                if input_tokens.is_none() && output_tokens.is_none() {
+                    terminal_snapshot = Some((context_token_budget, model_context_window));
+                }
+            }
+        }
+        // One usage-bearing frame from call 1, plus the terminal snapshot.
+        assert_eq!(
+            usage_frames, 2,
+            "expected the call-1 usage frame and a terminal snapshot for the usage-less final call"
+        );
+        let (budget, window) = terminal_snapshot.expect(
+            "the final usage-less call must publish a terminal snapshot despite the earlier \
+             usage-bearing call",
+        );
+        assert_eq!(budget, Some(180_000));
+        assert_eq!(
+            window,
+            Some(200_000),
+            "the terminal snapshot must carry the final served route's configured window"
         );
     }
 
