@@ -1605,14 +1605,8 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // Pipeline tool (execute_pipeline) — multi-step tool chaining.
-    if root_config.pipeline.enabled {
-        let pipeline_tools: Vec<Arc<dyn Tool>> = tool_arcs.clone();
-        tool_arcs.push(Arc::new(PipelineTool::new(
-            root_config.pipeline.clone(),
-            pipeline_tools,
-        )));
-    }
+    // Pipeline construction waits for ScopedToolRegistry::assemble(), where the
+    // effective per-agent policy and optional caller allowlist are both known.
 
     AllToolsResult {
         unfiltered_tool_arcs: tool_arcs.clone(),

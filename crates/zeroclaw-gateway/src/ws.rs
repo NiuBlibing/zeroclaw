@@ -960,7 +960,7 @@ fn done_frame_context_limits(
             usage_budget,
             usage_model_window,
             fallback_limits.unwrap_or(zeroclaw_config::schema::ResolvedContextLimits {
-                model_context_window: zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET,
+                model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
                 context_token_budget: 0,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
@@ -1612,7 +1612,7 @@ mod tests {
     #[test]
     fn done_context_limits_omit_unknown_compatibility_capacity() {
         let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
-            model_context_window: zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET,
+            model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
             context_token_budget: 16_000,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,

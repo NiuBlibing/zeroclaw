@@ -3419,7 +3419,13 @@ pub struct ResolvedRuntime {
 
 /// Historical proactive context budget used when an operator sets neither an
 /// absolute budget nor the opt-in model-relative ratio.
-pub const LEGACY_DEFAULT_CONTEXT_BUDGET: usize = 32_000;
+///
+/// Shares its value with [`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`] — the legacy
+/// default budget was exactly the unconfigured-window stub — but is a distinct
+/// concept: this is a proactive-trim budget default, not a model-capacity
+/// fallback. Kept as a named alias so the two never drift and each call site
+/// reads as the concept it means.
+pub const LEGACY_DEFAULT_CONTEXT_BUDGET: usize = UNCONFIGURED_CONTEXT_WINDOW_FALLBACK;
 
 /// Provenance of the model capacity used for one route. The compatibility
 /// fallback remains usable for internal safety calculations, but callers can
@@ -3450,18 +3456,18 @@ pub struct ResolvedContextLimits {
 
 impl ResolvedContextLimits {
     /// Compatibility-fallback limits for paths that cannot resolve a route
-    /// (missing config or an empty agent alias): the legacy 32k window with the
-    /// caller's budget preserved — `0` stays `0` (proactive trimming disabled),
-    /// any positive value is clamped to the legacy window.
+    /// (missing config or an empty agent alias): the unconfigured-window
+    /// fallback with the caller's budget preserved — `0` stays `0` (proactive
+    /// trimming disabled), any positive value is clamped to that window.
     #[must_use]
     pub fn legacy_fallback(budget: usize) -> Self {
         Self {
-            model_context_window: LEGACY_DEFAULT_CONTEXT_BUDGET,
+            model_context_window: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
             model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
             context_token_budget: if budget == 0 {
                 0
             } else {
-                budget.min(LEGACY_DEFAULT_CONTEXT_BUDGET)
+                budget.min(UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
             },
         }
     }
@@ -3492,7 +3498,7 @@ impl ResolvedRuntime {
         let model_context_window = if model_context_window > 0 {
             model_context_window
         } else {
-            LEGACY_DEFAULT_CONTEXT_BUDGET
+            UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
         };
 
         // Preserve the established disable sentinel before applying any
@@ -4201,8 +4207,24 @@ impl Config {
             .filter(|r| *r > 0.0 && *r <= 1.0)
     }
 
+    /// The model's context window exactly as configured, or `None` when no
+    /// provider profile declares one.
+    ///
+    /// `None` means *unknown*, not "small". Report it to an operator as unset
+    /// rather than resolving it to [`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`],
+    /// which would present a stub as though it were the model's real capacity.
+    /// Use [`Config::effective_model_context_window`] when a number is required
+    /// for budget arithmetic.
+    #[must_use]
+    pub fn configured_model_context_window(&self, agent_alias: &str) -> Option<usize> {
+        // Provider config (config.toml) is the source of truth for this value.
+        self.resolved_model_provider_for_agent(agent_alias)
+            .and_then(|(_, _, provider_config)| provider_config.context_window)
+    }
+
     /// Returns the model's context window size (max input tokens).
-    /// Source: provider config `context_window` → fallback 32,000.
+    /// Source: provider config `context_window` →
+    /// [`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`].
     /// Does NOT check runtime profile (that's for output budget).
     #[must_use]
     pub fn effective_model_context_window(&self, agent_alias: &str) -> usize {
@@ -4216,7 +4238,7 @@ impl Config {
     pub fn resolved_model_context_window(&self, agent_alias: &str) -> ResolvedModelContextWindow {
         let Some(agent) = self.agents.get(agent_alias) else {
             return ResolvedModelContextWindow {
-                tokens: LEGACY_DEFAULT_CONTEXT_BUDGET,
+                tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
                 source: ModelContextWindowSource::CompatibilityFallback,
             };
         };
@@ -4273,7 +4295,7 @@ impl Config {
 
         configured_window.map_or(
             ResolvedModelContextWindow {
-                tokens: LEGACY_DEFAULT_CONTEXT_BUDGET,
+                tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
                 source: ModelContextWindowSource::CompatibilityFallback,
             },
             |tokens| ResolvedModelContextWindow {
@@ -4789,6 +4811,18 @@ fn default_delegate_agentic_timeout_secs() -> u64 {
 
 /// Valid temperature range for all paths (config, CLI, env override).
 pub const TEMPERATURE_RANGE: std::ops::RangeInclusive<f64> = 0.0..=2.0;
+
+/// Context window assumed when no provider profile declares one.
+///
+/// Deliberately conservative: it has to be safe for any model, which means it
+/// is almost always *wrong* for the model actually in use — a 1M-context model
+/// on a profile that omits `context_window` runs against this number. It exists
+/// so budget arithmetic has an operand, not because it describes any model.
+///
+/// Anything reporting to an operator must call
+/// [`Config::configured_model_context_window`] and say "not configured" when it
+/// returns `None`, rather than echoing this value as the model's real capacity.
+pub const UNCONFIGURED_CONTEXT_WINDOW_FALLBACK: usize = 32_000;
 
 /// Defaults to 0 so configs without an explicit `schema_version` are recognized
 /// as pre-versioning and get migrated.
@@ -23695,6 +23729,54 @@ max_height = 8
         assert_eq!(cfg.location, super::TodoTrackerLocation::Bottom);
         assert_eq!(cfg.width, 40);
         assert_eq!(cfg.max_height, 8);
+    }
+
+    /// The whole point of splitting the accessor: an operator-facing caller
+    /// must be able to tell "unconfigured" from a real 32,000, which a bare
+    /// `usize` cannot express.
+    #[::core::prelude::v1::test]
+    fn configured_context_window_reports_unset_distinctly_from_the_fallback() {
+        let mut cfg = super::Config::default();
+        cfg.providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .model = Some("qwen3".to_string());
+        cfg.agents.insert(
+            "coder".to_string(),
+            super::AliasedAgentConfig {
+                model_provider: "ollama.local".into(),
+                ..Default::default()
+            },
+        );
+
+        // A real referenced profile without a declaration is honestly
+        // unknown, while budget arithmetic retains its historical operand.
+        assert_eq!(cfg.configured_model_context_window("coder"), None);
+        // Budget arithmetic still gets an operand, unchanged from before.
+        assert_eq!(
+            cfg.effective_model_context_window("coder"),
+            super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        );
+
+        // Explicitly configuring the same numeric value remains distinguishable
+        // from the fallback.
+        cfg.providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .context_window = Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK);
+        assert_eq!(
+            cfg.configured_model_context_window("coder"),
+            Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn unconfigured_context_window_fallback_is_documented_stub_value() {
+        // Pinned so a change to the stub is a deliberate, reviewed edit — the
+        // value is load-bearing for trim budgets on unconfigured profiles.
+        assert_eq!(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK, 32_000);
     }
 
     #[::core::prelude::v1::test]

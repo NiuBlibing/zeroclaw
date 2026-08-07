@@ -879,7 +879,7 @@ async fn agent_turn_with_sop_reassembly(
     );
     let resolved_capacity = config.map_or(
         zeroclaw_config::schema::ResolvedModelContextWindow {
-            tokens: zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET,
+            tokens: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
             source: zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
         },
         |config| config.resolved_model_context_window_for_route(provider_name, model),
@@ -3393,7 +3393,7 @@ mod tests {
         context_token_budget: usize,
     ) -> zeroclaw_config::schema::ResolvedContextLimits {
         zeroclaw_config::schema::ResolvedContextLimits {
-            model_context_window: zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET,
+            model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
             context_token_budget,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
