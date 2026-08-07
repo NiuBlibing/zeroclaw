@@ -402,7 +402,11 @@ mod tests {
 
         // apply wrote to the shared root, not data or agent roots.
         assert!(
-            shared_dir.join("sops").join("new-sop").join("SOP.md").exists(),
+            shared_dir
+                .join("sops")
+                .join("new-sop")
+                .join("SOP.md")
+                .exists(),
             "new SOP must land under the shared root"
         );
         assert!(

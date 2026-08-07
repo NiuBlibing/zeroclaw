@@ -23963,8 +23963,7 @@ max_height = 8
 
         // Reload from disk and confirm the disable stuck.
         let written = std::fs::read_to_string(&config_path).unwrap();
-        let reloaded: Config =
-            toml::from_str(&written).expect("persisted config should reload");
+        let reloaded: Config = toml::from_str(&written).expect("persisted config should reload");
         assert!(
             !reloaded.sop.runtime_enabled(),
             "empty/unset sops_dir must keep the SOP runtime off after reload; \
