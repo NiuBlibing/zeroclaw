@@ -3233,7 +3233,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn convert_messages_with_only_image_marker() {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
-            content: "[IMAGE:data:image/png;base64,iVBORw0KGgo]".to_string(),
+            content: "[IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         }];
 
         let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
