@@ -16,10 +16,12 @@ pub struct ServedRoute {
     pub provider_name: String,
     pub model: String,
     pub context_limits: zeroclaw_config::schema::ResolvedContextLimits,
-    /// Whether the call served by this route reported provider token usage. When
-    /// `false`, the per-call `TurnEvent::Usage` frame carried no route limits, so
-    /// a terminal snapshot must be published to update consumers to this route's
-    /// window; when `true`, that per-call frame already carried them.
+    /// Whether the call served by this route emitted a per-call
+    /// `TurnEvent::Usage` frame (i.e. the provider returned `Some(usage)`, even
+    /// if its token counts were `None` — as kilocli/gemini-cli do). When
+    /// `false`, no per-call frame carried this route's limits, so a terminal
+    /// snapshot must be published to update consumers to this route's window;
+    /// when `true`, that per-call frame already carried them.
     pub reported_usage: bool,
 }
 

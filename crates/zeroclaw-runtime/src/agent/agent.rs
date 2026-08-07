@@ -9497,6 +9497,57 @@ mod tests {
         );
     }
 
+    // A provider that returns `Some(usage)` with `None` token counts (kilocli,
+    // gemini-cli) still emits a per-call frame carrying the route limits. The
+    // terminal snapshot must NOT also fire, or the client would get two frames
+    // for one call. The gate keys on whether a per-call frame was emitted, not
+    // on whether token counts were present.
+    #[tokio::test]
+    async fn no_terminal_snapshot_when_call_emits_usage_frame_without_token_counts() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        // Single response carrying usage WITHOUT token counts (kilocli-style).
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: Some(zeroclaw_providers::traits::TokenUsage::default()),
+                reasoning_content: None,
+            }]),
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed_with_steering_state("hello", event_tx, None, None)
+            .await
+            .expect("streamed turn should succeed");
+
+        let usage_frames = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter(|ev| matches!(ev, TurnEvent::Usage { .. }))
+            .count();
+        assert_eq!(
+            usage_frames, 1,
+            "a usage frame with no token counts must not also trigger a terminal snapshot"
+        );
+    }
+
     // A multi-iteration turn whose earlier call reports usage but whose final
     // call returns no usage must still publish a terminal snapshot for the final
     // served route. The gate keys on the FINAL call's usage, not the turn's

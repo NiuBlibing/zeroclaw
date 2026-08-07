@@ -853,6 +853,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             protocol_suppressed,
             response_streamed_live,
             reported_input_tokens,
+            call_emitted_usage_frame,
         ) = match chat_result {
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
@@ -876,6 +877,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     streamed_protocol_suppressed,
                     streamed_live_deltas,
                     interpreted.input_tokens,
+                    interpreted.emitted_usage_frame,
                 )
             }
             Err(e) => {
@@ -931,7 +933,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         if let Some(sink) = served_route_sink.as_ref()
             && let Some(served) = sink.lock().expect("served-route sink lock").as_mut()
         {
-            served.reported_usage = reported_input_tokens.is_some();
+            served.reported_usage = call_emitted_usage_frame;
         }
 
         let display_text = resolve_display_text(
