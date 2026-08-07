@@ -1235,6 +1235,18 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
     let mut current = String::new();
     let mut quote = QuoteState::None;
     let mut chars = command.chars().peekable();
+    // Track the current whitespace-delimited token so the stop-parsing token
+    // `--%` can be rejected. `--%` tells PowerShell to pass the remaining
+    // arguments to a native command verbatim without parsing, so `git --% push`
+    // would reach Git as `push` while policy only ever sees `--%` as the first
+    // argument. `token_body` accumulates the token with quote *delimiters*
+    // removed (so mixed forms like `-"-"%` collapse to `--%`), and
+    // `token_has_bare` records whether any character appeared outside quotes.
+    // A fully quoted `"--%"` is an ordinary literal and is left alone; the
+    // operator is rejected only when the collapsed body is `--%` and at least
+    // one character was bare.
+    let mut token_body = String::new();
+    let mut token_has_bare = false;
 
     while let Some(ch) = chars.next() {
         // Backtick changes PowerShell parsing in every quoting mode. Supporting
@@ -1250,11 +1262,15 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
                         current.push(ch);
                         chars.next();
                         current.push(ch);
+                        token_body.push(ch);
                         continue;
                     }
                     quote = QuoteState::None;
+                    current.push(ch);
+                } else {
+                    token_body.push(ch);
+                    current.push(ch);
                 }
-                current.push(ch);
             }
             QuoteState::Double => {
                 if ch == '"' {
@@ -1262,11 +1278,15 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
                         current.push(ch);
                         chars.next();
                         current.push(ch);
+                        token_body.push(ch);
                         continue;
                     }
                     quote = QuoteState::None;
+                    current.push(ch);
+                } else {
+                    token_body.push(ch);
+                    current.push(ch);
                 }
-                current.push(ch);
             }
             QuoteState::None => match ch {
                 '\'' => {
@@ -1277,11 +1297,24 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
                     quote = QuoteState::Double;
                     current.push(ch);
                 }
+                ' ' | '\t' => {
+                    if token_has_bare && token_body == "--%" {
+                        return None;
+                    }
+                    token_body.clear();
+                    token_has_bare = false;
+                    current.push(ch);
+                }
                 '|' => {
                     // `||` is a control-flow operator, not a pipeline.
                     if chars.peek() == Some(&'|') {
                         return None;
                     }
+                    if token_has_bare && token_body == "--%" {
+                        return None;
+                    }
+                    token_body.clear();
+                    token_has_bare = false;
                     let segment = current.trim();
                     if segment.is_empty() {
                         return None;
@@ -1294,12 +1327,20 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
                 ';' | '\r' | '\n' | '&' | '(' | ')' | '{' | '}' | '[' | ']' | '<' | '>' | '@' => {
                     return None;
                 }
-                _ => current.push(ch),
+                _ => {
+                    token_body.push(ch);
+                    token_has_bare = true;
+                    current.push(ch);
+                }
             },
         }
     }
 
     if quote != QuoteState::None {
+        return None;
+    }
+
+    if token_has_bare && token_body == "--%" {
         return None;
     }
 
@@ -3733,6 +3774,117 @@ mod tests {
             )
             .expect("low-risk PowerShell commands should not require approval");
         assert_eq!(risk, CommandRiskLevel::Low);
+    }
+
+    #[test]
+    fn powershell_stop_parsing_token_is_rejected_by_grammar() {
+        // `--%` is PowerShell's stop-parsing token: it strips itself and passes
+        // the remaining arguments to a native command verbatim. Without special
+        // handling the policy would classify `git --% push` by its first token
+        // `--%` (low risk) while Git actually receives `push`. The bounded
+        // grammar must reject the unquoted operator so it never reaches the
+        // named risk classifier.
+        assert_eq!(
+            split_powershell_pipeline_syntax("git --% push origin main"),
+            None
+        );
+        assert_eq!(
+            split_powershell_pipeline_syntax("git --% reset --hard"),
+            None
+        );
+        assert_eq!(split_simple_powershell_pipeline("git --% push"), None);
+        // Also rejected when it is the trailing token or inside a pipeline stage.
+        assert_eq!(split_powershell_pipeline_syntax("echo hi | git --%"), None);
+
+        // A quoted `--%` is an ordinary literal argument, not the operator, so
+        // it must NOT trip the guard (avoid over-blocking legitimate strings).
+        assert!(split_powershell_pipeline_syntax("echo \"--%\"").is_some());
+        assert!(split_powershell_pipeline_syntax("echo '--%'").is_some());
+        // A token that merely contains `--%` as a substring is not the operator.
+        assert!(split_powershell_pipeline_syntax("echo --%tail").is_some());
+
+        // Mixed quoting must not launder the operator: PowerShell assembles
+        // adjacent quoted and unquoted fragments into one token, so `-"-"%`,
+        // `"-"-%`, and `--"%"` all reach the parser as the stop-parsing `--%`
+        // while a naive "any quote makes it a literal" check would let them
+        // through. The guard collapses quote delimiters and still rejects them
+        // because at least one character of the token is bare.
+        assert_eq!(
+            split_powershell_pipeline_syntax("git -\"-\"% push origin main"),
+            None
+        );
+        assert_eq!(
+            split_powershell_pipeline_syntax("git \"-\"-% reset --hard"),
+            None
+        );
+        assert_eq!(split_powershell_pipeline_syntax("git --\"%\" push"), None);
+        assert_eq!(split_powershell_pipeline_syntax("git -'-'% push"), None);
+        // But a token whose `--%` is fully quoted stays a literal argument.
+        assert!(split_powershell_pipeline_syntax("echo x\"--%\"").is_some());
+    }
+
+    #[test]
+    fn validate_command_blocks_powershell_stop_parsing_git_mutation() {
+        // Default Windows-style policy: `git` is on the default allowlist and
+        // the policy is supervised with medium-risk approval enabled. Before the
+        // fix, `git --% push` was classified Low and ran without approval.
+        let p = default_policy();
+
+        for command in [
+            "git --% push origin main",
+            "git --% reset --hard",
+            "git --% clean -fdx",
+        ] {
+            let error = p
+                .validate_command_execution_for_shell(command, false, ShellDialect::PowerShell)
+                .expect_err("stop-parsing native mutation must not be silently allowed");
+            assert!(
+                error.contains("not allowed by security policy"),
+                "unexpected acceptance for {command}: {error}"
+            );
+        }
+
+        // Approval must not launder the stop-parsing token either: the command
+        // is rejected outright rather than downgraded to an approved mutation.
+        let approved = p.validate_command_execution_for_shell(
+            "git --% push origin main",
+            true,
+            ShellDialect::PowerShell,
+        );
+        assert!(
+            approved.is_err(),
+            "approval must not bypass the grammar guard"
+        );
+
+        // The equivalent parsed command is still governed normally: an ordinary
+        // `git push` remains a recognized medium-risk mutation.
+        assert_eq!(
+            p.command_risk_level_for_shell("git push origin main", ShellDialect::PowerShell),
+            CommandRiskLevel::Medium,
+        );
+    }
+
+    #[test]
+    fn powershell_stop_parsing_token_still_follows_trusted_optout() {
+        // The wildcard + disabled high-risk-blocking escape hatch intentionally
+        // skips the bounded grammar, exactly as it does for backticks and
+        // subexpressions. `--%` is not special-cased against that contract.
+        let trusted = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            trusted
+                .validate_command_execution_for_shell(
+                    "git --% push origin main",
+                    true,
+                    ShellDialect::PowerShell,
+                )
+                .is_ok(),
+            "trusted opt-out must keep bypassing the grammar for --% too"
+        );
     }
 
     #[test]

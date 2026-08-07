@@ -926,6 +926,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn wrapped_shell_blocks_powershell_stop_parsing_native_mutation() {
+        // `git --% push` would reach native Git as `push` on PowerShell while
+        // policy sees only `--%` as the first argument. The dialect-aware
+        // validator must reject it before the process is ever built, so the
+        // guard holds on this Unix host too.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["git".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = RateLimitedTool::new(
+            PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
+            security,
+        );
+
+        let result = tool
+            .execute(json!({"command": "git --% push origin main"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed by security policy")),
+            "stop-parsing native mutation must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn powershell_agent_shell_executes_safe_pipeline_and_rejects_dangerous_alias() {

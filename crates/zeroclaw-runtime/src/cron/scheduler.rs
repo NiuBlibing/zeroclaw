@@ -1928,6 +1928,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_job_command_blocks_powershell_stop_parsing_native_mutation() {
+        // Cron shares the same dialect-aware validator as the shell tool. On a
+        // PowerShell runtime, `git --% push` would strip `--%` and hand `push`
+        // to native Git while policy only sees `--%`; the bounded grammar must
+        // reject it so scheduled jobs cannot launder mutations through it.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["git".into()];
+        let job = test_job("git --% push origin main");
+        let security = test_security(&config);
+        let runtime = crate::platform::NativeRuntime::with_shell("pwsh".into());
+
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
+
+        assert!(!success);
+        assert!(
+            output.contains("blocked by security policy"),
+            "output: {output}"
+        );
+    }
+
+    #[tokio::test]
     async fn run_job_command_blocks_forbidden_option_assignment_path_argument() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
