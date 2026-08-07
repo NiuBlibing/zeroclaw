@@ -191,17 +191,17 @@ pub fn parse_execution_mode(s: &str) -> SopExecutionMode {
 
 // ── SOP directory helpers ───────────────────────────────────────
 
-/// Return the default SOPs directory: `<workspace>/sops`.
+/// Return the fallback SOPs directory: `<shared>/sops`.
 fn sops_dir(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join("sops")
 }
 
-/// Resolve the SOPs directory from config, falling back to workspace default.
+/// Resolve the SOPs directory from config, falling back to the shared default.
 ///
-/// A relative `config_dir` (the common case in the documented
-/// `<workspace>/sops` layout) resolves against `workspace_dir`; an
-/// absolute or `~`-prefixed value is used as-is (`Path::join` replaces
-/// the base entirely when the joined path is itself absolute).
+/// A relative `config_dir` resolves against `workspace_dir` (the shared
+/// workspace), so `sops` yields `<shared>/sops`; an absolute or `~`-prefixed
+/// value is used as-is (`Path::join` replaces the base entirely when the
+/// joined path is itself absolute).
 pub fn resolve_sops_dir(workspace_dir: &Path, config_dir: Option<&str>) -> PathBuf {
     match config_dir {
         Some(dir) if !dir.is_empty() => {

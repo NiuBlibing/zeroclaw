@@ -4170,8 +4170,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
 
-                // SOP loading is gated on `[sop] sops_dir`: unset disables all
-                // SOP runtime behavior, matching the documented rollback path.
+                // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
+                // (or empty) by default, so SOP runtime behavior is off until an
+                // operator opts in by setting a directory.
                 let (sop_engine, sop_audit) = if current_config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
                         zeroclaw_memory::create_memory_from_config(&current_config, None)?,
