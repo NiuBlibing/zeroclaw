@@ -582,6 +582,18 @@ impl AnthropicModelProvider {
                                 let b64 = img_ref[comma + 1..].trim().to_string();
                                 (mime, b64)
                             } else {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({
+                                        "error_key": "anthropic_image_marker_malformed_data_uri",
+                                    })),
+                                    "dropping image marker: data URI has no base64 payload"
+                                );
                                 continue;
                             }
                         } else if std::path::Path::new(img_ref.trim()).exists() {
@@ -603,9 +615,38 @@ impl AnthropicModelProvider {
                                     .to_string();
                                     (mime, b64)
                                 }
-                                Err(_) => continue,
+                                Err(error) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "error": format!("{error}"),
+                                                "error_key": "anthropic_image_local_read_failed",
+                                            })
+                                        ),
+                                        "dropping image marker: local file could not be read"
+                                    );
+                                    continue;
+                                }
                             }
                         } else {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "error_key": "anthropic_image_source_missing",
+                                })),
+                                "dropping image marker: source is neither a data URI nor an existing file"
+                            );
                             continue;
                         };
 
