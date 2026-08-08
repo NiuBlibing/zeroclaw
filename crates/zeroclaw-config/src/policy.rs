@@ -1248,14 +1248,6 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     command_names_equivalent(allowed, executable_base)
 }
 
-/// Split a PowerShell command into simple pipeline stages.
-///
-/// PowerShell is an expression language, not just a command launcher. The
-/// generic POSIX-oriented splitter cannot safely reason about constructs such
-/// as `(...)`, script blocks, type literals, call operators, or backtick
-/// escapes. This parser intentionally accepts only a bounded command grammar:
-/// bare command invocations, quoted/plain arguments, simple variable reads,
-/// and pipelines. Everything else fails closed.
 /// Decide whether a completed PowerShell token must be rejected by the bounded
 /// grammar. Two shapes are rejected because the token the later provider, path,
 /// allowlist, and risk checks would inspect differs from the argument
@@ -1273,6 +1265,14 @@ fn reject_powershell_token(has_bare: bool, has_quoted: bool, body: &str) -> bool
     has_bare && (has_quoted || body == "--%")
 }
 
+/// Split a PowerShell command into simple pipeline stages.
+///
+/// PowerShell is an expression language, not just a command launcher. The
+/// generic POSIX-oriented splitter cannot safely reason about constructs such
+/// as `(...)`, script blocks, type literals, call operators, or backtick
+/// escapes. This parser intentionally accepts only a bounded command grammar:
+/// bare command invocations, quoted/plain arguments, simple variable reads,
+/// and pipelines. Everything else fails closed.
 fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
     let mut segments = Vec::new();
     let mut current = String::new();
