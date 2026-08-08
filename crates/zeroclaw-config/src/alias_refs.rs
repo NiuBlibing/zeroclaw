@@ -1028,21 +1028,21 @@ fn collect_provider_refs(
     match category {
         ProviderCategory::Models => {
             for (name, agent) in sorted_agents(cfg) {
-                if agent.model_provider.trim() == target {
+                if ref_targets_profile(agent.model_provider.as_str(), &target) {
                     sites.push(RefSite::hard(
                         format!("agents.{name}.model_provider"),
                         ScrubAction::Refuse,
                         agent.model_provider.as_str(),
                     ));
                 }
-                if agent.classifier_provider.trim() == target {
+                if ref_targets_profile(agent.classifier_provider.as_str(), &target) {
                     sites.push(RefSite::soft(
                         format!("agents.{name}.classifier_provider"),
                         ScrubAction::ClearOptional,
                         agent.classifier_provider.as_str(),
                     ));
                 }
-                if agent.summary_provider.trim() == target {
+                if ref_targets_profile(agent.summary_provider.as_str(), &target) {
                     sites.push(RefSite::soft(
                         format!("agents.{name}.summary_provider"),
                         ScrubAction::ClearOptional,
@@ -1058,7 +1058,7 @@ fn collect_provider_refs(
                     let sp = &cfg.runtime_profiles[pname]
                         .context_compression
                         .summary_provider;
-                    if sp.trim() == target {
+                    if ref_targets_profile(sp.as_str(), &target) {
                         sites.push(RefSite::soft(
                             format!(
                                 "runtime_profiles.{pname}.context_compression.summary_provider"
@@ -1071,7 +1071,7 @@ fn collect_provider_refs(
             }
             for (ty, al, profile) in cfg.providers.models.iter_entries() {
                 for (i, fb) in profile.fallback.iter().enumerate() {
-                    if fb.trim() == target {
+                    if ref_targets_profile(fb.as_str(), &target) {
                         sites.push(RefSite::soft(
                             format!("providers.models.{ty}.{al}.fallback[{i}]"),
                             ScrubAction::DropFromVec { index: i },
@@ -1081,7 +1081,7 @@ fn collect_provider_refs(
                 }
             }
             for (i, route) in cfg.model_routes.iter().enumerate() {
-                if route.model_provider.trim() == target {
+                if ref_targets_profile(route.model_provider.as_str(), &target) {
                     sites.push(RefSite::soft(
                         format!("model_routes[{i}].model_provider"),
                         ScrubAction::DropFromVec { index: i },
@@ -1090,7 +1090,7 @@ fn collect_provider_refs(
                 }
             }
             for (i, route) in cfg.embedding_routes.iter().enumerate() {
-                if route.model_provider.trim() == target {
+                if ref_targets_profile(route.model_provider.as_str(), &target) {
                     sites.push(RefSite::soft(
                         format!("embedding_routes[{i}].model_provider"),
                         ScrubAction::DropFromVec { index: i },
@@ -1380,6 +1380,43 @@ mod tests {
         );
         assert_eq!(report.blockers.len(), 1);
         assert_eq!(report.scrubs.len(), 2);
+    }
+
+    #[test]
+    fn provider_models_three_segment_ref_targets_profile() {
+        let mut cfg = empty_config();
+        // three-segment ref selecting a model within the "default" profile
+        cfg.agents.insert(
+            "researcher".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.default.fast".into(),
+                ..Default::default()
+            },
+        );
+        // three-segment ref into a *different* profile alias must not match
+        cfg.agents.insert(
+            "triage".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.work.fast".into(),
+                ..Default::default()
+            },
+        );
+
+        let kind = provider_kind("anthropic");
+        let sites = find_all_references(&cfg, &kind, "default");
+        assert_eq!(
+            sites.len(),
+            1,
+            "only the anthropic.default.* ref targets profile alias `default`"
+        );
+        assert_eq!(sites[0].path, "agents.researcher.model_provider");
+        assert_eq!(sites[0].action, ScrubAction::Refuse);
+
+        let report = plan_delete(&cfg, &kind, "default");
+        assert!(
+            !report.allowed,
+            "a three-segment ref into the profile must still block its delete"
+        );
     }
 
     #[test]

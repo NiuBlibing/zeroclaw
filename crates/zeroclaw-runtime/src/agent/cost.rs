@@ -666,9 +666,9 @@ mod tests {
         let map = build_model_provider_pricing(&config);
 
         // Builder keys each alias separately.
-        assert!(map.get("custom.cheap").is_some(), "cheap alias has a slot");
+        assert!(map.contains_key("custom.cheap"), "cheap alias has a slot");
         assert!(
-            map.get("custom.premium").is_some(),
+            map.contains_key("custom.premium"),
             "premium alias has a slot"
         );
 

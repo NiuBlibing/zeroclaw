@@ -21216,8 +21216,10 @@ impl Config {
             if value.is_empty() {
                 continue;
             }
-            match value.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+            // Accepts `<type>.<alias>` or a three-segment `<type>.<alias>.<model>`
+            // (the model entry, if named, must exist under the profile).
+            match provider_profile_ref(value) {
+                Some((ty, inner)) => {
                     let exists = self
                         .get_map_keys(&format!("providers.models.{ty}"))
                         .is_some_and(|keys| keys.iter().any(|k| k == inner));
@@ -21230,8 +21232,24 @@ impl Config {
                             "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
+                    if let Some(model_alias) = value.splitn(3, '.').nth(2)
+                        && !model_alias.is_empty()
+                        && self
+                            .providers
+                            .models
+                            .find_model(ty, inner, model_alias)
+                            .is_none()
+                    {
+                        validation_bail!(
+                            DanglingReference,
+                            format!(
+                                "runtime_profiles.{palias}.context_compression.summary_provider"
+                            ),
+                            "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} but [providers.models.{ty}.{inner}.models.{model_alias}] is not configured",
+                        );
+                    }
                 }
-                _ => validation_bail!(
+                None => validation_bail!(
                     InvalidFormat,
                     format!("runtime_profiles.{palias}.context_compression.summary_provider"),
                     "runtime_profiles.{palias}.context_compression.summary_provider must be dotted form `<type>.<alias>` (got {value:?})",
@@ -21367,8 +21385,12 @@ impl Config {
                 if value.is_empty() {
                     continue;
                 }
-                match value.split_once('.') {
-                    Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                // classifier_provider / summary_provider point into
+                // providers.models and may carry a third `<model>` segment;
+                // tts_provider / transcription_provider are always two-segment.
+                // `provider_profile_ref` extracts `<type>.<alias>` for both.
+                match provider_profile_ref(value) {
+                    Some((ty, inner)) => {
                         let exists = self
                             .get_map_keys(&format!("{section_prefix}.{ty}"))
                             .is_some_and(|keys| keys.iter().any(|k| k == inner));
@@ -21379,8 +21401,25 @@ impl Config {
                                 "agents.{alias}.{field} = {value:?} but {section_prefix}.{ty}.{inner} is not configured",
                             );
                         }
+                        // A three-segment models ref names a model entry under
+                        // the profile's `models` subtable — validate it exists.
+                        if *section_prefix == "providers.models"
+                            && let Some(model_alias) = value.splitn(3, '.').nth(2)
+                            && !model_alias.is_empty()
+                            && self
+                                .providers
+                                .models
+                                .find_model(ty, inner, model_alias)
+                                .is_none()
+                        {
+                            validation_bail!(
+                                DanglingReference,
+                                format!("agents.{alias}.{field}"),
+                                "agents.{alias}.{field} = {value:?} but [providers.models.{ty}.{inner}.models.{model_alias}] is not configured",
+                            );
+                        }
                     }
-                    _ => validation_bail!(
+                    None => validation_bail!(
                         InvalidFormat,
                         format!("agents.{alias}.{field}"),
                         "agents.{alias}.{field} must be dotted form `<type>.<alias>` (got {value:?})",
@@ -38907,6 +38946,61 @@ level = "supervised"
         let err = cfg
             .validate()
             .expect_err("dangling model alias must fail validation")
+            .to_string();
+        assert!(
+            err.contains("models.nope"),
+            "error should name the missing model entry, got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_accepts_three_segment_classifier_and_summary_refs() {
+        // classifier_provider / summary_provider (agent + profile) point into
+        // providers.models and must accept a three-segment `<type>.<alias>.<model>`
+        // ref, validating the named model entry — same as model_provider.
+        let base = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+api_key = "sk-x"
+
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+
+[risk_profiles.default]
+level = "supervised"
+
+[runtime_profiles.default]
+"#;
+        let ok = format!(
+            "{base}\n[agents.a]\nmodel_provider = \"openai.gw.fast\"\nclassifier_provider = \"openai.gw.fast\"\nsummary_provider = \"openai.gw.fast\"\nrisk_profile = \"default\"\nruntime_profile = \"default\"\n"
+        );
+        let cfg: Config = toml::from_str(&ok).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "three-segment classifier/summary refs must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        // Profile-level context_compression.summary_provider, three-segment.
+        let ok_profile = format!(
+            "{base}\ncontext_compression.summary_provider = \"openai.gw.fast\"\n[agents.a]\nmodel_provider = \"openai.gw.fast\"\nrisk_profile = \"default\"\nruntime_profile = \"default\"\n"
+        );
+        let cfg: Config = toml::from_str(&ok_profile).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "three-segment profile summary_provider must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        // Dangling model alias in a three-segment classifier ref → error.
+        let bad = format!(
+            "{base}\n[agents.a]\nmodel_provider = \"openai.gw.fast\"\nclassifier_provider = \"openai.gw.nope\"\nrisk_profile = \"default\"\nruntime_profile = \"default\"\n"
+        );
+        let cfg: Config = toml::from_str(&bad).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("dangling classifier model alias must fail")
             .to_string();
         assert!(
             err.contains("models.nope"),

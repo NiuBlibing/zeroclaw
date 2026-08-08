@@ -203,9 +203,9 @@ The `custom` slot requires `uri`. See [Custom providers](./custom.md).
 
 ## Picking which provider an agent uses
 
-Agents reference a provider by dotted alias. Provider entries on their own do nothing.
+Agents reference a provider by dotted alias — two-segment `<type>.<alias>` for the profile, or three-segment `<type>.<alias>.<model_alias>` to select a model in its `models` subtable. Provider entries on their own do nothing.
 
-`risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models.<type>.<alias>]` entry, or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry.
+`risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models.<type>.<alias>]` entry (or, for a three-segment ref, to a configured `[providers.models.<type>.<alias>.models.<model_alias>]` model entry), or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry.
 
 For multiple agents pointing at different providers, see [Routing](./routing.md).
 

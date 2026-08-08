@@ -1119,7 +1119,7 @@ fn api_key_and_uri_for_provider(
     provider_name: &str,
     fallback: Option<&zeroclaw_config::schema::ModelProviderConfig>,
 ) -> (Option<String>, Option<String>) {
-    if let Some((fam, al)) = provider_name.split_once('.')
+    if let Some((fam, al)) = zeroclaw_config::schema::provider_profile_ref(provider_name)
         && let Some(entry) = config.providers.models.find(fam, al)
     {
         return (entry.api_key.clone(), entry.uri.clone());

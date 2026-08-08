@@ -2070,16 +2070,16 @@ impl Agent {
                     .and_then(|r| r.api_key.as_deref());
                 let api_key = route_api_key.or(default_api_key);
 
-                let runtime_options = new_model_provider
-                    .split_once('.')
-                    .map(|(family, alias)| {
-                        zeroclaw_providers::provider_runtime_options_for_alias(
-                            full_config.as_ref(),
-                            family,
-                            alias,
-                        )
-                    })
-                    .unwrap_or_default();
+                let runtime_options =
+                    zeroclaw_config::schema::provider_profile_ref(&new_model_provider)
+                        .map(|(family, alias)| {
+                            zeroclaw_providers::provider_runtime_options_for_alias(
+                                full_config.as_ref(),
+                                family,
+                                alias,
+                            )
+                        })
+                        .unwrap_or_default();
 
                 zeroclaw_providers::create_routed_model_provider_with_options(
                     full_config.as_ref(),
@@ -3157,19 +3157,23 @@ pub async fn run(
     let mut effective_config = config;
     if let Some(ref p) = provider_override {
         // When a model_provider override is specified, ensure that model_provider type exists
-        // in models and update the agent's model_provider to reference it.
-        let (type_key, alias_key) = p.split_once('.').unwrap_or((p.as_str(), agent_alias));
+        // in models and update the agent's model_provider to reference it. The
+        // override may be three-segment (`<type>.<alias>.<model>`); key the
+        // profile off the first two segments and preserve the whole ref.
+        let (type_key, alias_key) =
+            zeroclaw_config::schema::provider_profile_ref(p).unwrap_or((p.as_str(), agent_alias));
         effective_config
             .providers
             .models
             .ensure(type_key, alias_key);
         if let Some(agent_cfg) = effective_config.agents.get_mut(agent_alias) {
-            agent_cfg.model_provider = format!("{type_key}.{alias_key}").into();
+            agent_cfg.model_provider = p.as_str().into();
         }
     }
     // Apply model/temperature overrides to the agent's resolved provider entry.
     if let Some(agent_cfg) = effective_config.agents.get(agent_alias)
-        && let Some((fam, ali)) = agent_cfg.model_provider.split_once('.')
+        && let Some((fam, ali)) =
+            zeroclaw_config::schema::provider_profile_ref(agent_cfg.model_provider.as_str())
         && let Some(entry) = effective_config.providers.models.ensure(fam, ali)
     {
         if let Some(m) = model_override {
