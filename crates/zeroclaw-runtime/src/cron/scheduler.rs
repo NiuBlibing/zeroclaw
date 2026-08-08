@@ -1955,6 +1955,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_job_command_blocks_powershell_mixed_quoted_provider_path() {
+        // A scheduled job must not launder an `Env:` provider read past policy
+        // by splitting the provider prefix with a quote: `cat E'nv:'PATH` binds
+        // as `Env:PATH` on PowerShell. The bounded grammar rejects the mixed
+        // quoted/unquoted token through the same validator cron uses.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["cat".into()];
+        let job = test_job("cat E'nv:'PATH");
+        let security = test_security(&config);
+        let runtime = crate::platform::NativeRuntime::with_shell("pwsh".into());
+
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
+
+        assert!(!success);
+        assert!(
+            output.contains("blocked by security policy"),
+            "output: {output}"
+        );
+    }
+
+    #[tokio::test]
     async fn run_job_command_blocks_forbidden_option_assignment_path_argument() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;

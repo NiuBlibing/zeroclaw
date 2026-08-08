@@ -961,6 +961,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn wrapped_shell_blocks_powershell_mixed_quoted_provider_path() {
+        // `cat E'nv:'PATH` binds as the `Env:PATH` provider read on PowerShell,
+        // but the interior quote hides the `Env:` prefix from policy's raw-token
+        // provider check. The bounded grammar rejects the mixed quoted/unquoted
+        // token so it is blocked before the process is ever built.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["cat".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = RateLimitedTool::new(
+            PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
+            security,
+        );
+
+        let result = tool
+            .execute(json!({"command": "cat E'nv:'PATH"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed by security policy")),
+            "mixed-quoted provider path must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn powershell_agent_shell_executes_safe_pipeline_and_rejects_dangerous_alias() {

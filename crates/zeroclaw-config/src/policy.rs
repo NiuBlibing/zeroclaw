@@ -1256,23 +1256,50 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
 /// escapes. This parser intentionally accepts only a bounded command grammar:
 /// bare command invocations, quoted/plain arguments, simple variable reads,
 /// and pipelines. Everything else fails closed.
+/// Decide whether a completed PowerShell token must be rejected by the bounded
+/// grammar. Two shapes are rejected because the token the later provider, path,
+/// allowlist, and risk checks would inspect differs from the argument
+/// PowerShell actually binds:
+///
+///   * Mixed quoted and unquoted fragments in one token (`E'nv:'PATH`,
+///     `C':'\win.ini`). PowerShell concatenates them before binding, so the
+///     raw token with embedded quote delimiters can hide a provider path,
+///     drive prefix, or `..` traversal.
+///   * The bare stop-parsing token `--%` (also matched via the collapsed body
+///     for forms whose quote delimiters were removed).
+///
+/// Fully bare and fully quoted tokens are accepted and parsed normally.
+fn reject_powershell_token(has_bare: bool, has_quoted: bool, body: &str) -> bool {
+    (has_bare && has_quoted) || (has_bare && body == "--%")
+}
+
 fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = QuoteState::None;
     let mut chars = command.chars().peekable();
-    // Track the current whitespace-delimited token so the stop-parsing token
-    // `--%` can be rejected. `--%` tells PowerShell to pass the remaining
-    // arguments to a native command verbatim without parsing, so `git --% push`
-    // would reach Git as `push` while policy only ever sees `--%` as the first
-    // argument. `token_body` accumulates the token with quote *delimiters*
-    // removed (so mixed forms like `-"-"%` collapse to `--%`), and
-    // `token_has_bare` records whether any character appeared outside quotes.
-    // A fully quoted `"--%"` is an ordinary literal and is left alone; the
-    // operator is rejected only when the collapsed body is `--%` and at least
-    // one character was bare.
+    // Track each whitespace-delimited token so the bounded grammar can reject
+    // two PowerShell constructs that would otherwise let policy inspect a token
+    // different from the one PowerShell binds:
+    //
+    //   * The stop-parsing token `--%`, which makes PowerShell pass the rest of
+    //     the line to a native command verbatim (`git --% push` reaches Git as
+    //     `push` while policy only sees `--%`).
+    //   * Mixed quoted/unquoted fragments in a single argument. PowerShell
+    //     concatenates adjacent fragments before binding, so `E'nv:'PATH` binds
+    //     as `Env:PATH` and `C':'\win.ini` as `C:\win.ini`. The later provider,
+    //     path, allowlist, and risk checks see the raw token with quote
+    //     delimiters still embedded, so a mixed token can hide a provider path,
+    //     drive prefix, or `..` traversal from them.
+    //
+    // `token_body` accumulates the token with quote *delimiters* removed (so
+    // `-"-"%` collapses to `--%`). `token_has_bare` records an unquoted
+    // character and `token_has_quoted` records a quote delimiter; a token with
+    // both is a mixed construction and is rejected. Fully bare and fully quoted
+    // tokens are left for normal parsing.
     let mut token_body = String::new();
     let mut token_has_bare = false;
+    let mut token_has_quoted = false;
 
     while let Some(ch) = chars.next() {
         // Backtick changes PowerShell parsing in every quoting mode. Supporting
@@ -1317,18 +1344,21 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
             QuoteState::None => match ch {
                 '\'' => {
                     quote = QuoteState::Single;
+                    token_has_quoted = true;
                     current.push(ch);
                 }
                 '"' => {
                     quote = QuoteState::Double;
+                    token_has_quoted = true;
                     current.push(ch);
                 }
                 ' ' | '\t' => {
-                    if token_has_bare && token_body == "--%" {
+                    if reject_powershell_token(token_has_bare, token_has_quoted, &token_body) {
                         return None;
                     }
                     token_body.clear();
                     token_has_bare = false;
+                    token_has_quoted = false;
                     current.push(ch);
                 }
                 '|' => {
@@ -1336,11 +1366,12 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
                     if chars.peek() == Some(&'|') {
                         return None;
                     }
-                    if token_has_bare && token_body == "--%" {
+                    if reject_powershell_token(token_has_bare, token_has_quoted, &token_body) {
                         return None;
                     }
                     token_body.clear();
                     token_has_bare = false;
+                    token_has_quoted = false;
                     let segment = current.trim();
                     if segment.is_empty() {
                         return None;
@@ -1366,7 +1397,7 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
         return None;
     }
 
-    if token_has_bare && token_body == "--%" {
+    if reject_powershell_token(token_has_bare, token_has_quoted, &token_body) {
         return None;
     }
 
@@ -3877,8 +3908,11 @@ mod tests {
         );
         assert_eq!(split_powershell_pipeline_syntax("git --\"%\" push"), None);
         assert_eq!(split_powershell_pipeline_syntax("git -'-'% push"), None);
-        // But a token whose `--%` is fully quoted stays a literal argument.
-        assert!(split_powershell_pipeline_syntax("echo x\"--%\"").is_some());
+        // A fully quoted `--%` stays a literal argument (no bare character).
+        assert!(split_powershell_pipeline_syntax("echo \"--%\"").is_some());
+        // But `x"--%"` is a mixed bare+quoted token (PowerShell binds it as
+        // `x--%`), so it is rejected by the mixed-quoting guard.
+        assert_eq!(split_powershell_pipeline_syntax("echo x\"--%\""), None);
     }
 
     #[test]
@@ -3919,6 +3953,63 @@ mod tests {
         assert_eq!(
             p.command_risk_level_for_shell("git push origin main", ShellDialect::PowerShell),
             CommandRiskLevel::Medium,
+        );
+    }
+
+    #[test]
+    fn powershell_grammar_rejects_mixed_quoted_tokens() {
+        // PowerShell concatenates adjacent quoted and unquoted fragments before
+        // binding an argument, so a token that mixes bare and quoted characters
+        // reaches the native command as a different string than policy's later
+        // provider, path, allowlist, and risk checks inspect. The bounded
+        // grammar rejects such tokens so those checks never see a laundered
+        // provider path, drive prefix, or `..` traversal.
+        for command in [
+            // `Env:`/provider access hidden by an interior quote.
+            "cat E'nv:'PATH",
+            "cat \"env\":path",
+            // Drive prefix split by a quote: binds as `C:\Windows\win.ini`.
+            "cat C':'\\Windows\\win.ini",
+            // `..` traversal split across a quote boundary.
+            "cat .'.'\\secret.txt",
+            "cat \"..\"\\secret.txt",
+        ] {
+            assert_eq!(
+                split_powershell_pipeline_syntax(command),
+                None,
+                "mixed quoted/unquoted token must be rejected: {command}"
+            );
+        }
+
+        // Fully bare and fully quoted tokens remain valid — only the *mix* is
+        // rejected, so ordinary quoted arguments are not over-blocked.
+        assert!(split_powershell_pipeline_syntax("cat env:path").is_some());
+        assert!(split_powershell_pipeline_syntax("cat \"env:path\"").is_some());
+        assert!(split_powershell_pipeline_syntax("cat 'env:path'").is_some());
+        assert!(split_powershell_pipeline_syntax("cat \"my file.txt\"").is_some());
+    }
+
+    #[test]
+    fn validate_blocks_powershell_provider_hidden_by_mixed_quoting() {
+        // End-to-end through the dialect-aware validator: a default-allowlisted
+        // read command must not launder an `Env:` provider read past policy by
+        // splitting the provider prefix with a quote.
+        let p = default_policy();
+        let denied = p.validate_command_execution_for_shell(
+            "cat E'nv:'PATH",
+            true,
+            ShellDialect::PowerShell,
+        );
+        assert!(
+            denied.is_err(),
+            "quote-hidden provider path must be rejected, got {denied:?}"
+        );
+
+        // The unobscured provider form is still recognized and blocked too, so
+        // the guard is not the only thing standing between policy and `Env:`.
+        assert!(
+            p.command_risk_level_for_shell("cat env:path", ShellDialect::PowerShell)
+                == CommandRiskLevel::High
         );
     }
 
