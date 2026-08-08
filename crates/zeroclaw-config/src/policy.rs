@@ -1270,7 +1270,7 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
 ///
 /// Fully bare and fully quoted tokens are accepted and parsed normally.
 fn reject_powershell_token(has_bare: bool, has_quoted: bool, body: &str) -> bool {
-    (has_bare && has_quoted) || (has_bare && body == "--%")
+    has_bare && (has_quoted || body == "--%")
 }
 
 fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
