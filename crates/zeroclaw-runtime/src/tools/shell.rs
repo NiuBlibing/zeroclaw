@@ -1137,7 +1137,7 @@ mod tests {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
             .with_persistent_writes(false);
         let result = tool
-            .execute(json!({"command": "ls /nonexistent_dir_xyz_4627"}))
+            .execute(json!({"command": "ls nonexistent_dir_xyz_4627"}))
             .await
             .expect("command should return a result");
         assert!(!result.success);
