@@ -298,6 +298,17 @@ impl Tool for ShellTool {
             }
         }
 
+        if let Some(path) = self
+            .security
+            .forbidden_workspace_path_argument_for_shell(command, self.runtime.shell_dialect())
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Path blocked by security policy: {path}")),
+            });
+        }
+
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
@@ -588,7 +599,7 @@ mod tests {
     use crate::platform::{DockerRuntime, NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use zeroclaw_config::schema::DockerRuntimeConfig;
-    use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
+    use zeroclaw_tools::wrappers::RateLimitedTool;
 
     #[tokio::test]
     async fn get_session_id_returns_scoped_session_key() {
@@ -672,17 +683,10 @@ mod tests {
             .expect("medium-risk test command should have a base command")
     }
 
-    /// Returns the fully-wrapped shell tool as it is composed in production:
-    /// RateLimited(PathGuarded(ShellTool)).  Tests that verify path-blocking or
-    /// rate-limiting behaviour must use this helper so they exercise the wrappers.
-    fn wrapped_shell(security: Arc<SecurityPolicy>) -> RateLimitedTool<PathGuardedTool<ShellTool>> {
-        RateLimitedTool::new(
-            PathGuardedTool::new(
-                ShellTool::new(security.clone(), test_runtime()),
-                security.clone(),
-            ),
-            security,
-        )
+    /// Returns the shell tool as composed in production. ShellTool owns the
+    /// runtime-dialect-aware workspace path scan; the outer wrapper rate-limits.
+    fn wrapped_shell(security: Arc<SecurityPolicy>) -> RateLimitedTool<ShellTool> {
+        RateLimitedTool::new(ShellTool::new(security.clone(), test_runtime()), security)
     }
 
     #[test]
@@ -905,10 +909,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
-        let tool = RateLimitedTool::new(
-            PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
-            security,
-        );
+        let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
 
         let result = tool
             .execute(json!({"command": "cat ..\\secret.txt"}))
@@ -940,10 +941,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
-        let tool = RateLimitedTool::new(
-            PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
-            security,
-        );
+        let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
 
         let result = tool
             .execute(json!({"command": "git --% push origin main"}))
@@ -975,10 +973,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
-        let tool = RateLimitedTool::new(
-            PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
-            security,
-        );
+        let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
 
         let result = tool
             .execute(json!({"command": "cat E'nv:'PATH"}))
@@ -1212,6 +1207,61 @@ mod tests {
                 .unwrap_or("")
                 .contains("Path blocked")
         );
+    }
+
+    /// End-to-end regression for the shell workspace-boundary bypass: driving
+    /// the REAL wrapped shell tool, a write through an in-workspace symlink
+    /// pointing outside must be refused before the command runs, and nothing may
+    /// be created at the target. This covers only the direct path-shaped
+    /// redirect form the static scan can see; dynamic forms (scripts,
+    /// expansion, races) are outside this layer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_blocks_symlink_escape_end_to_end() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_shell_e2e_symlink_escape_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // `link` inside the workspace points at the outside directory.
+        symlink(&outside, workspace.join("link")).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let tool = wrapped_shell(security);
+
+        let result = tool
+            .execute(json!({"command": "echo pwned > link/escape.txt", "approved": true}))
+            .await
+            .expect("shell tool must return a result");
+
+        assert!(!result.success, "the escaping write must be refused");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked"),
+            "expected a path-block error, got: {:?}",
+            result.error
+        );
+        assert!(
+            !outside.join("escape.txt").exists(),
+            "no file may be written outside the workspace through the symlink"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

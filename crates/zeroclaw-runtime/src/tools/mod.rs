@@ -285,11 +285,8 @@ pub fn default_tools_with_runtime(
     let persistent_writes = runtime.has_filesystem_access();
     vec![
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(
-                ShellTool::new(security.clone(), runtime.clone())
-                    .with_persistent_writes(persistent_writes),
-                security.clone(),
-            ),
+            ShellTool::new(security.clone(), runtime.clone())
+                .with_persistent_writes(persistent_writes),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
@@ -586,17 +583,14 @@ pub fn all_tools_with_runtime(
     // snapshot below.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(
-                ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox)
-                    .with_timeout_secs(if security.shell_timeout_secs > 0 {
-                        security.shell_timeout_secs
-                    } else {
-                        root_config.shell_tool.timeout_secs
-                    })
-                    .with_tui_env(tui_env)
-                    .with_persistent_writes(persistent_writes),
-                security.clone(),
-            ),
+            ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox)
+                .with_timeout_secs(if security.shell_timeout_secs > 0 {
+                    security.shell_timeout_secs
+                } else {
+                    root_config.shell_tool.timeout_secs
+                })
+                .with_tui_env(tui_env)
+                .with_persistent_writes(persistent_writes),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
