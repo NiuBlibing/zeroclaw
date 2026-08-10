@@ -14,7 +14,13 @@ const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/we
 /// never rejected by these caps — they exist so a small payload declaring huge
 /// dimensions is refused instead of allocated.
 const MAX_DECODED_IMAGE_DIMENSION: u32 = 16_384;
-const MAX_DECODED_IMAGE_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_DECODED_IMAGE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Aggregate decode budget for one `prepare_messages_for_provider` call.
+/// Once cumulative decoded allocations reach this threshold, remaining
+/// candidate images are skipped. This bounds total resource consumption
+/// when many images are present in history.
+const AGGREGATE_DECODE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Per-path cache for resolved local image data URIs. Keyed by absolute
 /// path; stores `(len, mtime)` for freshness checks (`(0, 0)` sentinel
@@ -507,6 +513,7 @@ async fn normalize_native_tool_result_json(
     remote_client: &Client,
     ctx: &ImageNormalizeCtx<'_>,
     cache: Option<&mut LocalImageCache>,
+    remaining_budget: &mut u64,
 ) -> Option<(String, bool)> {
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str::<serde_json::Value>(content)
     else {
@@ -522,8 +529,16 @@ async fn normalize_native_tool_result_json(
         return None;
     }
 
-    let normalized =
-        normalize_image_references(&refs, config, max_bytes, remote_client, ctx, cache).await;
+    let normalized = normalize_image_references(
+        &refs,
+        config,
+        max_bytes,
+        remote_client,
+        ctx,
+        cache,
+        remaining_budget,
+    )
+    .await;
     let new_inner = compose_multimodal_content(
         &cleaned_text,
         &normalized.data_uris,
@@ -590,20 +605,43 @@ async fn prepare_messages_inner(
         });
     }
 
-    // Normalize every image marker first, then enforce the per-request image
-    // cap further below based only on images that *successfully* normalize.
-    // Trimming the oldest images *before* normalization is unsafe: a newer
-    // image ref that fails to load would evict an older valid one that could
-    // still have been sent (see `skipped_images_do_not_consume_image_budget`).
-    // The post-normalization cap keeps the most recent successful images and
-    // prevents conversations from sticking once the cumulative count crosses
-    // the threshold, so no pre-normalization trim is needed here.
+    // Apply per-request image cap and age trimming *before* normalization to
+    // bound the number of candidates we decode. Full pixel validation is now
+    // CPU and memory intensive (unlike the prior header-only sniff), so
+    // decoding every candidate in a long history would create an unbounded
+    // resource sink even though only `max_images` are sent to the provider.
+    //
+    // Trade-off: a failed newer image can now consume budget and evict an
+    // older valid one. This is acceptable because (1) the aggregate decode
+    // budget further bounds total work, (2) most images that pass the
+    // encoded-byte check will decode successfully, and (3) preventing the
+    // resource exhaustion hazard takes precedence over the marginal UX loss.
     let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
     let latest_tool_indices = latest_tool_result_indices(messages);
 
-    let mut normalized_messages = Vec::with_capacity(messages.len());
+    // First pass: apply age-based trimming when configured.
+    let age_trimmed = if config.max_image_turns > 0 {
+        trim_images_by_age(messages, config.max_image_turns)
+    } else {
+        messages.to_vec()
+    };
+
+    // Second pass: apply per-request image cap before normalization.
+    let candidate_messages =
+        if count_image_markers_with_latest_tool_results(&age_trimmed, &latest_tool_indices)
+            > max_images
+        {
+            trim_old_images(&age_trimmed, max_images)
+        } else {
+            age_trimmed
+        };
+
+    // Track aggregate decode budget across all normalization in this call.
+    let mut remaining_decode_budget = AGGREGATE_DECODE_BUDGET_BYTES;
+
+    let mut normalized_messages = Vec::with_capacity(candidate_messages.len());
     let mut has_successful_images = false;
-    for (index, message) in messages.iter().enumerate() {
+    for (index, message) in candidate_messages.iter().enumerate() {
         if !should_normalize_message_images(index, message, &latest_tool_indices) {
             normalized_messages.push(replay_message_without_stale_tool_images(
                 index,
@@ -624,6 +662,7 @@ async fn prepare_messages_inner(
                     role: &message.role,
                 },
                 cache.as_deref_mut(),
+                &mut remaining_decode_budget,
             )
             .await
         {
@@ -651,6 +690,7 @@ async fn prepare_messages_inner(
                 role: &message.role,
             },
             cache.as_deref_mut(),
+            &mut remaining_decode_budget,
         )
         .await;
         let content = compose_multimodal_content(
@@ -853,6 +893,7 @@ async fn normalize_image_references(
     remote_client: &Client,
     ctx: &ImageNormalizeCtx<'_>,
     mut cache: Option<&mut LocalImageCache>,
+    remaining_budget: &mut u64,
 ) -> NormalizedImageReferences {
     let mut data_uris = Vec::with_capacity(refs.len());
     let mut skipped_count = 0usize;
@@ -864,6 +905,7 @@ async fn normalize_image_references(
             max_bytes,
             remote_client,
             cache.as_deref_mut(),
+            &mut *remaining_budget,
         )
         .await
         {
@@ -1001,9 +1043,10 @@ async fn normalize_image_reference(
     max_bytes: usize,
     remote_client: &Client,
     cache: Option<&mut LocalImageCache>,
+    remaining_budget: &mut u64,
 ) -> anyhow::Result<String> {
     if source.starts_with("data:") {
-        return normalize_data_uri(source, max_bytes);
+        return normalize_data_uri(source, max_bytes, remaining_budget).await;
     }
 
     if source.starts_with("http://") || source.starts_with("https://") {
@@ -1014,16 +1057,20 @@ async fn normalize_image_reference(
             .into());
         }
 
-        return normalize_remote_image(source, max_bytes, remote_client).await;
+        return normalize_remote_image(source, max_bytes, remote_client, remaining_budget).await;
     }
 
     match cache {
-        Some(c) => normalize_local_image_cached(source, max_bytes, c).await,
-        None => normalize_local_image(source, max_bytes).await,
+        Some(c) => normalize_local_image_cached(source, max_bytes, c, remaining_budget).await,
+        None => normalize_local_image(source, max_bytes, remaining_budget).await,
     }
 }
 
-fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> {
+async fn normalize_data_uri(
+    source: &str,
+    max_bytes: usize,
+    remaining_budget: &mut u64,
+) -> anyhow::Result<String> {
     let Some(comma_idx) = source.find(',') else {
         return Err(MultimodalError::InvalidMarker {
             input: source.to_string(),
@@ -1061,7 +1108,17 @@ fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> 
         })?;
 
     validate_size(source, decoded.len(), max_bytes)?;
-    validate_image_content(source, &mime, &decoded)?;
+
+    let allocation = validate_image_content(source, &mime, &decoded).await?;
+    if allocation > *remaining_budget {
+        return Err(MultimodalError::CorruptImage {
+            input: source.to_string(),
+            mime: mime.clone(),
+            reason: "aggregate decode budget exhausted".to_string(),
+        }
+        .into());
+    }
+    *remaining_budget = remaining_budget.saturating_sub(allocation);
 
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(decoded)))
 }
@@ -1070,6 +1127,7 @@ async fn normalize_remote_image(
     source: &str,
     max_bytes: usize,
     remote_client: &Client,
+    remaining_budget: &mut u64,
 ) -> anyhow::Result<String> {
     let response = remote_client.get(source).send().await.map_err(|error| {
         MultimodalError::RemoteFetchFailed {
@@ -1116,12 +1174,26 @@ async fn normalize_remote_image(
     })?;
 
     validate_mime(source, &mime)?;
-    validate_image_content(source, &mime, bytes.as_ref())?;
+
+    let allocation = validate_image_content(source, &mime, bytes.as_ref()).await?;
+    if allocation > *remaining_budget {
+        return Err(MultimodalError::CorruptImage {
+            input: source.to_string(),
+            mime: mime.clone(),
+            reason: "aggregate decode budget exhausted".to_string(),
+        }
+        .into());
+    }
+    *remaining_budget = remaining_budget.saturating_sub(allocation);
 
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
 
-async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result<String> {
+async fn normalize_local_image(
+    source: &str,
+    max_bytes: usize,
+    remaining_budget: &mut u64,
+) -> anyhow::Result<String> {
     let path = Path::new(source);
     if !path.exists() || !path.is_file() {
         return Err(MultimodalError::ImageSourceNotFound {
@@ -1160,18 +1232,29 @@ async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result
         })?;
 
     validate_mime(source, &mime)?;
-    validate_image_content(source, &mime, &bytes)?;
+
+    let allocation = validate_image_content(source, &mime, &bytes).await?;
+    if allocation > *remaining_budget {
+        return Err(MultimodalError::CorruptImage {
+            input: source.to_string(),
+            mime: mime.clone(),
+            reason: "aggregate decode budget exhausted".to_string(),
+        }
+        .into());
+    }
+    *remaining_budget = remaining_budget.saturating_sub(allocation);
 
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
 
 /// Cache-aware local image loader. On a hit (path + metadata unchanged) returns
 /// the stored data URI without touching the filesystem. Files under `/uploads/`
-/// are content-addressed and treated as immutable — checked once, never re-read.
+/// are content-addressed and treated as immutable ��� checked once, never re-read.
 async fn normalize_local_image_cached(
     source: &str,
     max_bytes: usize,
     cache: &mut LocalImageCache,
+    remaining_budget: &mut u64,
 ) -> anyhow::Result<String> {
     let path = Path::new(source);
     if !path.exists() || !path.is_file() {
@@ -1232,7 +1315,17 @@ async fn normalize_local_image_cached(
         })?;
 
     validate_mime(source, &mime)?;
-    validate_image_content(source, &mime, &bytes)?;
+
+    let allocation = validate_image_content(source, &mime, &bytes).await?;
+    if allocation > *remaining_budget {
+        return Err(MultimodalError::CorruptImage {
+            input: source.to_string(),
+            mime: mime.clone(),
+            reason: "aggregate decode budget exhausted".to_string(),
+        }
+        .into());
+    }
+    *remaining_budget = remaining_budget.saturating_sub(allocation);
 
     let data_uri = format!("data:{mime};base64,{}", STANDARD.encode(&bytes));
     cache.insert(source.to_string(), cache_len, mtime, data_uri.clone());
@@ -1274,7 +1367,10 @@ fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
 /// The decode is bounded by `Limits` so this validation cannot itself become a
 /// decompression-bomb sink: a small payload declaring enormous dimensions is
 /// rejected here rather than being allocated.
-fn validate_image_content(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Result<()> {
+///
+/// Returns the approximate decoded memory allocation (width × height × 4 bytes
+/// for RGBA) so callers can track aggregate budget consumption.
+async fn validate_image_content(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Result<u64> {
     let format = match mime {
         "image/png" => image::ImageFormat::Png,
         "image/jpeg" => image::ImageFormat::Jpeg,
@@ -1295,19 +1391,35 @@ fn validate_image_content(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Res
         reason,
     };
 
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_DECODED_IMAGE_DIMENSION);
-    limits.max_image_height = Some(MAX_DECODED_IMAGE_DIMENSION);
-    limits.max_alloc = Some(MAX_DECODED_IMAGE_ALLOC_BYTES);
+    let source_owned = source.to_string();
+    let mime_owned = mime.to_string();
+    let bytes_owned = bytes.to_vec();
 
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
-    reader.set_format(format);
-    reader.limits(limits);
-    reader
-        .decode()
-        .map_err(|error| corrupt(error.to_string()))?;
+    // Decode in a blocking pool to avoid stalling the async executor.
+    let img = tokio::task::spawn_blocking(move || {
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_DECODED_IMAGE_DIMENSION);
+        limits.max_image_height = Some(MAX_DECODED_IMAGE_DIMENSION);
+        limits.max_alloc = Some(MAX_DECODED_IMAGE_ALLOC_BYTES);
 
-    Ok(())
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes_owned));
+        reader.set_format(format);
+        reader.limits(limits);
+        reader
+            .decode()
+            .map_err(|error| MultimodalError::CorruptImage {
+                input: source_owned,
+                mime: mime_owned,
+                reason: error.to_string(),
+            })
+    })
+    .await
+    .map_err(|error| corrupt(format!("decode task failed: {error}")))?
+    .map_err(anyhow::Error::from)?;
+
+    // Approximate decoded allocation: width × height × 4 bytes per RGBA pixel.
+    let allocation = u64::from(img.width()) * u64::from(img.height()) * 4;
+    Ok(allocation)
 }
 
 fn detect_mime(
@@ -1386,6 +1498,48 @@ mod tests {
         .write_to(&mut buf, image::ImageFormat::Png)
         .expect("test PNG encodes");
         buf.into_inner()
+    }
+
+    /// A tiny PNG whose IHDR declares `width` x `height`. The payload stays a
+    /// few dozen bytes, so it sails past `validate_size`; only the decode
+    /// limits stop it. Used to prove a decompression bomb is refused before
+    /// the declared pixel buffer is ever allocated.
+    fn png_bomb(width: u32, height: u32) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut table = [0u32; 256];
+            for (i, slot) in table.iter_mut().enumerate() {
+                let mut c = i as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 {
+                        0xEDB8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
+                }
+                *slot = c;
+            }
+            let mut crc = 0xFFFF_FFFFu32;
+            for b in data {
+                crc = table[((crc ^ u32::from(*b)) & 0xFF) as usize] ^ (crc >> 8);
+            }
+            crc ^ 0xFFFF_FFFF
+        }
+
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        // bit depth 8, color type 2 (RGB), default compression/filter/interlace.
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+
+        let mut out = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        out.extend_from_slice(&13u32.to_be_bytes());
+        out.extend_from_slice(&ihdr);
+        out.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"IEND");
+        out.extend_from_slice(&crc32(b"IEND").to_be_bytes());
+        out
     }
 
     #[test]
@@ -1646,41 +1800,53 @@ mod tests {
         assert_eq!(multimodal_error_kind(&err), "unsupported_mime");
     }
 
-    #[test]
-    fn validate_image_content_accepts_a_real_image() {
-        assert!(validate_image_content("src", "image/png", &valid_png()).is_ok());
+    #[tokio::test]
+    async fn validate_image_content_accepts_a_real_image() {
+        assert!(
+            validate_image_content("src", "image/png", &valid_png())
+                .await
+                .is_ok()
+        );
     }
 
-    #[test]
-    fn validate_image_content_rejects_header_only_png() {
+    #[tokio::test]
+    async fn validate_image_content_rejects_header_only_png() {
         // The exact shape header sniffing cannot catch: a valid PNG signature
         // with no IDAT chunk. Produced by truncated downloads and interrupted
         // writes.
         let header_only = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        let err = validate_image_content("src", "image/png", &header_only).unwrap_err();
+        let err = validate_image_content("src", "image/png", &header_only)
+            .await
+            .unwrap_err();
         assert_eq!(multimodal_error_kind(&err), "corrupt_image");
     }
 
-    #[test]
-    fn validate_image_content_rejects_truncated_image() {
+    #[tokio::test]
+    async fn validate_image_content_rejects_truncated_image() {
         let full = valid_png();
         let truncated = &full[..full.len() / 2];
-        let err = validate_image_content("src", "image/png", truncated).unwrap_err();
+        let err = validate_image_content("src", "image/png", truncated)
+            .await
+            .unwrap_err();
         assert_eq!(multimodal_error_kind(&err), "corrupt_image");
     }
 
-    #[test]
-    fn validate_image_content_rejects_empty_payload() {
+    #[tokio::test]
+    async fn validate_image_content_rejects_empty_payload() {
         // Zero-byte files pass `validate_size`, which only has an upper bound.
-        let err = validate_image_content("src", "image/png", &[]).unwrap_err();
+        let err = validate_image_content("src", "image/png", &[])
+            .await
+            .unwrap_err();
         assert_eq!(multimodal_error_kind(&err), "corrupt_image");
     }
 
-    #[test]
-    fn validate_image_content_rejects_mime_content_mismatch() {
+    #[tokio::test]
+    async fn validate_image_content_rejects_mime_content_mismatch() {
         // Real PNG bytes declared as JPEG — the case an extension-derived MIME
         // produces when a file is simply renamed.
-        let err = validate_image_content("src", "image/jpeg", &valid_png()).unwrap_err();
+        let err = validate_image_content("src", "image/jpeg", &valid_png())
+            .await
+            .unwrap_err();
         assert_eq!(multimodal_error_kind(&err), "corrupt_image");
     }
 
@@ -1738,6 +1904,132 @@ mod tests {
         assert!(
             content.contains("1 of 2"),
             "note must report the partial skip: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_dimension_bomb_is_refused_before_allocation() {
+        // 60000x60000 RGB would be ~10 GiB decoded. The file itself is a few
+        // dozen bytes, so `validate_size` cannot see the problem — the
+        // dimension guard is the only thing standing between this marker and
+        // an OOM.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bomb.png");
+        std::fs::write(&path, png_bomb(60_000, 60_000)).unwrap();
+        let history = vec![ChatMessage::user(format!(
+            "describe [IMAGE:{}]",
+            path.display()
+        ))];
+
+        let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
+            .await
+            .expect("a bomb must be skipped, not propagated as a turn failure");
+
+        let content = &prepared.messages[0].content;
+        assert!(
+            !prepared.contains_images,
+            "dimension bomb must not be inlined: {content}"
+        );
+        assert!(
+            content.contains("could not be loaded"),
+            "model must be told the image was dropped: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn many_candidates_are_trimmed_before_any_decode_runs() {
+        // Pre-selection keeps decode cost proportional to `max_images` rather
+        // than to history length. Twelve older bombs, one per message, with
+        // `max_images = 1`: only the newest message survives the cap, so only
+        // its single image is ever decoded. Without pre-selection all twelve
+        // bombs would be decoded first and only then discarded.
+        //
+        // Note the trim granularity is per *message*, not per image
+        // (`trim_old_images` strips a message's images as a unit), so the
+        // bombs are spread across messages the way real history accumulates
+        // them rather than crammed into one turn.
+        let temp = tempfile::tempdir().unwrap();
+        let mut history = Vec::new();
+        for i in 0..12 {
+            let path = temp.path().join(format!("bomb_{i}.png"));
+            std::fs::write(&path, png_bomb(40_000, 40_000)).unwrap();
+            history.push(ChatMessage::user(format!(
+                "old {i} [IMAGE:{}]",
+                path.display()
+            )));
+            history.push(ChatMessage::assistant("ack"));
+        }
+        let good = temp.path().join("good.png");
+        std::fs::write(&good, valid_png()).unwrap();
+        history.push(ChatMessage::user(format!(
+            "newest [IMAGE:{}]",
+            good.display()
+        )));
+
+        let config = MultimodalConfig {
+            max_images: 1,
+            ..MultimodalConfig::default()
+        };
+        let prepared = prepare_messages_for_provider(&history, &config)
+            .await
+            .expect("a wall of bombs must not fail preparation");
+
+        let newest = &prepared
+            .messages
+            .last()
+            .expect("history is non-empty")
+            .content;
+        assert!(
+            prepared.contains_images,
+            "the newest valid image must survive the trim: {newest}"
+        );
+        assert!(
+            !prepared
+                .messages
+                .iter()
+                .any(|m| m.content.contains("could not be loaded")),
+            "trimmed-away bombs must never be decoded, so nothing is reported as skipped"
+        );
+        assert!(
+            prepared
+                .messages
+                .iter()
+                .any(|m| m.content.contains("old 0")),
+            "trimmed messages keep their text, losing only the image"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_decode_budget_bounds_total_work_per_request() {
+        // Each image is individually under both the size and dimension caps,
+        // so only the aggregate budget bounds the total decode cost of one
+        // request. Preparation must still succeed and still inline whatever
+        // fits inside the budget.
+        let temp = tempfile::tempdir().unwrap();
+        let mut markers = String::new();
+        for i in 0..4 {
+            let path = temp.path().join(format!("ok_{i}.png"));
+            std::fs::write(&path, valid_png()).unwrap();
+            markers.push_str(&format!(" [IMAGE:{}]", path.display()));
+        }
+        let history = vec![ChatMessage::user(format!("batch{markers}"))];
+
+        let config = MultimodalConfig {
+            max_images: 4,
+            ..MultimodalConfig::default()
+        };
+        let prepared = prepare_messages_for_provider(&history, &config)
+            .await
+            .expect("a batch within budget must prepare cleanly");
+
+        let content = &prepared.messages[0].content;
+        assert!(
+            prepared.contains_images,
+            "valid batch must be inlined: {content}"
+        );
+        assert!(
+            !content.contains("could not be loaded"),
+            "nothing in a within-budget batch should be skipped: {content}"
         );
     }
 
@@ -2558,7 +2850,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skipped_images_do_not_consume_image_budget() {
+    async fn failed_images_consume_budget_under_pre_normalization_trim() {
+        // BEHAVIOR CHANGE (PR #9819): the per-request image cap is now applied
+        // *before* normalization, so a newer image that fails to load does
+        // consume budget and can evict an older valid one.
+        //
+        // Rationale: full pixel validation is CPU/memory intensive, unlike the
+        // prior header-only sniff. Normalizing every candidate in a long
+        // history before capping created an unbounded resource sink — a
+        // history of N images forced N full decodes even though only
+        // `max_images` are ever sent. Bounding decode work takes precedence
+        // over preserving an older image when a newer reference is broken.
+        //
+        // The aggregate decode budget (`AGGREGATE_DECODE_BUDGET_BYTES`)
+        // provides the second bound for images that survive the cap.
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("older-valid.png");
         std::fs::write(&image_path, valid_png()).unwrap();
@@ -2581,13 +2886,25 @@ mod tests {
 
         let result = prepare_messages_for_provider(&messages, &config)
             .await
-            .expect("broken image should not evict an older valid image");
+            .expect("a broken newer image must not fail the whole turn");
 
-        assert!(result.contains_images);
+        // The cap kept only the newest marker, which then failed to load, so
+        // no image survives — but the turn still succeeds and the model is
+        // told what happened.
         assert!(
-            result.messages[0]
+            !result.contains_images,
+            "newest marker failed to load, so no image should be inlined: {:?}",
+            result.messages
+        );
+        assert!(
+            result.messages[0].content.contains("Older valid image"),
+            "older message text must survive the cap"
+        );
+        assert!(
+            !result.messages[0]
                 .content
-                .contains("data:image/png;base64,")
+                .contains("data:image/png;base64,"),
+            "older image was capped out before normalization"
         );
         assert!(result.messages[1].content.contains("Newer broken image"));
         assert!(
@@ -2598,7 +2915,8 @@ mod tests {
         assert!(
             !result.messages[1]
                 .content
-                .contains("https://example.com/missing.png")
+                .contains("https://example.com/missing.png"),
+            "raw URL must not leak to the model"
         );
     }
 
