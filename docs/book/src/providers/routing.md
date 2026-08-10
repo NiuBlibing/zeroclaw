@@ -29,7 +29,7 @@ Runtime switches use the same provider-profile contract as config-backed routing
 
 - `/models <type>.<alias>` selects the active provider profile for the sender session. Channel runtimes can also accept a bare `<type>` shorthand when exactly one configured alias exists for that provider family.
 - `/model <model-id>` selects a model within the active provider profile. If the value matches a `[[model_routes]]` hint or model, that route can switch both provider profile and model together.
-- The `model_switch` tool takes `model_provider = "<type>.<alias>"` plus `model = "<provider-local-model-id>"`. It also accepts a three-segment `model_provider = "<type>.<alias>.<model_alias>"`, in which case the `model` argument is optional — the model id is taken from the named model entry.
+- The `model_switch` tool takes `model_provider = "<type>.<alias>"` plus `model = "<provider-local-model-id>"`. It also accepts a three-segment `model_provider = "<type>.<alias>.<model_alias>"`, in which case the `model` argument is optional: the model id is taken from the named model entry.
 
 Runtime switches are session/runtime state. They do not edit `config.toml`; persisted defaults require an explicit config write. For tool-driven switches, bare provider family names such as `openai` are not switch targets because they do not identify which configured profile, credential, endpoint, or compatibility mode should be used.
 

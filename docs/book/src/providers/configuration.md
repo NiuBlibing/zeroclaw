@@ -48,7 +48,7 @@ max_tokens = 8192
 model_provider = "openai.gw.fast"
 ```
 
-The legacy two-segment ref `<type>.<alias>` still works. It resolves to `models.default` if present, otherwise to the sole model entry, otherwise to the entry-level `model` field — so existing single-model configs need no change.
+The legacy two-segment ref `<type>.<alias>` still works. It resolves to `models.default` if present, otherwise to the sole model entry, otherwise to the entry-level `model` field, so existing single-model configs need no change.
 
 ## Field resolution order
 
@@ -203,7 +203,7 @@ The `custom` slot requires `uri`. See [Custom providers](./custom.md).
 
 ## Picking which provider an agent uses
 
-Agents reference a provider by dotted alias — two-segment `<type>.<alias>` for the profile, or three-segment `<type>.<alias>.<model_alias>` to select a model in its `models` subtable. Provider entries on their own do nothing.
+Agents reference a provider by dotted alias: two-segment `<type>.<alias>` for the profile, or three-segment `<type>.<alias>.<model_alias>` to select a model in its `models` subtable. Provider entries on their own do nothing.
 
 `risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models.<type>.<alias>]` entry (or, for a three-segment ref, to a configured `[providers.models.<type>.<alias>.models.<model_alias>]` model entry), or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry.
 

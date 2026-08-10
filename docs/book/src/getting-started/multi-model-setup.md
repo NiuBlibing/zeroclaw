@@ -23,7 +23,7 @@ Each `[agents.<alias>]` entry points at exactly one `[providers.models.<type>.<a
 
 To run multiple models, run multiple agents, each binding to one model provider. Each channel binds to one agent at a time. To move a channel to a different agent, edit the `channels` list on the agent that should pick it up; `Config::validate()` makes sure references resolve at startup.
 
-A single provider entry can host several models that share its endpoint and credential — add a `models.<model_alias>` subtable per model and address it with a three-segment ref `<type>.<alias>.<model_alias>`. See [Hosting multiple models on one provider entry](../providers/configuration.md#hosting-multiple-models-on-one-provider-entry).
+A single provider entry can host several models that share its endpoint and credential: add a `models.<model_alias>` subtable per model and address it with a three-segment ref `<type>.<alias>.<model_alias>`. See [Hosting multiple models on one provider entry](../providers/configuration.md#hosting-multiple-models-on-one-provider-entry).
 
 ## Cross-vendor reliability: use OpenRouter
 
