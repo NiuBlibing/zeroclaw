@@ -317,7 +317,10 @@ impl ModelProviders {
     }
 
     pub fn find_by_name(&self, name: &str) -> Option<(&'static str, String, &ModelProviderConfig)> {
-        if let Some((kind, alias)) = name.split_once('.') {
+        // A ref may be three-segment (`<type>.<alias>.<model>`); the profile
+        // lookup only needs `<type>.<alias>`, so key off the first two segments
+        // and ignore any model selector.
+        if let Some((kind, alias)) = super::schema::provider_profile_ref(name) {
             macro_rules! emit_dotted {
                 ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
                     match kind {

@@ -1059,7 +1059,10 @@ fn apply_model_provider(
 ) -> Option<String> {
     match choice {
         SelectorChoice::Existing(reference) => {
-            let (family, alias) = match split_ref(reference) {
+            // A model_provider ref may be three-segment
+            // (`<type>.<alias>.<model>`); key the profile off the first two
+            // segments so a model-selecting ref is not rejected.
+            let (family, alias) = match zeroclaw_config::schema::provider_profile_ref(reference) {
                 Some(parts) => parts,
                 None => {
                     errors.push(QuickstartError::for_surface(

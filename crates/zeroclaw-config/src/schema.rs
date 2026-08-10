@@ -20635,12 +20635,13 @@ impl Config {
                     "model_routes[{i}].model_provider must not be empty"
                 );
             }
-            // Route refs are dotted `<type>.<alias>` and must resolve to a
-            // configured `[providers.models.<type>.<alias>]` entry. Unresolved
-            // routes are dropped at runtime construction; rejecting them here
-            // keeps that drift visible at config-load time.
-            match mp.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+            // Route refs are dotted `<type>.<alias>` (optionally three-segment
+            // `<type>.<alias>.<model>`) and must resolve to a configured
+            // `[providers.models.<type>.<alias>]` entry. Unresolved routes are
+            // dropped at runtime construction; rejecting them here keeps that
+            // drift visible at config-load time.
+            match provider_profile_ref(mp) {
+                Some((ty, inner)) => {
                     if self.providers.models.find(ty, inner).is_none() {
                         validation_bail!(
                             DanglingReference,
@@ -20648,8 +20649,22 @@ impl Config {
                             "model_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
+                    if let Some(model_alias) = mp.splitn(3, '.').nth(2)
+                        && !model_alias.is_empty()
+                        && self
+                            .providers
+                            .models
+                            .find_model(ty, inner, model_alias)
+                            .is_none()
+                    {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("model_routes[{i}].model_provider"),
+                            "model_routes[{i}].model_provider = {mp:?} but [providers.models.{ty}.{inner}.models.{model_alias}] is not configured",
+                        );
+                    }
                 }
-                _ => validation_bail!(
+                None => validation_bail!(
                     InvalidFormat,
                     format!("model_routes[{i}].model_provider"),
                     "model_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
@@ -20682,9 +20697,10 @@ impl Config {
                 );
             }
             // Embedding routes resolve against the same model-provider map;
-            // there is no separate `providers.embeddings` typed section.
-            match mp.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+            // there is no separate `providers.embeddings` typed section. Accepts
+            // an optional three-segment `<type>.<alias>.<model>` ref.
+            match provider_profile_ref(mp) {
+                Some((ty, inner)) => {
                     if self.providers.models.find(ty, inner).is_none() {
                         validation_bail!(
                             DanglingReference,
@@ -20692,8 +20708,22 @@ impl Config {
                             "embedding_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
+                    if let Some(model_alias) = mp.splitn(3, '.').nth(2)
+                        && !model_alias.is_empty()
+                        && self
+                            .providers
+                            .models
+                            .find_model(ty, inner, model_alias)
+                            .is_none()
+                    {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("embedding_routes[{i}].model_provider"),
+                            "embedding_routes[{i}].model_provider = {mp:?} but [providers.models.{ty}.{inner}.models.{model_alias}] is not configured",
+                        );
+                    }
                 }
-                _ => validation_bail!(
+                None => validation_bail!(
                     InvalidFormat,
                     format!("embedding_routes[{i}].model_provider"),
                     "embedding_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
@@ -39104,6 +39134,66 @@ level = "supervised"
         let err = cfg
             .validate()
             .expect_err("dangling classifier model alias must fail")
+            .to_string();
+        assert!(
+            err.contains("models.nope"),
+            "error should name the missing model entry, got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_accepts_three_segment_model_and_embedding_routes() {
+        // model_routes / embedding_routes model_provider refs must accept a
+        // three-segment `<type>.<alias>.<model>` ref and validate the named
+        // model entry, instead of false-rejecting it as a dangling reference.
+        let base = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+api_key = "sk-x"
+
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+
+[providers.models.openai.gw.models.embed]
+id = "text-embedding-3-small"
+
+[risk_profiles.default]
+level = "supervised"
+
+[runtime_profiles.default]
+
+[[model_routes]]
+hint = "deep"
+model_provider = "openai.gw.fast"
+model = "gpt-4o-mini"
+
+[[embedding_routes]]
+hint = "sem"
+model_provider = "openai.gw.embed"
+model = "text-embedding-3-small"
+
+[agents.a]
+model_provider = "openai.gw.fast"
+risk_profile = "default"
+runtime_profile = "default"
+"#;
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "three-segment route refs must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        // Dangling model alias in a route → error naming the missing entry.
+        let bad = base.replace(
+            "\"openai.gw.fast\"\nmodel = \"gpt-4o-mini\"",
+            "\"openai.gw.nope\"\nmodel = \"gpt-4o-mini\"",
+        );
+        let cfg: Config = toml::from_str(&bad).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("dangling route model alias must fail")
             .to_string();
         assert!(
             err.contains("models.nope"),
