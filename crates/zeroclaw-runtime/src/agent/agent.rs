@@ -9653,6 +9653,243 @@ mod tests {
         );
     }
 
+    // End-to-end route-switch boundary: a text call WITH usage, a tool that
+    // injects an image forcing a switch to a DIFFERENT vision route whose final
+    // call reports NO usage, driven through the real streamed producer path
+    // (`turn_streamed_with_steering_state` -> `run_tool_call_loop` ->
+    // `resolve_vision_provider`). Proves the terminal `TurnEvent::Usage` replaces
+    // the 200k text route with the final 8k vision route's provider/model and
+    // budget/window, rather than retaining the earlier usage-bearing route.
+    #[tokio::test]
+    async fn terminal_snapshot_follows_text_to_vision_switch_through_producer() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Mock vision endpoint: a small plain-text answer with NO usage.
+        async fn vision_reply(Json(_body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "vision saw the image"}}]
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind vision provider");
+        let addr = listener.local_addr().expect("vision provider address");
+        let app = Router::new().route("/v1/chat/completions", post(vision_reply));
+        let _server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("vision serves");
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .expect("write png");
+
+        // 200k text route (with usage) and an 8k vision route (no usage) served
+        // by the mock endpoint.
+        let config: zeroclaw_config::schema::Config = toml::from_str(&format!(
+            r#"
+schema_version = 3
+[providers.models.custom.text]
+model = "text-model"
+context_window = 200000
+[providers.models.custom.vision]
+uri = "http://{addr}/v1"
+model = "vision-model"
+context_window = 8000
+[agents.coder]
+enabled = true
+model_provider = "custom.text"
+[multimodal]
+vision_model_provider = "custom.vision"
+"#
+        ))
+        .expect("config parses");
+
+        // Text primary: iteration 0 emits a native tool call WITH usage; the tool
+        // injects an image, so iteration 1 routes to the vision endpoint (which
+        // returns no usage) and this provider is not called again.
+        struct TextPrimary {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl ModelProvider for TextPrimary {
+            fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    native_tool_calling: true,
+                    ..Default::default()
+                }
+            }
+            async fn chat_with_system(
+                &self,
+                _s: Option<&str>,
+                _m: &str,
+                _model: &str,
+                _t: Option<f64>,
+            ) -> Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _t: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: None,
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "c1".into(),
+                        name: "attach_image".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(100),
+                        cached_input_tokens: None,
+                        output_tokens: Some(20),
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for TextPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "text-primary"
+            }
+        }
+
+        struct AttachImage {
+            path: String,
+        }
+        #[async_trait]
+        impl Tool for AttachImage {
+            fn name(&self) -> &str {
+                "attach_image"
+            }
+            fn description(&self) -> &str {
+                "attaches an image"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: format!("here it is [IMAGE:{}]", self.path).into(),
+                    error: None,
+                })
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for AttachImage {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+            }
+            fn alias(&self) -> &str {
+                "attach_image"
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, temp.path(), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(TextPrimary {
+                calls: Arc::clone(&calls),
+            }))
+            .tools(vec![Box::new(AttachImage {
+                path: image_path.display().to_string(),
+            })])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(temp.path().to_path_buf())
+            .agent_alias("coder".into())
+            .multimodal_config(config.multimodal.clone())
+            .provider_switch_config(ProviderSwitchConfig {
+                config: Some(Arc::new(config.clone())),
+            })
+            // Auto-approve so the image-injecting tool runs and the vision route
+            // engages.
+            .approval_manager(Some(Arc::new(
+                crate::approval::ApprovalManager::for_non_interactive(
+                    &zeroclaw_config::schema::RiskProfileConfig {
+                        auto_approve: vec!["*".to_string()],
+                        ..Default::default()
+                    },
+                ),
+            )))
+            .build()
+            .expect("agent builder should succeed with valid config");
+        // Route-aware limits: the text route resolves to 200k, the vision route
+        // to 8k. The loop re-resolves per call, so the served (final) route is
+        // the 8k vision one.
+        let limit_config = Arc::new(config);
+        agent.context_limits_resolver = Some(Arc::new(move |provider_ref, model| {
+            limit_config.resolved_context_limits_for_route("coder", provider_ref, model)
+        }));
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed_with_steering_state("please attach the image", event_tx, None, None)
+            .await
+            .expect("streamed turn should succeed");
+
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "the text primary must have served the first call"
+        );
+
+        let mut terminal_snapshot = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                context_token_budget,
+                model_context_window,
+                ..
+            } = ev
+                && input_tokens.is_none()
+                && output_tokens.is_none()
+            {
+                terminal_snapshot = Some((context_token_budget, model_context_window));
+            }
+        }
+        let (budget, window) = terminal_snapshot.expect(
+            "the usage-less vision call must publish a terminal snapshot even though the earlier \
+             text call reported usage",
+        );
+        // The terminal snapshot must reflect the FINAL served (vision) route:
+        // an 8k window, not the 200k text route it started on.
+        assert_eq!(
+            window,
+            Some(8_000),
+            "terminal snapshot must carry the final vision route's 8k window, not the text route"
+        );
+        assert_eq!(
+            budget,
+            Some(8_000),
+            "the 8k vision capacity clamps the effective budget the terminal snapshot reports"
+        );
+    }
+
     fn build_test_agent(
         initial_provider_name: &str,
         initial_model_name: &str,
