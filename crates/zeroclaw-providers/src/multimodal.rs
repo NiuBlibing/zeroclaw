@@ -640,7 +640,6 @@ async fn prepare_messages_inner(
     let mut remaining_decode_budget = AGGREGATE_DECODE_BUDGET_BYTES;
 
     let mut normalized_messages = Vec::with_capacity(candidate_messages.len());
-    let mut has_successful_images = false;
     for (index, message) in candidate_messages.iter().enumerate() {
         if !should_normalize_message_images(index, message, &latest_tool_indices) {
             normalized_messages.push(replay_message_without_stale_tool_images(
@@ -652,7 +651,7 @@ async fn prepare_messages_inner(
         }
 
         if message.role == "tool"
-            && let Some((prepared, contains_images)) = normalize_native_tool_result_json(
+            && let Some((prepared, _contains_images)) = normalize_native_tool_result_json(
                 &message.content,
                 config,
                 max_bytes,
@@ -670,7 +669,6 @@ async fn prepare_messages_inner(
                 role: message.role.clone(),
                 content: prepared,
             });
-            has_successful_images |= contains_images;
             continue;
         }
 
@@ -699,60 +697,20 @@ async fn prepare_messages_inner(
             normalized.skipped_count,
             refs.len(),
         );
-        has_successful_images |= !normalized.data_uris.is_empty();
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
             content,
         });
     }
 
-    // Apply age-based trimming when configured: strip images from user messages
-    // older than `max_image_turns` turns back from the end of history.
-    // `max_image_turns == 0` means disabled — no age trimming.
-    let age_trimmed = if config.max_image_turns > 0 {
-        let before = count_image_markers(&normalized_messages);
-        let trimmed = trim_images_by_age(&normalized_messages, config.max_image_turns);
-        let after = count_image_markers(&trimmed);
-        if after < before {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "max_image_turns": config.max_image_turns,
-                        "images_before": before,
-                        "images_after": after,
-                        "images_dropped": before - after,
-                    })),
-                "multimodal: age-trimmed old images from conversation history"
-            );
-        }
-        trimmed
-    } else {
-        normalized_messages
-    };
-
-    // Apply the per-request image cap after normalization so failed image refs
-    // do not consume budget and evict older images that could still be sent.
-    let capped_messages = if has_successful_images && count_image_markers(&age_trimmed) > max_images
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "images_after_normalization": count_image_markers(&age_trimmed),
-                    "max_images": max_images,
-                })),
-            "multimodal: post-normalization image cap exceeded — trimming oldest images"
-        );
-        trim_old_images(&age_trimmed, max_images)
-    } else {
-        age_trimmed
-    };
+    // No post-normalization trim: both the age trim and the per-request cap
+    // already ran above, before any decode. Normalization emits at most one
+    // marker per *successful* reference, so the marker count can only shrink
+    // from here — re-running either trim would be a guaranteed no-op.
 
     Ok(PreparedMessages {
-        contains_images: count_image_markers(&capped_messages) > 0,
-        messages: capped_messages,
+        contains_images: count_image_markers(&normalized_messages) > 0,
+        messages: normalized_messages,
     })
 }
 fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMessage> {
