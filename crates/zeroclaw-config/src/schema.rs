@@ -39200,4 +39200,92 @@ runtime_profile = "default"
             "error should name the missing model entry, got: {err}"
         );
     }
+
+    #[::core::prelude::v1::test]
+    fn models_subtable_map_key_crud_reaches_third_level() {
+        // The nested `models` subtable
+        // (`providers.models.<type>.<alias>.models.<model_alias>`) must be
+        // fully manageable through the generic map-key machinery the web
+        // UI / RPC use — list, create, rename, delete — not just readable
+        // via get_prop on already-present entries.
+        let raw = r#"
+schema_version = 4
+[providers.models.openai.gw]
+model = "legacy"
+[providers.models.openai.gw.models.fast]
+id = "gpt-4o-mini"
+"#;
+        let mut cfg: Config = toml::from_str(raw).unwrap();
+        let sub = "providers.models.openai.gw.models";
+
+        // list existing sub-entries
+        assert_eq!(
+            cfg.get_map_keys(sub),
+            Some(vec!["fast".to_string()]),
+            "get_map_keys must list the subtable entry"
+        );
+
+        // create a new sub-entry, then set + read a field on it
+        assert_eq!(
+            cfg.create_map_key(sub, "cheap"),
+            Ok(true),
+            "create_map_key must add a subtable entry"
+        );
+        cfg.set_prop(&format!("{sub}.cheap.id"), "gpt-3-5")
+            .expect("set_prop on a freshly-created subtable entry");
+        assert_eq!(
+            cfg.get_prop(&format!("{sub}.cheap.id")).ok(),
+            Some("gpt-3-5".to_string()),
+            "the created entry's id must round-trip"
+        );
+        let mut keys = cfg.get_map_keys(sub).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["cheap".to_string(), "fast".to_string()]);
+
+        // rename
+        assert_eq!(cfg.rename_map_key(sub, "fast", "quick"), Ok(true));
+        let mut keys = cfg.get_map_keys(sub).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["cheap".to_string(), "quick".to_string()]);
+
+        // delete
+        assert_eq!(cfg.delete_map_key(sub, "cheap"), Ok(true));
+        assert_eq!(cfg.get_map_keys(sub), Some(vec!["quick".to_string()]));
+
+        // creating a subtable entry validates the alias key (non-resource-key map)
+        assert!(
+            cfg.create_map_key(sub, "Bad Alias").is_err(),
+            "invalid alias key must be rejected"
+        );
+
+        // Regression guard: the alias level itself still lists profiles, and an
+        // unrelated single-level map is unaffected.
+        assert_eq!(
+            cfg.get_map_keys("providers.models.openai"),
+            Some(vec!["gw".to_string()]),
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn models_subtable_empty_lists_and_serializes_clean() {
+        // A profile with no models subtable: get_map_keys returns Some([]) (the
+        // section exists, it's just empty), and serialization emits no empty
+        // `[...models]` table header.
+        let raw = r#"
+schema_version = 4
+[providers.models.openai.gw]
+model = "gpt-4o"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(
+            cfg.get_map_keys("providers.models.openai.gw.models"),
+            Some(vec![]),
+            "empty subtable must list as Some([]), not None"
+        );
+        let out = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            !out.contains("gw.models]") && !out.contains(".gw.models\n"),
+            "empty models map must not emit a table header:\n{out}"
+        );
+    }
 }
