@@ -205,11 +205,13 @@ fn default_sops_dir(install_root: &Path) -> PathBuf {
 /// documented `shared/sops` value yields `<install>/shared/sops`, the same
 /// directory the web/RPC SOP author writes to and the CLI scans. An absolute
 /// or `~`-prefixed value is used as-is (`Path::join` replaces the base entirely
-/// when the joined path is itself absolute). Unset or empty falls back to the
-/// canonical `<install>/shared/sops`.
+/// when the joined path is itself absolute). Unset, empty, or whitespace-only
+/// falls back to the canonical `<install>/shared/sops` — the same disabled
+/// sentinel `SopConfig::runtime_enabled()` recognizes, so the CLI/RPC scan root
+/// never diverges from whether the daemon built an engine.
 pub fn resolve_sops_dir(install_root: &Path, config_dir: Option<&str>) -> PathBuf {
     match config_dir {
-        Some(dir) if !dir.is_empty() => {
+        Some(dir) if !dir.trim().is_empty() => {
             let expanded = shellexpand::tilde(dir);
             install_root.join(expanded.as_ref())
         }
@@ -1174,6 +1176,9 @@ mod tests {
         let canonical = install_root.join("shared").join("sops");
         assert_eq!(resolve_sops_dir(install_root, None), canonical);
         assert_eq!(resolve_sops_dir(install_root, Some("")), canonical);
+        // Whitespace-only is the disabled sentinel `runtime_enabled()` also
+        // rejects; the scan root must fall back, not join a garbage segment.
+        assert_eq!(resolve_sops_dir(install_root, Some("   ")), canonical);
     }
 
     // Boundary regression: for the documented `sops_dir = "shared/sops"`, the
