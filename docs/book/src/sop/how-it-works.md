@@ -31,9 +31,9 @@ graph LR
 
 ## Getting started
 
-1. `sops_dir` is unset by default, so runtime SOP loading is off out of the box. Opt in by setting `sops_dir` through the gateway, zerocode, or `zeroclaw config set`: a relative value such as `sops` resolves against the shared workspace (`<shared>/sops`), the same directory the SOP author writes to. Setting it back to `""` (or removing it) disables runtime SOP loading again.
+1. `sops_dir` is unset by default, so runtime SOP loading is off out of the box. Opt in by setting `sops_dir` through the gateway, zerocode, or `zeroclaw config set`. A relative value resolves against the install root (the directory holding `config.toml`), so the documented `shared/sops` yields `<install>/shared/sops`, the same directory the SOP author writes to. An absolute or `~`-prefixed value is used as-is. Setting it back to `""` (or removing it) disables runtime SOP loading again; the CLI still falls back to `<install>/shared/sops` for offline inspection.
 
-   > **Migrating from an earlier build?** Relative `sops_dir` values now resolve against the shared workspace rather than a per-agent workspace. A config that carried `sops_dir = "shared/sops"` from before would resolve to `<shared>/shared/sops` (doubled). Set `sops_dir = "sops"` to point at the canonical `<shared>/sops`, or use an absolute path if you keep definitions elsewhere.
+   > **Migrating from an earlier build?** Relative `sops_dir` values now resolve against the install root, matching how `skill-bundles` directories resolve. Earlier builds joined relative values onto `data_dir`, so a config carrying `sops_dir = "shared/sops"` previously looked under `<data_dir>/shared/sops`; it now resolves to `<install>/shared/sops`, the canonical shared location the web/RPC author and CLI already use. If you kept definitions elsewhere, move them under `<install>/shared/sops` or set `sops_dir` to an absolute path.
 
 2. Create a SOP directory, for example:
 

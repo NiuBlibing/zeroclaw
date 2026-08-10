@@ -1281,7 +1281,7 @@ pub async fn run(
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
                 &config.data_dir,
-                &config.shared_workspace_dir(),
+                &config.install_root_dir(),
                 sop_mem,
                 Default::default(),
             );
@@ -2877,7 +2877,7 @@ pub async fn process_message(
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
                 &config.data_dir,
-                &config.shared_workspace_dir(),
+                &config.install_root_dir(),
                 sop_mem,
                 Default::default(),
             );

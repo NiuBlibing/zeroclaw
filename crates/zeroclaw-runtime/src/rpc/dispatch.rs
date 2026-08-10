@@ -4074,8 +4074,8 @@ impl RpcDispatcher {
 
     fn sops_dir_and_mode(&self) -> (std::path::PathBuf, crate::sop::SopExecutionMode) {
         let config = self.ctx.config.read();
-        let workspace = config.shared_workspace_dir();
-        let dir = crate::sop::resolve_sops_dir(&workspace, config.sop.sops_dir.as_deref());
+        let install_root = config.install_root_dir();
+        let dir = crate::sop::resolve_sops_dir(&install_root, config.sop.sops_dir.as_deref());
         let mode = crate::sop::parse_execution_mode(&config.sop.default_execution_mode);
         (dir, mode)
     }

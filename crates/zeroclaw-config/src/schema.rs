@@ -22785,12 +22785,14 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[prefix = "sop"]
 pub struct SopConfig {
     /// Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).
-    /// A relative value resolves against the shared workspace, so SOPs load
-    /// from `<shared>/sops` — the same directory the web/RPC SOP author writes
+    /// A relative value resolves against the install root (matching the
+    /// `skill-bundles` convention), so the documented `shared/sops` loads from
+    /// `<install>/shared/sops` — the same directory the web/RPC SOP author writes
     /// to. An absolute or `~`-prefixed value is used as-is. Unset by default;
     /// SOP runtime behavior activates only when this is set to a non-empty
     /// value, so leaving it unset (or an explicit empty value) keeps SOP
-    /// loading disabled.
+    /// loading disabled (unset/empty still falls back to `<install>/shared/sops`
+    /// for offline CLI inspection).
     #[serde(default = "default_sop_sops_dir")]
     pub sops_dir: Option<String>,
 

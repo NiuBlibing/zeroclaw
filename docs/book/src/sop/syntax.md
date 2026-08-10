@@ -1,6 +1,6 @@
 # SOP Syntax Reference
 
-SOP definitions are loaded from subdirectories under `sops_dir`, which is unset by default, so runtime SOP execution is off until an operator opts in. Set `sops_dir` to a directory to enable it: a relative value such as `sops` resolves against the shared workspace (`<shared>/sops`), the same directory the SOP author writes to. Setting it back to `""` (or leaving it unset) disables runtime SOP execution; CLI commands still fall back to `<shared>/sops` for offline inspection.
+SOP definitions are loaded from subdirectories under `sops_dir`, which is unset by default, so runtime SOP execution is off until an operator opts in. Set `sops_dir` to a directory to enable it: a relative value resolves against the install root (the directory holding `config.toml`), so the documented `shared/sops` yields `<install>/shared/sops`, the same directory the SOP author writes to. An absolute or `~`-prefixed value is used as-is. Setting it back to `""` (or leaving it unset) disables runtime SOP execution; CLI commands still fall back to `<install>/shared/sops` for offline inspection.
 
 ## 1. Directory Layout
 

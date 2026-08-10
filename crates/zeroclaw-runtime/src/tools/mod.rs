@@ -1225,7 +1225,7 @@ pub fn all_tools_with_runtime(
         if root_config.sop.procedural_memory_enabled {
             tool_arcs.push(Arc::new(SopWorkshopTool::new(
                 Arc::clone(sop_engine),
-                root_config.shared_workspace_dir(),
+                root_config.install_root_dir(),
             )));
         }
     }

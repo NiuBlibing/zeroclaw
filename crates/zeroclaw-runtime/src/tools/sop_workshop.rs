@@ -63,18 +63,19 @@ sop_workshop_actions! {
 /// Agent-facing SOP proposal lifecycle tool.
 pub struct SopWorkshopTool {
     engine: Arc<Mutex<SopEngine>>,
-    /// Shared workspace root that anchors SOP-definition writes. `apply`
-    /// resolves `<shared_sops_root>/sops` (via `resolve_sops_dir`) and reloads
-    /// the engine from the same root, so it must match the root the engine was
-    /// built from — otherwise apply would write to one tree and reload another.
-    shared_sops_root: std::path::PathBuf,
+    /// Install root (`config.install_root_dir()`) that anchors SOP-definition
+    /// writes. `apply` resolves `resolve_sops_dir(install_root, sops_dir)` (the
+    /// documented `shared/sops` yields `<install>/shared/sops`) and reloads the
+    /// engine from the same root, so it must match the root the engine was built
+    /// from — otherwise apply would write to one tree and reload another.
+    install_root: std::path::PathBuf,
 }
 
 impl SopWorkshopTool {
-    pub fn new(engine: Arc<Mutex<SopEngine>>, shared_sops_root: std::path::PathBuf) -> Self {
+    pub fn new(engine: Arc<Mutex<SopEngine>>, install_root: std::path::PathBuf) -> Self {
         Self {
             engine,
-            shared_sops_root,
+            install_root,
         }
     }
 }
@@ -272,7 +273,7 @@ impl SopWorkshopTool {
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let mut engine = self.lock_engine()?;
-        let outcome = apply_proposal(&mut engine, &self.shared_sops_root, id, actor)?;
+        let outcome = apply_proposal(&mut engine, &self.install_root, id, actor)?;
         Ok(serde_json::to_string_pretty(&json!({
             "id": outcome.proposal.id,
             "status": outcome.proposal.status,
@@ -343,22 +344,25 @@ mod tests {
         assert!(listed.output.contains("daily-check"));
     }
 
-    // Regression: apply must write only under the shared SOP root the workshop was
-    // constructed with, never a per-agent or data dir, and reload must not drop
-    // SOPs that already live in the shared root. Guards issue where apply wrote to
-    // the wrong workspace and then reloaded that root over the shared definitions.
+    // Regression: apply resolves the configured `sops_dir` against the install
+    // root the workshop was constructed with, so the documented `shared/sops`
+    // lands at `<install>/shared/sops` (not doubled, not the data dir), and
+    // reload must not drop SOPs that already live there. Mirrors build_sop_engine
+    // wiring, where the workshop base is `config.install_root_dir()`.
     #[tokio::test]
-    async fn apply_writes_only_to_shared_root_and_preserves_existing_sops() {
+    async fn apply_resolves_shared_sops_under_install_root_and_preserves_existing() {
         let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        let shared_dir = tmp.path().join("shared");
-        let agent_dir = tmp.path().join("agent-ws");
-        for d in [&data_dir, &shared_dir, &agent_dir] {
+        let install_root = tmp.path();
+        // Canonical resolved directory for `sops_dir = "shared/sops"`.
+        let sops_root = install_root.join("shared").join("sops");
+        let data_dir = install_root.join("data");
+        let agent_dir = install_root.join("agent-ws");
+        for d in [&sops_root, &data_dir, &agent_dir] {
             std::fs::create_dir_all(d).unwrap();
         }
 
-        // Pre-seed an existing SOP directly in the shared root's `sops/` dir.
-        let existing = shared_dir.join("sops").join("existing-sop");
+        // Pre-seed an existing SOP in the canonical `<install>/shared/sops` dir.
+        let existing = sops_root.join("existing-sop");
         std::fs::create_dir_all(&existing).unwrap();
         std::fs::write(
             existing.join("SOP.toml"),
@@ -367,18 +371,19 @@ mod tests {
         .unwrap();
         std::fs::write(existing.join("SOP.md"), "## Steps\n\n1. **Do** - it.\n").unwrap();
 
-        // Engine + workshop use the SHARED root (mirrors build_sop_engine wiring).
+        // Engine + workshop resolve against the INSTALL ROOT with the documented
+        // relative value (mirrors build_sop_engine wiring).
         let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig {
-            sops_dir: Some("sops".to_string()),
+            sops_dir: Some("shared/sops".to_string()),
             ..SopConfig::default()
         })));
-        engine.lock().unwrap().reload(&shared_dir);
+        engine.lock().unwrap().reload(install_root);
         assert!(
             engine.lock().unwrap().get_sop("existing-sop").is_some(),
             "pre-seeded shared SOP should load"
         );
 
-        let tool = SopWorkshopTool::new(Arc::clone(&engine), shared_dir.clone());
+        let tool = SopWorkshopTool::new(Arc::clone(&engine), install_root.to_path_buf());
 
         let proposed = tool
             .execute(json!({
@@ -400,14 +405,20 @@ mod tests {
             .unwrap();
         assert!(applied.success, "{:?}", applied.error);
 
-        // apply wrote to the shared root, not data or agent roots.
+        // apply wrote to the canonical `<install>/shared/sops`, not a doubled
+        // `shared/shared/sops`, the data dir, or the per-agent workspace.
         assert!(
-            shared_dir
+            sops_root.join("new-sop").join("SOP.md").exists(),
+            "new SOP must land under <install>/shared/sops"
+        );
+        assert!(
+            !install_root
+                .join("shared")
+                .join("shared")
                 .join("sops")
                 .join("new-sop")
-                .join("SOP.md")
                 .exists(),
-            "new SOP must land under the shared root"
+            "apply must not double the shared segment"
         );
         assert!(
             !data_dir.join("sops").join("new-sop").exists(),
@@ -419,7 +430,7 @@ mod tests {
         );
 
         // reload after apply must keep both the pre-seeded and the new SOP.
-        engine.lock().unwrap().reload(&shared_dir);
+        engine.lock().unwrap().reload(install_root);
         let guard = engine.lock().unwrap();
         assert!(
             guard.get_sop("existing-sop").is_some(),
