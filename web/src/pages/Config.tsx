@@ -170,9 +170,14 @@ export default function Config() {
   // Bust FieldForm's per-provider model catalog cache on section change so a
   // model alias just added under e.g. `providers.models.anthropic` shows up
   // the next time the user opens an agent form, without a hard refresh.
+  // Bust FieldForm's per-provider model catalog cache on section change so a
+  // model alias just added under e.g. `providers.models.anthropic` shows up
+  // the next time the user opens an agent form, without a hard refresh.
+  // Keyed on section/type/alias only — navigating between a profile's model
+  // sub-entries (subParam) stays within the same provider and needs no bust.
   useEffect(() => {
     clearFieldFormCatalogCaches();
-  }, [sectionParam, typeParam, aliasParam, subParam]);
+  }, [sectionParam, typeParam, aliasParam]);
 
   const activeSection = useMemo(
     () => sections.find((s) => s.key === activeKey) ?? null,
@@ -306,14 +311,16 @@ export default function Config() {
           : `${activeSection.key}.${typeParam}.${aliasParam}`
         : typeParam;
 
-      // Pre-scoped operator-bind tab on a pairing channel's own page, so you
-      // can authorize a user (no /bind message) right where you configured it.
-      const channelExtraTabs: SectionTabSpec[] = [];
+      // Extra tabs alongside the wire-driven field tabs for this alias page.
+      // Channels get a pre-scoped operator-bind tab (authorize a user right
+      // where you configured the channel, no /bind message); provider profiles
+      // get a Models subtable-CRUD tab (added below).
+      const aliasExtraTabs: SectionTabSpec[] = [];
       if (
         activeSection.key === "channels" &&
         ["telegram", "wechat", "line"].includes(typeParam)
       ) {
-        channelExtraTabs.push({
+        aliasExtraTabs.push({
           key: "bind",
           label: "Bind identity",
           render: () => (
@@ -332,7 +339,7 @@ export default function Config() {
       // machinery, keyed at `providers.models.<type>.<alias>.models`.
       if (activeSection.key === "providers.models") {
         const modelsMapPath = `providers.models.${typeParam}.${aliasParam}.models`;
-        channelExtraTabs.push({
+        aliasExtraTabs.push({
           key: "models",
           label: t("config.tab_models"),
           render: () => (
@@ -377,7 +384,7 @@ export default function Config() {
             onSaved={fetchDrift}
             drift={drifted}
             extraTabs={
-              channelExtraTabs.length > 0 ? channelExtraTabs : undefined
+              aliasExtraTabs.length > 0 ? aliasExtraTabs : undefined
             }
           />
         </div>
