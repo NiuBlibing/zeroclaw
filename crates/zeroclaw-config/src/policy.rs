@@ -1160,10 +1160,31 @@ fn looks_like_path_for_shell(candidate: &str, dialect: ShellDialect) -> bool {
 
 fn shell_path_tokens_equal(left: &str, right: &str, dialect: ShellDialect) -> bool {
     if shell_uses_windows_path_syntax(dialect) {
-        left.replace('\\', "/")
-            .eq_ignore_ascii_case(&right.replace('\\', "/"))
+        // Backslash acceptance is a dialect concern (PowerShell/cmd accept `\`
+        // on every host), but case sensitivity is a *host* concern. Normalize
+        // separators for both sides, then compare with the host filesystem's
+        // case rules so cross-platform `pwsh` on a case-sensitive host does not
+        // treat `/tmp/Safe/tool` and `/tmp/safe/tool` as the same executable.
+        host_path_tokens_equal(&left.replace('\\', "/"), &right.replace('\\', "/"))
     } else {
         expand_user_path(left) == expand_user_path(right)
+    }
+}
+
+/// Compare two path tokens with the host filesystem's case semantics after `~`
+/// expansion: case-insensitive on Windows, exact on case-sensitive Unix. An
+/// explicit path is a trust anchor, so folding case on Unix would authorize a
+/// differently cased — and potentially different — file.
+fn host_path_tokens_equal(left: &str, right: &str) -> bool {
+    let left = expand_user_path(left);
+    let right = expand_user_path(right);
+    #[cfg(target_os = "windows")]
+    {
+        left.as_os_str().eq_ignore_ascii_case(right.as_os_str())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        left == right
     }
 }
 
@@ -1576,7 +1597,12 @@ fn is_powershell_allowlist_entry_match(
 
     let allowed = strip_wrapping_quotes(allowed).trim();
     if looks_like_path(allowed) {
-        return allowed.eq_ignore_ascii_case(executable);
+        // An explicit path is the trust anchor, so it must match with the host
+        // filesystem's case semantics: case-insensitive on Windows, exact on
+        // case-sensitive Unix. Folding case on every host would let an
+        // allowlist entry `/tmp/Safe/tool` authorize the distinct executable
+        // `/tmp/safe/tool`.
+        return host_path_tokens_equal(allowed, executable);
     }
 
     let allowed = strip_powershell_executable_suffix(allowed);
@@ -5085,6 +5111,55 @@ mod tests {
                 )
                 .is_ok(),
             "an exact executable-path allowlist must retain its existing meaning"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn powershell_allowlist_path_is_case_sensitive_on_unix() {
+        // The explicit path is the trust anchor. On a case-sensitive host,
+        // `/tmp/Safe/tool` and `/tmp/safe/tool` can be different executables,
+        // so a differently cased request must not inherit the allowlist grant.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tp_ws(),
+            allowed_commands: vec!["/tmp/Safe/tool".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        // Exact case remains authorized.
+        assert!(
+            p.validate_command_execution_for_shell(
+                "/tmp/Safe/tool",
+                true,
+                ShellDialect::PowerShell,
+            )
+            .is_ok(),
+            "exact-case explicit path must stay authorized"
+        );
+
+        // Differently cased executable must NOT match the trusted entry.
+        assert!(
+            p.validate_command_execution_for_shell(
+                "/tmp/safe/tool",
+                true,
+                ShellDialect::PowerShell,
+            )
+            .is_err(),
+            "case-distinct executable must not inherit the allowlist grant on a case-sensitive host"
+        );
+
+        // The workspace-exemption path (forbidden_path_argument) must apply the
+        // same case rule: the differently cased executable is not exempted by
+        // the trusted entry, so it is subject to path confinement.
+        assert!(
+            !is_powershell_allowlist_entry_match("/tmp/Safe/tool", "/tmp/safe/tool", "tool"),
+            "path allowlist match must be case-sensitive on Unix"
+        );
+        assert!(
+            is_powershell_allowlist_entry_match("/tmp/Safe/tool", "/tmp/Safe/tool", "tool"),
+            "exact-case path allowlist match must still succeed"
         );
     }
 
