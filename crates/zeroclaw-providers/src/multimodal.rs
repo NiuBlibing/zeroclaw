@@ -2809,7 +2809,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_images_consume_budget_under_pre_normalization_trim() {
-        // BEHAVIOR CHANGE (PR #9819): the per-request image cap is now applied
+        // BEHAVIOR CHANGE: the per-request image cap is now applied
         // *before* normalization, so a newer image that fails to load does
         // consume budget and can evict an older valid one.
         //
