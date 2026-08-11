@@ -298,6 +298,10 @@ impl Tool for ShellTool {
             }
         }
 
+        // Own the workspace-resolving forbidden-path scan here, dialect-aware,
+        // rather than relying on an outer generic path guard that defaults to
+        // POSIX. This keeps symlink-escape hardening while allowing cmd.exe's
+        // null device only on the native Windows execution path.
         if let Some(path) = self
             .security
             .forbidden_workspace_path_argument_for_shell(command, self.runtime.shell_dialect())
@@ -683,8 +687,10 @@ mod tests {
             .expect("medium-risk test command should have a base command")
     }
 
-    /// Returns the shell tool as composed in production. ShellTool owns the
-    /// runtime-dialect-aware workspace path scan; the outer wrapper rate-limits.
+    /// The shell tool as assembled in production: `RateLimitedTool<ShellTool>`.
+    /// ShellTool owns its own dialect-aware command + forbidden-path validation,
+    /// so (like `SkillShellTool`) it is not wrapped in the generic POSIX
+    /// `PathGuardedTool`. Tests exercise this exact shape.
     fn wrapped_shell(security: Arc<SecurityPolicy>) -> RateLimitedTool<ShellTool> {
         RateLimitedTool::new(ShellTool::new(security.clone(), test_runtime()), security)
     }
@@ -829,6 +835,68 @@ mod tests {
         assert!(result.success);
         assert!(result.output.trim().contains("hello"));
         assert!(result.error.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_executes_windows_nul_redirect_through_cmd_exe() {
+        // Native-Windows runtime boundary through the FULLY WRAPPED production
+        // shape (`RateLimitedTool<ShellTool>`). `test_runtime()` is
+        // `NativeRuntime`, which reports `WindowsCmd`, so ShellTool's own
+        // dialect-aware validation accepts a redirect to the `nul` null device
+        // and cmd.exe then resolves `nul` to the discard-only device. Because the
+        // shell tool now owns its forbidden-path scan (no outer POSIX
+        // `PathGuardedTool`), the `\\.\nul` device form is no longer rejected
+        // ahead of the tool. Proves the allow decision AND real execution.
+        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+
+        // Bare `2>nul`: stderr is discarded, stdout is preserved, command succeeds.
+        let result = tool
+            .execute(json!({"command": "echo zeroclaw_nul_stdout 2>nul"}))
+            .await
+            .expect("`2>nul` command should return a result");
+        assert!(
+            result.success,
+            "`2>nul` must be allowed and execute on Windows: {:?}",
+            result.error
+        );
+        assert!(result.output.trim().contains("zeroclaw_nul_stdout"));
+        assert!(result.error.is_none());
+
+        // Full `\\.\nul` device form redirecting stdout: nothing is written to a
+        // real workspace file, and the command still succeeds.
+        let result = tool
+            .execute(json!({"command": r"echo zeroclaw_dev >\\.\nul"}))
+            .await
+            .expect(r"`>\\.\nul` command should return a result");
+        assert!(
+            result.success,
+            r"`>\\.\nul` must be allowed and execute on Windows: {:?}",
+            result.error
+        );
+        assert!(result.error.is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn shell_rejects_nul_redirect_through_posix_production_shape() {
+        // The POSIX counterpart, through the same production shape. On a POSIX
+        // sink (Unix native, Docker `sh -c`, cron `sh -c`) `nul` is an ordinary
+        // relative filename, so a redirect to it — bare `nul` or the `\\.\nul`
+        // device form — must stay blocked as an unsafe file redirect. This is the
+        // boundary the fix protects: dropping the outer `PathGuardedTool` must not
+        // weaken POSIX rejection, because ShellTool's own dialect-aware scan runs.
+        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        for cmd in ["echo zeroclaw x >nul", r"echo zeroclaw x >\\.\nul"] {
+            let result = tool
+                .execute(json!({ "command": cmd }))
+                .await
+                .expect("command should return a result");
+            assert!(
+                !result.success,
+                "POSIX must reject a redirect to `nul` as an unsafe file target: {cmd}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1136,6 +1204,11 @@ mod tests {
     async fn shell_warns_on_ephemeral_workspace_failure_path() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
             .with_persistent_writes(false);
+        // Use a bare (non-path-looking) name so the command fails on a missing
+        // directory rather than being stopped by the shell tool's own forbidden-
+        // path guard. An absolute `/nonexistent...` would be rejected before it
+        // ever runs, and this test is about the ephemeral banner on a *runtime*
+        // failure, not about path gating.
         let result = tool
             .execute(json!({"command": "ls nonexistent_dir_xyz_4627"}))
             .await

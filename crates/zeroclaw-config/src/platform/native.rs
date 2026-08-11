@@ -151,6 +151,10 @@ impl RuntimeAdapter for NativeRuntime {
     }
 
     fn shell_dialect(&self) -> ShellDialect {
+        // Must match the shell `build_shell_command` actually spawns below:
+        // a PowerShell interpreter when configured, else `cmd.exe /C` on
+        // Windows and POSIX `sh -c` (incl. Android) everywhere else. This is
+        // the only sink that reports `WindowsCmd` or `PowerShell`.
         #[cfg(not(target_os = "windows"))]
         if is_android() {
             return ShellDialect::Posix;
@@ -212,6 +216,25 @@ impl RuntimeAdapter for NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_shell_dialect_is_windows_cmd_on_windows() {
+        // Native execution on Windows runs through `cmd.exe /C`, so the policy
+        // must see `WindowsCmd` and accept the `nul` null device there.
+        assert_eq!(
+            NativeRuntime::new().shell_dialect(),
+            ShellDialect::WindowsCmd
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn native_shell_dialect_is_posix_off_windows() {
+        // Unix native (including Android) runs through POSIX `sh -c`, where
+        // `nul` is an ordinary filename — the policy must not treat it as safe.
+        assert_eq!(NativeRuntime::new().shell_dialect(), ShellDialect::Posix);
+    }
 
     #[test]
     fn native_name() {

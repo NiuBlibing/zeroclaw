@@ -5,11 +5,23 @@ use std::path::{Path, PathBuf};
 ///
 /// This is part of the execution boundary: security policy must validate the
 /// same language that [`RuntimeAdapter::build_shell_command`] will interpret.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The command-risk policy needs this to apply platform-specific safety rules —
+/// notably the null device: a POSIX shell treats `nul` as an ordinary relative
+/// filename (so `echo x >nul` would create/truncate a workspace file), while
+/// Windows `cmd.exe` resolves it to the discard-only null device. A redirect to
+/// `nul` is therefore only safe under [`ShellDialect::WindowsCmd`].
+///
+/// The dialect follows the *effective execution sink*, not merely the host OS:
+/// Docker and cron always run through `sh -c` and stay [`ShellDialect::Posix`]
+/// even on a Windows host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShellDialect {
-    /// A POSIX-style shell such as `sh`, `bash`, or `zsh`.
+    /// POSIX `sh`/`bash` semantics — Unix native execution, Docker `sh -c`,
+    /// and cron `sh -c`. The conservative default.
+    #[default]
     Posix,
-    /// The Windows command processor (`cmd.exe`).
+    /// Windows `cmd.exe` semantics — native execution on a Windows host.
     WindowsCmd,
     /// Windows PowerShell or PowerShell 7+.
     PowerShell,
@@ -76,6 +88,11 @@ pub trait RuntimeAdapter: Send + Sync {
     ///
     /// This is the source of truth for both shell capability and command
     /// policy. Adapters without shell access must return [`ShellDialect::None`].
+    ///
+    /// An adapter must report the dialect it *actually* runs under, because the
+    /// command-risk policy consults this to decide platform-specific safety
+    /// (e.g. accepting a redirect to the `nul` null device). Docker and cron
+    /// execute via `sh -c` and therefore stay POSIX even on Windows.
     fn shell_dialect(&self) -> ShellDialect;
 
     /// Build a shell command process configured for this runtime.
@@ -172,6 +189,15 @@ mod tests {
     fn default_memory_budget_is_zero() {
         let runtime = DummyRuntime;
         assert_eq!(runtime.memory_budget(), 0);
+    }
+
+    #[test]
+    fn default_shell_dialect_is_posix() {
+        // Any adapter that does not override `shell_dialect` (Docker, cron, and
+        // every non-native sink) runs commands through `sh -c`, so it must
+        // report POSIX. Only native execution on Windows overrides to cmd.exe.
+        let runtime = DummyRuntime;
+        assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
     }
 
     #[test]
