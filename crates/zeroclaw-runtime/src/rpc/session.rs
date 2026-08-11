@@ -239,6 +239,13 @@ impl SessionStore {
     /// provider box: it holds the hint→route table bound to that provider set,
     /// so leaving the old resolver would resolve routed hints through the
     /// previous provider while the new box serves the call.
+    /// `config_generation` is the `Arc<Config>` the caller built this provider
+    /// box and resolver FROM. It is published onto the agent in the same state
+    /// transition, so a later explicit `model_switch` rebuilds dispatch from
+    /// that generation rather than the agent's construction-time snapshot, and
+    /// `context_limits_for_route` reports capacity and budget from it too.
+    /// Passing a generation the box was not built from reintroduces the
+    /// mixed-generation split this parameter exists to close.
     pub async fn apply_model_provider(
         &self,
         id: &str,
@@ -247,6 +254,7 @@ impl SessionStore {
         model_name: String,
         model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
         tool_dispatcher: Box<dyn ToolDispatcher>,
+        config_generation: Arc<zeroclaw_config::schema::Config>,
     ) -> bool {
         let agent = {
             let sessions = self.sessions.lock().await;
@@ -261,6 +269,7 @@ impl SessionStore {
         guard.set_model_name(model_name);
         guard.set_model_route_resolver(model_route_resolver);
         guard.set_tool_dispatcher(tool_dispatcher);
+        guard.set_config_generation(config_generation);
         true
     }
 

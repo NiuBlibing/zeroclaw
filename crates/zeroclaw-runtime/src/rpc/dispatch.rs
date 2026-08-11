@@ -2096,6 +2096,9 @@ impl RpcDispatcher {
                     model_name,
                     model_route_resolver,
                     tool_dispatcher,
+                    // The exact generation the box and resolver above were built
+                    // from, published onto the agent with them.
+                    std::sync::Arc::new(config.clone()),
                 )
             };
             Some(built)
@@ -2116,6 +2119,7 @@ impl RpcDispatcher {
             model_name,
             model_route_resolver,
             tool_dispatcher,
+            config_generation,
         )) = built_model_provider
         {
             self.ctx
@@ -2127,6 +2131,7 @@ impl RpcDispatcher {
                     model_name,
                     model_route_resolver,
                     tool_dispatcher,
+                    config_generation,
                 )
                 .await
                 .then_some(())
@@ -2912,6 +2917,7 @@ impl RpcDispatcher {
                 model_route_resolver,
                 tool_dispatcher,
                 temperature,
+                config_generation,
             ) = {
                 let config = ctx.config.read();
                 let Some(model_provider_ref) =
@@ -2962,6 +2968,11 @@ impl RpcDispatcher {
                             model_route_resolver,
                             tool_dispatcher,
                             overrides.temperature.or(provider_temperature),
+                            // `config/set` already committed this generation to
+                            // the shared config; publishing it with the box means
+                            // the next prompt cannot observe the new limits with
+                            // a provider rebuilt from the old one.
+                            std::sync::Arc::new(config.clone()),
                         )
                     }
                     Err(e) => {
@@ -2993,6 +3004,7 @@ impl RpcDispatcher {
                     model_name,
                     model_route_resolver,
                     tool_dispatcher,
+                    config_generation,
                 )
                 .await
                 && let Some(agent) = ctx.sessions.get_agent(&session_id).await

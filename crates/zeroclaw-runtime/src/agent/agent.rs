@@ -410,6 +410,11 @@ pub struct Agent {
     /// the full conversation history on every turn and tool iteration.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
     provider_switch_config: Option<ProviderSwitchConfig>,
+    /// The generation cell the context-limits resolver reads. Republished
+    /// together with `provider_switch_config.config` by
+    /// `sync_config_generation`, so provider rebuilding and limit resolution
+    /// cannot observe different config generations.
+    config_generation: Option<ConfigGeneration>,
     /// Channel name stamped onto observer events to identify the calling surface
     /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
     channel_name: String,
@@ -456,9 +461,23 @@ pub struct StreamedTurnError {
     pub new_messages: Vec<ConversationMessage>,
 }
 
+/// The one config generation an agent dispatches from. Provider rebuilding
+/// (`try_apply_model_switch`) and context-limit resolution
+/// (`context_limits_for_route`) both read this cell, so a route, the provider
+/// box serving it, and the capacity/budget reported for it can never describe
+/// different generations. `Agent::sync_config_generation` republishes it from
+/// the live config at each turn boundary; between boundaries a turn observes
+/// one stable generation.
+pub type ConfigGeneration =
+    std::sync::Arc<parking_lot::RwLock<std::sync::Arc<zeroclaw_config::schema::Config>>>;
+
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
+    /// Live shared config this snapshot is refreshed from, when the agent is
+    /// daemon-backed. `None` for one-shot/test agents, whose `config` snapshot
+    /// is already the only generation that exists.
+    pub live: Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 }
 
 /// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
@@ -553,6 +572,7 @@ pub struct AgentBuilder {
     channel_name: Option<String>,
     exclude_memory: bool,
     provider_switch_config: Option<ProviderSwitchConfig>,
+    config_generation: Option<ConfigGeneration>,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
 }
@@ -601,6 +621,7 @@ impl AgentBuilder {
             approval_manager: None,
             agent_alias: None,
             channel_name: None,
+            config_generation: None,
             exclude_memory: false,
             provider_switch_config: None,
             #[cfg(test)]
@@ -841,6 +862,16 @@ impl AgentBuilder {
         self
     }
 
+    /// Install the generation cell that provider rebuilding and context-limit
+    /// resolution both read. Callers that supply one MUST derive the agent's
+    /// `context_limits_resolver` from the SAME cell (see
+    /// `Agent::context_generation_limits_resolver`); otherwise limits can be
+    /// resolved from a config generation the provider box was not built from.
+    pub fn config_generation(mut self, generation: ConfigGeneration) -> Self {
+        self.config_generation = Some(generation);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self.tools.ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -977,6 +1008,7 @@ impl AgentBuilder {
             agent_alias: self.agent_alias.unwrap_or_default(),
             channel_handles: AgentChannelHandles::default(),
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
+            config_generation: self.config_generation,
             provider_switch_config: self.provider_switch_config,
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(test)]
@@ -1075,6 +1107,49 @@ impl Agent {
     /// stale snapshot in a long-lived session.
     pub fn context_limits(&self) -> zeroclaw_config::schema::ResolvedContextLimits {
         self.context_limits_for_route(&self.model_provider_name, &self.model_name)
+    }
+
+    /// Build a limits resolver bound to a config generation CELL. Kept next to
+    /// `sync_config_generation` because the two form the single-generation
+    /// contract: this resolver reports capacity/budget from whatever generation
+    /// that function last published, which is the same generation
+    /// `try_apply_model_switch` rebuilds the provider and route resolver from.
+    pub fn context_generation_limits_resolver(
+        generation: ConfigGeneration,
+        agent_alias: String,
+    ) -> impl Fn(&str, &str) -> zeroclaw_config::schema::ResolvedContextLimits + Send + Sync + 'static
+    {
+        move |provider_ref, model| {
+            let config = Arc::clone(&generation.read());
+            config.resolved_context_limits_for_route(&agent_alias, provider_ref, model)
+        }
+    }
+
+    /// Republish the agent's config generation from the live shared config.
+    ///
+    /// Called at a turn boundary, before any route is resolved. Provider
+    /// rebuilding (`try_apply_model_switch`, via `provider_switch_config`) and
+    /// limit resolution (`context_limits_for_route`, via `config_generation`)
+    /// then read one identical `Arc<Config>`, so dispatch, route identity, and
+    /// reported limits cannot straddle a mid-session `config/set`. Within a turn
+    /// the generation is stable: a reload that lands mid-turn is observed by the
+    /// next turn, not by half of this one.
+    pub fn sync_config_generation(&mut self) {
+        let Some(live) = self
+            .provider_switch_config
+            .as_ref()
+            .and_then(|cfg| cfg.live.as_ref())
+            .map(Arc::clone)
+        else {
+            return;
+        };
+        let latest = Arc::new(live.read().clone());
+        if let Some(generation) = self.config_generation.as_ref() {
+            *generation.write() = Arc::clone(&latest);
+        }
+        if let Some(switch_config) = self.provider_switch_config.as_mut() {
+            switch_config.config = Some(latest);
+        }
     }
 
     /// Resolve capacity and proactive budget for a route selected for the
@@ -1244,6 +1319,33 @@ impl Agent {
         model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
     ) {
         self.model_route_resolver = model_route_resolver;
+    }
+
+    /// Publish the config generation a freshly swapped provider box was built
+    /// from. MUST be called in the same state transition as
+    /// `set_model_provider` / `set_model_route_resolver` (see
+    /// `SessionStore::apply_model_provider`): it moves the provider-rebuild
+    /// snapshot and the limits generation together, so a later explicit
+    /// `model_switch` cannot rebuild dispatch from stale profiles and routes
+    /// while `context_limits_for_route` reports the new config's capacity.
+    pub fn set_config_generation(
+        &mut self,
+        config_generation: Arc<zeroclaw_config::schema::Config>,
+    ) {
+        if let Some(generation) = self.config_generation.as_ref() {
+            *generation.write() = Arc::clone(&config_generation);
+        }
+        match self.provider_switch_config.as_mut() {
+            Some(switch_config) => {
+                switch_config.config = Some(config_generation);
+            }
+            None => {
+                self.provider_switch_config = Some(ProviderSwitchConfig {
+                    config: Some(config_generation),
+                    live: None,
+                });
+            }
+        }
     }
 
     /// Resolve a selector through the agent's CURRENT route resolver. Test-only
@@ -1760,16 +1862,25 @@ impl Agent {
             ApprovalManager::for_non_interactive(risk_profile)
         };
 
+        // Daemon-backed agents resolve limits from a generation CELL rather than
+        // directly from `live_config`. `sync_config_generation` republishes that
+        // cell and `provider_switch_config.config` from the live config as one
+        // step at each turn boundary, so `try_apply_model_switch` rebuilds the
+        // provider and route resolver from exactly the generation these limits
+        // are resolved from. Reading `live_config` here instead would let a
+        // mid-session `config/set` report new capacity for a provider that was
+        // rebuilt from the construction-time snapshot.
+        let config_generation: Option<ConfigGeneration> = live_config
+            .as_ref()
+            .map(|live| Arc::new(parking_lot::RwLock::new(Arc::new(live.read().clone()))));
+        let live_config_for_generation = live_config.as_ref().map(Arc::clone);
+
         let context_limits_resolver: ContextLimitsResolver =
-            if let Some(limit_config) = live_config.as_ref().map(Arc::clone) {
-                let limit_agent_alias = agent_alias.to_string();
-                Arc::new(move |provider_ref, model| {
-                    limit_config.read().resolved_context_limits_for_route(
-                        &limit_agent_alias,
-                        provider_ref,
-                        model,
-                    )
-                })
+            if let Some(generation) = config_generation.as_ref().map(Arc::clone) {
+                Arc::new(Agent::context_generation_limits_resolver(
+                    generation,
+                    agent_alias.to_string(),
+                ))
             } else {
                 let limit_config = config.clone();
                 let limit_agent_alias = agent_alias.to_string();
@@ -1795,7 +1906,7 @@ impl Agent {
                 Arc::new(move || max)
             };
 
-        let mut agent = Agent::builder()
+        let mut builder = Agent::builder()
             .model_provider(model_provider)
             .tools(tools)
             .memory(memory.clone())
@@ -1844,10 +1955,21 @@ impl Agent {
                 None
             })
             .approval_manager(Some(Arc::new(approval_manager)))
+            // The switch snapshot is seeded from the SAME generation the limits
+            // resolver above reads, and both are republished together by
+            // `sync_config_generation`.
             .provider_switch_config(ProviderSwitchConfig {
-                config: Some(std::sync::Arc::new(config.clone())),
-            })
-            .build()?;
+                config: Some(
+                    config_generation
+                        .as_ref()
+                        .map_or_else(|| Arc::new(config.clone()), |cell| Arc::clone(&cell.read())),
+                ),
+                live: live_config_for_generation,
+            });
+        if let Some(generation) = config_generation {
+            builder = builder.config_generation(generation);
+        }
+        let mut agent = builder.build()?;
 
         // Wire per-tool channel-map handles into the agent so callers (e.g.
         // the ACP server) can register back-channels after construction.
@@ -2354,6 +2476,11 @@ impl Agent {
                 )));
         }
 
+        // Pin one config generation for this whole turn BEFORE resolving a
+        // route, so the provider this turn may rebuild and the limits it
+        // reports come from the same generation.
+        self.sync_config_generation();
+
         let effective_model = self.classify_model(user_message);
         let selected_route = self.model_route_resolver.resolve(&effective_model);
         let context_limits =
@@ -2708,6 +2835,10 @@ impl Agent {
         }
 
         let mut new_msgs: Vec<ConversationMessage> = Vec::new();
+        // Pin one config generation for this whole turn BEFORE resolving a
+        // route, so a mid-turn `model_switch` rebuilds the provider from the
+        // same generation the limits below are resolved from.
+        self.sync_config_generation();
         // `effective_model` is `mut` so a `model_switch` requested mid-turn
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_model_switch`) can rebind it for later rounds
@@ -9822,9 +9953,15 @@ vision_model_provider = "custom.vision"
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(temp.path().to_path_buf())
             .agent_alias("coder".into())
+            // The first call must resolve against the configured text route, not
+            // the builder's `<unconfigured>` default, or its per-call usage frame
+            // reports no window (the source stays Fallback, not Configured).
+            .model_provider_name("custom.text".into())
+            .model_name("text-model".into())
             .multimodal_config(config.multimodal.clone())
             .provider_switch_config(ProviderSwitchConfig {
                 config: Some(Arc::new(config.clone())),
+                live: None,
             })
             // Auto-approve so the image-injecting tool runs and the vision route
             // engages.
@@ -9847,7 +9984,7 @@ vision_model_provider = "custom.vision"
         }));
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-        let _ = agent
+        let outcome = agent
             .turn_streamed_with_steering_state("please attach the image", event_tx, None, None)
             .await
             .expect("streamed turn should succeed");
@@ -9857,7 +9994,11 @@ vision_model_provider = "custom.vision"
             "the text primary must have served the first call"
         );
 
-        let mut terminal_snapshot = None;
+        // Collect usage frames IN ORDER so the transition itself is asserted,
+        // not just the final state: the first frame must carry the 200k text
+        // route's window with real usage, and only the later usage-less frame
+        // may carry the 8k vision window.
+        let mut usage_frames = Vec::new();
         while let Ok(ev) = event_rx.try_recv() {
             if let TurnEvent::Usage {
                 input_tokens,
@@ -9866,16 +10007,53 @@ vision_model_provider = "custom.vision"
                 model_context_window,
                 ..
             } = ev
-                && input_tokens.is_none()
-                && output_tokens.is_none()
             {
-                terminal_snapshot = Some((context_token_budget, model_context_window));
+                usage_frames.push((
+                    input_tokens,
+                    output_tokens,
+                    context_token_budget,
+                    model_context_window,
+                ));
             }
         }
-        let (budget, window) = terminal_snapshot.expect(
-            "the usage-less vision call must publish a terminal snapshot even though the earlier \
-             text call reported usage",
+        assert!(
+            usage_frames.len() >= 2,
+            "expected a text-route usage frame followed by the vision terminal snapshot, got {:?}",
+            usage_frames
         );
+
+        let (first_input, _, first_budget, first_window) = usage_frames[0];
+        assert!(
+            first_input.is_some(),
+            "the first frame is the text call that DID report usage, got {:?}",
+            usage_frames[0]
+        );
+        assert_eq!(
+            first_window,
+            Some(200_000),
+            "the first usage frame must carry the 200k text route it was served on"
+        );
+        // No runtime profile in this config, so the budget is the legacy 32k
+        // default: under the text route's 200k capacity it survives unclamped,
+        // which is what distinguishes it from the vision frame below.
+        assert_eq!(
+            first_budget,
+            Some(32_000),
+            "the legacy default budget fits under the text route's 200k capacity unclamped"
+        );
+
+        let terminal_index = usage_frames
+            .iter()
+            .position(|(input, output, _, _)| input.is_none() && output.is_none())
+            .expect(
+                "the usage-less vision call must publish a terminal snapshot even though the \
+                 earlier text call reported usage",
+            );
+        assert!(
+            terminal_index > 0,
+            "the terminal snapshot must come AFTER the text route's usage frame, not before it"
+        );
+        let (_, _, budget, window) = usage_frames[terminal_index];
         // The terminal snapshot must reflect the FINAL served (vision) route:
         // an 8k window, not the 200k text route it started on.
         assert_eq!(
@@ -9887,6 +10065,29 @@ vision_model_provider = "custom.vision"
             budget,
             Some(8_000),
             "the 8k vision capacity clamps the effective budget the terminal snapshot reports"
+        );
+
+        // Route IDENTITY on the outcome, not just the numbers: a window that
+        // happened to match would otherwise pass without the vision route
+        // actually having served the final call.
+        assert_eq!(
+            outcome.provider_name, "custom.vision",
+            "the outcome's final provider must be the vision route the switch landed on"
+        );
+        assert_eq!(
+            outcome.model, "vision-model",
+            "the outcome's final model must be the vision route's model"
+        );
+        let final_limits = outcome
+            .final_context_limits
+            .expect("a served call must publish final limits on the outcome");
+        assert_eq!(
+            final_limits.model_context_window, 8_000,
+            "the outcome's limits must agree with the terminal snapshot's window"
+        );
+        assert_eq!(
+            final_limits.context_token_budget, 8_000,
+            "the outcome's limits must agree with the terminal snapshot's budget"
         );
     }
 
@@ -9920,6 +10121,155 @@ vision_model_provider = "custom.vision"
             builder = builder.provider_switch_config(cfg);
         }
         builder.build().expect("agent builder")
+    }
+
+    /// Build a config whose `ollama.large` route carries `window` capacity, so a
+    /// generation swap is observable in both dispatch (the route's model) and the
+    /// resolved limits.
+    fn generation_config(window: usize, model: &str) -> zeroclaw_config::schema::Config {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.providers.models.custom.insert(
+            "large".to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    // The custom slot has no family-default endpoint, so a
+                    // provider rebuild fails without a uri.
+                    uri: Some("http://127.0.0.1:1/v1".to_string()),
+                    model: Some(model.to_string()),
+                    context_window: Some(window),
+                    ..zeroclaw_config::schema::ModelProviderConfig::default()
+                },
+            },
+        );
+        cfg
+    }
+
+    /// A mid-session `config/set` must be observed by provider rebuilding and by
+    /// limit resolution as ONE generation. The regression this pins: limits read
+    /// the live shared config while `try_apply_model_switch` rebuilt from the
+    /// construction-time snapshot, so a `config/set` followed by an explicit
+    /// model switch dispatched on the old profiles while reporting the new
+    /// capacity.
+    #[test]
+    fn config_set_then_model_switch_dispatches_and_reports_one_generation() {
+        let live = Arc::new(parking_lot::RwLock::new(generation_config(
+            200_000, "large-v1",
+        )));
+        let generation: ConfigGeneration =
+            Arc::new(parking_lot::RwLock::new(Arc::new(live.read().clone())));
+
+        let mut agent = build_test_agent(
+            "custom.large",
+            "large-v1",
+            Some(ProviderSwitchConfig {
+                config: Some(Arc::clone(&generation.read())),
+                live: Some(Arc::clone(&live)),
+            }),
+        );
+        agent.config_generation = Some(Arc::clone(&generation));
+        agent.context_limits_resolver = Some(Arc::new(Agent::context_generation_limits_resolver(
+            Arc::clone(&generation),
+            String::new(),
+        )));
+
+        assert_eq!(
+            agent
+                .context_limits_for_route("custom.large", "large-v1")
+                .model_context_window,
+            200_000,
+            "baseline limits come from the construction generation"
+        );
+
+        // A `config/set` lands on the live shared config mid-session.
+        *live.write() = generation_config(8_000, "large-v2");
+
+        // Within the turn already in flight the generation is still the old one:
+        // a reload must not be observed by half a turn.
+        assert_eq!(
+            agent
+                .context_limits_for_route("custom.large", "large-v1")
+                .model_context_window,
+            200_000,
+            "an in-flight turn must not observe a mid-turn reload"
+        );
+
+        // The next turn boundary republishes it.
+        agent.sync_config_generation();
+
+        let switched = agent.try_apply_model_switch(
+            "large-v1",
+            "custom.large".to_string(),
+            "large-v2".to_string(),
+        );
+        assert_eq!(
+            switched.as_deref(),
+            Some("large-v2"),
+            "the switch must rebuild from the refreshed generation, which knows large-v2"
+        );
+
+        let limits = agent.context_limits_for_route("custom.large", "large-v2");
+        assert_eq!(
+            limits.model_context_window, 8_000,
+            "limits must report the SAME generation the provider was rebuilt from"
+        );
+        assert_eq!(
+            limits.context_token_budget, 8_000,
+            "the legacy 32k default clamps to the refreshed 8k capacity"
+        );
+        assert_eq!(
+            agent
+                .provider_switch_config
+                .as_ref()
+                .and_then(|cfg| cfg.config.as_ref())
+                .and_then(|cfg| cfg.providers.models.custom.get("large"))
+                .and_then(|p| p.base.model.as_deref()),
+            Some("large-v2"),
+            "the provider-rebuild snapshot must be the refreshed generation, not the \
+             construction-time clone"
+        );
+    }
+
+    /// `apply_model_provider` publishes the generation it built the provider box
+    /// from. Both derived handles must move together, or a later switch rebuilds
+    /// from a generation the caller already replaced.
+    #[test]
+    fn set_config_generation_moves_switch_snapshot_and_limits_together() {
+        let generation: ConfigGeneration = Arc::new(parking_lot::RwLock::new(Arc::new(
+            generation_config(200_000, "large-v1"),
+        )));
+        let mut agent = build_test_agent(
+            "custom.large",
+            "large-v1",
+            Some(ProviderSwitchConfig {
+                config: Some(Arc::clone(&generation.read())),
+                live: None,
+            }),
+        );
+        agent.config_generation = Some(Arc::clone(&generation));
+        agent.context_limits_resolver = Some(Arc::new(Agent::context_generation_limits_resolver(
+            Arc::clone(&generation),
+            String::new(),
+        )));
+
+        agent.set_config_generation(Arc::new(generation_config(8_000, "large-v2")));
+
+        assert_eq!(
+            agent
+                .context_limits_for_route("custom.large", "large-v2")
+                .model_context_window,
+            8_000,
+            "limit resolution must follow the published generation"
+        );
+        assert_eq!(
+            agent
+                .provider_switch_config
+                .as_ref()
+                .and_then(|cfg| cfg.config.as_ref())
+                .and_then(|cfg| cfg.providers.models.custom.get("large"))
+                .and_then(|p| p.base.context_window),
+            Some(8_000),
+            "the provider-rebuild snapshot must follow the same published generation"
+        );
     }
 
     #[test]
@@ -9961,6 +10311,7 @@ vision_model_provider = "custom.vision"
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -9988,6 +10339,7 @@ vision_model_provider = "custom.vision"
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live: None,
         };
 
         let mut agent = build_test_agent("openai", "shared-name", Some(switch_cfg));
@@ -10015,6 +10367,7 @@ vision_model_provider = "custom.vision"
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live: None,
         };
         let mut agent = build_test_agent("ollama.large", "large", Some(switch_cfg));
         agent.context_limits_resolver = Some(Arc::new(|provider_ref, model| {
@@ -10075,6 +10428,7 @@ vision_model_provider = "custom.vision"
         };
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(route_config)),
+            live: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -10269,6 +10623,7 @@ vision_model_provider = "custom.vision"
                 },
                 ..zeroclaw_config::schema::Config::default()
             })),
+            live: None,
         };
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
             resolved: zeroclaw_config::schema::ResolvedRuntime {
