@@ -22,15 +22,31 @@ const MAX_DECODED_IMAGE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
 /// when many images are present in history.
 const AGGREGATE_DECODE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Counts full decodes performed by [`validate_image_content`].
-///
-/// Budget exhaustion is observable two ways — an image can be skipped because
-/// it was rejected *before* decoding, or skipped after being decoded and found
-/// too large. Both look identical in the prepared output, so asserting on the
-/// output alone cannot tell "never decoded" from "decoded then discarded". The
-/// latter is the bug this counter exists to catch.
+// Counts full decodes performed by `validate_image_content`.
+//
+// Budget exhaustion is observable two ways — an image can be skipped because it
+// was rejected *before* decoding, or skipped after being decoded and found too
+// large. Both look identical in the prepared output, so asserting on the output
+// alone cannot tell "never decoded" from "decoded then discarded". The latter is
+// the bug this counter exists to catch.
+//
+// Task-local rather than process-global: the suite runs tests concurrently and
+// many of them decode images, so a global counter would also see their decodes.
+// Each observing test scopes its own counter; tests that do not opt in leave it
+// unset. A plain comment because doc comments do not attach to a macro
+// invocation.
 #[cfg(test)]
-static DECODE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+tokio::task_local! {
+    static DECODE_CALLS: std::sync::atomic::AtomicUsize;
+}
+
+/// Records one decode against the ambient counter, if a test installed one.
+#[cfg(test)]
+fn record_decode_call() {
+    let _ = DECODE_CALLS.try_with(|calls| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
 
 /// Per-path cache for resolved local image data URIs. Keyed by absolute
 /// path; stores `(len, mtime)` for freshness checks (`(0, 0)` sentinel
@@ -1563,7 +1579,7 @@ async fn validate_within_budget(
 /// for RGBA) so callers can track aggregate budget consumption.
 async fn validate_image_content(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Result<u64> {
     #[cfg(test)]
-    DECODE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    record_decode_call();
 
     let format = image_format_for_mime(source, mime)?;
 
@@ -2407,9 +2423,25 @@ mod tests {
         );
     }
 
-    /// Serializes the tests that read [`DECODE_CALLS`]; the counter is process
-    /// global and `cargo test` runs these on separate threads.
-    static DECODE_COUNTER_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Runs `body` with a fresh [`DECODE_CALLS`] counter scoped to it, and
+    /// returns `(body's value, decodes observed)`.
+    ///
+    /// The counter is task-local, so concurrent tests decoding their own images
+    /// cannot inflate this count and no cross-test locking is needed.
+    async fn counting_decodes<F, T>(body: F) -> (T, usize)
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        DECODE_CALLS
+            .scope(counter, async move {
+                let value = body.await;
+                let count =
+                    DECODE_CALLS.with(|calls| calls.load(std::sync::atomic::Ordering::Relaxed));
+                (value, count)
+            })
+            .await
+    }
 
     /// A PNG that really is `width` x `height` — unlike [`png_bomb`], it decodes,
     /// so it actually consumes decode budget.
@@ -2427,45 +2459,38 @@ mod tests {
 
     #[tokio::test]
     async fn budget_exhaustion_rejects_without_decoding() {
-        let _guard = DECODE_COUNTER_GUARD.lock().unwrap();
-
         // 512x512 RGBA = 1 MiB projected.
         let bytes = real_png(512, 512);
-        let mut budget = 1024 * 1024;
 
-        DECODE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let ((), decodes) = counting_decodes(async {
+            let mut budget = 1024 * 1024;
 
-        // Exactly fits: decoded, and the budget lands on zero.
-        validate_within_budget("first.png", "image/png", &bytes, &mut budget)
-            .await
-            .expect("an image that fits the budget is accepted");
-        assert_eq!(budget, 0, "a decode consumes its projected allocation");
-        assert_eq!(
-            DECODE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "the first image must be decoded"
-        );
-
-        // Every subsequent candidate must be refused *without* a decode. Before
-        // this change the budget was checked after decoding, so each of these
-        // paid a full decode before being discarded.
-        for i in 0..3 {
-            validate_within_budget("later.png", "image/png", &bytes, &mut budget)
+            // Exactly fits: decoded, and the budget lands on zero.
+            validate_within_budget("first.png", "image/png", &bytes, &mut budget)
                 .await
-                .expect_err("an exhausted budget must reject");
-            assert_eq!(budget, 0, "an exhausted budget stays exhausted (i={i})");
-        }
+                .expect("an image that fits the budget is accepted");
+            assert_eq!(budget, 0, "a decode consumes its projected allocation");
+
+            // Every subsequent candidate must be refused *without* a decode.
+            // Before this change the budget was checked after decoding, so each
+            // of these paid a full decode before being discarded.
+            for i in 0..3 {
+                validate_within_budget("later.png", "image/png", &bytes, &mut budget)
+                    .await
+                    .expect_err("an exhausted budget must reject");
+                assert_eq!(budget, 0, "an exhausted budget stays exhausted (i={i})");
+            }
+        })
+        .await;
+
         assert_eq!(
-            DECODE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "no decode may happen once the budget is exhausted"
+            decodes, 1,
+            "only the first image may be decoded; the rest are refused up front"
         );
     }
 
     #[tokio::test]
     async fn newest_first_traversal_preserves_message_order() {
-        let _guard = DECODE_COUNTER_GUARD.lock().unwrap();
-
         // Normalization walks candidates newest-first so budget exhaustion sheds
         // the oldest images; the caller still requires original order back. This
         // covers the reversal only — the shedding priority itself is asserted in
@@ -2482,10 +2507,12 @@ mod tests {
             ChatMessage::user(format!("new [IMAGE:{}]", new_path.display())),
         ];
 
-        DECODE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
-        let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
-            .await
-            .expect("two small images are well within budget");
+        let (prepared, decodes) = counting_decodes(async {
+            prepare_messages_for_provider(&history, &MultimodalConfig::default())
+                .await
+                .expect("two small images are well within budget")
+        })
+        .await;
 
         assert_eq!(
             prepared.messages.len(),
@@ -2502,39 +2529,31 @@ mod tests {
                 .map(|m| &m.content)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(
-            DECODE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
-            2,
-            "both images fit, so both are decoded"
-        );
+        assert_eq!(decodes, 2, "both images fit, so both are decoded");
     }
 
     #[tokio::test]
     async fn budget_exhaustion_sheds_oldest_images() {
-        let _guard = DECODE_COUNTER_GUARD.lock().unwrap();
-
         // Mirrors what the newest-first traversal does to a shared budget: the
         // candidates arrive newest-first, and the budget fits only one 1 MiB
         // image. The newest must be the one that survives — matching
         // `trim_old_images`, which also sheds oldest-first. An oldest-first walk
         // would invert this and drop the image the user just sent.
         let bytes = real_png(512, 512);
-        let mut budget = 1024 * 1024;
 
-        DECODE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let ((), decodes) = counting_decodes(async {
+            let mut budget = 1024 * 1024;
 
-        validate_within_budget("newest.png", "image/png", &bytes, &mut budget)
-            .await
-            .expect("the newest image gets first claim on the budget");
-        validate_within_budget("oldest.png", "image/png", &bytes, &mut budget)
-            .await
-            .expect_err("the older image is shed once the budget is gone");
+            validate_within_budget("newest.png", "image/png", &bytes, &mut budget)
+                .await
+                .expect("the newest image gets first claim on the budget");
+            validate_within_budget("oldest.png", "image/png", &bytes, &mut budget)
+                .await
+                .expect_err("the older image is shed once the budget is gone");
+        })
+        .await;
 
-        assert_eq!(
-            DECODE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "the shed image is never decoded"
-        );
+        assert_eq!(decodes, 1, "the shed image is never decoded");
     }
 
     /// Header plus one valid 1x1 frame, with no trailer yet.
