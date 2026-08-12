@@ -249,6 +249,7 @@ pub fn add_once_validated(
     agent_alias: &str,
     delay: &str,
     command: &str,
+    delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
@@ -260,6 +261,7 @@ pub fn add_once_validated(
         agent_alias,
         delay,
         command,
+        delivery,
         approved,
     )
 }
@@ -271,6 +273,7 @@ pub(crate) fn add_once_validated_with_runtime(
     agent_alias: &str,
     delay: &str,
     command: &str,
+    delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
     let duration = parse_delay(delay)?;
@@ -282,6 +285,7 @@ pub(crate) fn add_once_validated_with_runtime(
         agent_alias,
         at,
         command,
+        delivery,
         approved,
     )
 }
@@ -292,6 +296,7 @@ pub fn add_once_at_validated(
     agent_alias: &str,
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
+    delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
@@ -303,6 +308,7 @@ pub fn add_once_at_validated(
         agent_alias,
         at,
         command,
+        delivery,
         approved,
     )
 }
@@ -314,6 +320,7 @@ pub(crate) fn add_once_at_validated_with_runtime(
     agent_alias: &str,
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
+    delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
     let schedule = Schedule::At { at };
@@ -325,7 +332,7 @@ pub(crate) fn add_once_at_validated_with_runtime(
         None,
         schedule,
         command,
-        None,
+        delivery,
         approved,
     )
 }
@@ -365,8 +372,14 @@ pub fn add_job(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-pub fn add_once(config: &Config, agent_alias: &str, delay: &str, command: &str) -> Result<CronJob> {
-    add_once_validated(config, agent_alias, delay, command, false)
+pub fn add_once(
+    config: &Config,
+    agent_alias: &str,
+    delay: &str,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+) -> Result<CronJob> {
+    add_once_validated(config, agent_alias, delay, command, delivery, false)
 }
 
 pub fn add_once_at(
@@ -374,8 +387,9 @@ pub fn add_once_at(
     agent_alias: &str,
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
+    delivery: Option<DeliveryConfig>,
 ) -> Result<CronJob> {
-    add_once_at_validated(config, agent_alias, at, command, false)
+    add_once_at_validated(config, agent_alias, at, command, delivery, false)
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {

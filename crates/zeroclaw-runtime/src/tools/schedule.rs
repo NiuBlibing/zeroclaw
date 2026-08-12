@@ -451,6 +451,7 @@ impl ScheduleTool {
                 &self.agent_alias,
                 value,
                 command,
+                None,
                 approved,
             ) {
                 Ok(job) => job,
@@ -507,6 +508,7 @@ impl ScheduleTool {
             &self.agent_alias,
             run_at_parsed,
             command,
+            None,
             approved,
         ) {
             Ok(job) => job,
