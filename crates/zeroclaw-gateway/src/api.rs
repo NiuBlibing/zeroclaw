@@ -812,6 +812,11 @@ pub async fn handle_api_cron_settings_patch(
         return e.into_response();
     }
 
+    // Held through the swap below so a concurrent config writer can't land
+    // between this read and the save.
+    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
+        .lock_owned()
+        .await;
     let mut config = state.config.read().clone();
 
     if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) {
@@ -2089,7 +2094,6 @@ pub(crate) mod tests {
     #[cfg(any(
         feature = "channel-linq",
         feature = "channel-nextcloud",
-        feature = "channel-wati",
         feature = "channel-whatsapp-cloud"
     ))]
     use std::collections::HashMap;
@@ -2255,6 +2259,7 @@ pub(crate) mod tests {
     pub(crate) fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
         AppState {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
@@ -2285,8 +2290,6 @@ pub(crate) mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
