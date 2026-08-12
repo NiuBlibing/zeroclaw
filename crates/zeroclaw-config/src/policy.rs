@@ -1022,8 +1022,8 @@ fn contains_unsafe_output_redirect_for_shell(command: &str, dialect: ShellDialec
     // `>nul.txt`, `>null`) is left intact so only the bare device matches.
     //
     // Gated on the effective shell: only Windows `cmd.exe` resolves `nul` to
-    // the discard-only null device. Under a POSIX shell (Unix native, Docker
-    // `sh -c`, cron `sh -c`) `nul` is an ordinary relative filename, so
+    // the discard-only null device. Under a POSIX shell (Unix native or Docker
+    // `sh -c`) `nul` is an ordinary relative filename, so
     // `echo x >nul` would create/truncate a workspace file — it must stay
     // flagged as an unsafe file redirect.
     let safe = if matches!(dialect, ShellDialect::WindowsCmd) {
@@ -1282,8 +1282,8 @@ fn is_safe_device_redirect_target(target: &str, dialect: ShellDialect) -> bool {
     }
     // Windows null device: `nul`/`NUL` (case-insensitive) and the full `\\.\nul`
     // device form. Only under a native Windows `cmd.exe` shell does `nul` always
-    // resolve to the discard-only null device. Under a POSIX shell (Unix native,
-    // Docker `sh -c`, cron `sh -c`) `nul` is an ordinary relative filename, so it
+    // resolve to the discard-only null device. Under a POSIX shell (Unix native
+    // or Docker `sh -c`) `nul` is an ordinary relative filename, so it
     // must not be treated as a safe device.
     matches!(dialect, ShellDialect::WindowsCmd)
         && (target.eq_ignore_ascii_case("nul") || target.eq_ignore_ascii_case(r"\\.\nul"))
@@ -1634,13 +1634,13 @@ fn is_powershell_allowlist_entry_match(
     }
 
     let allowed = strip_wrapping_quotes(allowed).trim();
-    if looks_like_path(allowed) {
+    if looks_like_path_for_shell(allowed, ShellDialect::PowerShell) {
         // An explicit path is the trust anchor, so it must match with the host
         // filesystem's case semantics: case-insensitive on Windows, exact on
         // case-sensitive Unix. Folding case on every host would let an
         // allowlist entry `/tmp/Safe/tool` authorize the distinct executable
         // `/tmp/safe/tool`.
-        return host_path_tokens_equal(allowed, executable);
+        return shell_path_tokens_equal(allowed, executable, ShellDialect::PowerShell);
     }
 
     let allowed = strip_powershell_executable_suffix(allowed);
@@ -1648,7 +1648,10 @@ fn is_powershell_allowlist_entry_match(
 }
 
 fn strip_powershell_executable_suffix(name: &str) -> &str {
-    name.strip_suffix(".exe").unwrap_or(name)
+    match name.rsplit_once('.') {
+        Some((stem, extension)) if extension.eq_ignore_ascii_case("exe") => stem,
+        _ => name,
+    }
 }
 
 fn is_powershell_batch_file(name: &str) -> bool {
@@ -4948,7 +4951,7 @@ mod tests {
     fn windows_nul_redirect_allowed_only_under_cmd_exe() {
         // The Windows null device is a safe discard-only redirect target — but
         // ONLY under a native Windows `cmd.exe` shell. Under a POSIX shell (Unix
-        // native, Docker `sh -c`, cron `sh -c`) `nul` is an ordinary relative
+        // native or Docker `sh -c`) `nul` is an ordinary relative
         // filename, so `>nul` must stay blocked to prevent a workspace-file write.
         use ShellDialect::{Posix, WindowsCmd};
         let p = SecurityPolicy {
@@ -4976,8 +4979,8 @@ mod tests {
             );
         }
 
-        // The default (dialect-less) entry point is POSIX/fail-closed, so a
-        // Docker or cron `sh -c` sink — which never reports WindowsCmd — blocks nul.
+        // The default (dialect-less) entry point is POSIX/fail-closed, so it
+        // blocks `nul`; configured runtime consumers pass their actual dialect.
         assert!(!p.is_command_allowed("echo x >nul"));
 
         // The redirect gate itself: nul is stripped as safe only under cmd.exe.
@@ -5262,6 +5265,22 @@ mod tests {
                 .is_ok(),
             "an exact executable-path allowlist must retain its existing meaning"
         );
+    }
+
+    #[test]
+    fn powershell_allowlist_accepts_case_insensitive_exe_suffix() {
+        assert!(is_powershell_allowlist_entry_match(
+            "git.EXE", "git.exe", "git"
+        ));
+    }
+
+    #[test]
+    fn powershell_allowlist_accepts_windows_relative_path_spelling() {
+        assert!(is_powershell_allowlist_entry_match(
+            r".\tools\git.exe",
+            "./tools/git.exe",
+            "git"
+        ));
     }
 
     #[cfg(not(target_os = "windows"))]

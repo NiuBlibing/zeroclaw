@@ -12,13 +12,13 @@ use std::path::{Path, PathBuf};
 /// Windows `cmd.exe` resolves it to the discard-only null device. A redirect to
 /// `nul` is therefore only safe under [`ShellDialect::WindowsCmd`].
 ///
-/// The dialect follows the *effective execution sink*, not merely the host OS:
-/// Docker and cron always run through `sh -c` and stay [`ShellDialect::Posix`]
-/// even on a Windows host.
+/// The dialect follows the *effective execution sink*, not merely the host OS.
+/// Docker always runs through `sh -c` and stays [`ShellDialect::Posix`] even on
+/// a Windows host. Native cron execution follows the configured runtime dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShellDialect {
-    /// POSIX `sh`/`bash` semantics — Unix native execution, Docker `sh -c`,
-    /// and cron `sh -c`. The conservative default.
+    /// POSIX `sh`/`bash` semantics — Unix native execution and Docker `sh -c`.
+    /// The conservative default.
     #[default]
     Posix,
     /// Windows `cmd.exe` semantics — native execution on a Windows host.
@@ -91,8 +91,9 @@ pub trait RuntimeAdapter: Send + Sync {
     ///
     /// An adapter must report the dialect it *actually* runs under, because the
     /// command-risk policy consults this to decide platform-specific safety
-    /// (e.g. accepting a redirect to the `nul` null device). Docker and cron
-    /// execute via `sh -c` and therefore stay POSIX even on Windows.
+    /// (e.g. accepting a redirect to the `nul` null device). Docker executes
+    /// via `sh -c` and therefore stays POSIX even on Windows; native cron jobs
+    /// follow the configured runtime dialect.
     fn shell_dialect(&self) -> ShellDialect;
 
     /// Build a shell command process configured for this runtime.
@@ -193,9 +194,9 @@ mod tests {
 
     #[test]
     fn default_shell_dialect_is_posix() {
-        // Any adapter that does not override `shell_dialect` (Docker, cron, and
-        // every non-native sink) runs commands through `sh -c`, so it must
-        // report POSIX. Only native execution on Windows overrides to cmd.exe.
+        // Any adapter that does not override `shell_dialect` uses the
+        // conservative POSIX default. Concrete adapters report their actual
+        // execution sink, including the configured native shell dialect.
         let runtime = DummyRuntime;
         assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
     }
