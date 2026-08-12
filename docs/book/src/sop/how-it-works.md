@@ -33,7 +33,20 @@ graph LR
 
 1. `sops_dir` is unset by default, so runtime SOP loading is off out of the box. Opt in by setting `sops_dir` through the gateway, zerocode, or `zeroclaw config set`. A relative value resolves against the install root (the directory holding `config.toml`), so the documented `shared/sops` yields `<install>/shared/sops`, the same directory the SOP author writes to. An absolute or `~`-prefixed value is used as-is. Setting it back to `""` (or removing it) disables runtime SOP loading again; the CLI still falls back to `<install>/shared/sops` for offline inspection.
 
-   > **Migrating from an earlier build?** Relative `sops_dir` values now resolve against the install root, matching how `skill-bundles` directories resolve. Earlier builds joined relative values onto `data_dir`, so `sops_dir = "shared/sops"` previously looked under `<data_dir>/shared/sops` and now resolves to `<install>/shared/sops`, the canonical shared location the web/RPC author and CLI already use. Any other relative value shifts the same way: `sops_dir = "my-sops"` moves from `<data_dir>/my-sops` to `<install>/my-sops`. Absolute and `~`-prefixed values are unaffected. If your definitions live under the old `data_dir`-relative location, move them to the new install-root-relative path (or set `sops_dir` to an absolute path); `zeroclaw sop list` reads the new location, so an empty listing after upgrade means the path needs moving.
+   > **Migrating from an earlier build?** Relative `sops_dir` values now resolve against the install root, matching how `skill-bundles` directories resolve. Earlier builds had **two** different roots for the same setting, so check both before upgrading:
+   >
+   > | Surface on earlier builds | Root it used | Where `sops_dir = "shared/sops"` landed |
+   > | --- | --- | --- |
+   > | Runtime loading and local `zeroclaw sop` CLI | `data_dir` | `<data_dir>/shared/sops` |
+   > | Web and RPC SOP authoring | `<install>/shared` | `<install>/shared/shared/sops` (doubled segment) |
+   >
+   > Both now resolve to the single canonical `<install>/shared/sops`. Inspect **both** old locations and move any definitions you find there into `<install>/shared/sops`; definitions left behind in either tree become invisible after upgrade. Definitions authored through the old web or RPC surface are the easiest to miss, because they sit in the doubled writer path rather than the location the docs described.
+   >
+   > Any other relative value shifts the same way: `sops_dir = "my-sops"` moves from `<data_dir>/my-sops` (runtime and CLI) or `<install>/shared/my-sops` (web and RPC authoring) to `<install>/my-sops`. Absolute and `~`-prefixed values are unaffected.
+   >
+   > The unset case moves too: the offline CLI fallback used to scan `<data_dir>/sops` and now scans `<install>/shared/sops`.
+   >
+   > `zeroclaw sop list` reads the new location, so an empty listing after upgrade means definitions are still sitting in one of the old trees.
 
 2. Create a SOP directory, for example:
 
