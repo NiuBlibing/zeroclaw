@@ -2390,6 +2390,9 @@ impl DelegateTool {
 
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
+            // This builder renders neither RuntimeSection nor ShellSection,
+            // so the sub-agent's shell is reported by its own agent loop.
+            shell_profile: None,
         };
 
         let builder = SystemPromptBuilder::default()
