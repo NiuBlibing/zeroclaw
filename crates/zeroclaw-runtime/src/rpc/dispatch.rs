@@ -385,6 +385,18 @@ fn model_provider_ref_from_provider_profile_prop(prop: &str) -> Option<String> {
     }
 }
 
+/// Whether a config prop path touches `model_routes` (a field edit like
+/// `model_routes.<hint>.model_provider`, or the section path itself from a
+/// map-key create/delete/rename on `model_routes`). A route table edit can
+/// change which provider/model a hint-routed call dispatches to and which
+/// capacity `ResolvedContextLimits` reports for it, so it needs the same live
+/// rebuild `providers.models.*` and `agents.<alias>.model_provider` trigger —
+/// otherwise a session's `ModelRouteResolver` keeps resolving hints through
+/// the pre-edit route table after `config/set` commits the new one.
+fn touches_model_routes(prop: &str) -> bool {
+    prop == "model_routes" || prop.starts_with("model_routes.") || prop.starts_with("model_routes[")
+}
+
 /// Extract the agent alias from an `agents.<alias>.model_provider` prop path.
 /// A live change to an agent's bound provider must rebuild that agent's live
 /// session boxes the same way a `providers.models.*` edit does, so any
@@ -2869,6 +2881,9 @@ impl RpcDispatcher {
         if let Some(agent_alias) = agent_alias_from_model_provider_prop(&req.prop) {
             self.schedule_live_sessions_refresh_for_agent(agent_alias);
         }
+        if touches_model_routes(&req.prop) {
+            self.schedule_live_sessions_refresh_for_model_routes();
+        }
         to_result(ConfigSetResult {
             prop: req.prop,
             set: true,
@@ -2956,6 +2971,35 @@ impl RpcDispatcher {
             config
                 .agent(agent_alias)
                 .map(|agent| agent.model_provider.to_string())
+        })
+        .await;
+    }
+
+    /// Rebuild the live provider box, `ModelRouteResolver`, and config
+    /// generation for every live session. Fired when `model_routes.*`
+    /// changes via `config/set`/`config/delete`/a map-key create-delete-rename
+    /// on `model_routes`, because the resolver is a process-wide hint→route
+    /// table snapshot: every session's resolver — regardless of which
+    /// provider profile the session itself is bound to — must move to the new
+    /// table together, or a hint-routed call after the edit can dispatch
+    /// through a stale route while `context_limits_for_route` reports the new
+    /// config's capacity for it. Every session is selected unconditionally
+    /// (unlike the provider/agent-scoped refreshes above, which only rebuild
+    /// sessions whose own resolved provider ref actually changed).
+    fn schedule_live_sessions_refresh_for_model_routes(&self) {
+        let ctx = Arc::clone(&self.ctx);
+        zeroclaw_spawn::spawn!(async move {
+            Self::refresh_live_sessions_for_model_routes(ctx).await;
+        });
+    }
+
+    async fn refresh_live_sessions_for_model_routes(ctx: Arc<RpcContext>) {
+        Self::refresh_live_sessions_matching(ctx, |config, session_agent, overrides| {
+            overrides.model_provider.clone().or_else(|| {
+                config
+                    .agent(session_agent)
+                    .map(|a| a.model_provider.to_string())
+            })
         })
         .await;
     }
@@ -3183,6 +3227,9 @@ impl RpcDispatcher {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
         }
+        if touches_model_routes(&req.prop) {
+            self.schedule_live_sessions_refresh_for_model_routes();
+        }
         to_result(ConfigDeleteResult {
             prop: req.prop,
             deleted: true,
@@ -3235,6 +3282,9 @@ impl RpcDispatcher {
         };
         if created {
             self.flush_config(&config_write_guard).await?;
+            if touches_model_routes(&req.path) {
+                self.schedule_live_sessions_refresh_for_model_routes();
+            }
         }
         to_result(ConfigMapKeyCreateResult {
             path: req.path,
@@ -3258,6 +3308,9 @@ impl RpcDispatcher {
         };
         if deleted {
             self.flush_config(&config_write_guard).await?;
+            if touches_model_routes(&req.path) {
+                self.schedule_live_sessions_refresh_for_model_routes();
+            }
         }
         to_result(ConfigMapKeyDeleteResult {
             path: req.path,
@@ -3298,6 +3351,9 @@ impl RpcDispatcher {
             };
             if renamed {
                 self.flush_config(&config_write_guard).await?;
+                if touches_model_routes(&req.path) {
+                    self.schedule_live_sessions_refresh_for_model_routes();
+                }
             }
             to_result(ConfigMapKeyRenameResult {
                 path: req.path,
@@ -9327,6 +9383,136 @@ mod tests {
         );
 
         wait_for_model_name(&dispatcher, &session_id, "other-model").await;
+    }
+
+    /// The Aug 13 review's specifically-requested boundary: a route-affecting
+    /// `config/set` (here, `model_routes.*`) followed immediately by the next
+    /// prompt on an already-running live session must dispatch AND report
+    /// context limits from the SAME refreshed generation. Before this fix,
+    /// only `providers.models.*` and `agents.<alias>.model_provider` edits
+    /// rebuilt a live session's `ModelRouteResolver`; a `model_routes.*` edit
+    /// landed in shared config but the session's resolver kept mapping the
+    /// hint to the pre-edit provider until a restart. This drives the real
+    /// `config/set` -> live-session-refresh path (not a manually-mutated
+    /// `Agent` lock), so it also proves the refresh actually reaches a
+    /// running session's resolver and reported limits together.
+    #[tokio::test]
+    async fn config_set_model_routes_refreshes_live_session_resolver_and_limits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+
+        // Distinct-capacity provider the route can be switched to.
+        let big = cfg
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("openai test-provider slot exists");
+        big.context_window = Some(200_000);
+
+        let small = cfg
+            .providers
+            .models
+            .ensure("openai", "small-provider")
+            .expect("openai provider slot exists");
+        small.api_key = Some("test-key-small".into());
+        small.uri = Some("http://127.0.0.1:1".into());
+        small.model = Some("small-model".into());
+        small.context_window = Some(8_000);
+
+        // A hint route initially points at the large provider.
+        cfg.model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "reasoning".into(),
+                model_provider: "openai.test-provider".into(),
+                model: "old-model".into(),
+                api_key: None,
+            });
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        {
+            let agent = dispatcher
+                .ctx
+                .sessions
+                .get_agent(&session_id)
+                .await
+                .expect("session agent exists");
+            let agent = agent.lock().await;
+            let route = agent.resolved_route_for_test("hint:reasoning");
+            assert_eq!(
+                route.provider_name, "openai.test-provider",
+                "baseline route resolves the hint through the large provider"
+            );
+            let limits = agent.context_limits_for_route(&route.provider_name, &route.model);
+            assert_eq!(
+                limits.model_context_window, 200_000,
+                "baseline limits report the large provider's capacity"
+            );
+        }
+
+        // Repoint the route at the small provider via the live config/set path.
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "model_routes.reasoning.model_provider",
+                "value": "openai.small-provider"
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "config/set model_routes.<hint>.model_provider must succeed: {res:?}"
+        );
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "model_routes.reasoning.model",
+                "value": "small-model"
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "config/set model_routes.<hint>.model must succeed: {res:?}"
+        );
+
+        // The live-session refresh runs on a spawned task; poll until the
+        // resolver reflects the new route, then assert dispatch and limits
+        // agree on the same (new) generation in the same observation.
+        for _ in 0..50 {
+            let agent = dispatcher
+                .ctx
+                .sessions
+                .get_agent(&session_id)
+                .await
+                .expect("session agent exists");
+            let agent = agent.lock().await;
+            if agent
+                .resolved_route_for_test("hint:reasoning")
+                .provider_name
+                == "openai.small-provider"
+            {
+                break;
+            }
+            drop(agent);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let agent = agent.lock().await;
+        let route = agent.resolved_route_for_test("hint:reasoning");
+        assert_eq!(
+            route.provider_name, "openai.small-provider",
+            "the immediate next prompt after config/set must dispatch through the refreshed route"
+        );
+        let limits = agent.context_limits_for_route(&route.provider_name, &route.model);
+        assert_eq!(
+            limits.model_context_window, 8_000,
+            "reported limits must come from the SAME refreshed generation as the dispatched route, \
+             not the stale large-provider capacity"
+        );
     }
 
     #[tokio::test]

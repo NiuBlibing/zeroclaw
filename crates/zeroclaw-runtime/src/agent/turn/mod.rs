@@ -793,8 +793,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // The wire selector for `call_provider`: routed providers may need a
         // `hint:<name>` selector distinct from the resolved `model` used for
         // attribution above, so this cannot just reuse `provider_request_model`.
-        let provider_dispatch_model =
-            hook_selected_model.as_deref().unwrap_or(active_dispatch_model);
+        let provider_dispatch_model = hook_selected_model
+            .as_deref()
+            .unwrap_or(active_dispatch_model);
 
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
