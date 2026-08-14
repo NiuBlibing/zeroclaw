@@ -1559,7 +1559,7 @@ async fn validate_within_budget(
         return Err(budget_exhausted().into());
     }
 
-    let allocation = validate_image_content(source, mime, bytes).await?;
+    let allocation = validate_image_content(source, mime, bytes, *remaining_budget).await?;
     *remaining_budget = remaining_budget.saturating_sub(allocation);
     Ok(allocation)
 }
@@ -1575,9 +1575,22 @@ async fn validate_within_budget(
 /// decompression-bomb sink: a small payload declaring enormous dimensions is
 /// rejected here rather than being allocated.
 ///
+/// `budget_cap` is the caller's remaining aggregate decode budget at the time
+/// of this call (see [`AGGREGATE_DECODE_BUDGET_BYTES`]). For single-frame
+/// formats `projected_allocation` already gates admission accurately, so this
+/// is only load-bearing for GIF: a multi-frame animation's total decoded size
+/// cannot be known from the header alone, so the per-image cap and the
+/// caller's remaining budget are both applied live, during frame iteration,
+/// rather than only projected once up front.
+///
 /// Returns the approximate decoded memory allocation (width × height × 4 bytes
 /// for RGBA) so callers can track aggregate budget consumption.
-async fn validate_image_content(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Result<u64> {
+async fn validate_image_content(
+    source: &str,
+    mime: &str,
+    bytes: &[u8],
+    budget_cap: u64,
+) -> anyhow::Result<u64> {
     #[cfg(test)]
     record_decode_call();
 
@@ -1606,7 +1619,27 @@ async fn validate_image_content(source: &str, mime: &str, bytes: &[u8]) -> anyho
         // that frame would forward a GIF whose later frames are corrupt or
         // oversized, which is exactly what this validation exists to prevent.
         if format == image::ImageFormat::Gif {
-            let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(&bytes_owned))
+            // The tighter of the per-image cap and whatever the caller has left
+            // in its aggregate request budget. Passed to the decoder as
+            // `Limits::max_alloc` below so a single oversized frame is refused
+            // by the decoder's own allocator check *before* that frame's buffer
+            // is allocated, instead of only being caught by the cumulative
+            // `total` check after the fact.
+            let effective_cap = MAX_DECODED_IMAGE_ALLOC_BYTES.min(budget_cap);
+
+            let mut decoder =
+                image::codecs::gif::GifDecoder::new(std::io::Cursor::new(&bytes_owned))
+                    .map_err(|error| corrupt(error.to_string()))?;
+
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(MAX_DECODED_IMAGE_DIMENSION);
+            limits.max_image_height = Some(MAX_DECODED_IMAGE_DIMENSION);
+            limits.max_alloc = Some(effective_cap);
+            // `GifDecoder` starts with `Limits::no_limits()`, so without this
+            // call nothing bounds a per-frame allocation before it happens —
+            // `into_frames` would read and allocate an oversized frame first
+            // and only then hand it back for the dimension check below.
+            image::ImageDecoder::set_limits(&mut decoder, limits)
                 .map_err(|error| corrupt(error.to_string()))?;
 
             let mut total: u64 = 0;
@@ -1627,12 +1660,15 @@ async fn validate_image_content(source: &str, mime: &str, bytes: &[u8]) -> anyho
                 total = total
                     .saturating_add(u64::from(buffer.width()) * u64::from(buffer.height()) * 4);
 
-                // Charged cumulatively: a long animation of individually small
-                // frames must not slip past a per-frame-only check.
-                if total > MAX_DECODED_IMAGE_ALLOC_BYTES {
+                // Charged cumulatively against the tighter of the two caps: the
+                // decoder's own per-frame check above does not accumulate
+                // across frames (each frame is checked against the same
+                // post-canvas remaining allowance, not a running total), so a
+                // long animation of individually small frames must still be
+                // caught here rather than slipping past a per-frame-only check.
+                if total > effective_cap {
                     return Err(corrupt(format!(
-                        "cumulative frame allocation exceeds limit of \
-                         {MAX_DECODED_IMAGE_ALLOC_BYTES} bytes"
+                        "cumulative frame allocation exceeds limit of {effective_cap} bytes"
                     )));
                 }
             }
@@ -2193,9 +2229,14 @@ mod tests {
     #[tokio::test]
     async fn validate_image_content_accepts_a_real_image() {
         assert!(
-            validate_image_content("src", "image/png", &valid_png())
-                .await
-                .is_ok()
+            validate_image_content(
+                "src",
+                "image/png",
+                &valid_png(),
+                MAX_DECODED_IMAGE_ALLOC_BYTES
+            )
+            .await
+            .is_ok()
         );
     }
 
@@ -2205,9 +2246,14 @@ mod tests {
         // with no IDAT chunk. Produced by truncated downloads and interrupted
         // writes.
         let header_only = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        let err = validate_image_content("src", "image/png", &header_only)
-            .await
-            .unwrap_err();
+        let err = validate_image_content(
+            "src",
+            "image/png",
+            &header_only,
+            MAX_DECODED_IMAGE_ALLOC_BYTES,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(multimodal_error_kind(&err), "corrupt_image");
     }
 
@@ -2215,16 +2261,17 @@ mod tests {
     async fn validate_image_content_rejects_truncated_image() {
         let full = valid_png();
         let truncated = &full[..full.len() / 2];
-        let err = validate_image_content("src", "image/png", truncated)
-            .await
-            .unwrap_err();
+        let err =
+            validate_image_content("src", "image/png", truncated, MAX_DECODED_IMAGE_ALLOC_BYTES)
+                .await
+                .unwrap_err();
         assert_eq!(multimodal_error_kind(&err), "corrupt_image");
     }
 
     #[tokio::test]
     async fn validate_image_content_rejects_empty_payload() {
         // Zero-byte files pass `validate_size`, which only has an upper bound.
-        let err = validate_image_content("src", "image/png", &[])
+        let err = validate_image_content("src", "image/png", &[], MAX_DECODED_IMAGE_ALLOC_BYTES)
             .await
             .unwrap_err();
         assert_eq!(multimodal_error_kind(&err), "corrupt_image");
@@ -2234,9 +2281,14 @@ mod tests {
     async fn validate_image_content_rejects_mime_content_mismatch() {
         // Real PNG bytes declared as JPEG — the case an extension-derived MIME
         // produces when a file is simply renamed.
-        let err = validate_image_content("src", "image/jpeg", &valid_png())
-            .await
-            .unwrap_err();
+        let err = validate_image_content(
+            "src",
+            "image/jpeg",
+            &valid_png(),
+            MAX_DECODED_IMAGE_ALLOC_BYTES,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(multimodal_error_kind(&err), "corrupt_image");
     }
 
@@ -2603,13 +2655,19 @@ mod tests {
         // below can only come from frame two.
         let mut first_frame_only = gif_prefix_with_one_frame();
         first_frame_only.push(GIF_TRAILER);
-        validate_image_content("one.gif", "image/gif", &first_frame_only)
-            .await
-            .expect("fixture premise: the first frame is valid on its own");
+        validate_image_content(
+            "one.gif",
+            "image/gif",
+            &first_frame_only,
+            MAX_DECODED_IMAGE_ALLOC_BYTES,
+        )
+        .await
+        .expect("fixture premise: the first frame is valid on its own");
 
-        let error = validate_image_content("anim.gif", "image/gif", &gif)
-            .await
-            .expect_err("a GIF with a corrupt later frame must be rejected, not forwarded");
+        let error =
+            validate_image_content("anim.gif", "image/gif", &gif, MAX_DECODED_IMAGE_ALLOC_BYTES)
+                .await
+                .expect_err("a GIF with a corrupt later frame must be rejected, not forwarded");
         assert!(
             error.to_string().to_lowercase().contains("corrupt")
                 || error.to_string().to_lowercase().contains("gif"),
@@ -2624,13 +2682,84 @@ mod tests {
         let mut gif = two_frame_gif(&GIF_VALID_1X1_LZW);
         gif.push(GIF_TRAILER);
 
-        let allocation = validate_image_content("anim.gif", "image/gif", &gif)
-            .await
-            .expect("a well-formed animated GIF is accepted");
+        let allocation =
+            validate_image_content("anim.gif", "image/gif", &gif, MAX_DECODED_IMAGE_ALLOC_BYTES)
+                .await
+                .expect("a well-formed animated GIF is accepted");
         assert_eq!(
             allocation, 8,
             "two 1x1 RGBA frames are charged cumulatively"
         );
+    }
+
+    /// Image descriptor for a single frame declaring 60000x60000 — well past
+    /// `MAX_DECODED_IMAGE_DIMENSION`. Decoded naively that's tens of
+    /// gigabytes; `set_limits` must reject it before any buffer for it is
+    /// allocated.
+    fn gif_oversized_frame_descriptor() -> [u8; 10] {
+        let dim: u16 = 60_000;
+        let [lo, hi] = dim.to_le_bytes();
+        [0x2C, 0, 0, 0, 0, lo, hi, lo, hi, 0x00]
+    }
+
+    #[tokio::test]
+    async fn gif_oversized_later_frame_is_rejected_before_allocation() {
+        // Frame one is valid (guarded above); frame two's descriptor alone
+        // claims 60000x60000. Before this fix `GifDecoder` was constructed
+        // with `Limits::no_limits()`, so nothing stopped `into_frames` from
+        // allocating that buffer before the post-decode dimension check ran.
+        // Applying `set_limits` up front means the decoder's own per-frame
+        // `reserve_buffer` check rejects the descriptor first.
+        let mut gif = gif_prefix_with_one_frame();
+        gif.extend_from_slice(&gif_oversized_frame_descriptor());
+        gif.extend_from_slice(&GIF_VALID_1X1_LZW);
+        gif.push(GIF_TRAILER);
+
+        let error =
+            validate_image_content("anim.gif", "image/gif", &gif, MAX_DECODED_IMAGE_ALLOC_BYTES)
+                .await
+                .expect_err("an oversized later frame must be rejected, not allocated");
+        assert_eq!(multimodal_error_kind(&error), "corrupt_image");
+    }
+
+    #[tokio::test]
+    async fn gif_cumulative_frames_exceeding_remaining_budget_are_rejected() {
+        // Three 1x1 frames, each individually far under any per-frame cap —
+        // the decoder's own per-frame check (not cumulative across frames,
+        // since each frame is checked against the same post-canvas remaining
+        // allowance rather than a running total) would let every one of them
+        // through on its own. Only this function's own running `total` catches
+        // the aggregate: with a 10-byte budget_cap, three 4-byte frames (12
+        // bytes) must still be rejected once the third would cross it.
+        let mut gif = gif_prefix_with_one_frame();
+        for _ in 0..2 {
+            gif.extend_from_slice(&GIF_IMAGE_DESCRIPTOR_1X1);
+            gif.extend_from_slice(&GIF_VALID_1X1_LZW);
+        }
+        gif.push(GIF_TRAILER);
+
+        let error = validate_image_content("anim.gif", "image/gif", &gif, 10)
+            .await
+            .expect_err("cumulative frame allocation must not exceed the remaining budget");
+        assert_eq!(multimodal_error_kind(&error), "corrupt_image");
+    }
+
+    #[tokio::test]
+    async fn gif_admitted_by_projection_but_over_budget_across_frames_is_rejected() {
+        // Reproduces the accounting gap the projection alone cannot see: for a
+        // two-frame 1x1 GIF, `projected_allocation` (canvas-once) reports 4
+        // bytes, but the real cumulative decode is 8. A remaining budget of 6
+        // sits between those two numbers, so the header-only pre-check in
+        // `validate_within_budget` admits the GIF — the live, budget-aware
+        // enforcement inside `validate_image_content` must still catch it
+        // rather than silently landing on zero via `saturating_sub`.
+        let mut gif = two_frame_gif(&GIF_VALID_1X1_LZW);
+        gif.push(GIF_TRAILER);
+
+        let mut budget = 6u64;
+        validate_within_budget("anim.gif", "image/gif", &gif, &mut budget)
+            .await
+            .expect_err("an animation whose real cost exceeds the remaining budget must reject");
     }
 
     #[tokio::test]
