@@ -532,21 +532,25 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
         // only sees the flat `prop_fields()` view and can't produce these
         // per-model refs, so this list is built directly from the nested
         // `providers.models` structure instead.
-        model_providers: cfg
-            .providers
-            .models
-            .iter_entries()
-            .flat_map(|(family, alias, cfg)| {
-                let base = format!("{family}.{alias}");
-                let mut model_aliases: Vec<String> = cfg.models.keys().cloned().collect();
-                model_aliases.sort();
-                std::iter::once(base.clone()).chain(
-                    model_aliases
-                        .into_iter()
-                        .map(move |m| format!("{base}.{m}")),
-                )
-            })
-            .collect(),
+        model_providers: {
+            let mut refs: Vec<String> = cfg
+                .providers
+                .models
+                .iter_entries()
+                .flat_map(|(family, alias, cfg)| {
+                    let base = format!("{family}.{alias}");
+                    let mut model_aliases: Vec<String> = cfg.models.keys().cloned().collect();
+                    model_aliases.sort();
+                    std::iter::once(base.clone()).chain(
+                        model_aliases
+                            .into_iter()
+                            .map(move |m| format!("{base}.{m}")),
+                    )
+                })
+                .collect();
+            refs.sort();
+            refs
+        },
         channels: collect_aliased_refs(&cfg.channels),
         unassigned_channels: collect_aliased_refs(&cfg.channels)
             .into_iter()

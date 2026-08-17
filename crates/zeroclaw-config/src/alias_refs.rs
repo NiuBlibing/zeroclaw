@@ -41,17 +41,15 @@ pub fn alias_kind_for_map_path(path: &str) -> Option<AliasKind> {
         let mut parts = rest.splitn(3, '.');
         if let (Some(family), Some(profile_alias), Some("models")) =
             (parts.next(), parts.next(), parts.next())
+            && !family.is_empty()
+            && !family.contains('.')
+            && !profile_alias.is_empty()
+            && !profile_alias.contains('.')
         {
-            if !family.is_empty()
-                && !family.contains('.')
-                && !profile_alias.is_empty()
-                && !profile_alias.contains('.')
-            {
-                return Some(AliasKind::ModelAlias {
-                    family: family.to_string(),
-                    profile_alias: profile_alias.to_string(),
-                });
-            }
+            return Some(AliasKind::ModelAlias {
+                family: family.to_string(),
+                profile_alias: profile_alias.to_string(),
+            });
         }
     }
 
