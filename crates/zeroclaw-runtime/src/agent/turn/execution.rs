@@ -387,6 +387,7 @@ mod run_model_query_tests {
             model_provider: provider,
             provider_name: "custom",
             model: "test-model",
+            dispatch_model: "test-model",
             temperature: None,
         }
     }
@@ -463,6 +464,7 @@ mod run_model_query_tests {
                     model_provider: &reliable,
                     provider_name: "reliable",
                     model: "test-model",
+                    dispatch_model: "test-model",
                     temperature: None,
                 }
                 .run_model_query(ChatRequest {
@@ -510,6 +512,7 @@ mod run_model_query_tests {
                     model_provider: &reliable,
                     provider_name: "reliable",
                     model: "test-model",
+                    dispatch_model: "test-model",
                     temperature: None,
                 }
                 .run_model_query(ChatRequest {

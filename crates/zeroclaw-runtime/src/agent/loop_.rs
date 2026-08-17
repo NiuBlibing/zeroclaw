@@ -14819,11 +14819,13 @@ Let me check the result."#;
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
                     sop_reassembly: None,
+                    served_route_sink: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &provider,
                             provider_name: "reliable-test",
                             model: "test-model",
+                            dispatch_model: "test-model",
                             temperature: Some(0.0),
                         },
                         tools_registry: &[],
@@ -14842,7 +14844,9 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
-                        context_token_budget: 100,
+                        context_limits:
+                            zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(100),
+                        context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },
