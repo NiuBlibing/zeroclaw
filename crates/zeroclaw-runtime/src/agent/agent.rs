@@ -2088,7 +2088,13 @@ impl Agent {
                     .and_then(|r| r.api_key.as_deref());
                 let api_key = route_api_key.or(default_api_key);
 
-                let runtime_options =
+                // Resolve runtime options via the full model-selection chain so a
+                // three-segment `<family>.<alias>.<model_alias>` ref picks up
+                // model-entry-level overrides (max_tokens, native_tools,
+                // provider_extra, replay_assistant_reasoning, think, vision,
+                // chat_template_kwargs); a two-segment ref falls back to
+                // profile-level options only.
+                let mut runtime_options =
                     zeroclaw_config::schema::provider_profile_ref(&new_model_provider)
                         .map(|(family, alias)| {
                             zeroclaw_providers::provider_runtime_options_for_alias(
@@ -2098,6 +2104,33 @@ impl Agent {
                             )
                         })
                         .unwrap_or_default();
+                if let Some(sel) = full_config.resolve_model_selection(&new_model_provider) {
+                    if let Some(entry) = sel.model_entry {
+                        if entry.max_tokens.is_some() {
+                            runtime_options.provider_max_tokens = entry.max_tokens;
+                        }
+                        if entry.native_tools.is_some() {
+                            runtime_options.native_tools = entry.native_tools;
+                        }
+                        if entry.provider_extra.is_some() {
+                            runtime_options.provider_extra = entry.provider_extra.clone();
+                        }
+                        if entry.replay_assistant_reasoning.is_some() {
+                            runtime_options.replay_assistant_reasoning =
+                                entry.replay_assistant_reasoning;
+                        }
+                        if entry.think.is_some() {
+                            runtime_options.think = entry.think;
+                        }
+                        if entry.vision.is_some() {
+                            runtime_options.vision = entry.vision;
+                        }
+                        if entry.chat_template_kwargs.is_some() {
+                            runtime_options.chat_template_kwargs =
+                                entry.chat_template_kwargs.clone();
+                        }
+                    }
+                }
 
                 zeroclaw_providers::create_routed_model_provider_with_options(
                     full_config.as_ref(),

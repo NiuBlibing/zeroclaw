@@ -889,16 +889,35 @@ fn configured_model_entries(
     provider_override: Option<&str>,
 ) -> Vec<(String, Option<String>)> {
     let filter = provider_override.map(str::trim).filter(|p| !p.is_empty());
-    config
-        .providers
-        .models
-        .iter_entries()
-        .map(|(ty, alias, entry)| (format!("{ty}.{alias}"), entry.model.clone()))
-        .filter(|(provider_ref, _)| match filter {
-            Some(f) => provider_ref == f || provider_ref.split('.').next() == Some(f),
+    let mut entries: Vec<(String, Option<String>)> = Vec::new();
+    for (ty, alias, entry) in config.providers.models.iter_entries() {
+        let profile_ref = format!("{ty}.{alias}");
+        let passes = match filter {
+            Some(f) => profile_ref == f || profile_ref.split('.').next() == Some(f),
             None => true,
-        })
-        .collect()
+        };
+        if !passes {
+            continue;
+        }
+        if !entry.models.is_empty() {
+            // Emit one three-segment entry per nested model alias, using the
+            // resolved model id from the model entry (or profile fallback).
+            let mut model_aliases: Vec<&str> = entry.models.keys().map(String::as_str).collect();
+            model_aliases.sort();
+            for model_alias in model_aliases {
+                let three_seg = format!("{profile_ref}.{model_alias}");
+                let model_id = config
+                    .resolve_model_selection(&three_seg)
+                    .and_then(|s| s.model_id);
+                entries.push((three_seg, model_id));
+            }
+        } else {
+            // Legacy path: no nested models, emit the profile ref with the
+            // profile-level model.
+            entries.push((profile_ref, entry.model.clone()));
+        }
+    }
+    entries
 }
 
 /// Whether a configured model id appears verbatim in a provider's live catalog.

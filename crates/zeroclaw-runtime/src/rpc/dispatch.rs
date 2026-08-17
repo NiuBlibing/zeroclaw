@@ -3015,16 +3015,16 @@ impl RpcDispatcher {
                 else {
                     continue;
                 };
-                let provider_temperature = zeroclaw_config::schema::provider_profile_ref(
-                    &model_provider_ref,
-                )
-                .and_then(|(provider_type, provider_alias)| {
-                    config
-                        .providers
-                        .models
-                        .find(provider_type, provider_alias)
-                        .and_then(|entry| entry.temperature)
-                });
+                // Use resolve_model_selection so temperature respects the
+                // model-entry level when a three-segment ref selects one;
+                // a two-segment ref falls back to profile-level temperature.
+                let provider_temperature = config
+                    .resolve_model_selection(&model_provider_ref)
+                    .and_then(|sel| {
+                        sel.model_entry
+                            .and_then(|e| e.temperature)
+                            .or(sel.entry.temperature)
+                    });
                 let Some(agent_cfg) = config
                     .resolved_agent_config(&agent_alias)
                     .or_else(|| config.agent(&agent_alias).cloned())

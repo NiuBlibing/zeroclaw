@@ -3971,6 +3971,22 @@ impl Config {
                     }
                 }
             }
+            // For model providers, also append per-profile model alias entries as
+            // three-segment `<family>.<alias>.<model_alias>` refs so pickers can
+            // target individual models without requiring a separate provider profile.
+            if source == crate::traits::AliasSource::ModelProviders {
+                for (family, alias, profile) in self.providers.models.iter_entries() {
+                    let mut model_aliases: Vec<&str> =
+                        profile.models.keys().map(String::as_str).collect();
+                    model_aliases.sort();
+                    for model_alias in model_aliases {
+                        let three_seg = format!("{family}.{alias}.{model_alias}");
+                        if !out.contains(&three_seg) {
+                            out.push(three_seg);
+                        }
+                    }
+                }
+            }
             out.sort();
             out
         } else {
