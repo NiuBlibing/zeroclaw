@@ -526,14 +526,17 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
         default_runtime_profile: recommended_runtime_preset(None)
             .map(|preset| preset.preset_name.to_string())
             .unwrap_or_default(),
+        // The two-segment profile ref, plus one three-segment ref per model
+        // entry so pickers can target a specific model on the same provider
+        // profile. `resolve_alias_source` (the generic two-tier resolver)
+        // only sees the flat `prop_fields()` view and can't produce these
+        // per-model refs, so this list is built directly from the nested
+        // `providers.models` structure instead.
         model_providers: cfg
             .providers
             .models
             .iter_entries()
             .flat_map(|(family, alias, cfg)| {
-                // The two-segment profile ref, plus one three-segment ref per
-                // model entry so pickers can target a specific model on the
-                // same provider profile.
                 let base = format!("{family}.{alias}");
                 let mut model_aliases: Vec<String> = cfg.models.keys().cloned().collect();
                 model_aliases.sort();
@@ -2285,6 +2288,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn snapshot_state_sorts_configured_model_provider_refs() {
+        let mut cfg = Config::default();
+        cfg.create_map_key("providers.models.openai", "zeta")
+            .unwrap();
+        cfg.create_map_key("providers.models.anthropic", "omega")
+            .unwrap();
+        cfg.create_map_key("providers.models.anthropic", "alpha")
+            .unwrap();
+
+        let snapshot = snapshot_state(&cfg);
+
+        assert_eq!(
+            snapshot.model_providers,
+            vec![
+                "anthropic.alpha".to_string(),
+                "anthropic.omega".to_string(),
+                "openai.zeta".to_string(),
+            ]
+        );
     }
 
     fn fresh_submission(agent_name: &str) -> BuilderSubmission {

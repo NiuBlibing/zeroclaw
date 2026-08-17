@@ -3,8 +3,9 @@ import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
+import { getProp, putProp, resolveAliasSource, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
+import { resolveAvailableModels } from './modelPicker.logic';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
 import {
@@ -600,30 +601,26 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         // falling back to the daemon status model only if unset.
         setCurrentModel(activeRef ?? activeModel);
 
-        // Available switch targets = every configured provider ref. Two-segment
-        // profile refs come from `providers.models.<type>.<alias>.model`;
-        // three-segment refs come from a multi-model subtable entry
-        // `providers.models.<type>.<alias>.models.<sub>.id`.
+        // Available switch targets = every configured provider ref
+        // (`providers.models.<family>.<alias>`, plus a three-segment
+        // `<family>.<alias>.<model_alias>` per nested model entry), resolved
+        // and sorted by the config layer's canonical alias-source resolver.
+        //
+        // The `/api/config/resolve-alias-source` endpoint only exists on
+        // daemons that declare the `PropKind::AliasRef` contract. Embedded-web
+        // builds ship the bundle inside the daemon binary, so skew is
+        // impossible there — but `gateway.web_dist_dir` filesystem serving can
+        // pair a newer bundle with an older daemon. `resolveAvailableModels`
+        // falls back to the pre-resolver `listProps` scan (sorted through the
+        // same key) when the endpoint is unavailable, so the picker never
+        // silently collapses to a single ref on those deployments.
         try {
-          const list = await listProps('providers.models');
+          const refs = await resolveAvailableModels({
+            resolveAliasSource: () => resolveAliasSource('model_providers'),
+            listProps: () => listProps('providers.models'),
+          });
           if (cancelled) return;
-          const paths = (list.entries ?? []).map((e) => e.path);
-          const twoSeg = paths
-            .filter((p) => /^providers\.models\.[^.]+\.[^.]+\.model$/.test(p))
-            .map((p) =>
-              p.replace(/^providers\.models\./, '').replace(/\.model$/, ''),
-            );
-          const threeSeg = paths
-            .filter((p) =>
-              /^providers\.models\.[^.]+\.[^.]+\.models\.[^.]+\.id$/.test(p),
-            )
-            .map((p) =>
-              p
-                .replace(/^providers\.models\./, '')
-                .replace(/\.models\.([^.]+)\.id$/, '.$1'),
-            );
-          const unique = Array.from(new Set([...twoSeg, ...threeSeg]));
-          setAvailableModels(unique.length > 0 ? unique : activeRef ? [activeRef] : []);
+          setAvailableModels(refs.length > 0 ? refs : activeRef ? [activeRef] : []);
         } catch {
           setAvailableModels(activeRef ? [activeRef] : []);
         }
