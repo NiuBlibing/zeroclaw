@@ -131,9 +131,6 @@ zip = { version = "8.1", default-features = false, features = ["deflate-flate2"]
 # Error handling
 anyhow = "1.0"
 
-# UUID generation
-uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
-
 # HMAC for webhook signature verification
 sha2 = "0.10"
 hex = "0.4"
@@ -415,6 +412,7 @@ base64 = "0.22"
 hmac = "0.12"
 parking_lot = "0.12"
 regex = "1.10"
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 [[test]]
 name = "component"
