@@ -5588,16 +5588,26 @@ mod tests {
 
         struct PosixRuntime;
         impl crate::platform::RuntimeAdapter for PosixRuntime {
-            fn name(&self) -> &str { "posix-test" }
-            fn has_filesystem_access(&self) -> bool { true }
-            fn storage_path(&self) -> std::path::PathBuf { std::env::temp_dir() }
-            fn supports_long_running(&self) -> bool { false }
+            fn name(&self) -> &str {
+                "posix-test"
+            }
+            fn has_filesystem_access(&self) -> bool {
+                true
+            }
+            fn storage_path(&self) -> std::path::PathBuf {
+                std::env::temp_dir()
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
             fn shell_dialect(&self) -> crate::platform::ShellDialect {
                 crate::platform::ShellDialect::Posix
             }
-            fn build_shell_command(&self, command: &str, workspace_dir: &std::path::Path)
-                -> anyhow::Result<tokio::process::Command>
-            {
+            fn build_shell_command(
+                &self,
+                command: &str,
+                workspace_dir: &std::path::Path,
+            ) -> anyhow::Result<tokio::process::Command> {
                 let mut cmd = tokio::process::Command::new("/bin/sh");
                 cmd.args(["-c", command]).current_dir(workspace_dir);
                 Ok(cmd)
@@ -5708,20 +5718,38 @@ mod tests {
         }
         #[async_trait]
         impl Tool for MockShellTool {
-            fn name(&self) -> &str { "shell" }
-            fn description(&self) -> &str { "Execute shell commands" }
-            fn parameters_schema(&self) -> serde_json::Value { json!({"type": "object"}) }
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "Execute shell commands"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
             async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-                Ok(ToolResult { success: true, output: ToolOutput::default(), error: None })
+                Ok(ToolResult {
+                    success: true,
+                    output: ToolOutput::default(),
+                    error: None,
+                })
             }
         }
 
         struct PsRuntime;
         impl crate::platform::RuntimeAdapter for PsRuntime {
-            fn name(&self) -> &str { "ps-test" }
-            fn has_filesystem_access(&self) -> bool { true }
-            fn storage_path(&self) -> std::path::PathBuf { std::env::temp_dir() }
-            fn supports_long_running(&self) -> bool { false }
+            fn name(&self) -> &str {
+                "ps-test"
+            }
+            fn has_filesystem_access(&self) -> bool {
+                true
+            }
+            fn storage_path(&self) -> std::path::PathBuf {
+                std::env::temp_dir()
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
             fn shell_dialect(&self) -> crate::platform::ShellDialect {
                 crate::platform::ShellDialect::PowerShell
             }
@@ -5731,9 +5759,11 @@ mod tests {
                     dialect: crate::platform::ShellDialect::PowerShell,
                 })
             }
-            fn build_shell_command(&self, command: &str, workspace_dir: &std::path::Path)
-                -> anyhow::Result<tokio::process::Command>
-            {
+            fn build_shell_command(
+                &self,
+                command: &str,
+                workspace_dir: &std::path::Path,
+            ) -> anyhow::Result<tokio::process::Command> {
                 let mut cmd = tokio::process::Command::new("powershell");
                 cmd.args(["-Command", command]).current_dir(workspace_dir);
                 Ok(cmd)
