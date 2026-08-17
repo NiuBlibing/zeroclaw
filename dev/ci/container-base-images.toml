@@ -15,7 +15,7 @@ repo = "library/node"
 image_ref = "node"
 discover = true
 tag = "24-bookworm-slim"
-digest = "sha256:235600a8101ab264e117b1768e925532262668dc9b581ef1dd7d96ced463b8e7"
+digest = "sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03"
 
 [[image]]
 zone = "base-arg-rust-slim"
@@ -24,7 +24,7 @@ registry = "dockerhub"
 repo = "library/rust"
 image_ref = "rust"
 tag = "1.97-slim"
-digest = "sha256:858f8882676b21c915fb5fab0261fc80d47c21f00faf9f610db89f966978eca6"
+digest = "sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c"
 
 [[image]]
 zone = "base-arg-rust-bookworm"
@@ -33,7 +33,7 @@ registry = "dockerhub"
 repo = "library/rust"
 image_ref = "rust"
 tag = "1.97-bookworm"
-digest = "sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa"
+digest = "sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97"
 
 [[image]]
 zone = "base-arg-debian"
@@ -42,7 +42,7 @@ registry = "dockerhub"
 repo = "library/debian"
 image_ref = "debian"
 tag = "trixie-slim"
-digest = "sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd"
+digest = "sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258"
 
 [[image]]
 zone = "base-arg-distroless"
@@ -60,7 +60,7 @@ registry = "dockerhub"
 repo = "library/node"
 image_ref = "node"
 tag = "24-alpine3.23"
-digest = "sha256:595398b0081eacda8e1c4c5b97b76cd1020e4d58a8ebcb4843b9bca1e79e7436"
+digest = "sha256:244cc2b53f46f9e876304391d17682b0ddae9ac33491f4857e25e35a36ba7995"
 
 [[image]]
 zone = "base-arg-rust-alpine"
@@ -68,8 +68,8 @@ arg = "ZEROCLAW_BASE_RUST_ALPINE"
 registry = "dockerhub"
 repo = "library/rust"
 image_ref = "rust"
-tag = "1.96-alpine3.23"
-digest = "sha256:14b9b5f47dcc6644d0f0c1b35a2c2c5d0124f67159aaee28a348627523459b55"
+tag = "1.97-alpine3.23"
+digest = "sha256:c4a364ddbf684fe038e6fa6a4f25b30c8dc85247423e0e660676ece0d17be4a2"
 
 [[image]]
 zone = "base-arg-alpine"
