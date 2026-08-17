@@ -1381,7 +1381,7 @@ async fn normalize_local_image(
 
 /// Cache-aware local image loader. On a hit (path + metadata unchanged) returns
 /// the stored data URI without touching the filesystem. Files under `/uploads/`
-/// are content-addressed and treated as immutable ��� checked once, never re-read.
+/// are content-addressed and treated as immutable — checked once, never re-read.
 async fn normalize_local_image_cached(
     source: &str,
     max_bytes: usize,
@@ -1559,9 +1559,33 @@ async fn validate_within_budget(
         return Err(budget_exhausted().into());
     }
 
-    let allocation = validate_image_content(source, mime, bytes, *remaining_budget).await?;
-    *remaining_budget = remaining_budget.saturating_sub(allocation);
-    Ok(allocation)
+    match validate_image_content(source, mime, bytes, *remaining_budget).await {
+        Ok(allocation) => {
+            *remaining_budget = remaining_budget.saturating_sub(allocation);
+            Ok(allocation)
+        }
+        Err(error) => {
+            // `projected_allocation` charges a GIF's canvas once, but the real
+            // decode charges it once per frame, so the pre-decode admission
+            // check above can let a GIF in whose real cumulative cost exceeds
+            // what was admitted. When that happens, `validate_image_content`'s
+            // own cumulative check rejects it only after already performing
+            // decode work on the order of its per-image cap — one bounded
+            // frame's worth over the assumed cost. Closing the budget here
+            // stops a later candidate from repeating that same bounded
+            // overshoot against an allowance that a plain `saturating_sub`
+            // would otherwise have left non-zero. Every other rejection
+            // reason (corrupt bytes, an oversized first frame refused by
+            // `set_limits` before allocation, a MIME mismatch) fails at or
+            // below the cost `projected_allocation` already assumed, so this
+            // is deliberately broader than strictly necessary rather than
+            // parsing the error to tell the two cases apart.
+            if mime == "image/gif" {
+                *remaining_budget = 0;
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Decode the image far enough to prove the bytes really are a well-formed
@@ -2760,6 +2784,44 @@ mod tests {
         validate_within_budget("anim.gif", "image/gif", &gif, &mut budget)
             .await
             .expect_err("an animation whose real cost exceeds the remaining budget must reject");
+        assert_eq!(
+            budget, 0,
+            "a cumulative-budget rejection must close the request budget, not leave it \
+             non-zero for a later candidate to repeat the same bounded overshoot against"
+        );
+    }
+
+    #[tokio::test]
+    async fn gif_over_budget_rejection_stops_a_later_candidate_from_decoding() {
+        // The request-level regression the prior review asked for: with two
+        // over-budget GIF candidates walked newest-first (mirroring how
+        // `prepare_messages_inner` drives `remaining_decode_budget`), the first
+        // candidate's cumulative-budget rejection must close the budget so the
+        // second candidate is refused by the cheap pre-decode projection check
+        // rather than entering `validate_image_content` and repeating the same
+        // bounded decode overshoot.
+        let mut gif = two_frame_gif(&GIF_VALID_1X1_LZW);
+        gif.push(GIF_TRAILER);
+
+        let ((), decodes) = counting_decodes(async {
+            let mut budget = 6u64;
+
+            validate_within_budget("newest.gif", "image/gif", &gif, &mut budget)
+                .await
+                .expect_err("first over-budget candidate must reject");
+            assert_eq!(budget, 0, "the first rejection must close the budget");
+
+            validate_within_budget("oldest.gif", "image/gif", &gif, &mut budget)
+                .await
+                .expect_err("second candidate must reject too, against a closed budget");
+        })
+        .await;
+
+        assert_eq!(
+            decodes, 1,
+            "only the first candidate may decode; a closed budget must refuse the \
+             second via the pre-decode projection check, not by repeating the decode"
+        );
     }
 
     #[tokio::test]
