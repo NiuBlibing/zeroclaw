@@ -7,7 +7,8 @@ use crate::schema::v2::V2Config;
 
 /// The schema version this binary writes and expects on disk.
 ///
-/// V4 is reserved for the breaking schema cut in #8754 (channel/tool removals).
+/// V4 is reserved for the breaking schema cut covering channel/tool removals
+/// (the companion PR that removes deprecated channels and SaaS integrations).
 /// This branch's multi-model provider feature occupies V5 so the two cuts can
 /// land independently and in either order.
 pub const CURRENT_SCHEMA_VERSION: u32 = 5;
@@ -796,7 +797,8 @@ pub(crate) fn fold_string_into_array(
 /// compatibility; this step only mints `models.default.id` from the legacy
 /// entry-level `model` field.
 ///
-/// V4 is reserved for the breaking channel/tool-removal cut in #8754.
+/// V4 is reserved for the breaking channel/tool-removal cut that removes
+/// deprecated channels and SaaS integrations.
 /// This step sits at V4→V5 so the two cuts can land independently and in
 /// either order without competing for the same version slot.
 fn migrate_v4_to_v5(value: toml::Value) -> Result<toml::Value> {
@@ -871,8 +873,9 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
             .context("failed to deserialize as V2 schema")?;
         v2.migrate().context("failed to migrate V2 → V3")
     },
-    // V3 → V4: reserved for the breaking channel/tool-removal cut in #8754.
-    // This slot is a passthrough until that PR lands and fills it in.
+    // V3 → V4: reserved for the breaking channel/tool-removal cut that removes
+    // deprecated channels and SaaS integrations. This slot is a passthrough
+    // until that PR lands and fills it in.
     |value| {
         let mut root = match value {
             toml::Value::Table(t) => t,
