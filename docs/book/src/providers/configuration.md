@@ -27,7 +27,7 @@ Family-specific entries add their own typed fields on top of these shared fields
 
 ## Hosting multiple models on one provider entry
 
-A single provider entry is a connection + credential unit. To serve several models over the same endpoint and credential without duplicating the entry, add a `[providers.models.<type>.<alias>.models.<model_alias>]` subtable per model. Each subtable carries its own `id` (the model identifier sent to the provider) plus optional model-side tuning that overlays the entry-level fields: `temperature`, `max_tokens`, `context_window`, `fallback_models`, `think`, `vision`, `native_tools`, `replay_assistant_reasoning`, `provider_extra`, `chat_template_kwargs`, and `pricing`. Any field left unset falls back to the entry-level value.
+A single provider entry is a connection + credential unit. To serve several models over the same endpoint and credential without duplicating the entry, add a `[providers.models.<type>.<alias>.models.<model_alias>]` subtable per model. Each subtable carries its own `id` (the model identifier sent to the provider) plus optional model-side tuning that overlays the entry-level fields: `temperature`, `max_tokens`, `context_window`, `think`, `vision`, `native_tools`, `replay_assistant_reasoning`, `provider_extra`, and `chat_template_kwargs`. Any field left unset falls back to the entry-level value. `fallback_models` and `pricing` remain profile-level concepts and are not supported per nested model entry.
 
 An agent addresses a specific model with a three-segment ref `<type>.<alias>.<model_alias>`:
 
