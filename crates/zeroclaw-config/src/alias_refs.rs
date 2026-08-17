@@ -445,13 +445,7 @@ fn scrub_model_alias_refs(cfg: &mut Config, target: &str) {
         }
     }
     for profile in cfg.runtime_profiles.values_mut() {
-        if profile
-            .context_compression
-            .summary_provider
-            .as_str()
-            .trim()
-            == target
-        {
+        if profile.context_compression.summary_provider.as_str().trim() == target {
             profile.context_compression.summary_provider =
                 crate::providers::ModelProviderRef::default();
         }
@@ -954,13 +948,7 @@ fn rewrite_model_alias_refs(
         }
     }
     for (pname, profile) in cfg.runtime_profiles.iter_mut() {
-        if profile
-            .context_compression
-            .summary_provider
-            .as_str()
-            .trim()
-            == old_target
-        {
+        if profile.context_compression.summary_provider.as_str().trim() == old_target {
             profile.context_compression.summary_provider = new_target.as_str().into();
             dirty.push(format!(
                 "runtime_profiles.{pname}.context_compression.summary_provider"
@@ -1251,9 +1239,7 @@ fn collect_model_alias_refs(
                 .summary_provider;
             if sp.as_str().trim() == target {
                 sites.push(RefSite::soft(
-                    format!(
-                        "runtime_profiles.{pname}.context_compression.summary_provider"
-                    ),
+                    format!("runtime_profiles.{pname}.context_compression.summary_provider"),
                     ScrubAction::ClearOptional,
                     sp.as_str(),
                 ));
@@ -3225,10 +3211,7 @@ mod tests {
         );
         let kind = model_alias_kind("custom", "rag_bot");
         let report = plan_delete(&cfg, &kind, "fast");
-        assert!(
-            !report.allowed,
-            "hard model_provider ref must block delete"
-        );
+        assert!(!report.allowed, "hard model_provider ref must block delete");
         assert_eq!(report.blockers.len(), 1);
         assert_eq!(report.blockers[0].path, "agents.bot.model_provider");
         assert_eq!(report.blockers[0].action, ScrubAction::Refuse);
@@ -3248,7 +3231,8 @@ mod tests {
         // Add the provider entry so delete_model_alias can find it.
         use crate::schema::{CustomModelProviderConfig, ModelEntryConfig, ModelProviderConfig};
         let mut base = ModelProviderConfig::default();
-        base.models.insert("fast".to_string(), ModelEntryConfig::default());
+        base.models
+            .insert("fast".to_string(), ModelEntryConfig::default());
         let profile = CustomModelProviderConfig { base };
         cfg.providers
             .models
@@ -3287,7 +3271,8 @@ mod tests {
 
         use crate::schema::{CustomModelProviderConfig, ModelEntryConfig, ModelProviderConfig};
         let mut base = ModelProviderConfig::default();
-        base.models.insert("fast".to_string(), ModelEntryConfig::default());
+        base.models
+            .insert("fast".to_string(), ModelEntryConfig::default());
         let profile = CustomModelProviderConfig { base };
         cfg.providers
             .models
@@ -3295,8 +3280,8 @@ mod tests {
             .insert("rag_bot".to_string(), profile);
 
         let kind = model_alias_kind("custom", "rag_bot");
-        let report = rename_with_cascade(&mut cfg, &kind, "fast", "turbo")
-            .expect("rename should succeed");
+        let report =
+            rename_with_cascade(&mut cfg, &kind, "fast", "turbo").expect("rename should succeed");
         assert_eq!(report.old_alias, "fast");
         assert_eq!(report.new_alias, "turbo");
         assert_eq!(
@@ -3339,7 +3324,8 @@ mod tests {
         );
         use crate::schema::{CustomModelProviderConfig, ModelEntryConfig, ModelProviderConfig};
         let mut base = ModelProviderConfig::default();
-        base.models.insert("fast".to_string(), ModelEntryConfig::default());
+        base.models
+            .insert("fast".to_string(), ModelEntryConfig::default());
         let profile = CustomModelProviderConfig { base };
         cfg.providers
             .models
