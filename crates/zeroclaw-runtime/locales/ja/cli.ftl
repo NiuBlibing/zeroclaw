@@ -429,7 +429,7 @@ cli-sop-ws-invalid-approval = sop approval_response には run_id と approve �
 cli-sop-ws-resolve-failed = SOP の解決に失敗しました: {$error}
 cli-sop-ws-engine-lock-poisoned = SOP エンジンロックがポイズンされました
 cli-sop-ws-subsystem-disabled = SOP サブシステムは有効ではありません
-cli-sop-create-hint = {"  "}作成: mkdir -p <workspace>/sops/my-sop
+cli-sop-create-hint = {"  "}作成: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}その後 SOP.toml と SOP.md を追加します
 cli-sop-loaded-header = 読み込み済みの SOP ({$count}):
 cli-sop-none-to-validate = 検証する SOP が見つかりません。
@@ -984,6 +984,8 @@ channel-approval-btn-always = 常に
 channel-approval-tap-instruction = 下のボタンをタップしてください：
 channel-approval-reply-instruction-yesno = 返信：「{ $yes_command }」、「{ $no_command }」、または「{ $always_command }」
 channel-approval-reply-instruction-approve-deny = 「{ $approve_command }」/「{ $deny_command }」/「{ $always_command }」と返信してください。
+channel-approval-group-visibility-warning =
+    これはグループチャットのため、ここにいる全員がこのコードと上に表示されたツールの引数を見ることができます。このチャンネルの承認されたピアのみが応答できます。
 channel-telegram-approval-ack-approved = 承認しました
 channel-telegram-approval-ack-always-approved = 常に承認しました
 channel-telegram-approval-ack-denied = 拒否しました
