@@ -22,7 +22,7 @@ lru = "0.18.2"
 rumqttc = { version = "0.25", optional = true }
 notify = { version = "6", optional = true }
 glob = { version = "0.3", optional = true }
-lapin = { version = "2", optional = true, default-features = false, features = [
+lapin = { version = "4", optional = true, default-features = false, features = [
   "rustls",
 ] }
 tokio-executor-trait = { version = "2", optional = true }
