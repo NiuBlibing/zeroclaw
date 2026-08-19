@@ -11,6 +11,15 @@ use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_infra::session_queue::SessionActorQueue;
 use zeroclaw_providers::ModelProvider;
 
+/// Error returned by [`SessionStore::wait_for_provider_update`].
+#[derive(Debug)]
+pub(crate) enum WaitForProviderUpdateError {
+    /// The session no longer exists.
+    SessionNotFound,
+    /// The update lock was not released within the requested timeout.
+    Timeout,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelCause {
@@ -174,6 +183,56 @@ impl SessionStore {
     #[cfg(test)]
     pub(crate) fn model_provider_update_waiting(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.model_provider_update_waiting)
+    }
+
+    /// Wait for any in-progress live-session provider refresh to finish, then
+    /// return.  Acquiring and immediately releasing the per-session update lock
+    /// establishes a happens-before edge: any refresh that held the lock before
+    /// this call has completed by the time this returns, so the next turn will
+    /// call `sync_config_generation()` against a fully applied config generation.
+    ///
+    /// Returns `Err` if the session no longer exists, or if the lock is not
+    /// released within `timeout`.  The caller should surface the timeout as a
+    /// retryable error rather than proceeding with a potentially stale resolver.
+    pub(crate) async fn wait_for_provider_update(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), WaitForProviderUpdateError> {
+        let lock = self
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| Arc::clone(&session.model_provider_update))
+            .ok_or(WaitForProviderUpdateError::SessionNotFound)?;
+
+        #[cfg(test)]
+        let acquire = {
+            let waiting = Arc::clone(&self.model_provider_update_waiting);
+            let mut lock = Box::pin(lock.lock_owned());
+            let mut notified = false;
+            std::future::poll_fn(
+                move |cx| match std::future::Future::poll(lock.as_mut(), cx) {
+                    std::task::Poll::Pending => {
+                        if !notified {
+                            waiting.notify_one();
+                            notified = true;
+                        }
+                        std::task::Poll::Pending
+                    }
+                    std::task::Poll::Ready(guard) => std::task::Poll::Ready(guard),
+                },
+            )
+        };
+        #[cfg(not(test))]
+        let acquire = lock.lock_owned();
+
+        tokio::time::timeout(timeout, acquire)
+            .await
+            .map_err(|_| WaitForProviderUpdateError::Timeout)?;
+        // Guard is dropped here — the lock is released immediately.
+        Ok(())
     }
 
     pub async fn touch(&self, id: &str) {
