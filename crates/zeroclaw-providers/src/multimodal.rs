@@ -1530,6 +1530,9 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImageValidationFailureKind {
     InvalidImage,
+    /// Refused by a header-only check before any decoder could allocate, so no
+    /// decode work was performed and nothing should be charged.
+    RefusedBeforeDecode,
     AggregateBudgetExhausted,
 }
 
@@ -1719,15 +1722,27 @@ async fn validate_within_budget(
             Ok(allocation)
         }
         Err(failure) => {
-            if failure.kind == ImageValidationFailureKind::AggregateBudgetExhausted {
-                *remaining_budget = 0;
-            } else {
-                // A corrupt payload still consumed bounded decode work. Charge
-                // at least its admitted canvas, plus any completed/attempted
-                // animation frames reported by the decoder, while preserving
-                // the remainder for unrelated candidates.
-                let charge = projected_allocation.max(failure.consumed_allocation);
-                *remaining_budget = budget_before_decode.saturating_sub(charge);
+            match failure.kind {
+                ImageValidationFailureKind::AggregateBudgetExhausted => {
+                    *remaining_budget = 0;
+                }
+                ImageValidationFailureKind::RefusedBeforeDecode => {
+                    // A header-only refusal: no decoder ran, so there is no
+                    // work to charge. The check that produced it is bounded by
+                    // the header parse already paid for by `projected_allocation`,
+                    // and the per-request image cap bounds how often it can run,
+                    // so leaving the allowance intact cannot be used to repeat
+                    // real decode work.
+                }
+                ImageValidationFailureKind::InvalidImage => {
+                    // A corrupt payload still consumed bounded decode work.
+                    // Charge at least its admitted canvas, plus any
+                    // completed/attempted animation frames reported by the
+                    // decoder, while preserving the remainder for unrelated
+                    // candidates.
+                    let charge = projected_allocation.max(failure.consumed_allocation);
+                    *remaining_budget = budget_before_decode.saturating_sub(charge);
+                }
             }
             Err(failure.error)
         }
@@ -1785,6 +1800,35 @@ async fn validate_image_content_with_projection(
         consumed_allocation: 0,
         kind: ImageValidationFailureKind::InvalidImage,
     })?;
+
+    // Enforce the per-image allocation cap ourselves, before any decoder can
+    // allocate. `Limits::max_alloc` is not a reliable guard here: the trait's
+    // default `set_limits` only checks `check_support` and `check_dimensions`,
+    // and `WebPDecoder` (image 0.25.10) does not override it, so the cap is
+    // silently dropped on that path. A 5000x5000 WebP clears the dimension
+    // limit and the aggregate budget, yet still projects ~100 MB — above the
+    // per-image cap — and would otherwise reach a direct allocation in
+    // `DynamicImage::from_decoder` or in the animation frame iterator before
+    // the post-decode accounting in `validate_animation_frames` can run.
+    //
+    // This is the image's own cap, not the shared allowance, so it is an
+    // ordinary invalid-image failure: it must not close the budget for
+    // unrelated siblings. Nothing has been decoded yet, hence a zero charge.
+    if projected_allocation > MAX_DECODED_IMAGE_ALLOC_BYTES {
+        return Err(ImageValidationFailure {
+            error: MultimodalError::CorruptImage {
+                input: source.to_string(),
+                mime: mime.to_string(),
+                reason: format!(
+                    "decoded canvas of {projected_allocation} bytes exceeds per-image limit of \
+                     {MAX_DECODED_IMAGE_ALLOC_BYTES} bytes"
+                ),
+            }
+            .into(),
+            consumed_allocation: 0,
+            kind: ImageValidationFailureKind::RefusedBeforeDecode,
+        });
+    }
 
     let source_owned = source.to_string();
     let mime_owned = mime.to_string();
@@ -3391,6 +3435,105 @@ mod tests {
         )
         .await
         .expect_err("a corrupt later WebP frame must be rejected");
+    }
+
+    /// A WebP whose `VP8X` canvas is 5000x5000. That clears the 16,384-pixel
+    /// dimension limit and projects ~100 MB of RGBA — above the 64 MiB
+    /// per-image cap but below the 256 MiB aggregate budget, which is exactly
+    /// the window where `Limits::max_alloc` was the only thing standing
+    /// between the payload and a direct decoder allocation.
+    ///
+    /// `animated` selects the `ANIM`/`ANMF` form; the frames themselves stay
+    /// 1x1 so the fixture is small, proving the canvas alone is what gets the
+    /// payload refused.
+    fn oversized_canvas_webp(animated: bool) -> Vec<u8> {
+        // 24-bit little-endian canvas width-1 and height-1.
+        const CANVAS_MINUS_ONE: [u8; 3] = [0x87, 0x13, 0x00]; // 4999 => 5000px
+        let mut vp8x = vec![if animated { 0x02 } else { 0x00 }, 0, 0, 0];
+        vp8x.extend_from_slice(&CANVAS_MINUS_ONE);
+        vp8x.extend_from_slice(&CANVAS_MINUS_ONE);
+
+        let mut body = b"WEBP".to_vec();
+        append_webp_chunk(&mut body, b"VP8X", &vp8x);
+
+        if animated {
+            append_webp_chunk(&mut body, b"ANIM", &[0, 0, 0, 0, 0, 0]);
+            for encoded in [lossless_webp([255, 0, 0]), lossless_webp([0, 255, 0])] {
+                let mut frame = vec![0; 16];
+                frame[12] = 1; // one-millisecond duration
+                frame.extend_from_slice(&encoded[12..]);
+                append_webp_chunk(&mut body, b"ANMF", &frame);
+            }
+        } else {
+            let encoded = lossless_webp([255, 0, 0]);
+            append_webp_chunk(&mut body, b"VP8L", &encoded[20..]);
+        }
+
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn oversized_webp_canvas_is_refused_before_allocation() {
+        // `WebPDecoder` (image 0.25.10) does not override `set_limits`, and the
+        // trait default only checks `check_support`/`check_dimensions` — the
+        // `max_alloc` cap is silently dropped. Without an explicit pre-decode
+        // guard, `DynamicImage::from_decoder` allocates from `total_bytes()`
+        // and the animation iterator builds frame buffers, both before any
+        // post-decode accounting can run. Every WebP shape must be refused on
+        // the canvas projection alone.
+        for animated in [false, true] {
+            let webp = oversized_canvas_webp(animated);
+
+            let error = validate_image_content(
+                "big.webp",
+                "image/webp",
+                &webp,
+                AGGREGATE_DECODE_BUDGET_BYTES,
+            )
+            .await
+            .expect_err("a canvas above the per-image cap must be refused, not allocated");
+
+            assert_eq!(
+                multimodal_error_kind(&error),
+                "corrupt_image",
+                "animated={animated}"
+            );
+            assert!(
+                error.to_string().contains("per-image limit"),
+                "the refusal must name the per-image cap (animated={animated}): {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_webp_canvas_does_not_close_the_shared_budget() {
+        // The per-image cap is this image's own ceiling, not the shared
+        // allowance. Exceeding it is an ordinary invalid-image failure, so an
+        // unrelated sibling must keep its budget — the same contract the GIF
+        // sibling regressions above assert.
+        let webp = oversized_canvas_webp(false);
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+
+        validate_within_budget("big.webp", "image/webp", &webp, &mut budget)
+            .await
+            .expect_err("an over-cap canvas must be refused");
+
+        assert_eq!(
+            budget, AGGREGATE_DECODE_BUDGET_BYTES,
+            "nothing was decoded, so the shared budget must be untouched for siblings"
+        );
+
+        let allocation = validate_within_budget("ok.png", "image/png", &valid_png(), &mut budget)
+            .await
+            .expect("an unrelated valid sibling must still be admitted");
+        assert_eq!(
+            budget,
+            AGGREGATE_DECODE_BUDGET_BYTES - allocation,
+            "only the sibling's real decode is charged"
+        );
     }
 
     #[tokio::test]
