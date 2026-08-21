@@ -429,13 +429,102 @@ fn agent_scoped_refresh_selects(
 /// (`providers.models.*` edit). A session is eligible when its own
 /// `model_provider` override matches the edited provider, or when it has no
 /// override and thus inherits the agent's provider (final provider match is
-/// resolved separately against config).
+/// resolved separately against config). A complete `model_routes` entry that
+/// targets the edited profile expands the scope to every session in
+/// `LiveSessionRefreshScope::resolve_provider_ref`, because every routed
+/// provider materialization contains that target.
 fn provider_scoped_refresh_selects(target_ref: &str, overrides: &SessionOverrides) -> bool {
     overrides
         .model_provider
         .as_deref()
         .map(|r| r == target_ref)
         .unwrap_or(true)
+}
+
+/// The live-session materialization affected by one config mutation.
+///
+/// `Config` remains the canonical source. This value only describes which
+/// ephemeral provider/resolver views must be rebuilt before that candidate
+/// config can be committed.
+#[derive(Clone)]
+enum LiveSessionRefreshScope {
+    ModelProvider(String),
+    Agent(String),
+    ModelRoutes,
+}
+
+impl LiveSessionRefreshScope {
+    fn for_prop(prop: &str) -> Option<Self> {
+        model_provider_ref_from_provider_profile_prop(prop)
+            .map(Self::ModelProvider)
+            .or_else(|| agent_alias_from_model_provider_prop(prop).map(Self::Agent))
+            .or_else(|| touches_model_routes(prop).then_some(Self::ModelRoutes))
+    }
+
+    fn resolve_provider_ref(
+        &self,
+        config: &Config,
+        session_agent: &str,
+        overrides: &SessionOverrides,
+    ) -> Result<Option<String>, String> {
+        match self {
+            Self::ModelProvider(target_ref) => {
+                let effective_ref = overrides.model_provider.as_deref().or_else(|| {
+                    config
+                        .agent(session_agent)
+                        .map(|agent| agent.model_provider.as_str())
+                });
+                let materialized_route_uses_target = config.model_routes.iter().any(|route| {
+                    !route.hint.trim().is_empty()
+                        && !route.model.trim().is_empty()
+                        && route.model_provider.trim() == target_ref
+                });
+                if materialized_route_uses_target {
+                    return effective_ref
+                        .map(str::to_string)
+                        .map(Some)
+                        .ok_or_else(|| format!("agent `{session_agent}` is not configured"));
+                }
+                if !provider_scoped_refresh_selects(target_ref, overrides) {
+                    return Ok(None);
+                }
+                Ok((effective_ref == Some(target_ref.as_str())).then(|| target_ref.clone()))
+            }
+            Self::Agent(edited_agent) => {
+                if !agent_scoped_refresh_selects(edited_agent, session_agent, overrides) {
+                    return Ok(None);
+                }
+                config
+                    .agent(edited_agent)
+                    .map(|agent| Some(agent.model_provider.to_string()))
+                    .ok_or_else(|| format!("agent `{edited_agent}` is not configured"))
+            }
+            Self::ModelRoutes => overrides
+                .model_provider
+                .clone()
+                .or_else(|| {
+                    config
+                        .agent(session_agent)
+                        .map(|agent| agent.model_provider.to_string())
+                })
+                .map(Some)
+                .ok_or_else(|| format!("agent `{session_agent}` is not configured")),
+        }
+    }
+}
+
+/// A provider/resolver view built from a candidate `Config` while the
+/// corresponding session generation lock is held. The guard deliberately
+/// travels with the values until they are published after the config commit.
+struct PreparedLiveSessionRefresh {
+    session_id: String,
+    _model_provider_update: tokio::sync::OwnedMutexGuard<()>,
+    model_provider: Box<dyn zeroclaw_providers::ModelProvider>,
+    model_provider_name: String,
+    model_name: String,
+    model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
+    tool_dispatcher: Box<dyn crate::agent::dispatcher::ToolDispatcher>,
+    temperature: Option<f64>,
 }
 
 /// Whether memory embeddings resolve from the given `<type>.<alias>` provider
@@ -1129,7 +1218,6 @@ impl RpcDispatcher {
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let config = self.ctx.config.read().clone();
         let chat_mode = req
             .chat_mode
             .clone()
@@ -1177,6 +1265,15 @@ impl RpcDispatcher {
                 }
             }
         }
+
+        // Session construction is a reader in the route-generation
+        // transaction. Hold the config writer gate from the first config read
+        // through insertion so a route-affecting commit cannot miss a session
+        // built from the prior generation (or publish midway through Agent
+        // construction). Persistence lookup above does not depend on config and
+        // deliberately remains outside this boundary.
+        let config_generation_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let config = self.ctx.config.read().clone();
 
         // The session cwd: caller-supplied wins, then a resumed ACP session's
         // persisted cwd, then the agent's workspace dir.
@@ -1241,6 +1338,7 @@ impl RpcDispatcher {
             )
             .await
             .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
+        drop(config_generation_guard);
 
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
@@ -1812,32 +1910,24 @@ impl RpcDispatcher {
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
-        // Wait for any live-session provider refresh (triggered by a
-        // model_routes.* or providers.models.* config/set) to finish before
-        // entering the turn.  The refresh holds the per-session
-        // `model_provider_update` lock while it rebuilds the provider box,
-        // `ModelRouteResolver`, and config generation.  Acquiring and
-        // immediately releasing that lock here establishes a happens-before
-        // edge: any refresh that started before this prompt will have
-        // completed — and its new resolver and generation will be in place —
-        // by the time `sync_config_generation()` runs at the turn boundary.
-        // Without this gate a prompt that wins the race against a spawned
-        // refresh can call `sync_config_generation()` against the new shared
-        // config while still holding the old resolver, producing the
-        // mixed-generation split this PR is meant to close.
+        // Own the live-session provider generation through this turn. A
+        // route-affecting config transaction holds the same lock while it
+        // publishes the live Config, provider box, ModelRouteResolver, and
+        // generation. Keeping the guard (rather than merely waiting for and
+        // immediately releasing it) orders both race directions: a transaction
+        // already in progress completes first, and a later transaction cannot
+        // swap the live config between this boundary and
+        // `sync_config_generation()` at the start of the turn.
         //
         // A 30-second timeout surfaces a retryable error to the caller
-        // rather than blocking indefinitely.  A failed provider rebuild
-        // leaves the session on its last coherent generation, so a prompt
-        // that completes after such a timeout is also safe — it runs on a
-        // complete (though potentially stale) generation.
-        match self
+        // rather than blocking indefinitely.
+        let _model_provider_generation = match self
             .ctx
             .sessions
-            .wait_for_provider_update(sid, std::time::Duration::from_secs(30))
+            .lock_model_provider_update_with_timeout(sid, std::time::Duration::from_secs(30))
             .await
         {
-            Ok(()) => {}
+            Ok(guard) => guard,
             Err(crate::rpc::session::WaitForProviderUpdateError::SessionNotFound) => {
                 return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
             }
@@ -1847,7 +1937,7 @@ impl RpcDispatcher {
                     "provider update in progress; retry shortly",
                 ));
             }
-        }
+        };
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
@@ -2868,9 +2958,9 @@ impl RpcDispatcher {
     async fn handle_config_set(&self, params: &Value) -> RpcResult {
         let req: ConfigSetParams = parse_params(params)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
+        let refresh_scope = LiveSessionRefreshScope::for_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        {
-            let mut config = self.ctx.config.write();
+        let apply = |config: &mut Config| -> Result<(), JsonRpcError> {
             if config.ensure_map_key_for_path(&req.prop) {
                 // Refused to vivify the reserved `default` agent: return a
                 // reserved error rather than a downstream "Unknown property".
@@ -2916,17 +3006,22 @@ impl RpcDispatcher {
             config
                 .set_prop_persistent(&req.prop, &value_str)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))?;
+            Ok(())
+        };
+        if let Some(scope) = refresh_scope.as_ref() {
+            let mut working = self.ctx.config.read().clone();
+            apply(&mut working)?;
+            self.commit_config_with_live_session_refresh(working, &config_write_guard, scope)
+                .await?;
+        } else {
+            {
+                let mut config = self.ctx.config.write();
+                apply(&mut config)?;
+            }
+            self.flush_config(&config_write_guard).await?;
         }
-        self.flush_config(&config_write_guard).await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
-            self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
-        }
-        if let Some(agent_alias) = agent_alias_from_model_provider_prop(&req.prop) {
-            self.schedule_live_sessions_refresh_for_agent(agent_alias);
-        }
-        if touches_model_routes(&req.prop) {
-            self.schedule_live_sessions_refresh_for_model_routes();
         }
         to_result(ConfigSetResult {
             prop: req.prop,
@@ -2985,95 +3080,42 @@ impl RpcDispatcher {
         }
     }
 
-    fn schedule_live_sessions_refresh_for_model_provider(&self, model_provider_ref: String) {
-        let ctx = Arc::clone(&self.ctx);
-        zeroclaw_spawn::spawn!(async move {
-            Self::refresh_live_sessions_for_model_provider(ctx, &model_provider_ref).await;
-        });
-    }
-
-    /// Rebuild the live agent box for every session bound to `agent_alias`,
-    /// resolving the agent's currently-configured `model_provider` from config.
-    /// Fired when `agents.<alias>.model_provider` changes via `config/set` so a
-    /// provider switch takes effect on the running session without a restart —
-    /// the same refresh a `providers.models.*` edit triggers. Only sessions
-    /// bound to the edited agent are rebuilt; sessions belonging to other
-    /// agents, and sessions that carry their own `model_provider` override, are
-    /// left untouched even when they resolve to the same provider.
-    fn schedule_live_sessions_refresh_for_agent(&self, agent_alias: String) {
-        let ctx = Arc::clone(&self.ctx);
-        zeroclaw_spawn::spawn!(async move {
-            Self::refresh_live_sessions_for_agent(ctx, &agent_alias).await;
-        });
-    }
-
-    async fn refresh_live_sessions_for_agent(ctx: Arc<RpcContext>, agent_alias: &str) {
-        Self::refresh_live_sessions_matching(ctx, |config, session_agent, overrides| {
-            if !agent_scoped_refresh_selects(agent_alias, session_agent, overrides) {
-                return None;
-            }
-            config
-                .agent(agent_alias)
-                .map(|agent| agent.model_provider.to_string())
-        })
+    /// Validate and materialize every affected live-session provider view from
+    /// `working`, then atomically commit that candidate config and publish the
+    /// prepared views while their per-session generation locks remain held.
+    ///
+    /// `working` is deliberately not installed before preparation succeeds.
+    /// A provider construction failure therefore leaves both the canonical
+    /// config and every derived live-session view on the prior generation.
+    async fn commit_config_with_live_session_refresh(
+        &self,
+        working: Config,
+        config_write_guard: &ConfigWriteGuard,
+        scope: &LiveSessionRefreshScope,
+    ) -> Result<(), JsonRpcError> {
+        let prepared =
+            Self::prepare_live_sessions_refresh(Arc::clone(&self.ctx), &working, scope).await?;
+        self.save_and_swap_config(working, config_write_guard)
+            .await?;
+        let config_generation = Arc::new(self.ctx.config.read().clone());
+        Self::apply_prepared_live_sessions_refresh(
+            Arc::clone(&self.ctx),
+            prepared,
+            config_generation,
+        )
         .await;
+        Ok(())
     }
 
-    /// Rebuild the live provider box, `ModelRouteResolver`, and config
-    /// generation for every live session. Fired when `model_routes.*`
-    /// changes via `config/set`/`config/delete`/a map-key create-delete-rename
-    /// on `model_routes`, because the resolver is a process-wide hint→route
-    /// table snapshot: every session's resolver — regardless of which
-    /// provider profile the session itself is bound to — must move to the new
-    /// table together, or a hint-routed call after the edit can dispatch
-    /// through a stale route while `context_limits_for_route` reports the new
-    /// config's capacity for it. Every session is selected unconditionally
-    /// (unlike the provider/agent-scoped refreshes above, which only rebuild
-    /// sessions whose own resolved provider ref actually changed).
-    fn schedule_live_sessions_refresh_for_model_routes(&self) {
-        let ctx = Arc::clone(&self.ctx);
-        zeroclaw_spawn::spawn!(async move {
-            Self::refresh_live_sessions_for_model_routes(ctx).await;
-        });
-    }
-
-    async fn refresh_live_sessions_for_model_routes(ctx: Arc<RpcContext>) {
-        Self::refresh_live_sessions_matching(ctx, |config, session_agent, overrides| {
-            overrides.model_provider.clone().or_else(|| {
-                config
-                    .agent(session_agent)
-                    .map(|a| a.model_provider.to_string())
-            })
-        })
-        .await;
-    }
-
-    async fn refresh_live_sessions_for_model_provider(
+    async fn prepare_live_sessions_refresh(
         ctx: Arc<RpcContext>,
-        model_provider_ref: &str,
-    ) {
-        let target_ref = model_provider_ref.to_string();
-        Self::refresh_live_sessions_matching(ctx, move |config, session_agent, overrides| {
-            if !provider_scoped_refresh_selects(&target_ref, overrides) {
-                return None;
-            }
-            let effective_ref = overrides.model_provider.as_deref().or_else(|| {
-                config
-                    .agent(session_agent)
-                    .map(|agent| agent.model_provider.as_str())
-            });
-            (effective_ref == Some(target_ref.as_str())).then(|| target_ref.clone())
-        })
-        .await;
-    }
-
-    async fn refresh_live_sessions_matching<F>(ctx: Arc<RpcContext>, resolve_provider_ref: F)
-    where
-        F: Fn(&Config, &str, &SessionOverrides) -> Option<String>,
-    {
+        config: &Config,
+        scope: &LiveSessionRefreshScope,
+    ) -> Result<Vec<PreparedLiveSessionRefresh>, JsonRpcError> {
         let session_ids = ctx.sessions.list_ids().await;
+        let mut prepared = Vec::new();
         for session_id in session_ids {
-            let Some(_model_provider_update) =
+            let Some(model_provider_update) =
                 ctx.sessions.lock_model_provider_update(&session_id).await
             else {
                 continue;
@@ -3084,92 +3126,91 @@ impl RpcDispatcher {
             let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
                 continue;
             };
-            let (
+            let Some(model_provider_ref) = scope
+                .resolve_provider_ref(config, &agent_alias, &overrides)
+                .map_err(|error| {
+                    rpc_err(
+                        INVALID_PARAMS,
+                        format!(
+                            "Config update cannot refresh live session `{session_id}`: {error}"
+                        ),
+                    )
+                })?
+            else {
+                continue;
+            };
+            let provider_temperature =
+                model_provider_ref
+                    .split_once('.')
+                    .and_then(|(provider_type, provider_alias)| {
+                        config
+                            .providers
+                            .models
+                            .find(provider_type, provider_alias)
+                            .and_then(|entry| entry.temperature)
+                    });
+            let agent_cfg = config
+                .resolved_agent_config(&agent_alias)
+                .or_else(|| config.agent(&agent_alias).cloned())
+                .ok_or_else(|| {
+                    rpc_err(
+                        INVALID_PARAMS,
+                        format!(
+                            "Config update cannot refresh live session `{session_id}`: agent \
+                             `{agent_alias}` is not configured"
+                        ),
+                    )
+                })?;
+            let (model_provider, model_provider_name, model_name, model_route_resolver) =
+                crate::agent::agent::build_session_model_provider(
+                    config,
+                    &model_provider_ref,
+                    overrides.model.as_deref(),
+                )
+                .map_err(|error| {
+                    rpc_err(
+                        INVALID_PARAMS,
+                        format!(
+                            "Config update cannot refresh live session `{session_id}` from \
+                             `{model_provider_ref}`: {error}"
+                        ),
+                    )
+                })?;
+            let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
+                &agent_cfg,
+                model_provider.as_ref(),
+                &model_name,
+            );
+            prepared.push(PreparedLiveSessionRefresh {
+                session_id,
+                _model_provider_update: model_provider_update,
+                model_provider,
+                model_provider_name,
+                model_name,
+                model_route_resolver,
+                tool_dispatcher,
+                temperature: overrides.temperature.or(provider_temperature),
+            });
+        }
+        Ok(prepared)
+    }
+
+    async fn apply_prepared_live_sessions_refresh(
+        ctx: Arc<RpcContext>,
+        prepared: Vec<PreparedLiveSessionRefresh>,
+        config_generation: Arc<Config>,
+    ) {
+        for refresh in prepared {
+            let PreparedLiveSessionRefresh {
+                session_id,
+                _model_provider_update,
                 model_provider,
                 model_provider_name,
                 model_name,
                 model_route_resolver,
                 tool_dispatcher,
                 temperature,
-                config_generation,
-            ) = {
-                let config = ctx.config.read();
-                let Some(model_provider_ref) =
-                    resolve_provider_ref(&config, &agent_alias, &overrides)
-                else {
-                    continue;
-                };
-                let provider_temperature = model_provider_ref.split_once('.').and_then(
-                    |(provider_type, provider_alias)| {
-                        config
-                            .providers
-                            .models
-                            .find(provider_type, provider_alias)
-                            .and_then(|entry| entry.temperature)
-                    },
-                );
-                let Some(agent_cfg) = config
-                    .resolved_agent_config(&agent_alias)
-                    .or_else(|| config.agent(&agent_alias).cloned())
-                else {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "session_id": session_id,
-                                "agent_alias": agent_alias,
-                                "model_provider": model_provider_ref,
-                            })),
-                        "config/set saved provider profile but live session refresh could not resolve agent config"
-                    );
-                    continue;
-                };
-                match crate::agent::agent::build_session_model_provider(
-                    &config,
-                    &model_provider_ref,
-                    overrides.model.as_deref(),
-                ) {
-                    Ok((model_provider, model_provider_name, model_name, model_route_resolver)) => {
-                        let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
-                            &agent_cfg,
-                            model_provider.as_ref(),
-                            &model_name,
-                        );
-                        (
-                            model_provider,
-                            model_provider_name,
-                            model_name,
-                            model_route_resolver,
-                            tool_dispatcher,
-                            overrides.temperature.or(provider_temperature),
-                            // `config/set` already committed this generation to
-                            // the shared config; publishing it with the box means
-                            // the next prompt cannot observe the new limits with
-                            // a provider rebuilt from the old one.
-                            std::sync::Arc::new(config.clone()),
-                        )
-                    }
-                    Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "session_id": session_id,
-                                "agent_alias": agent_alias,
-                                "model_provider": model_provider_ref,
-                                "error": e.to_string(),
-                            })),
-                            "config/set saved provider profile but live session refresh failed"
-                        );
-                        continue;
-                    }
-                }
-            };
+            } = refresh;
             if ctx
                 .sessions
                 .apply_model_provider(
@@ -3179,15 +3220,30 @@ impl RpcDispatcher {
                     model_name,
                     model_route_resolver,
                     tool_dispatcher,
-                    config_generation,
+                    Arc::clone(&config_generation),
                 )
                 .await
                 && let Some(agent) = ctx.sessions.get_agent(&session_id).await
             {
-                let mut agent = agent.lock().await;
-                agent.set_temperature(temperature);
+                agent.lock().await.set_temperature(temperature);
             }
         }
+    }
+
+    #[cfg(test)]
+    async fn refresh_live_sessions_for_agent(
+        ctx: Arc<RpcContext>,
+        agent_alias: &str,
+    ) -> Result<(), JsonRpcError> {
+        let config = ctx.config.read().clone();
+        let prepared = Self::prepare_live_sessions_refresh(
+            Arc::clone(&ctx),
+            &config,
+            &LiveSessionRefreshScope::Agent(agent_alias.to_string()),
+        )
+        .await?;
+        Self::apply_prepared_live_sessions_refresh(ctx, prepared, Arc::new(config)).await;
+        Ok(())
     }
 
     fn handle_config_validate(&self) -> RpcResult {
@@ -3260,20 +3316,26 @@ impl RpcDispatcher {
     async fn handle_config_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigDeleteParams = parse_params(params)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
+        let refresh_scope = LiveSessionRefreshScope::for_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        {
-            let mut config = self.ctx.config.write();
-            config
+        if let Some(scope) = refresh_scope.as_ref() {
+            let mut working = self.ctx.config.read().clone();
+            working
                 .set_prop_persistent(&req.prop, "")
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
+            self.commit_config_with_live_session_refresh(working, &config_write_guard, scope)
+                .await?;
+        } else {
+            {
+                let mut config = self.ctx.config.write();
+                config
+                    .set_prop_persistent(&req.prop, "")
+                    .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
+            }
+            self.flush_config(&config_write_guard).await?;
         }
-        self.flush_config(&config_write_guard).await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
-            self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
-        }
-        if touches_model_routes(&req.prop) {
-            self.schedule_live_sessions_refresh_for_model_routes();
         }
         to_result(ConfigDeleteResult {
             prop: req.prop,
@@ -3309,28 +3371,40 @@ impl RpcDispatcher {
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        let created = {
-            let mut config = self.ctx.config.write();
+        let create = |config: &mut Config| -> Result<bool, JsonRpcError> {
             // Shared guarded boundary: enforces the reserved-agent rule (the
             // `default` runtime fallback) on this surface too, so the RPC create
             // path cannot author an `agents.default` the rename guard then traps.
-            let created = zeroclaw_config::alias_refs::create_map_key_checked(
-                &mut config,
-                &req.path,
-                &req.key,
-            )
-            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+            let created =
+                zeroclaw_config::alias_refs::create_map_key_checked(config, &req.path, &req.key)
+                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
             if created {
                 config.mark_dirty(&format!("{}.{}", req.path, req.key));
             }
+            Ok(created)
+        };
+        let created = if touches_model_routes(&req.path) {
+            let mut working = self.ctx.config.read().clone();
+            let created = create(&mut working)?;
+            if created {
+                self.commit_config_with_live_session_refresh(
+                    working,
+                    &config_write_guard,
+                    &LiveSessionRefreshScope::ModelRoutes,
+                )
+                .await?;
+            }
+            created
+        } else {
+            let created = {
+                let mut config = self.ctx.config.write();
+                create(&mut config)?
+            };
+            if created {
+                self.flush_config(&config_write_guard).await?;
+            }
             created
         };
-        if created {
-            self.flush_config(&config_write_guard).await?;
-            if touches_model_routes(&req.path) {
-                self.schedule_live_sessions_refresh_for_model_routes();
-            }
-        }
         to_result(ConfigMapKeyCreateResult {
             path: req.path,
             key: req.key,
@@ -3341,22 +3415,37 @@ impl RpcDispatcher {
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        let deleted = {
-            let mut config = self.ctx.config.write();
+        let delete = |config: &mut Config| -> Result<bool, JsonRpcError> {
             let deleted = config
                 .delete_map_key(&req.path, &req.key)
                 .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
             if deleted {
                 config.mark_dirty(&format!("{}.{}", req.path, req.key));
             }
+            Ok(deleted)
+        };
+        let deleted = if touches_model_routes(&req.path) {
+            let mut working = self.ctx.config.read().clone();
+            let deleted = delete(&mut working)?;
+            if deleted {
+                self.commit_config_with_live_session_refresh(
+                    working,
+                    &config_write_guard,
+                    &LiveSessionRefreshScope::ModelRoutes,
+                )
+                .await?;
+            }
+            deleted
+        } else {
+            let deleted = {
+                let mut config = self.ctx.config.write();
+                delete(&mut config)?
+            };
+            if deleted {
+                self.flush_config(&config_write_guard).await?;
+            }
             deleted
         };
-        if deleted {
-            self.flush_config(&config_write_guard).await?;
-            if touches_model_routes(&req.path) {
-                self.schedule_live_sessions_refresh_for_model_routes();
-            }
-        }
         to_result(ConfigMapKeyDeleteResult {
             path: req.path,
             key: req.key,
@@ -3383,8 +3472,7 @@ impl RpcDispatcher {
                     .await;
             }
 
-            let renamed = {
-                let mut config = self.ctx.config.write();
+            let rename = |config: &mut Config| -> Result<bool, JsonRpcError> {
                 let renamed = config
                     .rename_map_key(&req.path, &req.from, &req.to)
                     .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
@@ -3392,14 +3480,30 @@ impl RpcDispatcher {
                     config.mark_dirty(&format!("{}.{}", req.path, req.from));
                     config.mark_dirty(&format!("{}.{}", req.path, req.to));
                 }
+                Ok(renamed)
+            };
+            let renamed = if touches_model_routes(&req.path) {
+                let mut working = self.ctx.config.read().clone();
+                let renamed = rename(&mut working)?;
+                if renamed {
+                    self.commit_config_with_live_session_refresh(
+                        working,
+                        &config_write_guard,
+                        &LiveSessionRefreshScope::ModelRoutes,
+                    )
+                    .await?;
+                }
+                renamed
+            } else {
+                let renamed = {
+                    let mut config = self.ctx.config.write();
+                    rename(&mut config)?
+                };
+                if renamed {
+                    self.flush_config(&config_write_guard).await?;
+                }
                 renamed
             };
-            if renamed {
-                self.flush_config(&config_write_guard).await?;
-                if touches_model_routes(&req.path) {
-                    self.schedule_live_sessions_refresh_for_model_routes();
-                }
-            }
             to_result(ConfigMapKeyRenameResult {
                 path: req.path,
                 from: req.from,
@@ -9457,7 +9561,11 @@ mod tests {
             "config/set agents.<alias>.model_provider must succeed: {res:?}"
         );
 
-        wait_for_model_name(&dispatcher, &session_id, "other-model").await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "other-model",
+            "config/set must publish the new provider before acknowledging the write"
+        );
     }
 
     /// The Aug 13 review's specifically-requested boundary: a route-affecting
@@ -9548,28 +9656,8 @@ mod tests {
             "config/set model_routes.<hint>.model must succeed: {res:?}"
         );
 
-        // The live-session refresh runs on a spawned task; poll until the
-        // resolver reflects the new route, then assert dispatch and limits
-        // agree on the same (new) generation in the same observation.
-        for _ in 0..50 {
-            let agent = dispatcher
-                .ctx
-                .sessions
-                .get_agent(&session_id)
-                .await
-                .expect("session agent exists");
-            let agent = agent.lock().await;
-            if agent
-                .resolved_route_for_test("hint:reasoning")
-                .provider_name
-                == "openai.small-provider"
-            {
-                break;
-            }
-            drop(agent);
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
+        // A successful response acknowledges an already-published generation;
+        // no convergence polling is permitted at this boundary.
         let agent = dispatcher
             .ctx
             .sessions
@@ -9588,6 +9676,64 @@ mod tests {
             "reported limits must come from the SAME refreshed generation as the dispatched route, \
              not the stale large-provider capacity"
         );
+    }
+
+    #[tokio::test]
+    async fn staged_model_route_becomes_live_only_when_complete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        dispatcher
+            .handle_config_map_key_create(&json!({
+                "path": "model_routes",
+                "key": "reasoning"
+            }))
+            .await
+            .expect("creating a staged model route must succeed");
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "model_routes.reasoning.model_provider",
+                "value": "openai.test-provider"
+            }))
+            .await
+            .expect("setting the staged route provider must succeed");
+
+        {
+            let agent = dispatcher
+                .ctx
+                .sessions
+                .get_agent(&session_id)
+                .await
+                .expect("session agent exists");
+            let route = agent.lock().await.resolved_route_for_test("hint:reasoning");
+            assert!(matches!(
+                route.kind,
+                zeroclaw_providers::router::RouteResolutionKind::UnknownHintFallback
+            ));
+        }
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "model_routes.reasoning.model",
+                "value": "old-model"
+            }))
+            .await
+            .expect("completing the staged route must atomically publish it");
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let route = agent.lock().await.resolved_route_for_test("hint:reasoning");
+        assert!(matches!(
+            route.kind,
+            zeroclaw_providers::router::RouteResolutionKind::MatchedHint
+        ));
+        assert_eq!(route.provider_name, "openai.test-provider");
+        assert_eq!(route.model, "old-model");
     }
 
     #[tokio::test]
@@ -9634,33 +9780,34 @@ mod tests {
             .expect("session/configure must succeed after the update boundary is released");
     }
 
-    /// Deterministic ordering regression for the config-mutation → prompt race.
+    /// Deterministic regression for the queued config-mutation → prompt race.
     ///
-    /// The fix: `session/prompt` waits for the per-session `model_provider_update`
-    /// lock before entering its turn, establishing a happens-before edge with any
-    /// in-progress live-session provider refresh. This test holds the lock open,
-    /// fires `session/prompt`, asserts that the prompt reaches the update boundary
-    /// and stalls there, then releases the lock and asserts the prompt succeeds
-    /// — proving the turn waited for the generation to converge rather than racing
-    /// ahead with a stale resolver.
-    ///
-    /// The failure case (no rebuild-failure path) is covered: a failed provider
-    /// rebuild leaves the session entirely on the prior generation, so the lock
-    /// is released and the prompt proceeds on a coherent (old) generation. That
-    /// invariant is enforced by the `refresh_live_sessions_matching` continue-on-
-    /// build-failure path and is validated by the
-    /// `config_set_model_routes_refreshes_live_session_resolver_and_limits`
-    /// convergence test.
+    /// This queues the real `config/set` transaction behind a held session
+    /// generation lock, then queues `session/prompt` behind that transaction.
+    /// The mock records the dispatched model, proving the prompt could not slip
+    /// past before the queued transaction rebuilt and published the provider.
     #[tokio::test]
-    async fn session_prompt_waits_for_in_progress_provider_update() {
+    async fn session_prompt_waits_for_queued_provider_update_transaction() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = Arc::new(make_config_set_test_dispatcher(
-            make_model_refresh_test_config(&tmp),
-        ));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("test provider exists")
+            .uri = Some(server.uri());
+        let dispatcher = Arc::new(make_config_set_test_dispatcher(config));
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
 
-        // Simulate an in-progress live-session provider refresh by holding the
-        // per-session update lock.
         let update_guard = dispatcher
             .ctx
             .sessions
@@ -9668,9 +9815,22 @@ mod tests {
             .await
             .expect("session update lock exists");
 
-        // Fire session/prompt from a separate task.  The prompt handler must
-        // reach the `wait_for_provider_update` boundary and stall there — the
-        // `model_provider_update_waiting` Notify signals that moment.
+        let config_dispatcher = Arc::clone(&dispatcher);
+        let config_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let config_wait = config_waiting.notified();
+        let config_set = zeroclaw_spawn::spawn!(async move {
+            config_dispatcher
+                .handle_config_set(&json!({
+                    "prop": "providers.models.openai.test-provider.model",
+                    "value": "new-model"
+                }))
+                .await
+        });
+        let mut config_set = Box::pin(config_set);
+        tokio::time::timeout(std::time::Duration::from_secs(1), config_wait)
+            .await
+            .expect("config/set must queue at the provider update boundary");
+
         let prompt_dispatcher = Arc::clone(&dispatcher);
         let prompt_sid = session_id.clone();
         let update_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
@@ -9684,28 +9844,51 @@ mod tests {
                 .await
         });
         let mut prompt = Box::pin(prompt);
-
-        // Wait until the prompt task is at the update boundary.
         tokio::time::timeout(std::time::Duration::from_secs(1), update_wait)
             .await
-            .expect("session/prompt must reach the provider update boundary within 1 s");
+            .expect("session/prompt must queue behind the config transaction");
 
-        // The prompt must not complete while the refresh holds the lock.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut config_set)
+                .await
+                .is_err(),
+            "config/set must remain queued while the prior generation is in use"
+        );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(25), &mut prompt)
                 .await
                 .is_err(),
-            "session/prompt must stall while a provider update owns the ordering boundary"
+            "session/prompt must remain queued behind the config transaction"
         );
 
-        // Release the lock — the prompt should now proceed.
         drop(update_guard);
-        // The prompt will fail because the mock provider is unreachable, but
-        // the important thing is that it proceeds past the boundary and does
-        // not time out.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), prompt)
+        tokio::time::timeout(std::time::Duration::from_secs(5), config_set)
             .await
-            .expect("session/prompt must complete after the update boundary is released");
+            .expect("config/set must finish after the old generation is released")
+            .expect("config/set task must complete")
+            .expect("config/set must commit the rebuilt generation");
+        let prompt_result = tokio::time::timeout(std::time::Duration::from_secs(5), prompt)
+            .await
+            .expect("session/prompt must complete after the config transaction")
+            .expect("session/prompt task must complete");
+        assert!(
+            prompt_result.is_err(),
+            "the mock intentionally returns a provider error"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock server must retain received requests");
+        assert!(!requests.is_empty(), "session/prompt must reach the mock");
+        for request in requests {
+            let body: Value = serde_json::from_slice(&request.body)
+                .expect("OpenAI request body must be valid JSON");
+            assert_eq!(
+                body.get("model").and_then(Value::as_str),
+                Some("new-model"),
+                "a queued prompt must only dispatch after the candidate generation is published"
+            );
+        }
     }
 
     #[tokio::test]
@@ -9769,7 +9952,9 @@ mod tests {
         let refresh_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
         let refresh_wait = refresh_waiting.notified();
         let refresh = zeroclaw_spawn::spawn!(async move {
-            RpcDispatcher::refresh_live_sessions_for_agent(refresh_ctx, "test-agent").await;
+            RpcDispatcher::refresh_live_sessions_for_agent(refresh_ctx, "test-agent")
+                .await
+                .expect("agent refresh must succeed");
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), refresh_wait)
             .await
@@ -9857,7 +10042,9 @@ mod tests {
         let older_ctx = Arc::clone(&dispatcher.ctx);
         let older_refresh = zeroclaw_spawn::spawn!(async move {
             older_release.notified().await;
-            RpcDispatcher::refresh_live_sessions_for_agent(older_ctx, "test-agent").await;
+            RpcDispatcher::refresh_live_sessions_for_agent(older_ctx, "test-agent")
+                .await
+                .expect("older agent refresh must succeed");
         });
 
         dispatcher
@@ -9872,7 +10059,9 @@ mod tests {
         let latest_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
         let latest_wait = latest_waiting.notified();
         let latest_refresh = zeroclaw_spawn::spawn!(async move {
-            RpcDispatcher::refresh_live_sessions_for_agent(latest_ctx, "test-agent").await;
+            RpcDispatcher::refresh_live_sessions_for_agent(latest_ctx, "test-agent")
+                .await
+                .expect("latest agent refresh must succeed");
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), latest_wait)
             .await
@@ -9973,14 +10162,19 @@ mod tests {
             }))
             .await;
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
-
-        wait_for_model_name(&dispatcher, &session_id, "new-model").await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "new-model",
+            "a successful config/set response must acknowledge an already-published provider"
+        );
     }
 
     #[tokio::test]
-    async fn config_set_provider_refresh_failure_does_not_fail_saved_write() {
+    async fn config_set_provider_refresh_failure_rolls_back_config_and_session() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let config = make_model_refresh_test_config(&tmp);
+        config.save().await.expect("baseline config must save");
+        let dispatcher = make_config_set_test_dispatcher(config);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
@@ -9994,8 +10188,8 @@ mod tests {
             }))
             .await;
         assert!(
-            res.is_ok(),
-            "config/set must report the saved write even if live refresh cannot rebuild: {res:?}"
+            res.is_err(),
+            "config/set must surface a provider rebuild failure: {res:?}"
         );
         let cfg = dispatcher.ctx.config.read().clone();
         let stored = cfg
@@ -10005,13 +10199,79 @@ mod tests {
             .get("test-provider")
             .and_then(|e| e.base.model.clone());
         assert_eq!(
-            stored, None,
-            "config/set must still persist the requested provider-profile clear"
+            stored.as_deref(),
+            Some("old-model"),
+            "a failed refresh must leave the canonical live config on the prior generation"
         );
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
             "old-model",
-            "failed live refresh must leave the existing session provider intact"
+            "a failed refresh must leave the session provider on that same prior generation"
+        );
+        let written = std::fs::read_to_string(&cfg.config_path)
+            .expect("baseline config must remain readable after rollback");
+        assert!(
+            written.contains("old-model"),
+            "a failed refresh must not persist the rejected candidate config: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_provider_profile_refreshes_other_base_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let routed = config
+            .providers
+            .models
+            .ensure("openai", "routed-provider")
+            .expect("routed provider slot exists");
+        routed.api_key = Some("routed-key".into());
+        routed.model = Some("routed-model".into());
+        routed.context_window = Some(8_000);
+        config
+            .model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "reasoning".into(),
+                model_provider: "openai.routed-provider".into(),
+                model: "routed-model".into(),
+                api_key: None,
+            });
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.routed-provider.context_window",
+                "value": 16_000
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "a routed profile used by another base provider must refresh: {res:?}"
+        );
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let route = agent.lock().await.resolved_route_for_test("hint:reasoning");
+        assert_eq!(route.provider_name, "openai.routed-provider");
+        assert_eq!(route.model, "routed-model");
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        assert_eq!(
+            agent
+                .lock()
+                .await
+                .context_limits_for_route(&route.provider_name, &route.model)
+                .model_context_window,
+            16_000,
+            "config/set must publish the routed target's new limits before acknowledging"
         );
     }
 

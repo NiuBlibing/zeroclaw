@@ -11,7 +11,7 @@ use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_infra::session_queue::SessionActorQueue;
 use zeroclaw_providers::ModelProvider;
 
-/// Error returned by [`SessionStore::wait_for_provider_update`].
+/// Error returned by [`SessionStore::lock_model_provider_update_with_timeout`].
 #[derive(Debug)]
 pub(crate) enum WaitForProviderUpdateError {
     /// The session no longer exists.
@@ -185,20 +185,23 @@ impl SessionStore {
         Arc::clone(&self.model_provider_update_waiting)
     }
 
-    /// Wait for any in-progress live-session provider refresh to finish, then
-    /// return.  Acquiring and immediately releasing the per-session update lock
-    /// establishes a happens-before edge: any refresh that held the lock before
-    /// this call has completed by the time this returns, so the next turn will
-    /// call `sync_config_generation()` against a fully applied config generation.
+    /// Lock the provider generation for a prompt, waiting at most `timeout`.
+    ///
+    /// The caller must hold the returned guard through the turn boundary (and,
+    /// today, through the whole turn). That closes both sides of the ordering
+    /// race: a config transaction that already owns the lock finishes publishing
+    /// its provider/resolver/generation first, while a transaction that starts
+    /// after this call cannot publish a new live config between the prompt's
+    /// generation check and `sync_config_generation()`.
     ///
     /// Returns `Err` if the session no longer exists, or if the lock is not
     /// released within `timeout`.  The caller should surface the timeout as a
     /// retryable error rather than proceeding with a potentially stale resolver.
-    pub(crate) async fn wait_for_provider_update(
+    pub(crate) async fn lock_model_provider_update_with_timeout(
         &self,
         id: &str,
         timeout: std::time::Duration,
-    ) -> Result<(), WaitForProviderUpdateError> {
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, WaitForProviderUpdateError> {
         let lock = self
             .sessions
             .lock()
@@ -230,9 +233,7 @@ impl SessionStore {
 
         tokio::time::timeout(timeout, acquire)
             .await
-            .map_err(|_| WaitForProviderUpdateError::Timeout)?;
-        // Guard is dropped here — the lock is released immediately.
-        Ok(())
+            .map_err(|_| WaitForProviderUpdateError::Timeout)
     }
 
     pub async fn touch(&self, id: &str) {
