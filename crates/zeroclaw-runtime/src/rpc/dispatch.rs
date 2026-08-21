@@ -3011,8 +3011,12 @@ impl RpcDispatcher {
         if let Some(scope) = refresh_scope.as_ref() {
             let mut working = self.ctx.config.read().clone();
             apply(&mut working)?;
-            self.commit_config_with_live_session_refresh(working, &config_write_guard, scope)
-                .await?;
+            Box::pin(self.commit_config_with_live_session_refresh(
+                working,
+                &config_write_guard,
+                scope,
+            ))
+            .await?;
         } else {
             {
                 let mut config = self.ctx.config.write();
@@ -3323,8 +3327,12 @@ impl RpcDispatcher {
             working
                 .set_prop_persistent(&req.prop, "")
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
-            self.commit_config_with_live_session_refresh(working, &config_write_guard, scope)
-                .await?;
+            Box::pin(self.commit_config_with_live_session_refresh(
+                working,
+                &config_write_guard,
+                scope,
+            ))
+            .await?;
         } else {
             {
                 let mut config = self.ctx.config.write();
@@ -3387,11 +3395,11 @@ impl RpcDispatcher {
             let mut working = self.ctx.config.read().clone();
             let created = create(&mut working)?;
             if created {
-                self.commit_config_with_live_session_refresh(
+                Box::pin(self.commit_config_with_live_session_refresh(
                     working,
                     &config_write_guard,
                     &LiveSessionRefreshScope::ModelRoutes,
-                )
+                ))
                 .await?;
             }
             created
@@ -3428,11 +3436,11 @@ impl RpcDispatcher {
             let mut working = self.ctx.config.read().clone();
             let deleted = delete(&mut working)?;
             if deleted {
-                self.commit_config_with_live_session_refresh(
+                Box::pin(self.commit_config_with_live_session_refresh(
                     working,
                     &config_write_guard,
                     &LiveSessionRefreshScope::ModelRoutes,
-                )
+                ))
                 .await?;
             }
             deleted
@@ -3486,11 +3494,11 @@ impl RpcDispatcher {
                 let mut working = self.ctx.config.read().clone();
                 let renamed = rename(&mut working)?;
                 if renamed {
-                    self.commit_config_with_live_session_refresh(
+                    Box::pin(self.commit_config_with_live_session_refresh(
                         working,
                         &config_write_guard,
                         &LiveSessionRefreshScope::ModelRoutes,
-                    )
+                    ))
                     .await?;
                 }
                 renamed
