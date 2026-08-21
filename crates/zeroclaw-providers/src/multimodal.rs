@@ -9,7 +9,8 @@ use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
 
-/// Bounds for the content-validation decode in [`validate_image_content`].
+/// Bounds for the content-validation decode in
+/// [`validate_image_content_with_projection`].
 /// Vision providers downscale well below this, so a legitimate attachment is
 /// never rejected by these caps — they exist so a small payload declaring huge
 /// dimensions is refused instead of allocated.
@@ -1495,10 +1496,10 @@ fn image_format_for_mime(source: &str, mime: &str) -> anyhow::Result<image::Imag
     }
 }
 
-/// Upper bound on what [`validate_image_content`] will allocate, derived from
-/// the header alone. Reading dimensions does not decode pixels, so this is
-/// cheap enough to run before the budget check — which is the point: an image
-/// that cannot fit the remaining budget is refused without ever being decoded.
+/// Admission charge for one decoded canvas, derived from the header alone.
+/// Reading dimensions does not decode pixels, so this is cheap enough to run
+/// before the budget check — which is the point: an image whose first canvas
+/// cannot fit the remaining budget is refused without ever being decoded.
 ///
 /// A header that cannot be parsed is reported as corrupt here rather than
 /// charged against the budget; the same payload would fail the decode anyway.
@@ -1526,6 +1527,155 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
     Ok(u64::from(width) * u64::from(height) * 4)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageValidationFailureKind {
+    InvalidImage,
+    AggregateBudgetExhausted,
+}
+
+#[derive(Debug)]
+struct ImageValidationFailure {
+    error: anyhow::Error,
+    consumed_allocation: u64,
+    kind: ImageValidationFailureKind,
+}
+
+fn invalid_image_failure(
+    source: &str,
+    mime: &str,
+    reason: String,
+    consumed_allocation: u64,
+) -> ImageValidationFailure {
+    ImageValidationFailure {
+        error: MultimodalError::CorruptImage {
+            input: source.to_string(),
+            mime: mime.to_string(),
+            reason,
+        }
+        .into(),
+        consumed_allocation,
+        kind: ImageValidationFailureKind::InvalidImage,
+    }
+}
+
+fn aggregate_budget_failure(
+    source: &str,
+    mime: &str,
+    consumed_allocation: u64,
+) -> ImageValidationFailure {
+    ImageValidationFailure {
+        error: MultimodalError::CorruptImage {
+            input: source.to_string(),
+            mime: mime.to_string(),
+            reason: "aggregate decode budget exhausted".to_string(),
+        }
+        .into(),
+        consumed_allocation,
+        kind: ImageValidationFailureKind::AggregateBudgetExhausted,
+    }
+}
+
+fn image_error_failure(
+    source: &str,
+    mime: &str,
+    error: image::ImageError,
+    consumed_allocation: u64,
+    budget_cap: u64,
+) -> ImageValidationFailure {
+    let allocation_limit_hit = matches!(
+        &error,
+        image::ImageError::Limits(limit)
+            if matches!(
+                limit.kind(),
+                image::error::LimitErrorKind::InsufficientMemory
+            )
+    );
+
+    // When the caller's remaining budget is the tighter allocation cap, an
+    // allocator-limit error is a real aggregate-budget exhaustion. Otherwise
+    // it is this image hitting the independent per-image safety cap and must
+    // not discard unrelated siblings.
+    if allocation_limit_hit && budget_cap <= MAX_DECODED_IMAGE_ALLOC_BYTES {
+        aggregate_budget_failure(source, mime, consumed_allocation)
+    } else {
+        invalid_image_failure(source, mime, error.to_string(), consumed_allocation)
+    }
+}
+
+fn validate_animation_frames(
+    frames: image::Frames<'_>,
+    source: &str,
+    mime: &str,
+    projected_allocation: u64,
+    budget_cap: u64,
+) -> Result<u64, ImageValidationFailure> {
+    let effective_cap = MAX_DECODED_IMAGE_ALLOC_BYTES.min(budget_cap);
+    let aggregate_cap_is_tighter = budget_cap <= MAX_DECODED_IMAGE_ALLOC_BYTES;
+    let mut total = 0u64;
+
+    for frame in frames {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                // Animation decoders normally allocate or reuse a canvas before
+                // discovering corrupt frame data. Charge one attempted canvas
+                // in addition to the frames that completed, but do not close
+                // the entire shared budget unless the decoder identified its
+                // allocation limit as the cause.
+                let attempted = total.saturating_add(projected_allocation);
+                return Err(image_error_failure(
+                    source, mime, error, attempted, budget_cap,
+                ));
+            }
+        };
+        let buffer = frame.buffer();
+
+        if buffer.width() > MAX_DECODED_IMAGE_DIMENSION
+            || buffer.height() > MAX_DECODED_IMAGE_DIMENSION
+        {
+            return Err(invalid_image_failure(
+                source,
+                mime,
+                format!(
+                    "frame dimensions {}x{} exceed limit of {MAX_DECODED_IMAGE_DIMENSION}",
+                    buffer.width(),
+                    buffer.height()
+                ),
+                total.saturating_add(projected_allocation),
+            ));
+        }
+
+        let frame_allocation = u64::from(buffer.width()) * u64::from(buffer.height()) * 4;
+        let next_total = total.saturating_add(frame_allocation);
+        if next_total > effective_cap {
+            if aggregate_cap_is_tighter {
+                return Err(aggregate_budget_failure(source, mime, next_total));
+            }
+            return Err(invalid_image_failure(
+                source,
+                mime,
+                format!(
+                    "cumulative frame allocation exceeds per-image limit of \
+                     {MAX_DECODED_IMAGE_ALLOC_BYTES} bytes"
+                ),
+                next_total,
+            ));
+        }
+        total = next_total;
+    }
+
+    if total == 0 {
+        return Err(invalid_image_failure(
+            source,
+            mime,
+            "no frames".to_string(),
+            projected_allocation,
+        ));
+    }
+
+    Ok(total)
+}
+
 /// Validate `bytes` against the aggregate decode budget, then decode.
 ///
 /// The projected allocation is checked *before* the decode so an image that
@@ -1544,46 +1694,42 @@ async fn validate_within_budget(
     bytes: &[u8],
     remaining_budget: &mut u64,
 ) -> anyhow::Result<u64> {
-    let budget_exhausted = || MultimodalError::CorruptImage {
-        input: source.to_string(),
-        mime: mime.to_string(),
-        reason: "aggregate decode budget exhausted".to_string(),
-    };
-
     if *remaining_budget == 0 {
-        return Err(budget_exhausted().into());
+        return Err(aggregate_budget_failure(source, mime, 0).error);
     }
 
-    if projected_allocation(source, mime, bytes)? > *remaining_budget {
+    let projected_allocation = projected_allocation(source, mime, bytes)?;
+    if projected_allocation > *remaining_budget {
         *remaining_budget = 0;
-        return Err(budget_exhausted().into());
+        return Err(aggregate_budget_failure(source, mime, 0).error);
     }
 
-    match validate_image_content(source, mime, bytes, *remaining_budget).await {
+    let budget_before_decode = *remaining_budget;
+    match validate_image_content_with_projection(
+        source,
+        mime,
+        bytes,
+        budget_before_decode,
+        projected_allocation,
+    )
+    .await
+    {
         Ok(allocation) => {
-            *remaining_budget = remaining_budget.saturating_sub(allocation);
+            *remaining_budget = budget_before_decode.saturating_sub(allocation);
             Ok(allocation)
         }
-        Err(error) => {
-            // `projected_allocation` charges a GIF's canvas once, but the real
-            // decode charges it once per frame, so the pre-decode admission
-            // check above can let a GIF in whose real cumulative cost exceeds
-            // what was admitted. When that happens, `validate_image_content`'s
-            // own cumulative check rejects it only after already performing
-            // decode work on the order of its per-image cap — one bounded
-            // frame's worth over the assumed cost. Closing the budget here
-            // stops a later candidate from repeating that same bounded
-            // overshoot against an allowance that a plain `saturating_sub`
-            // would otherwise have left non-zero. Every other rejection
-            // reason (corrupt bytes, an oversized first frame refused by
-            // `set_limits` before allocation, a MIME mismatch) fails at or
-            // below the cost `projected_allocation` already assumed, so this
-            // is deliberately broader than strictly necessary rather than
-            // parsing the error to tell the two cases apart.
-            if mime == "image/gif" {
+        Err(failure) => {
+            if failure.kind == ImageValidationFailureKind::AggregateBudgetExhausted {
                 *remaining_budget = 0;
+            } else {
+                // A corrupt payload still consumed bounded decode work. Charge
+                // at least its admitted canvas, plus any completed/attempted
+                // animation frames reported by the decoder, while preserving
+                // the remainder for unrelated candidates.
+                let charge = projected_allocation.max(failure.consumed_allocation);
+                *remaining_budget = budget_before_decode.saturating_sub(charge);
             }
-            Err(error)
+            Err(failure.error)
         }
     }
 }
@@ -1600,130 +1746,221 @@ async fn validate_within_budget(
 /// rejected here rather than being allocated.
 ///
 /// `budget_cap` is the caller's remaining aggregate decode budget at the time
-/// of this call (see [`AGGREGATE_DECODE_BUDGET_BYTES`]). For single-frame
-/// formats `projected_allocation` already gates admission accurately, so this
-/// is only load-bearing for GIF: a multi-frame animation's total decoded size
-/// cannot be known from the header alone, so the per-image cap and the
-/// caller's remaining budget are both applied live, during frame iteration,
-/// rather than only projected once up front.
+/// of this call (see [`AGGREGATE_DECODE_BUDGET_BYTES`]). A multi-frame GIF,
+/// APNG, or WebP animation can cost more than the header's single-canvas
+/// projection, so the per-image cap and caller budget are also enforced live
+/// while every frame is decoded.
 ///
 /// Returns the approximate decoded memory allocation (width × height × 4 bytes
 /// for RGBA) so callers can track aggregate budget consumption.
+#[cfg(test)]
 async fn validate_image_content(
     source: &str,
     mime: &str,
     bytes: &[u8],
     budget_cap: u64,
 ) -> anyhow::Result<u64> {
+    let projected_allocation = projected_allocation(source, mime, bytes)?;
+    if projected_allocation > budget_cap {
+        return Err(aggregate_budget_failure(source, mime, 0).error);
+    }
+
+    validate_image_content_with_projection(source, mime, bytes, budget_cap, projected_allocation)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+async fn validate_image_content_with_projection(
+    source: &str,
+    mime: &str,
+    bytes: &[u8],
+    budget_cap: u64,
+    projected_allocation: u64,
+) -> Result<u64, ImageValidationFailure> {
     #[cfg(test)]
     record_decode_call();
 
-    let format = image_format_for_mime(source, mime)?;
-
-    let corrupt = |reason: String| MultimodalError::CorruptImage {
-        input: source.to_string(),
-        mime: mime.to_string(),
-        reason,
-    };
+    let format = image_format_for_mime(source, mime).map_err(|error| ImageValidationFailure {
+        error,
+        consumed_allocation: 0,
+        kind: ImageValidationFailureKind::InvalidImage,
+    })?;
 
     let source_owned = source.to_string();
     let mime_owned = mime.to_string();
     let bytes_owned = bytes.to_vec();
 
     // Decode in a blocking pool to avoid stalling the async executor.
-    let allocation = tokio::task::spawn_blocking(move || {
-        let corrupt = |reason: String| MultimodalError::CorruptImage {
-            input: source_owned.clone(),
-            mime: mime_owned.clone(),
-            reason,
-        };
-
-        // GIF is the one allowed format that can carry more than one frame, and
-        // the single-image decoder path reads only the first. Validating just
-        // that frame would forward a GIF whose later frames are corrupt or
-        // oversized, which is exactly what this validation exists to prevent.
-        if format == image::ImageFormat::Gif {
-            // The tighter of the per-image cap and whatever the caller has left
-            // in its aggregate request budget. Passed to the decoder as
-            // `Limits::max_alloc` below so a single oversized frame is refused
-            // by the decoder's own allocator check *before* that frame's buffer
-            // is allocated, instead of only being caught by the cumulative
-            // `total` check after the fact.
-            let effective_cap = MAX_DECODED_IMAGE_ALLOC_BYTES.min(budget_cap);
-
-            let mut decoder =
-                image::codecs::gif::GifDecoder::new(std::io::Cursor::new(&bytes_owned))
-                    .map_err(|error| corrupt(error.to_string()))?;
-
-            let mut limits = image::Limits::default();
-            limits.max_image_width = Some(MAX_DECODED_IMAGE_DIMENSION);
-            limits.max_image_height = Some(MAX_DECODED_IMAGE_DIMENSION);
-            limits.max_alloc = Some(effective_cap);
-            // `GifDecoder` starts with `Limits::no_limits()`, so without this
-            // call nothing bounds a per-frame allocation before it happens —
-            // `into_frames` would read and allocate an oversized frame first
-            // and only then hand it back for the dimension check below.
-            image::ImageDecoder::set_limits(&mut decoder, limits)
-                .map_err(|error| corrupt(error.to_string()))?;
-
-            let mut total: u64 = 0;
-            for frame in image::AnimationDecoder::into_frames(decoder) {
-                let frame = frame.map_err(|error| corrupt(error.to_string()))?;
-                let buffer = frame.buffer();
-
-                if buffer.width() > MAX_DECODED_IMAGE_DIMENSION
-                    || buffer.height() > MAX_DECODED_IMAGE_DIMENSION
-                {
-                    return Err(corrupt(format!(
-                        "frame dimensions {}x{} exceed limit of {MAX_DECODED_IMAGE_DIMENSION}",
-                        buffer.width(),
-                        buffer.height()
-                    )));
-                }
-
-                total = total
-                    .saturating_add(u64::from(buffer.width()) * u64::from(buffer.height()) * 4);
-
-                // Charged cumulatively against the tighter of the two caps: the
-                // decoder's own per-frame check above does not accumulate
-                // across frames (each frame is checked against the same
-                // post-canvas remaining allowance, not a running total), so a
-                // long animation of individually small frames must still be
-                // caught here rather than slipping past a per-frame-only check.
-                if total > effective_cap {
-                    return Err(corrupt(format!(
-                        "cumulative frame allocation exceeds limit of {effective_cap} bytes"
-                    )));
-                }
-            }
-
-            if total == 0 {
-                return Err(corrupt("no frames".to_string()));
-            }
-
-            return Ok(total);
-        }
-
+    tokio::task::spawn_blocking(move || {
+        let effective_cap = MAX_DECODED_IMAGE_ALLOC_BYTES.min(budget_cap);
         let mut limits = image::Limits::default();
         limits.max_image_width = Some(MAX_DECODED_IMAGE_DIMENSION);
         limits.max_image_height = Some(MAX_DECODED_IMAGE_DIMENSION);
-        limits.max_alloc = Some(MAX_DECODED_IMAGE_ALLOC_BYTES);
+        limits.max_alloc = Some(effective_cap);
 
-        let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes_owned));
-        reader.set_format(format);
-        reader.limits(limits);
-        let img = reader
-            .decode()
-            .map_err(|error| corrupt(error.to_string()))?;
-
-        // Approximate decoded allocation: width × height × 4 bytes per RGBA pixel.
-        Ok(u64::from(img.width()) * u64::from(img.height()) * 4)
+        match format {
+            image::ImageFormat::Gif => {
+                let mut decoder =
+                    image::codecs::gif::GifDecoder::new(std::io::Cursor::new(&bytes_owned))
+                        .map_err(|error| {
+                            image_error_failure(
+                                &source_owned,
+                                &mime_owned,
+                                error,
+                                projected_allocation,
+                                budget_cap,
+                            )
+                        })?;
+                // `GifDecoder` starts with `Limits::no_limits()`. Apply limits
+                // before frame iteration so an oversized canvas/frame is
+                // refused by the decoder before its output buffer is allocated.
+                image::ImageDecoder::set_limits(&mut decoder, limits).map_err(|error| {
+                    image_error_failure(
+                        &source_owned,
+                        &mime_owned,
+                        error,
+                        projected_allocation,
+                        budget_cap,
+                    )
+                })?;
+                validate_animation_frames(
+                    image::AnimationDecoder::into_frames(decoder),
+                    &source_owned,
+                    &mime_owned,
+                    projected_allocation,
+                    budget_cap,
+                )
+            }
+            image::ImageFormat::Png => {
+                // `with_limits` also passes the allocation cap to the lower
+                // level PNG decoder; setting limits only after construction
+                // would leave its internal buffers unconstrained.
+                let decoder = image::codecs::png::PngDecoder::with_limits(
+                    std::io::Cursor::new(&bytes_owned),
+                    limits,
+                )
+                .map_err(|error| {
+                    image_error_failure(
+                        &source_owned,
+                        &mime_owned,
+                        error,
+                        projected_allocation,
+                        budget_cap,
+                    )
+                })?;
+                let is_apng = decoder.is_apng().map_err(|error| {
+                    image_error_failure(
+                        &source_owned,
+                        &mime_owned,
+                        error,
+                        projected_allocation,
+                        budget_cap,
+                    )
+                })?;
+                if is_apng {
+                    let decoder = decoder.apng().map_err(|error| {
+                        image_error_failure(
+                            &source_owned,
+                            &mime_owned,
+                            error,
+                            projected_allocation,
+                            budget_cap,
+                        )
+                    })?;
+                    validate_animation_frames(
+                        image::AnimationDecoder::into_frames(decoder),
+                        &source_owned,
+                        &mime_owned,
+                        projected_allocation,
+                        budget_cap,
+                    )
+                } else {
+                    let image = image::DynamicImage::from_decoder(decoder).map_err(|error| {
+                        image_error_failure(
+                            &source_owned,
+                            &mime_owned,
+                            error,
+                            projected_allocation,
+                            budget_cap,
+                        )
+                    })?;
+                    Ok(u64::from(image.width()) * u64::from(image.height()) * 4)
+                }
+            }
+            image::ImageFormat::WebP => {
+                let mut decoder =
+                    image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(&bytes_owned))
+                        .map_err(|error| {
+                            image_error_failure(
+                                &source_owned,
+                                &mime_owned,
+                                error,
+                                projected_allocation,
+                                budget_cap,
+                            )
+                        })?;
+                image::ImageDecoder::set_limits(&mut decoder, limits).map_err(|error| {
+                    image_error_failure(
+                        &source_owned,
+                        &mime_owned,
+                        error,
+                        projected_allocation,
+                        budget_cap,
+                    )
+                })?;
+                if decoder.has_animation() {
+                    validate_animation_frames(
+                        image::AnimationDecoder::into_frames(decoder),
+                        &source_owned,
+                        &mime_owned,
+                        projected_allocation,
+                        budget_cap,
+                    )
+                } else {
+                    let image = image::DynamicImage::from_decoder(decoder).map_err(|error| {
+                        image_error_failure(
+                            &source_owned,
+                            &mime_owned,
+                            error,
+                            projected_allocation,
+                            budget_cap,
+                        )
+                    })?;
+                    Ok(u64::from(image.width()) * u64::from(image.height()) * 4)
+                }
+            }
+            image::ImageFormat::Jpeg => {
+                let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes_owned));
+                reader.set_format(format);
+                reader.limits(limits);
+                let image = reader.decode().map_err(|error| {
+                    image_error_failure(
+                        &source_owned,
+                        &mime_owned,
+                        error,
+                        projected_allocation,
+                        budget_cap,
+                    )
+                })?;
+                Ok(u64::from(image.width()) * u64::from(image.height()) * 4)
+            }
+            _ => Err(invalid_image_failure(
+                &source_owned,
+                &mime_owned,
+                format!("unsupported decoder format: {format:?}"),
+                0,
+            )),
+        }
     })
     .await
-    .map_err(|error| corrupt(format!("decode task failed: {error}")))?
-    .map_err(anyhow::Error::from)?;
-
-    Ok(allocation)
+    .map_err(|error| {
+        invalid_image_failure(
+            source,
+            mime,
+            format!("decode task failed: {error}"),
+            projected_allocation,
+        )
+    })?
 }
 
 fn detect_mime(
@@ -2466,11 +2703,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aggregate_decode_budget_bounds_total_work_per_request() {
+    async fn aggregate_decode_budget_bounds_total_work_per_normalization_call() {
         // Each image is individually under both the size and dimension caps,
         // so only the aggregate budget bounds the total decode cost of one
-        // request. Preparation must still succeed and still inline whatever
-        // fits inside the budget.
+        // normalization call. Preparation must still succeed and still inline
+        // whatever fits inside the budget.
         let temp = tempfile::tempdir().unwrap();
         let mut markers = String::new();
         for i in 0..4 {
@@ -2562,6 +2799,40 @@ mod tests {
         assert_eq!(
             decodes, 1,
             "only the first image may be decoded; the rest are refused up front"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_decode_is_charged_without_closing_the_budget() {
+        let valid = valid_png();
+        let mut corrupt = valid_png();
+        corrupt_png_chunk_data(&mut corrupt, b"IDAT");
+        assert_eq!(
+            projected_allocation("bad.png", "image/png", &corrupt)
+                .expect("fixture retains a readable IHDR"),
+            4
+        );
+
+        let ((), decodes) = counting_decodes(async {
+            let mut budget = 8u64;
+            validate_within_budget("bad.png", "image/png", &corrupt, &mut budget)
+                .await
+                .expect_err("the truncated PNG must be rejected");
+            assert_eq!(
+                budget, 4,
+                "ordinary corruption spends this candidate's admitted decode charge only"
+            );
+
+            validate_within_budget("good.png", "image/png", &valid, &mut budget)
+                .await
+                .expect("an unrelated valid sibling must retain the remaining budget");
+            assert_eq!(budget, 0);
+        })
+        .await;
+
+        assert_eq!(
+            decodes, 2,
+            "both the corrupt candidate and its valid sibling reach bounded decode"
         );
     }
 
@@ -2700,6 +2971,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn corrupt_later_gif_frame_does_not_discard_valid_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let good = temp.path().join("good.png");
+        let bad = temp.path().join("bad.gif");
+        std::fs::write(&good, valid_png()).unwrap();
+        std::fs::write(&bad, two_frame_gif(&[0x02, 0x04, 0xAA])).unwrap();
+
+        // Put the corrupt GIF first so it reaches the shared budget before the
+        // valid PNG. A generic "GIF error closes the budget" rule would discard
+        // the valid sibling as collateral damage.
+        let history = vec![ChatMessage::user(format!(
+            "compare [IMAGE:{}] with [IMAGE:{}]",
+            bad.display(),
+            good.display()
+        ))];
+        let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
+            .await
+            .expect("a corrupt animation must be skipped without failing preparation");
+
+        assert!(prepared.contains_images, "the valid PNG must survive");
+        assert!(
+            prepared
+                .messages
+                .iter()
+                .any(|message| message.content.contains("1 of 2")),
+            "the partial-skip note must report one rejected image: {:?}",
+            prepared
+                .messages
+                .iter()
+                .map(|message| &message.content)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn gif_with_valid_frames_is_accepted() {
         // The counterpart to the rejection above: per-frame validation must not
         // start refusing ordinary animations.
@@ -2786,7 +3092,7 @@ mod tests {
             .expect_err("an animation whose real cost exceeds the remaining budget must reject");
         assert_eq!(
             budget, 0,
-            "a cumulative-budget rejection must close the request budget, not leave it \
+            "a cumulative-budget rejection must close this call's budget, not leave it \
              non-zero for a later candidate to repeat the same bounded overshoot against"
         );
     }
@@ -2822,6 +3128,217 @@ mod tests {
             "only the first candidate may decode; a closed budget must refuse the \
              second via the pre-decode projection check, not by repeating the decode"
         );
+    }
+
+    fn two_frame_apng() -> Vec<u8> {
+        fn crc32(name: &[u8; 4], data: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for byte in name.iter().chain(data) {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 0 {
+                        crc >> 1
+                    } else {
+                        0xEDB8_8320 ^ (crc >> 1)
+                    };
+                }
+            }
+            !crc
+        }
+
+        fn append_chunk(output: &mut Vec<u8>, name: &[u8; 4], data: &[u8]) {
+            output.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            output.extend_from_slice(name);
+            output.extend_from_slice(data);
+            output.extend_from_slice(&crc32(name, data).to_be_bytes());
+        }
+
+        // Reuse the encoder-backed still fixture's compressed scanline as each
+        // APNG frame. This keeps the test dependency-free while constructing a
+        // standards-shaped two-frame stream with explicit animation chunks.
+        let still = valid_png();
+        let mut idat = Vec::new();
+        let mut offset = 8usize;
+        while offset + 12 <= still.len() {
+            let length = u32::from_be_bytes(
+                still[offset..offset + 4]
+                    .try_into()
+                    .expect("chunk length is four bytes"),
+            ) as usize;
+            let chunk_end = offset + 12 + length;
+            assert!(chunk_end <= still.len(), "test PNG chunks are in bounds");
+            if &still[offset + 4..offset + 8] == b"IDAT" {
+                idat.extend_from_slice(&still[offset + 8..offset + 8 + length]);
+            }
+            offset = chunk_end;
+        }
+        assert!(!idat.is_empty(), "test PNG contains compressed image data");
+
+        let ihdr = [
+            0, 0, 0, 1, // width
+            0, 0, 0, 1, // height
+            8, 6, 0, 0, 0, // RGBA8, compression, filter, interlace
+        ];
+        let mut frame_control = [0u8; 26];
+        frame_control[4..8].copy_from_slice(&1u32.to_be_bytes());
+        frame_control[8..12].copy_from_slice(&1u32.to_be_bytes());
+        frame_control[20..22].copy_from_slice(&1u16.to_be_bytes());
+        frame_control[22..24].copy_from_slice(&100u16.to_be_bytes());
+
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        append_chunk(&mut bytes, b"IHDR", &ihdr);
+        let mut animation_control = Vec::with_capacity(8);
+        animation_control.extend_from_slice(&2u32.to_be_bytes());
+        animation_control.extend_from_slice(&0u32.to_be_bytes());
+        append_chunk(&mut bytes, b"acTL", &animation_control);
+        append_chunk(&mut bytes, b"fcTL", &frame_control);
+        append_chunk(&mut bytes, b"IDAT", &idat);
+
+        frame_control[..4].copy_from_slice(&1u32.to_be_bytes());
+        append_chunk(&mut bytes, b"fcTL", &frame_control);
+        let mut frame_data = Vec::with_capacity(4 + idat.len());
+        frame_data.extend_from_slice(&2u32.to_be_bytes());
+        frame_data.extend_from_slice(&idat);
+        append_chunk(&mut bytes, b"fdAT", &frame_data);
+        append_chunk(&mut bytes, b"IEND", &[]);
+        bytes
+    }
+
+    fn corrupt_png_chunk_data(bytes: &mut [u8], wanted: &[u8; 4]) {
+        let mut offset = 8usize;
+        while offset + 12 <= bytes.len() {
+            let length = u32::from_be_bytes(
+                bytes[offset..offset + 4]
+                    .try_into()
+                    .expect("chunk length is four bytes"),
+            ) as usize;
+            let chunk_end = offset + 12 + length;
+            assert!(chunk_end <= bytes.len(), "test PNG chunks are in bounds");
+            if &bytes[offset + 4..offset + 8] == wanted {
+                let data_offset = offset + 8 + usize::from(wanted == b"fdAT") * 4;
+                assert!(data_offset < offset + 8 + length, "chunk has payload data");
+                bytes[data_offset] ^= 0xFF;
+                return;
+            }
+            offset = chunk_end;
+        }
+        panic!("test PNG contains the requested chunk");
+    }
+
+    #[tokio::test]
+    async fn apng_validates_every_frame() {
+        let valid = two_frame_apng();
+        let allocation = validate_image_content(
+            "anim.png",
+            "image/png",
+            &valid,
+            MAX_DECODED_IMAGE_ALLOC_BYTES,
+        )
+        .await
+        .expect("a valid two-frame APNG is accepted");
+        assert_eq!(allocation, 8, "both APNG canvases are charged");
+
+        let mut corrupt = valid;
+        corrupt_png_chunk_data(&mut corrupt, b"fdAT");
+        validate_image_content(
+            "anim.png",
+            "image/png",
+            &corrupt,
+            MAX_DECODED_IMAGE_ALLOC_BYTES,
+        )
+        .await
+        .expect_err("a corrupt later APNG frame must be rejected");
+    }
+
+    fn lossless_webp(pixel: [u8; 3]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::ImageEncoder::write_image(
+            image::codecs::webp::WebPEncoder::new_lossless(&mut bytes),
+            &pixel,
+            1,
+            1,
+            image::ExtendedColorType::Rgb8,
+        )
+        .expect("test WebP frame encodes");
+        bytes
+    }
+
+    fn append_webp_chunk(output: &mut Vec<u8>, name: &[u8; 4], data: &[u8]) {
+        output.extend_from_slice(name);
+        output.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        output.extend_from_slice(data);
+        if !data.len().is_multiple_of(2) {
+            output.push(0);
+        }
+    }
+
+    fn two_frame_webp() -> Vec<u8> {
+        let mut body = b"WEBP".to_vec();
+        // Animation flag, three reserved bytes, then 24-bit canvas width-1
+        // and height-1. Both dimensions are one pixel.
+        append_webp_chunk(&mut body, b"VP8X", &[0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        append_webp_chunk(&mut body, b"ANIM", &[0, 0, 0, 0, 0, 0]);
+
+        for encoded in [lossless_webp([255, 0, 0]), lossless_webp([0, 255, 0])] {
+            let mut frame = vec![0; 16];
+            frame[12] = 1; // one-millisecond duration
+            frame.extend_from_slice(&encoded[12..]);
+            append_webp_chunk(&mut body, b"ANMF", &frame);
+        }
+
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    fn corrupt_second_webp_frame(bytes: &mut [u8]) {
+        let mut offset = 12usize;
+        let mut animation_frames = 0usize;
+        while offset + 8 <= bytes.len() {
+            let length = u32::from_le_bytes(
+                bytes[offset + 4..offset + 8]
+                    .try_into()
+                    .expect("chunk length is four bytes"),
+            ) as usize;
+            let padded_length = length + (length % 2);
+            if &bytes[offset..offset + 4] == b"ANMF" {
+                animation_frames += 1;
+                if animation_frames == 2 {
+                    let frame_bitstream = offset + 8 + 16 + 8;
+                    assert!(frame_bitstream < bytes.len());
+                    bytes[frame_bitstream] ^= 0xFF;
+                    return;
+                }
+            }
+            offset += 8 + padded_length;
+        }
+        panic!("test WebP contains a second animation frame");
+    }
+
+    #[tokio::test]
+    async fn animated_webp_validates_every_frame() {
+        let valid = two_frame_webp();
+        let allocation = validate_image_content(
+            "anim.webp",
+            "image/webp",
+            &valid,
+            MAX_DECODED_IMAGE_ALLOC_BYTES,
+        )
+        .await
+        .expect("a valid two-frame animated WebP is accepted");
+        assert_eq!(allocation, 8, "both WebP canvases are charged");
+
+        let mut corrupt = valid;
+        corrupt_second_webp_frame(&mut corrupt);
+        validate_image_content(
+            "anim.webp",
+            "image/webp",
+            &corrupt,
+            MAX_DECODED_IMAGE_ALLOC_BYTES,
+        )
+        .await
+        .expect_err("a corrupt later WebP frame must be rejected");
     }
 
     #[tokio::test]
