@@ -3423,7 +3423,23 @@ impl RpcDispatcher {
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        let delete = |config: &mut Config| -> Result<bool, JsonRpcError> {
+
+        // Provider model alias deletions must participate in the same
+        // prepare-commit-apply transaction as provider profile field edits so
+        // that active sessions' provider box, resolver, and config-generation
+        // snapshot stay on one coherent generation.
+        let provider_model_alias_kind =
+            zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path).filter(|k| {
+                matches!(
+                    k,
+                    zeroclaw_config::alias_refs::AliasKind::Provider {
+                        category: zeroclaw_config::alias_refs::ProviderCategory::Models,
+                        ..
+                    }
+                )
+            });
+
+        let delete_plain = |config: &mut Config| -> Result<bool, JsonRpcError> {
             let deleted = config
                 .delete_map_key(&req.path, &req.key)
                 .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
@@ -3432,10 +3448,42 @@ impl RpcDispatcher {
             }
             Ok(deleted)
         };
+
         let deleted = if touches_model_routes(&req.path) {
             let mut working = self.ctx.config.read().clone();
-            let deleted = delete(&mut working)?;
+            let deleted = delete_plain(&mut working)?;
             if deleted {
+                Box::pin(self.commit_config_with_live_session_refresh(
+                    working,
+                    &config_write_guard,
+                    &LiveSessionRefreshScope::ModelRoutes,
+                ))
+                .await?;
+            }
+            deleted
+        } else if let Some(kind) = provider_model_alias_kind {
+            // Use delete_with_cascade so referrer fields are scrubbed and hard
+            // references refuse the delete, then run the live-session rebuild
+            // transactionally so sessions observe one consistent generation.
+            let mut working = self.ctx.config.read().clone();
+            let cascade = zeroclaw_config::alias_refs::delete_with_cascade(
+                &mut working,
+                &kind,
+                &req.key,
+                zeroclaw_config::alias_refs::CascadePolicy::RefuseOnHard,
+            )
+            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+            let deleted = cascade.deleted_entry.is_some();
+            if deleted {
+                for path in cascade.dirty_paths() {
+                    working.mark_dirty(&path);
+                }
+                // Scope on the new (post-delete) provider ref is moot — the
+                // alias is gone, so resolve_provider_ref returns None for every
+                // session whose provider ref matched it. Use ModelRoutes as the
+                // widest safe scope: it refreshes every session regardless of
+                // their provider ref, ensuring the deleted alias is never
+                // consulted again.
                 Box::pin(self.commit_config_with_live_session_refresh(
                     working,
                     &config_write_guard,
@@ -3447,7 +3495,7 @@ impl RpcDispatcher {
         } else {
             let deleted = {
                 let mut config = self.ctx.config.write();
-                delete(&mut config)?
+                delete_plain(&mut config)?
             };
             if deleted {
                 self.flush_config(&config_write_guard).await?;
@@ -3530,6 +3578,18 @@ impl RpcDispatcher {
     ) -> BoxRpcFuture<'a> {
         Box::pin(async move {
             let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
+            // A model-provider alias rename is a route-affecting live
+            // configuration surface: sessions whose provider ref pointed at
+            // `from` must be rebuilt against `to` on the same generation as
+            // the config commit, the same as a `providers.models.*` field
+            // edit already does.
+            let model_provider_family = match &kind {
+                zeroclaw_config::alias_refs::AliasKind::Provider {
+                    category: zeroclaw_config::alias_refs::ProviderCategory::Models,
+                    family,
+                } => Some(family.clone()),
+                _ => None,
+            };
             if is_agent {
                 // Live RPC sessions hold the selected agent alias in memory; refuse
                 // rather than letting them recreate old-alias state after the rename.
@@ -3573,8 +3633,18 @@ impl RpcDispatcher {
                 for path in &report.dirty_paths {
                     working.mark_dirty(path);
                 }
-                self.save_and_swap_config(working.clone(), &config_write_guard)
+                if let Some(family) = model_provider_family.as_ref() {
+                    let new_ref = format!("{family}.{}", req.to);
+                    Box::pin(self.commit_config_with_live_session_refresh(
+                        working.clone(),
+                        &config_write_guard,
+                        &LiveSessionRefreshScope::ModelProvider(new_ref),
+                    ))
                     .await?;
+                } else {
+                    self.save_and_swap_config(working.clone(), &config_write_guard)
+                        .await?;
+                }
             }
             // Config is committed (saved + swapped, or already committed by a
             // prior crashed run). Release before the post-commit side effects
@@ -10221,6 +10291,120 @@ mod tests {
         assert!(
             written.contains("old-model"),
             "a failed refresh must not persist the rejected candidate config: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_alias_delete_refuses_hard_refs_and_leaves_session_intact() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        // test-agent has a hard ref to openai.test-provider via model_provider.
+        // Add an extra unreferenced provider to delete successfully.
+        let extra = config
+            .providers
+            .models
+            .ensure("openai", "extra-provider")
+            .expect("extra provider slot exists");
+        extra.api_key = Some("extra-key".into());
+        extra.uri = Some("http://127.0.0.1:1".into());
+        extra.model = Some("extra-model".into());
+        extra.context_window = Some(8_000);
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        // Deleting the referenced provider must be refused.
+        let err = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "providers.models.openai",
+                "key": "test-provider"
+            }))
+            .await
+            .expect_err("delete of hard-referenced provider alias must fail");
+        assert_eq!(
+            err.code, INVALID_PARAMS,
+            "refused delete must return INVALID_PARAMS"
+        );
+
+        // Session must still be on the original generation.
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model",
+            "session must remain on the prior generation after a refused delete"
+        );
+
+        // Deleting the unreferenced extra provider must succeed and leave the
+        // session unaffected.
+        let res = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "providers.models.openai",
+                "key": "extra-provider"
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "delete of unreferenced provider alias must succeed: {res:?}"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model",
+            "session must still serve old-model after unrelated provider deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_rebuilds_live_session_resolver_and_limits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("provider slot exists");
+        provider.context_window = Some(200_000);
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        // Rename openai.test-provider → openai.renamed_provider. The target
+        // alias must satisfy `validate_alias_key` (lowercase, digits, single
+        // underscores); the pre-existing hyphenated source key predates that
+        // rule and is only reachable through the direct `ensure` constructor.
+        let res = dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "providers.models.openai",
+                "from": "test-provider",
+                "to": "renamed_provider"
+            }))
+            .await;
+        assert!(res.is_ok(), "provider alias rename must succeed: {res:?}");
+
+        // Session must immediately observe the new provider alias and its capacity.
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let agent = agent.lock().await;
+        let (_, provider_name, model_name) = agent.attribution_fields();
+        assert_eq!(
+            provider_name, "openai.renamed_provider",
+            "session model_provider_name must update to the renamed alias"
+        );
+        assert_eq!(model_name, "old-model");
+        let limits = agent.context_limits_for_route("openai.renamed_provider", "old-model");
+        assert_eq!(
+            limits.model_context_window, 200_000,
+            "context limits must come from the renamed alias, not the stale old name"
         );
     }
 
