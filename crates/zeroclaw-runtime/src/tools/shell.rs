@@ -635,6 +635,21 @@ mod tests {
         })
     }
 
+    fn test_security_with_allowed_commands(
+        autonomy: AutonomyLevel,
+        commands: &[&str],
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: commands
+                .iter()
+                .map(|command| (*command).to_string())
+                .collect(),
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[cfg(unix)]
     fn unrestricted_shell_test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -672,7 +687,7 @@ mod tests {
 
     #[cfg(windows)]
     fn medium_risk_write_command() -> &'static str {
-        "copy /Y NUL zeroclaw_shell_approval_test"
+        "copy NUL zeroclaw_shell_approval_test"
     }
 
     #[cfg(not(windows))]
@@ -1267,7 +1282,10 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_absolute_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["cat"],
+        ));
         let result = tool
             .execute(json!({"command": format!("cat {}", absolute_path_outside_workspace())}))
             .await
@@ -1339,7 +1357,10 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_option_assignment_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["grep"],
+        ));
         let result = tool
             .execute(json!({"command": format!("grep --file={} root ./src", absolute_path_outside_workspace())}))
             .await
@@ -1356,7 +1377,10 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_short_option_attached_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["grep"],
+        ));
         let result = tool
             .execute(json!({"command": format!("grep -f{} root ./src", absolute_path_outside_workspace())}))
             .await
@@ -1373,7 +1397,10 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_tilde_user_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["cat"],
+        ));
         let result = tool
             .execute(json!({"command": "cat ~root/.ssh/id_rsa"}))
             .await
@@ -1605,10 +1632,11 @@ mod tests {
 
     #[tokio::test]
     async fn shell_requires_approval_for_medium_risk_command() {
+        let workspace = tempfile::TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             allowed_commands: vec![medium_risk_write_base().into()],
-            workspace_dir: std::env::temp_dir(),
+            workspace_dir: workspace.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
 
@@ -1633,10 +1661,7 @@ mod tests {
             }))
             .await
             .expect("approved command execution should succeed");
-        assert!(allowed.success);
-
-        let _ =
-            tokio::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test")).await;
+        assert!(allowed.success, "{:?}", allowed.error);
     }
 
     // ── shell timeout enforcement tests ─────────────────

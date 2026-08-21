@@ -2928,7 +2928,7 @@ mod tests {
         crate::cron::validate_shell_command_with_security(
             runtime.as_ref(),
             &security,
-            "Write-Output $PSHOME",
+            "Write-Output cron-ok",
             false,
         )
         .expect("documented read-only PowerShell command should pass");

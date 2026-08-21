@@ -8,6 +8,10 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+fn bash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 fn workflow(name: &str) -> String {
     let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(".github/workflows")
@@ -281,11 +285,13 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
     let source_srcinfo = root.join("dist/aur/.SRCINFO");
     let source_pkgbuild = root.join("dist/aur/PKGBUILD");
     let source_guard = Command::new("bash")
-        .arg(root.join("scripts/release/aur_version_guard.sh"))
-        .arg(&source_srcinfo)
-        .arg(&source_srcinfo)
-        .arg(&source_pkgbuild)
-        .arg(&source_pkgbuild)
+        .arg(bash_path(
+            &root.join("scripts/release/aur_version_guard.sh"),
+        ))
+        .arg(bash_path(&source_srcinfo))
+        .arg(bash_path(&source_srcinfo))
+        .arg(bash_path(&source_pkgbuild))
+        .arg(bash_path(&source_pkgbuild))
         .output()
         .expect("validate checked-in AUR package metadata");
     assert!(
@@ -345,15 +351,15 @@ fn aur_publisher_rejects_stale_release_downgrades() {
         fs::write(&target_pkgbuild, target_build).expect("write target AUR PKGBUILD");
         fs::write(&current_pkgbuild, current_build).expect("write current AUR PKGBUILD");
         let mut command = Command::new("bash");
-        command.arg(&guard_script);
+        command.arg(bash_path(&guard_script));
         if allow_downgrade {
             command.arg("--allow-downgrade");
         }
         command
-            .arg(&target_srcinfo)
-            .arg(&current_srcinfo)
-            .arg(&target_pkgbuild)
-            .arg(&current_pkgbuild)
+            .arg(bash_path(&target_srcinfo))
+            .arg(bash_path(&current_srcinfo))
+            .arg(bash_path(&target_pkgbuild))
+            .arg(bash_path(&current_pkgbuild))
             .output()
             .expect("run AUR monotonic package guard")
     };
@@ -526,11 +532,11 @@ fn aur_publisher_rejects_stale_release_downgrades() {
     fs::remove_file(&current_srcinfo).expect("remove current AUR .SRCINFO");
     fs::remove_file(&current_pkgbuild).expect("remove current AUR PKGBUILD");
     let output = Command::new("bash")
-        .arg(&guard_script)
-        .arg(&target_srcinfo)
-        .arg(&current_srcinfo)
-        .arg(&target_pkgbuild)
-        .arg(&current_pkgbuild)
+        .arg(bash_path(&guard_script))
+        .arg(bash_path(&target_srcinfo))
+        .arg(bash_path(&current_srcinfo))
+        .arg(bash_path(&target_pkgbuild))
+        .arg(bash_path(&current_pkgbuild))
         .output()
         .expect("run AUR guard with missing current metadata");
     assert_command_failure(
@@ -542,11 +548,11 @@ fn aur_publisher_rejects_stale_release_downgrades() {
 
     fs::write(&current_srcinfo, &equal).expect("restore only current AUR .SRCINFO");
     let output = Command::new("bash")
-        .arg(&guard_script)
-        .arg(&target_srcinfo)
-        .arg(&current_srcinfo)
-        .arg(&target_pkgbuild)
-        .arg(&current_pkgbuild)
+        .arg(bash_path(&guard_script))
+        .arg(bash_path(&target_srcinfo))
+        .arg(bash_path(&current_srcinfo))
+        .arg(bash_path(&target_pkgbuild))
+        .arg(bash_path(&current_pkgbuild))
         .output()
         .expect("run AUR guard with partial current metadata");
     assert_command_failure(
@@ -568,7 +574,7 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
                     bucket_token: Option<&str>| {
         let mut command = Command::new("bash");
         command
-            .arg(&gate)
+            .arg(bash_path(&gate))
             .env("DRY_RUN", dry_run)
             .env("CREDENTIAL_CANARY", credential_canary)
             .env_remove("SCOOP_BUCKET_REPO")
@@ -868,8 +874,8 @@ fn scoop_publisher_metadata_follows_canonical_url_template() {
     .expect("write temporary Scoop manifest");
 
     let output = Command::new("bash")
-        .arg(&metadata_script)
-        .arg(&manifest_path)
+        .arg(bash_path(&metadata_script))
+        .arg(bash_path(&manifest_path))
         .arg("1.2.3")
         .output()
         .expect("run Scoop metadata materializer");
@@ -892,8 +898,8 @@ fn scoop_publisher_metadata_follows_canonical_url_template() {
     );
 
     let output = Command::new("bash")
-        .arg(&metadata_script)
-        .arg(&manifest_path)
+        .arg(bash_path(&metadata_script))
+        .arg(bash_path(&manifest_path))
         .arg("v1.2.3")
         .output()
         .expect("run Scoop version validation");
@@ -920,8 +926,8 @@ fn scoop_publisher_metadata_follows_canonical_url_template() {
         )
         .expect("write invalid Scoop manifest");
         let output = Command::new("bash")
-            .arg(&metadata_script)
-            .arg(&manifest_path)
+            .arg(bash_path(&metadata_script))
+            .arg(bash_path(&manifest_path))
             .arg("1.2.3")
             .output()
             .expect("run Scoop metadata validation");

@@ -341,7 +341,9 @@ mod tests {
         )));
         assert_eq!(
             rendered,
-            std::fs::read_to_string(root().join("dist/aur/.SRCINFO")).unwrap()
+            std::fs::read_to_string(root().join("dist/aur/.SRCINFO"))
+                .unwrap()
+                .replace("\r\n", "\n")
         );
 
         let changed = pkgbuild.replace(
