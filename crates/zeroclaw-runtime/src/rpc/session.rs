@@ -333,6 +333,25 @@ impl SessionStore {
         true
     }
 
+    /// Rewrite a session's in-memory `model_provider` override to a new
+    /// reference. `SessionOverrides` is transient session state rather than
+    /// config, so a provider alias rename does not reach it through the
+    /// config cascade. Without this migration the override would keep naming
+    /// an alias that no longer exists, and the next resolution would fall
+    /// back to compatibility values or fail while rebuilding the old
+    /// reference. Called from the live-refresh publication step while that
+    /// session's `model_provider_update` guard is held.
+    pub async fn migrate_model_provider_override(&self, id: &str, new_ref: String) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        match sessions.get_mut(id) {
+            Some(session) => {
+                session.overrides.model_provider = Some(new_ref);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub async fn get_overrides(&self, id: &str) -> Option<SessionOverrides> {
         self.sessions
             .lock()

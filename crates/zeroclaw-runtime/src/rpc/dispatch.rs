@@ -451,6 +451,18 @@ enum LiveSessionRefreshScope {
     ModelProvider(String),
     Agent(String),
     ModelRoutes,
+    /// A provider alias rename (`providers.models.<family>.<from>` ->
+    /// `<to>`). This cannot reuse `ModelProvider(new_ref)`: the cascade
+    /// rewrites *config* referrers to the new alias, but a session's
+    /// `SessionOverrides.model_provider` is transient in-memory state that
+    /// still names the old alias. Scoping on the new reference alone would
+    /// skip exactly those sessions, leaving them holding the pre-rename
+    /// provider box and resolver while their override points at an alias
+    /// that no longer exists.
+    ProviderAliasRename {
+        old_ref: String,
+        new_ref: String,
+    },
 }
 
 impl LiveSessionRefreshScope {
@@ -509,6 +521,33 @@ impl LiveSessionRefreshScope {
                 })
                 .map(Some)
                 .ok_or_else(|| format!("agent `{session_agent}` is not configured")),
+            Self::ProviderAliasRename { old_ref, new_ref } => {
+                let effective_ref = overrides
+                    .model_provider
+                    .as_deref()
+                    .or_else(|| {
+                        config
+                            .agent(session_agent)
+                            .map(|agent| agent.model_provider.as_str())
+                    })
+                    .ok_or_else(|| format!("agent `{session_agent}` is not configured"))?;
+                // An inheriting session already reads the rewritten `new_ref`
+                // from config; a session carrying an explicit override still
+                // reads `old_ref`. Both name the same profile across the
+                // rename, so both rebuild against the new reference.
+                if effective_ref == old_ref || effective_ref == new_ref {
+                    return Ok(Some(new_ref.clone()));
+                }
+                // Otherwise the session keeps its own provider, but a route
+                // table that materializes the renamed alias still binds it
+                // into this session's resolver.
+                let materialized_route_uses_target = config.model_routes.iter().any(|route| {
+                    !route.hint.trim().is_empty()
+                        && !route.model.trim().is_empty()
+                        && route.model_provider.trim() == new_ref
+                });
+                Ok(materialized_route_uses_target.then(|| effective_ref.to_string()))
+            }
         }
     }
 }
@@ -525,6 +564,11 @@ struct PreparedLiveSessionRefresh {
     model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
     tool_dispatcher: Box<dyn crate::agent::dispatcher::ToolDispatcher>,
     temperature: Option<f64>,
+    /// New `model_provider` override value for a session whose stored override
+    /// names an alias this transaction renames away. Applied in the same
+    /// publication step as the provider box, so the override never survives as
+    /// a dangling reference to a removed alias.
+    override_migration: Option<String>,
 }
 
 /// Whether memory embeddings resolve from the given `<type>.<alias>` provider
@@ -3194,6 +3238,14 @@ impl RpcDispatcher {
                 model_route_resolver,
                 tool_dispatcher,
                 temperature: overrides.temperature.or(provider_temperature),
+                override_migration: match scope {
+                    LiveSessionRefreshScope::ProviderAliasRename { old_ref, new_ref } => overrides
+                        .model_provider
+                        .as_deref()
+                        .is_some_and(|current| current == old_ref)
+                        .then(|| new_ref.clone()),
+                    _ => None,
+                },
             });
         }
         Ok(prepared)
@@ -3214,7 +3266,16 @@ impl RpcDispatcher {
                 model_route_resolver,
                 tool_dispatcher,
                 temperature,
+                override_migration,
             } = refresh;
+            // Migrate the stored override first so the session's own reference
+            // and the provider box it is about to receive name the same alias
+            // for the whole publication, still under this session's guard.
+            if let Some(new_ref) = override_migration {
+                ctx.sessions
+                    .migrate_model_provider_override(&session_id, new_ref)
+                    .await;
+            }
             if ctx
                 .sessions
                 .apply_model_provider(
@@ -3634,11 +3695,13 @@ impl RpcDispatcher {
                     working.mark_dirty(path);
                 }
                 if let Some(family) = model_provider_family.as_ref() {
-                    let new_ref = format!("{family}.{}", req.to);
                     Box::pin(self.commit_config_with_live_session_refresh(
                         working.clone(),
                         &config_write_guard,
-                        &LiveSessionRefreshScope::ModelProvider(new_ref),
+                        &LiveSessionRefreshScope::ProviderAliasRename {
+                            old_ref: format!("{family}.{}", req.from),
+                            new_ref: format!("{family}.{}", req.to),
+                        },
                     ))
                     .await?;
                 } else {
@@ -10405,6 +10468,104 @@ mod tests {
         assert_eq!(
             limits.model_context_window, 200_000,
             "context limits must come from the renamed alias, not the stale old name"
+        );
+    }
+
+    /// A session that pinned its provider through `session/configure` holds
+    /// that reference in transient `SessionOverrides`, which the config
+    /// rename cascade does not reach. Scoping the refresh on the new
+    /// reference alone skips exactly these sessions: they keep the pre-rename
+    /// provider box and resolver while `sync_config_generation` publishes the
+    /// post-rename config, so dispatch and reported limits straddle
+    /// generations and the override itself dangles at a removed alias.
+    #[tokio::test]
+    async fn provider_alias_rename_migrates_explicit_session_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let pinned = config
+            .providers
+            .models
+            .ensure("openai", "pinned_provider")
+            .expect("pinned provider slot exists");
+        pinned.api_key = Some("pinned-key".into());
+        pinned.uri = Some("http://127.0.0.1:1".into());
+        pinned.model = Some("pinned-model".into());
+        pinned.context_window = Some(120_000);
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        // Pin the session to a provider OTHER than the one its agent inherits,
+        // so the override is what decides the route.
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "model_provider": "openai.pinned_provider" }
+            }))
+            .await
+            .expect("session/configure must pin the provider override");
+        assert_eq!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|o| o.model_provider)
+                .as_deref(),
+            Some("openai.pinned_provider"),
+            "baseline: the session owns an explicit provider override"
+        );
+
+        // Rename the alias the override points at.
+        dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "providers.models.openai",
+                "from": "pinned_provider",
+                "to": "pinned_renamed"
+            }))
+            .await
+            .expect("provider alias rename must succeed for an override-pinned session");
+
+        // The override must have moved with the alias rather than dangling.
+        assert_eq!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|o| o.model_provider)
+                .as_deref(),
+            Some("openai.pinned_renamed"),
+            "the stored override must be migrated to the renamed alias, not left \
+             pointing at an alias that no longer exists"
+        );
+
+        // Provider identity, resolver, and limits must all be on the new alias.
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let agent = agent.lock().await;
+        let (_, provider_name, model_name) = agent.attribution_fields();
+        assert_eq!(
+            provider_name, "openai.pinned_renamed",
+            "the override-pinned session must be rebuilt onto the renamed alias"
+        );
+        assert_eq!(model_name, "pinned-model");
+        let route = agent.resolved_route_for_test("openai.pinned_renamed");
+        assert_eq!(
+            route.provider_name, "openai.pinned_renamed",
+            "the rebuilt resolver must resolve through the renamed alias"
+        );
+        assert_eq!(
+            agent
+                .context_limits_for_route(&provider_name, &model_name)
+                .model_context_window,
+            120_000,
+            "reported capacity must come from the renamed alias on the same \
+             generation that dispatch uses"
         );
     }
 
