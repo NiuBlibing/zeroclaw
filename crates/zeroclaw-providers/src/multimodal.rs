@@ -3006,6 +3006,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn corrupt_gif_in_newer_message_does_not_discard_valid_png_in_older_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_png = temp.path().join("old.png");
+        let new_gif = temp.path().join("new.gif");
+        std::fs::write(&old_png, valid_png()).unwrap();
+        std::fs::write(&new_gif, two_frame_gif(&[0x02, 0x04, 0xAA])).unwrap();
+
+        // The corrupt GIF is in the newer message. `prepare_messages_inner`
+        // walks candidates newest-first, so the newer message (with the corrupt
+        // GIF) is processed before the older message (with the valid PNG).
+        // An ordinary corrupt-image failure must not close the shared budget;
+        // only aggregate-budget exhaustion may do that. The older PNG must
+        // therefore still pass validation despite the GIF having been rejected
+        // before it.
+        let history = vec![
+            ChatMessage::user(format!("here is [IMAGE:{}]", old_png.display())),
+            ChatMessage::user(format!("check this [IMAGE:{}]", new_gif.display())),
+        ];
+        let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
+            .await
+            .expect("a corrupt animation in a newer message must not abort preparation");
+
+        assert!(
+            prepared.contains_images,
+            "the valid PNG in the older message must survive the corrupt GIF in the newer \
+             message: {:?}",
+            prepared
+                .messages
+                .iter()
+                .map(|m| &m.content)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            prepared.messages.len(),
+            2,
+            "both messages must be present with original order restored"
+        );
+        assert!(
+            prepared
+                .messages
+                .iter()
+                .any(|m| m.content.contains("could not be loaded")),
+            "the newer message must carry the skip note for the corrupt GIF: {:?}",
+            prepared
+                .messages
+                .iter()
+                .map(|m| &m.content)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn gif_with_valid_frames_is_accepted() {
         // The counterpart to the rejection above: per-frame validation must not
         // start refusing ordinary animations.
