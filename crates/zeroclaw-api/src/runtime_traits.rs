@@ -382,9 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn dummy_runtime_shell_dialect_matches_host() {
-        // The dummy adapter mirrors the host-native command builder used by
-        // this test module.
+    fn dummy_runtime_shell_dialect_matches_compilation_platform() {
         let runtime = DummyRuntime;
         #[cfg(windows)]
         assert_eq!(runtime.shell_dialect(), ShellDialect::WindowsCmd);

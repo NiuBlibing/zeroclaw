@@ -5083,6 +5083,17 @@ pub struct McpServerConfig {
     /// warning. Read once per run (not refreshed; no subscriptions).
     #[serde(default)]
     pub pinned_resources: Vec<String>,
+    /// Absolute path to a PEM-encoded CA certificate or bundle to trust in
+    /// addition to the default roots for this server's HTTP/SSE transport.
+    ///
+    /// Certificate and hostname verification remain enabled. The path must
+    /// name a regular file no larger than 1 MiB; a missing, unreadable, empty,
+    /// oversized, non-regular, or invalid file is a hard connection error
+    /// rather than a fallback to the default trust store. When set, the
+    /// configured URL and any advertised SSE message endpoint must use HTTPS;
+    /// plaintext URLs and downgrade redirects are rejected. Ignored by stdio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_cert_path: Option<String>,
 }
 
 /// External MCP client configuration (`[mcp]` section).
@@ -10118,6 +10129,23 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
                 if !matches!(parsed.scheme(), "http" | "https") {
                     anyhow::bail!("mcp.servers[{i}].url must use http/https");
                 }
+                if let Some(ca_path) = server.tls_ca_cert_path.as_deref() {
+                    if ca_path.trim().is_empty() {
+                        validation_bail!(
+                            RequiredFieldEmpty,
+                            format!("mcp.servers[{i}].tls_ca_cert_path"),
+                            "mcp.servers[{i}].tls_ca_cert_path must not be empty"
+                        );
+                    }
+                    if !std::path::Path::new(ca_path).is_absolute() {
+                        anyhow::bail!("mcp.servers[{i}].tls_ca_cert_path must be an absolute path");
+                    }
+                    if parsed.scheme() != "https" {
+                        anyhow::bail!(
+                            "mcp.servers[{i}].url must use https when tls_ca_cert_path is set"
+                        );
+                    }
+                }
             }
         }
     }
@@ -11608,18 +11636,27 @@ pub fn validate_memory_semantics(
 
 /// Surface WhatsApp chat-policy keys that are accepted but never consulted.
 ///
-/// `dm_policy`, `group_policy` and `self_chat_mode` are read only by the Web
-/// transport inside its `mode == Personal` block, so under `mode = "business"`
-/// they validate cleanly and have no effect. That is easy to miss because
-/// `dm_policy` DEFAULTS to `Allowlist`: a business-mode Web channel reads as
-/// restrictive while answering every DM it receives.
+/// `self_chat_mode` is read only by the Web transport inside its
+/// `mode == Personal` block, so under `mode = "business"` it validates cleanly
+/// and has no effect. `mode` selects ZeroClaw's policy posture, not a WhatsApp
+/// account type: both modes drive the same linked-device session, and the
+/// self-chat affordance is scoped to the personal branch by design.
+///
+/// `dm_policy` and `group_policy` are consulted under BOTH modes, so they are
+/// not reported here.
 ///
 /// `allowed_groups` is separate. `is_group_chat_allowed` returns true when the
-/// list is empty, and that gate does run in both modes, which makes an empty
-/// list the only group protection under `mode = "business"` and an open one.
+/// list is empty, so under `group_policy = "allowlist"` an empty list is an
+/// allowlist that admits every group. That holds under both modes.
 ///
-/// Warnings only, no behaviour change: an operator who is relying on the
-/// current defaults keeps working, and learns about it at `config validate`.
+/// Warnings only, no behaviour change to the validator itself. But be precise
+/// about WHICH reliance is reported, because this sentence used to promise more
+/// than the function delivers: under `mode = "business"` the inert-key warning
+/// covers `self_chat_mode` ONLY. `dm_policy` and `group_policy` are now live in
+/// business mode, so an operator who was relying on the old permissive business
+/// behaviour gets NO warning here and can start silently dropping DMs or groups
+/// under the default `allowlist`. That upgrade note belongs in the channel book
+/// and the release notes; `config validate` will not surface it for them.
 ///
 /// Called from `Config::collect_warnings`, so this reaches the CLI and the
 /// gateway dashboard on the same path as the other warnings.
@@ -11628,24 +11665,19 @@ pub fn validate_whatsapp_semantics(
     wa: &WhatsAppConfig,
 ) -> Vec<crate::validation_warnings::ValidationWarning> {
     let mut out = Vec::new();
-    if !wa.enabled || !wa.is_web_config() {
+    // Gate on the backend the runtime will actually select, not on whether a
+    // Web selector is merely present. `is_web_config` is true whenever any Web
+    // selector is set, including alongside `phone_number_id`, and that
+    // combination runs as Cloud. The Cloud transport consults none of the keys
+    // below, so diagnosing them against a Cloud channel reports a Web gate that
+    // never runs. The ambiguity itself is already surfaced separately at
+    // startup, so it is not restated here.
+    if !wa.enabled || wa.backend_type() != "web" {
         return out;
     }
 
     if wa.mode != WhatsAppWebMode::Personal {
         let mut inert: Vec<(&'static str, String)> = Vec::new();
-        if wa.dm_policy != WhatsAppChatPolicy::All {
-            inert.push((
-                "dm_policy",
-                "every direct message is answered regardless of this setting".to_string(),
-            ));
-        }
-        if wa.group_policy != WhatsAppChatPolicy::All {
-            inert.push((
-                "group_policy",
-                "group messages are not filtered by this setting".to_string(),
-            ));
-        }
         if wa.self_chat_mode {
             inert.push((
                 "self_chat_mode",
@@ -11665,7 +11697,7 @@ pub fn validate_whatsapp_semantics(
     }
 
     // An empty allowed_groups only creates UNINTENDED open access where the
-    // effective policy would otherwise have consulted the list. Two personal-mode
+    // effective policy would otherwise have consulted the list. Two
     // configurations must stay quiet:
     //
     //   group_policy = "ignore"    the channel gate drops every group message
@@ -11675,14 +11707,10 @@ pub fn validate_whatsapp_semantics(
     //   group_policy = "all"       an explicit opt-in to open group access. Warning
     //                              here reports a deliberate choice as unsafe.
     //
-    // So the warning applies to business mode (where the list is consulted no matter
-    // what group_policy says) and to personal mode with group_policy = "allowlist"
-    // (where an empty list is an allowlist that admits everything).
-    let empty_list_permits_all = if wa.mode == WhatsAppWebMode::Personal {
-        wa.group_policy == WhatsAppChatPolicy::Allowlist
-    } else {
-        true
-    };
+    // group_policy is consulted under BOTH modes, so this predicate is
+    // mode-independent: the unintended case is `allowlist`, where an empty list
+    // is an allowlist that admits every group.
+    let empty_list_permits_all = wa.group_policy == WhatsAppChatPolicy::Allowlist;
 
     if wa.allowed_groups.is_empty() && empty_list_permits_all {
         out.push(crate::validation_warnings::ValidationWarning::new(
@@ -11690,7 +11718,7 @@ pub fn validate_whatsapp_semantics(
             format!(
                 "channels.whatsapp.{alias}.allowed_groups is empty, which permits EVERY \
                  group the linked account belongs to. List the group JIDs you intend to \
-                 serve, or set group_policy = \"ignore\" under mode = \"personal\"."
+                 serve, or set group_policy = \"ignore\" to serve no group at all."
             ),
             format!("channels.whatsapp.{alias}.allowed_groups"),
         ));
@@ -15664,28 +15692,42 @@ impl ChannelConfig for SignalConfig {
 
 /// WhatsApp Web usage mode.
 ///
-/// `Personal` treats the account as a personal phone — the bot only responds to
-/// incoming messages that pass the DM/group/self-chat policy filters.
-/// `Business` (default) responds to all incoming messages, subject only to the
-/// `allowed_numbers` allowlist.
+/// The mode no longer decides WHETHER the chat policies apply. `dm_policy` and
+/// `group_policy` are consulted under BOTH modes, and an unrecognized sender is
+/// dropped before the message is logged or dispatched either way.
+///
+/// `Personal` additionally applies the self-chat exception, so `self_chat_mode`
+/// is consulted only there.
+/// `Business` (default) is the same admission path without that exception.
+///
+/// Neither mode consults `allowed_numbers`. That is a V2 field which migrates
+/// into `peer_groups` on load, so it names no knob the current model exposes;
+/// senders resolve from `[peer_groups.<name>].external_peers` scoped to the
+/// alias.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, zeroclaw_macros::ConfigEnum)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WhatsAppWebMode {
-    /// Respond to all messages passing the allowlist (default).
+    /// Respond to messages passing `dm_policy` and `group_policy` (default).
     #[default]
     Business,
-    /// Apply per-chat-type policies (dm_policy, group_policy, self_chat_mode).
+    /// As business mode, and additionally applies the self-chat semantics
+    /// (`self_chat_mode` and the fromMe handling). Both modes run the same
+    /// linked-device session, and WhatsApp can mirror an operator's own
+    /// messages as `fromMe` under either, so that scoping is a property of
+    /// this branch rather than of the account.
     Personal,
 }
 
-/// Policy for a particular WhatsApp chat type (DMs or groups) when
-/// `mode = "personal"`.
+/// Policy for a particular WhatsApp chat type (DMs or groups).
+///
+/// Applied under both `mode = "business"` and `mode = "personal"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, zeroclaw_macros::ConfigEnum)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WhatsAppChatPolicy {
-    /// Only respond to senders on the `allowed_numbers` list (default).
+    /// Only respond to recognized senders (default). Senders are resolved from
+    /// the channel's peer group, via `[peer_groups.<name>].external_peers`.
     #[default]
     Allowlist,
     /// Ignore all messages in this chat type.
@@ -15783,17 +15825,19 @@ pub struct WhatsAppConfig {
     #[serde(default)]
     pub interrupt_on_new_message: bool,
     /// Usage mode for WhatsApp Web: "business" (default) or "personal".
-    /// In personal mode the bot applies dm_policy, group_policy, and
-    /// self_chat_mode to decide which chats to respond in.
+    /// `dm_policy` and `group_policy` apply under BOTH modes. Personal mode
+    /// additionally applies `self_chat_mode` and the fromMe handling; both are
+    /// scoped to the personal branch by design, not by any protocol difference
+    /// between the two modes.
     #[tab(Advanced)]
     #[serde(default)]
     pub mode: WhatsAppWebMode,
-    /// Policy for direct messages when mode = "personal".
+    /// Policy for direct messages, applied under both modes.
     /// "allowlist" (default) | "ignore" | "all".
     #[tab(Advanced)]
     #[serde(default)]
     pub dm_policy: WhatsAppChatPolicy,
-    /// Policy for group chats when mode = "personal".
+    /// Policy for group chats, applied under both modes.
     /// "allowlist" (default) | "ignore" | "all".
     #[tab(Advanced)]
     #[serde(default)]
@@ -24473,6 +24517,32 @@ max_height = 8
         )
         .unwrap();
         assert_eq!(cfg.pinned_resources, vec!["file:///a", "file:///b"]);
+    }
+
+    #[::core::prelude::v1::test]
+    fn mcp_server_config_tls_ca_cert_path_defaults_none_and_round_trips() {
+        let cfg: McpServerConfig = serde_json::from_str(r#"{"name":"s","command":"x"}"#).unwrap();
+        assert!(cfg.tls_ca_cert_path.is_none());
+        assert!(
+            !serde_json::to_value(&cfg)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("tls_ca_cert_path")
+        );
+
+        let cfg: McpServerConfig = serde_json::from_str(
+            r#"{"name":"s","transport":"http","url":"https://example.invalid/mcp","tls_ca_cert_path":"/etc/zeroclaw/internal-ca.pem"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.tls_ca_cert_path.as_deref(),
+            Some("/etc/zeroclaw/internal-ca.pem")
+        );
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap()["tls_ca_cert_path"],
+            "/etc/zeroclaw/internal-ca.pem"
+        );
     }
 
     #[::core::prelude::v1::test]
@@ -33823,6 +33893,97 @@ high_entropy_tokens = false
     }
 
     #[test]
+    async fn validate_mcp_config_enforces_custom_ca_invariants_through_config() {
+        let absolute_ca = std::env::temp_dir().join("zeroclaw-test-ca.pem");
+        let absolute_ca_string = absolute_ca.to_string_lossy().into_owned();
+
+        let mut config = Config::default();
+        config.mcp.servers = vec![
+            http_server("public", "http://localhost:8080/mcp"),
+            McpServerConfig {
+                name: "private".into(),
+                transport: McpTransport::Sse,
+                url: Some("https://internal.example.invalid/sse".into()),
+                tls_ca_cert_path: Some(absolute_ca_string.clone()),
+                ..Default::default()
+            },
+        ];
+        config
+            .validate()
+            .expect("unset and valid custom-CA configurations should validate");
+
+        for (path, url, expected) in [
+            (
+                String::new(),
+                "https://internal.example.invalid/mcp",
+                "must not be empty",
+            ),
+            (
+                "relative-ca.pem".to_string(),
+                "https://internal.example.invalid/mcp",
+                "must be an absolute path",
+            ),
+            (
+                absolute_ca_string,
+                "http://internal.example.invalid/mcp",
+                "must use https when tls_ca_cert_path is set",
+            ),
+        ] {
+            let mut config = Config::default();
+            config.mcp.servers = vec![McpServerConfig {
+                name: "private".into(),
+                transport: McpTransport::Http,
+                url: Some(url.into()),
+                tls_ca_cert_path: Some(path),
+                ..Default::default()
+            }];
+            let error = config
+                .validate()
+                .expect_err("invalid custom-CA configuration must fail validation");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    async fn mcp_custom_ca_configured_and_unset_survive_save_and_reload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let absolute_ca = dir.path().join("internal-ca.pem");
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("workspace"),
+            ..Default::default()
+        };
+        config.mcp.servers = vec![
+            http_server("public", "https://public.example.invalid/mcp"),
+            McpServerConfig {
+                name: "private".into(),
+                transport: McpTransport::Sse,
+                url: Some("https://private.example.invalid/sse".into()),
+                tls_ca_cert_path: Some(absolute_ca.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        ];
+
+        config.save().await.unwrap();
+        let raw = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        let loaded: Config = crate::migration::migrate_to_current(&raw).unwrap();
+        loaded
+            .validate()
+            .expect("saved custom-CA configuration should validate after reload");
+        assert_eq!(loaded.mcp.servers.len(), 2);
+        assert!(loaded.mcp.servers[0].tls_ca_cert_path.is_none());
+        assert_eq!(
+            loaded.mcp.servers[1].tls_ca_cert_path.as_deref(),
+            Some(absolute_ca.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
     async fn validate_mcp_config_rejects_empty_name() {
         let cfg = McpConfig {
             enabled: true,
@@ -37511,6 +37672,116 @@ allowed_users = []
         );
     }
 
+    /// Regression: a bare `zeroclaw config init` (no
+    /// section — `init_defaults(None)`) must produce a config.toml that
+    /// strictly reloads. Before the fix, `init_defaults` unconditionally
+    /// scaffolded every `#[nested] Option<T>` field from
+    /// `T::default()`, including structs with a required non-defaulted
+    /// `String` leaf (`GatewayTlsConfig::cert_path`/`key_path`,
+    /// `LocalWhisperConfig::url`, `OpenVpnTunnelConfig::config_file`).
+    /// Those leaves default to `""`, which `prune_empty_leaves` strips
+    /// on save, leaving a partial sub-table (kept alive by a non-empty
+    /// sibling like `enabled`/`max_audio_bytes`/`connect_timeout_secs`)
+    /// that fails strict deserialization with `missing field ...` — the
+    /// exact failure `zeroclaw config migrate` hits and exits 1 on.
+    ///
+    /// Mirrors the production boundary of
+    /// `local_whisper_config_init_preserves_transcription_section`
+    /// (crates/zeroclaw-channels/src/transcription.rs) but drives a bare
+    /// full init instead of an exact-prefix one.
+    #[test]
+    async fn config_init_full_produces_strict_roundtrippable_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Pre-create config.toml (mirrors `load_or_init`) so `save_dirty`
+        // below takes the incremental existing-document path, not the
+        // full-save fallback for a missing file.
+        Config {
+            config_path: config_path.clone(),
+            ..Config::default()
+        }
+        .save()
+        .await
+        .unwrap();
+
+        // The real scaffold: bare `config init`, no section targeted —
+        // the exact call `ConfigCommands::Init { section: None }` makes.
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Config::default()
+        };
+        let initialized = config.init_defaults(None);
+
+        // The three required-field sections must be omitted by a bare
+        // init (that is the fix); the fully-defaulted siblings must still
+        // be scaffolded. Asserting both sides here catches an over-broad
+        // `init_requires_explicit_config` predicate that skips too much —
+        // which the strict-reload assert below would otherwise pass
+        // silently (a missing section only looks "even more absent").
+        assert!(
+            !initialized.iter().any(|s| {
+                *s == "gateway.tls" || *s == "transcription.local_whisper" || *s == "tunnel.openvpn"
+            }),
+            "required-field sections must be omitted by bare init, got: {initialized:?}"
+        );
+        assert!(
+            initialized.contains(&"transcription.openai")
+                && initialized.contains(&"tunnel.tailscale"),
+            "fully-defaulted sibling sections must still scaffold on bare init, got: {initialized:?}"
+        );
+
+        for s in &initialized {
+            config.mark_dirty(s);
+        }
+        config.save_dirty().await.unwrap();
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+
+        // STRICT assert — this is what `config migrate` runs; it exits 1
+        // today on unpatched code.
+        assert!(
+            crate::migration::migrate_to_current(&contents).is_ok(),
+            "fresh full `config init` must strictly deserialize; err: {:?}",
+            crate::migration::migrate_to_current(&contents).err()
+        );
+
+        // RESILIENT assert — even the salvage path must not have to drop
+        // an entire parent section on a fresh, untouched init.
+        let salv = crate::migration::migrate_to_current_salvaged(&contents);
+        assert!(
+            !salv
+                .dropped
+                .iter()
+                .any(|p| p == "gateway" || p == "transcription" || p == "tunnel"),
+            "no parent section may be salvage-reset on a fresh init, dropped: {:?}",
+            salv.dropped
+        );
+    }
+
+    /// The gate's other side: explicitly targeting a required-field
+    /// section (as `zeroclaw config init <section>` and the dashboard
+    /// section picker both do) must still scaffold it so the operator can
+    /// fill in the required fields. `transcription.local_whisper` already
+    /// has this coverage via the channels-crate test
+    /// `local_whisper_config_init_preserves_transcription_section`; this
+    /// locks the same behavior for the two remaining sections.
+    #[test]
+    async fn config_init_explicit_prefix_still_scaffolds_required_field_sections() {
+        for section in ["gateway.tls", "tunnel.openvpn"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = Config {
+                config_path: tmp.path().join("config.toml"),
+                ..Config::default()
+            };
+            let initialized = config.init_defaults(Some(section));
+            assert!(
+                initialized.contains(&section),
+                "explicit `config init {section}` must scaffold the section, got: {initialized:?}"
+            );
+        }
+    }
+
     #[test]
     async fn nested_get_set_prop_traverses_config_tree() {
         let mut config = Config::default();
@@ -39767,24 +40038,100 @@ allowed_users = []
     const WA_INERT_WARNING: &str = "whatsapp_chat_policy_inert";
     const WA_OPEN_GROUPS_WARNING: &str = "whatsapp_empty_group_allowlist_permits_all";
 
-    /// A Web channel in business mode: the chat policies are accepted and never
-    /// consulted, and dm_policy DEFAULTS to allowlist, so the operator believes
-    /// the channel is gated when every DM is answered.
+    /// A config carrying both `phone_number_id` and a Web selector runs as
+    /// Cloud, and the Cloud transport consults none of the Web chat-policy
+    /// keys. Diagnosing them here would describe a gate that never runs, and
+    /// the open-groups warning in particular would report unintended group
+    /// access on a channel whose Web group gate is not in the path.
+    ///
+    /// The second half is the control: strip `phone_number_id` so the same
+    /// keys select the Web backend, and both warnings must return. Without it
+    /// this test would also pass against a validator that had been switched
+    /// off entirely.
     #[test]
-    async fn whatsapp_business_mode_flags_inert_chat_policies() {
+    async fn whatsapp_mixed_selectors_run_as_cloud_and_report_no_web_policy_warnings() {
+        let mixed = r#"
+[channels.whatsapp.shop]
+enabled = true
+phone_number_id = "1234567890"
+access_token = "token"
+verify_token = "verify"
+session_path = "/tmp/wa-session"
+mode = "business"
+self_chat_mode = true
+group_policy = "allowlist"
+allowed_groups = []
+"#;
+        let cfg: Config = toml::from_str(mixed).unwrap();
+        assert_eq!(
+            cfg.channels.whatsapp["shop"].backend_type(),
+            "cloud",
+            "a Cloud selector must win over a Web selector, or this test is not \
+             exercising the mixed case"
+        );
+        assert!(
+            warnings_with_code(&cfg, WA_INERT_WARNING).is_empty(),
+            "a Cloud-backed channel must not be diagnosed against the Web chat-policy gate"
+        );
+        assert!(
+            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            "the Web group gate is not in a Cloud channel's path, so an empty \
+             allowed_groups grants no group access here"
+        );
+
+        let web_only = r#"
+[channels.whatsapp.shop]
+enabled = true
+session_path = "/tmp/wa-session"
+mode = "business"
+self_chat_mode = true
+group_policy = "allowlist"
+allowed_groups = []
+"#;
+        let cfg: Config = toml::from_str(web_only).unwrap();
+        assert_eq!(cfg.channels.whatsapp["shop"].backend_type(), "web");
+        assert!(
+            !warnings_with_code(&cfg, WA_INERT_WARNING).is_empty(),
+            "removing the Cloud selector must restore the inert-key diagnostic"
+        );
+        assert!(
+            !warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            "removing the Cloud selector must restore the open-groups diagnostic"
+        );
+    }
+
+    /// A Web channel in business mode: `dm_policy` and `group_policy` are
+    /// consulted under both modes, so calling them inert would now be false.
+    /// `self_chat_mode` is read only inside the personal branch, so it is the
+    /// one key that stays inert here.
+    #[test]
+    async fn whatsapp_business_mode_flags_only_self_chat_mode() {
         let toml = r#"
 [channels.whatsapp.shop]
 enabled = true
 mode = "business"
 session_path = "/tmp/wa-session"
+self_chat_mode = true
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         let warnings = warnings_with_code(&cfg, WA_INERT_WARNING);
         assert!(
-            warnings
+            !warnings
                 .iter()
                 .any(|w| w.path == "channels.whatsapp.shop.dm_policy"),
-            "default dm_policy under business mode must be flagged: {warnings:?}"
+            "dm_policy is enforced under both modes and must not be reported inert: {warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.path == "channels.whatsapp.shop.group_policy"),
+            "group_policy is enforced under both modes and must not be reported inert: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.path == "channels.whatsapp.shop.self_chat_mode"),
+            "self_chat_mode has no business-mode equivalent and stays inert: {warnings:?}"
         );
         assert!(
             warnings.iter().any(|w| w.message.contains("personal")),
@@ -39909,9 +40256,9 @@ group_policy = "all"
         );
     }
 
-    /// Business mode never consults group_policy, so the list is the only gate
-    /// and an empty one really does admit every group. This is the positive
-    /// case that must survive narrowing the warning.
+    /// The default group_policy is `allowlist`, so an empty list really does
+    /// admit every group. This is the positive case that must survive narrowing
+    /// the warning.
     #[test]
     async fn whatsapp_business_empty_allowed_groups_is_flagged() {
         let toml = r#"
@@ -39930,12 +40277,11 @@ session_path = "/tmp/wa-session"
         assert_eq!(warnings[0].path, "channels.whatsapp.shop.allowed_groups");
     }
 
-    /// Business mode ignores group_policy entirely, so even the value that
-    /// silences the warning under personal mode must NOT silence it here.
-    /// Without this, narrowing the check could be over-applied and reopen the
-    /// original bug from the other side.
+    /// Business mode now consults group_policy, so `ignore` closes group access
+    /// there exactly as it does under personal mode. Warning that an empty list
+    /// "permits EVERY group" would be false for this configuration.
     #[test]
-    async fn whatsapp_business_ignore_group_policy_still_flagged() {
+    async fn whatsapp_business_ignore_group_policy_is_not_flagged() {
         let toml = r#"
 [channels.whatsapp.shop]
 enabled = true
@@ -39944,11 +40290,10 @@ session_path = "/tmp/wa-session"
 group_policy = "ignore"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(
-            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).len(),
-            1,
-            "group_policy is inert under business mode, so it must not silence \
-             the open-groups warning"
+        assert!(
+            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            "group_policy = \"ignore\" drops every group message under both modes, \
+             so the open-groups warning must not fire"
         );
     }
 
