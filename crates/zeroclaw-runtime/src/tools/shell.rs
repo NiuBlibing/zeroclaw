@@ -710,6 +710,27 @@ mod tests {
         RateLimitedTool::new(ShellTool::new(security.clone(), test_runtime()), security)
     }
 
+    /// A forbidden path argument is refused by whichever guard sees it first,
+    /// and the two guards word it differently. On a Windows shell dialect the
+    /// policy's own scan inside `validate_command_execution_for_shell` runs
+    /// before the tool body and reports `Command blocked: forbidden path
+    /// argument`; on POSIX dialects that scan is skipped (an operator may
+    /// legitimately allow absolute arguments there) and the refusal comes from
+    /// the shell tool's workspace scan as `Path blocked by security policy`.
+    /// Both are the same verdict, so assert the refusal rather than one
+    /// platform's phrasing.
+    fn assert_path_argument_blocked(result: &ToolResult, context: &str) {
+        assert!(
+            !result.success,
+            "{context}: the forbidden path argument must be refused, got: {result:?}"
+        );
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("Path blocked") || error.contains("forbidden path argument"),
+            "{context}: expected a path-guard refusal, got: {error:?}"
+        );
+    }
+
     #[test]
     fn shell_tool_name() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
@@ -1290,14 +1311,7 @@ mod tests {
             .execute(json!({"command": format!("cat {}", absolute_path_outside_workspace())}))
             .await
             .expect("absolute path argument should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "absolute path argument");
     }
 
     /// End-to-end regression for the shell workspace-boundary bypass: driving
@@ -1365,14 +1379,7 @@ mod tests {
             .execute(json!({"command": format!("grep --file={} root ./src", absolute_path_outside_workspace())}))
             .await
             .expect("option-assigned forbidden path should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "option-assigned forbidden path");
     }
 
     #[tokio::test]
@@ -1385,14 +1392,7 @@ mod tests {
             .execute(json!({"command": format!("grep -f{} root ./src", absolute_path_outside_workspace())}))
             .await
             .expect("short option attached forbidden path should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "short option attached forbidden path");
     }
 
     #[tokio::test]
@@ -1405,14 +1405,7 @@ mod tests {
             .execute(json!({"command": "cat ~root/.ssh/id_rsa"}))
             .await
             .expect("tilde-user path should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "tilde-user path");
     }
 
     #[tokio::test]
