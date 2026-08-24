@@ -386,13 +386,12 @@ fn find_anchor_in_segments(segs: &[(PathBuf, String)], anchor_id: &str) -> Optio
             }
             let line_end = byte_off + n as u64;
             let trimmed = buf.trim();
-            if !trimmed.is_empty() {
-                if serde_json::from_str::<LogEvent>(trimmed)
+            if !trimmed.is_empty()
+                && serde_json::from_str::<LogEvent>(trimmed)
                     .map(|e| e.id == anchor_id)
                     .unwrap_or(false)
-                {
-                    return Some((i, line_end));
-                }
+            {
+                return Some((i, line_end));
             }
             byte_off = line_end;
         }

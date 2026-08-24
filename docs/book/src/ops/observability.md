@@ -262,7 +262,7 @@ Log pagination walks backward with a segment-aware cursor. While `at_end` is fal
 
 Restart from the newest page after changing filters. Treat `at_end: true` as the signal to stop requesting older pages for that walk.
 
-`until_line_offset` is a position in the current active file. Archive rotation, startup migration, and a configured path change replace the bytes or active file it refers to; restart from the newest page after those boundaries. `until_segment_cursor` is stable across rotations for retained archives but becomes stale once the named archive is pruned by retention; the reader falls back to a full scan in that case.
+`until_line_offset` is a position in the current active file. Archive rotation, startup migration, and a configured path change replace the bytes or active file it refers to; restart from the newest page after those boundaries. `until_segment_cursor` embeds an anchor event id alongside the segment basename and byte offset. On each resume, the reader verifies the event immediately before the cursor boundary matches the stored id. If the active file was rotated between requests, creating a new file with the same basename, the mismatch is detected and the reader rebases the cursor to the rotated archive that actually contains the anchored event, so pagination continues safely across the rotation boundary without duplicating or skipping events.
 
 The `/api/status` response includes `daemon_started_at: string` (RFC
 3339), so a dashboard can default to "since daemon start" without an
