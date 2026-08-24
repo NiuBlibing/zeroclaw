@@ -4087,25 +4087,40 @@ impl RpcDispatcher {
     /// `logs/get { id } → LogEvent`. Loads one full event by id from
     /// the persistent JSONL log so the Logs pane can keep only preview
     /// fields in memory and lazy-fetch the full payload only when the
-    /// user opens the detail pane.
+    /// user opens the detail pane. Searches the active file first, then
+    /// retained archives oldest-first, so archive events returned by
+    /// `logs/query` are always findable by id.
     async fn handle_logs_get(&self, params: &Value) -> RpcResult {
         let p: LogsGetParams = parse_params(params)?;
-        let path = zeroclaw_log::current_log_path()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"))?;
-        let event = zeroclaw_log::find_event_by_id(&path, &p.id)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
-        match event {
-            Some(evt) => {
-                let event = serde_json::to_value(evt).map_err(|e| {
-                    rpc_err(INTERNAL_ERROR, format!("Failed to serialize event: {e}"))
-                })?;
-                to_result(LogsGetResult { event })
+        let Some((active, mut archives)) = zeroclaw_log::segment_files() else {
+            return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
+        };
+
+        // Search active file first (most recent events), then archives
+        // oldest-first. Stop as soon as the event is found.
+        let mut search_paths: Vec<std::path::PathBuf> = vec![active];
+        archives.sort_by_key(|(_, mtime)| *mtime);
+        search_paths.extend(archives.into_iter().map(|(p, _)| p));
+
+        for path in &search_paths {
+            match zeroclaw_log::find_event_by_id(path, &p.id) {
+                Ok(Some(evt)) => {
+                    let event = serde_json::to_value(evt).map_err(|e| {
+                        rpc_err(INTERNAL_ERROR, format!("Failed to serialize event: {e}"))
+                    })?;
+                    return to_result(LogsGetResult { event });
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    return Err(rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")));
+                }
             }
-            None => Err(rpc_err(
-                INTERNAL_ERROR,
-                format!("Log id `{}` not found", p.id),
-            )),
         }
+
+        Err(rpc_err(
+            INTERNAL_ERROR,
+            format!("Log id `{}` not found", p.id),
+        ))
     }
 
     // ── File attachment handler ────────────────────────────────
