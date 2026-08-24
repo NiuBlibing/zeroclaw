@@ -3603,17 +3603,17 @@ mod tests {
 
     #[tokio::test]
     async fn high_bit_depth_png_is_refused_when_output_exceeds_cap() {
-        // A valid 3000x3000 RGB16 PNG projects to 3000*3000*6 = 54_000_000
-        // bytes from the decoder's actual ColorType — above the 64 MiB cap
-        // when accounting for the real output width (6 bytes/pixel for Rgb16,
-        // not 4).  projected_allocation now uses total_bytes(), which returns
-        // the decoder's own output-buffer size, so this is caught before
-        // DynamicImage::from_decoder allocates.
+        // A valid 3400x3400 RGB16 PNG has a decoded output of 3400*3400*6 =
+        // 69_360_000 bytes, which exceeds MAX_DECODED_IMAGE_ALLOC_BYTES
+        // (67_108_864). The old width*height*4 projection (46 MB) would have
+        // admitted it. projected_allocation now calls total_bytes() on the
+        // decoder, which uses the actual ColorType byte width (6 for Rgb16),
+        // so the image is caught before DynamicImage::from_decoder allocates.
         let png = {
             let mut buf = std::io::Cursor::new(Vec::new());
             image::DynamicImage::ImageRgb16(image::ImageBuffer::from_pixel(
-                3000,
-                3000,
+                3400,
+                3400,
                 image::Rgb([u16::MAX, 0, 0]),
             ))
             .write_to(&mut buf, image::ImageFormat::Png)
@@ -3622,7 +3622,7 @@ mod tests {
         };
 
         // Sanity-check that the output byte count really exceeds the cap.
-        let rgb16_bytes = u64::from(3000u32) * u64::from(3000u32) * 6;
+        let rgb16_bytes = u64::from(3400u32) * u64::from(3400u32) * 6;
         assert!(
             rgb16_bytes > MAX_DECODED_IMAGE_ALLOC_BYTES,
             "test fixture must project above the cap: {rgb16_bytes} vs {MAX_DECODED_IMAGE_ALLOC_BYTES}"
@@ -3632,7 +3632,7 @@ mod tests {
             validate_image_content("hbd.png", "image/png", &png, AGGREGATE_DECODE_BUDGET_BYTES)
                 .await
                 .expect_err(
-                    "a 3000x3000 RGB16 PNG must be refused before its output buffer is allocated",
+                    "a 3400x3400 RGB16 PNG must be refused before its output buffer is allocated",
                 );
 
         assert_eq!(multimodal_error_kind(&error), "corrupt_image");
