@@ -1805,8 +1805,21 @@ async fn validate_within_budget(
     .await
     {
         Ok(allocation) => {
-            *remaining_budget = budget_before_decode.saturating_sub(allocation);
-            Ok(allocation)
+            // Charge the same model admission reserved against. The decode
+            // reports the buffer it can see — the decoded output, or the
+            // cumulative frame output for an animation — but the projection
+            // also covered decoder scratch that is invisible from out here
+            // (the WebP RGBA/alpha temporaries, the animation canvas, and the
+            // adapter's RGB->RGBA conversion). Debiting only the visible
+            // buffer would let this counter drift below real consumption: with
+            // up to 16 candidates permitted, a sequence of valid sub-cap WebPs
+            // would each reserve their full peak here and refund most of it,
+            // so the request could decode far more than the aggregate envelope
+            // claims. The real figure still wins whenever it is larger, which
+            // is what keeps a high-bit-depth PNG honestly charged.
+            let charge = allocation.max(projected_allocation);
+            *remaining_budget = budget_before_decode.saturating_sub(charge);
+            Ok(charge)
         }
         Err(failure) => {
             match failure.kind {
@@ -2106,20 +2119,6 @@ async fn validate_image_content_with_projection(
             projected_allocation,
         )
     })?
-    // Charge the same model admission used. Each branch above reports the
-    // buffer it can actually see — the decoded output, or the cumulative frame
-    // output for an animation — but the peak that admission reserved also
-    // covered decoder scratch that is never visible from out here (the WebP
-    // RGBA/alpha temporaries, the animation canvas and its RGB→RGBA
-    // conversion). Debiting only the visible buffer would let the shared
-    // counter drift below real consumption: with 16 candidates permitted, a
-    // sequence of valid sub-cap WebPs could each reserve their full peak at
-    // admission and refund most of it here, so the request would decode far
-    // more than the aggregate envelope claims. Taking the max keeps the
-    // counter an upper bound on work actually performed, while still charging
-    // the real figure whenever it is the larger of the two (a 16-bit PNG whose
-    // output exceeds the header projection).
-    .map(|actual| actual.max(projected_allocation))
 }
 
 fn detect_mime(
@@ -3610,7 +3609,7 @@ mod tests {
             "CAP_DIMENSION must be chosen so old w*h*4 sits exactly on the cap"
         );
         // Sanity: the peak-aware projection for a still WebP at this size is
-        // output(w*h*3) + scratch(w*h*4) = w*h*7, strictly above the cap.
+        // output(3 B/px) + still scratch, strictly above the cap.
         let still_peak = u64::from(CAP_DIMENSION)
             * u64::from(CAP_DIMENSION)
             * (3 + WEBP_STILL_SCRATCH_BYTES_PER_PIXEL);
@@ -3619,17 +3618,16 @@ mod tests {
             "the still-WebP peak at CAP_DIMENSION must exceed the cap: {still_peak} vs {MAX_DECODED_IMAGE_ALLOC_BYTES}"
         );
 
+        // An unbounded aggregate allowance so the per-image cap is the only
+        // gate under test. At this canvas the animated peak model also exceeds
+        // the 256 MiB aggregate envelope, and an aggregate refusal would prove
+        // nothing about the per-image guard this test exists to cover.
         for animated in [false, true] {
             let webp = webp_with_canvas(CAP_DIMENSION, animated);
 
-            let error = validate_image_content(
-                "boundary.webp",
-                "image/webp",
-                &webp,
-                AGGREGATE_DECODE_BUDGET_BYTES,
-            )
-            .await
-            .expect_err("a canvas landing exactly on the per-image cap must be refused");
+            let error = validate_image_content("boundary.webp", "image/webp", &webp, u64::MAX)
+                .await
+                .expect_err("a canvas landing exactly on the per-image cap must be refused");
 
             assert_eq!(
                 multimodal_error_kind(&error),
@@ -3653,19 +3651,17 @@ mod tests {
         // peak is ~112 MB — well above the 64 MiB cap.  projected_allocation
         // now adds the scratch cost, so the image is refused before any
         // decoder runs.
+        // An unbounded budget so the per-image cap is the only gate being tested.
+        // At 4000px the animated peak model exceeds the 256 MiB aggregate, and
+        // an aggregate refusal would prove nothing about the per-image guard.
         for animated in [false, true] {
             let webp = webp_with_canvas(4000, animated);
 
-            let error = validate_image_content(
-                "compact.webp",
-                "image/webp",
-                &webp,
-                AGGREGATE_DECODE_BUDGET_BYTES,
-            )
-            .await
-            .expect_err(
-                "a 4000x4000 WebP must be refused even though its projection is below the cap",
-            );
+            let error = validate_image_content("compact.webp", "image/webp", &webp, u64::MAX)
+                .await
+                .expect_err(
+                    "a 4000x4000 WebP must be refused even though its projection is below the cap",
+                );
 
             assert_eq!(
                 multimodal_error_kind(&error),
@@ -3830,7 +3826,7 @@ mod tests {
         let error = validate_image_content(
             "alpha.webp",
             "image/webp",
-            &png_alpha,
+            &alpha_webp,
             AGGREGATE_DECODE_BUDGET_BYTES,
         )
         .await
@@ -3844,7 +3840,7 @@ mod tests {
 
         // Budget must be untouched — no decoder ran.
         let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
-        validate_within_budget("alpha.webp", "image/webp", &png_alpha, &mut budget)
+        validate_within_budget("alpha.webp", "image/webp", &alpha_webp, &mut budget)
             .await
             .expect_err("validate_within_budget must also refuse it");
         assert_eq!(
