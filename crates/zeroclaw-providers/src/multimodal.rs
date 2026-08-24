@@ -3572,21 +3572,26 @@ mod tests {
 
     #[tokio::test]
     async fn webp_canvas_at_the_per_image_cap_is_refused_before_allocation() {
-        // The equality boundary. 4096x4096x4 is exactly
-        // `MAX_DECODED_IMAGE_ALLOC_BYTES`, so a strict `>` comparison would
-        // admit it — and the projection is not the decoder's peak. For a
-        // lossless non-alpha WebP, `image-webp` 0.2.4 allocates a
-        // width x height x 4 temporary RGBA buffer and converts it into a
-        // separate RGB output owned by `DynamicImage::from_decoder`: 64 MiB
-        // plus another 48 MiB at this size, well past the per-image cap that
-        // `WebPDecoder` cannot itself enforce. Animated WebP adds frame
-        // buffers on the same path. The canvas must therefore be refused at
-        // the cap, not merely above it.
+        // Before the peak-aware bound, `projected_allocation` returned w*h*4 for
+        // every image. For a 4096x4096 WebP, w*h*4 = MAX_DECODED_IMAGE_ALLOC_BYTES
+        // exactly, so a `>` comparison would have admitted it. Now the bound
+        // includes the decoder's scratch cost too, so even a still 4096x4096 WebP
+        // projects well above the cap and is refused on the `>=` branch.
         const CAP_DIMENSION: u32 = 4096;
+        // Sanity: the old w*h*4 value sat exactly on the boundary.
         assert_eq!(
             u64::from(CAP_DIMENSION) * u64::from(CAP_DIMENSION) * 4,
             MAX_DECODED_IMAGE_ALLOC_BYTES,
-            "this fixture must sit exactly on the cap for the boundary to be covered"
+            "CAP_DIMENSION must be chosen so old w*h*4 sits exactly on the cap"
+        );
+        // Sanity: the peak-aware projection for a still WebP at this size is
+        // output(w*h*3) + scratch(w*h*4) = w*h*7, strictly above the cap.
+        let still_peak = u64::from(CAP_DIMENSION)
+            * u64::from(CAP_DIMENSION)
+            * (3 + WEBP_STILL_SCRATCH_BYTES_PER_PIXEL);
+        assert!(
+            still_peak > MAX_DECODED_IMAGE_ALLOC_BYTES,
+            "the still-WebP peak at CAP_DIMENSION must exceed the cap: {still_peak} vs {MAX_DECODED_IMAGE_ALLOC_BYTES}"
         );
 
         for animated in [false, true] {
