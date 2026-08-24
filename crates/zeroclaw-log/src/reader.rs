@@ -41,6 +41,14 @@ pub struct LogFilter {
 /// Segment-aware pagination cursor. Identifies a byte position within a named
 /// segment file. Pass back as `?until_segment_cursor=` on the next `/api/logs`
 /// request to walk older pages across segment boundaries.
+///
+/// The `anchor_id` field pins the cursor to the exact log event at `off`. When
+/// the reader resolves the cursor, it checks that the first non-empty JSONL line
+/// at or after `off` in the named segment has `id == anchor_id`. If not — which
+/// means the active file was rotated and a new file with the same basename was
+/// created since the cursor was issued — the reader searches all segments for the
+/// anchor event and rebases the cursor to the segment and offset that contains it.
+/// This prevents duplicating or skipping events across an active-file rotation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentCursor {
     /// Basename of the segment file, e.g. `runtime-trace.jsonl` for the active
@@ -50,26 +58,48 @@ pub struct SegmentCursor {
     /// strictly less than this offset are included on the next page (same
     /// semantics as [`LogFilter::until_line_offset`]).
     pub off: u64,
+    /// ID of the oldest event on the page that produced this cursor (i.e. the
+    /// event immediately before the `off` boundary in file order). Used to detect
+    /// whether the named segment was replaced since the cursor was issued.
+    /// `None` for cursors issued by older daemons that predate this field.
+    pub anchor_id: Option<String>,
 }
 
 impl SegmentCursor {
-    /// Parse from wire format `"<seg_basename>:<byte_offset>"`. Returns `None`
-    /// on any parse error.
+    /// Parse from wire format `"<seg_basename>:<byte_offset>"` (legacy, no
+    /// anchor) or `"<seg_basename>:<byte_offset>:<anchor_id>"` (current).
+    /// Returns `None` on any parse error.
+    ///
+    /// Disambiguation: the offset is always a decimal integer, so a trailing
+    /// field that parses as `u64` is the offset (legacy form) and one that does
+    /// not is the anchor id (current form).
     pub fn from_wire(s: &str) -> Option<Self> {
-        let (seg, off_str) = s.rsplit_once(':')?;
-        let off = off_str.parse().ok()?;
+        let (head, tail) = s.rsplit_once(':')?;
+        let (seg, off, anchor_id) = match tail.parse::<u64>() {
+            // Legacy `<seg>:<off>` — the trailing field is the offset.
+            Ok(off) => (head, off, None),
+            // Current `<seg>:<off>:<anchor>` — the trailing field is the anchor.
+            Err(_) => {
+                let (seg, off_str) = head.rsplit_once(':')?;
+                (seg, off_str.parse().ok()?, Some(tail.to_owned()))
+            }
+        };
         if seg.is_empty() {
             return None;
         }
         Some(Self {
             seg: seg.to_owned(),
             off,
+            anchor_id,
         })
     }
 
     /// Serialize to wire format.
     pub fn to_wire(&self) -> String {
-        format!("{}:{}", self.seg, self.off)
+        match &self.anchor_id {
+            Some(id) => format!("{}:{}:{}", self.seg, self.off, id),
+            None => format!("{}:{}", self.seg, self.off),
+        }
     }
 }
 
@@ -283,7 +313,93 @@ fn matches_filter(event: &LogEvent, filter: &LogFilter, needle: Option<&str>) ->
     true
 }
 
-/// Find a single event by id. Scans the file backwards from the end.
+/// Check whether the event at or after `anchor_off` in `seg_path` has the
+/// expected `anchor_id`. Returns `false` on any I/O or parse error, on a
+/// missing file, or when the first non-empty JSON line found does not match.
+fn anchor_matches_offset(seg_path: &Path, anchor_off: u64, anchor_id: &str) -> bool {
+    let file = match std::fs::File::open(seg_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    use std::io::Seek;
+    let mut reader = BufReader::new(file);
+    // Seek to the line that ends at anchor_off: that line starts somewhere
+    // before it. To find the exact line, seek to anchor_off minus a generous
+    // window (line is always ≤ 128 KiB) and scan forward. For simplicity,
+    // seek to the start of the line by scanning from the previous offset:
+    // the cursor was produced as the byte-end of the oldest-matching line,
+    // so the line itself ends exactly at anchor_off — we seek before it.
+    let seek_pos = anchor_off.saturating_sub(512 * 1024);
+    if reader.seek(std::io::SeekFrom::Start(seek_pos)).is_err() {
+        return false;
+    }
+    let mut buf = String::new();
+    let mut byte_off = seek_pos;
+    loop {
+        buf.clear();
+        let n = match reader.read_line(&mut buf) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if n == 0 {
+            return false;
+        }
+        byte_off += n as u64;
+        if byte_off < anchor_off {
+            continue;
+        }
+        // This is (or is past) the line that produced the cursor.
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return serde_json::from_str::<LogEvent>(trimmed)
+            .map(|e| e.id == anchor_id)
+            .unwrap_or(false);
+    }
+}
+
+/// Search all segments for the event with `anchor_id`. Returns the
+/// segment index and the byte-end offset of that line, suitable for
+/// use as a new `(cursor_idx, cursor_off)` that excludes the anchor
+/// event itself (so the next page returns events older than it).
+fn find_anchor_in_segments(segs: &[(PathBuf, String)], anchor_id: &str) -> Option<(usize, u64)> {
+    for (i, (seg_path, _)) in segs.iter().enumerate() {
+        if !seg_path.exists() {
+            continue;
+        }
+        let file = match std::fs::File::open(seg_path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let mut reader = BufReader::new(file);
+        let mut byte_off: u64 = 0;
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let n = match reader.read_line(&mut buf) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if n == 0 {
+                break;
+            }
+            let line_end = byte_off + n as u64;
+            let trimmed = buf.trim();
+            if !trimmed.is_empty() {
+                if serde_json::from_str::<LogEvent>(trimmed)
+                    .map(|e| e.id == anchor_id)
+                    .unwrap_or(false)
+                {
+                    return Some((i, line_end));
+                }
+            }
+            byte_off = line_end;
+        }
+    }
+    None
+}
+
 pub fn find_event_by_id(path: &Path, id: &str) -> Result<Option<LogEvent>> {
     if !path.exists() {
         return Ok(None);
@@ -368,10 +484,41 @@ pub fn load_page_multi(
     // If the named segment no longer exists (e.g. its archive was pruned by
     // retention between requests), fall back to a full scan rather than
     // misapplying the offset to an unrelated segment.
+    //
+    // Active-file rotation check: when the cursor names the active file and
+    // carries an anchor_id, verify that the event just before `cursor_off` in
+    // that file is actually the anchored event. If the active file was rotated
+    // since the cursor was issued, the old content now lives in an archive under
+    // a different name, and the same basename maps to a *new* file whose content
+    // is unrelated. In that case, look for the archive that contains the anchor
+    // event and rebase the cursor to its exact byte-offset boundary so the next
+    // page starts cleanly from the right position.
     let (cursor_idx, cursor_off): (usize, Option<u64>) = match cursor_seg {
         None => (segs.len().saturating_sub(1), None),
         Some(name) => match segs.iter().rposition(|(_, n)| n == name) {
-            Some(idx) => (idx, cursor_off),
+            Some(idx) => {
+                // Check whether a rotation invalidated an active-file cursor.
+                let anchor_id = segment_cursor.and_then(|c| c.anchor_id.as_deref());
+                if let (Some(anchor), Some(off)) = (anchor_id, cursor_off) {
+                    if !anchor_matches_offset(&segs[idx].0, off, anchor) {
+                        // The file at this basename no longer contains the
+                        // expected anchor event: rotation occurred. Search all
+                        // segments for the anchor event and rebase the cursor
+                        // to the byte offset immediately after it.
+                        match find_anchor_in_segments(&segs, anchor) {
+                            Some((anchor_idx, anchor_end_off)) => {
+                                (anchor_idx, Some(anchor_end_off))
+                            }
+                            // Anchor not found at all (e.g. pruned): full scan.
+                            None => (segs.len().saturating_sub(1), None),
+                        }
+                    } else {
+                        (idx, cursor_off)
+                    }
+                } else {
+                    (idx, cursor_off)
+                }
+            }
             None => (segs.len().saturating_sub(1), None),
         },
     };
@@ -455,10 +602,11 @@ pub fn load_page_multi(
 
     // Derive cursors from the oldest event in the window.
     let oldest = window.front();
-    let next_segment_cursor = oldest.map(|(_, seg, off)| {
+    let next_segment_cursor = oldest.map(|(evt, seg, off)| {
         SegmentCursor {
             seg: seg.clone(),
             off: *off,
+            anchor_id: Some(evt.id.clone()),
         }
         .to_wire()
     });
@@ -1130,5 +1278,77 @@ mod tests {
         assert_eq!(page2.events[0].message.as_deref(), Some("old-b"));
         assert_eq!(page2.events[1].message.as_deref(), Some("old-a"));
         assert!(page2.at_end, "no older events remain");
+    }
+
+    /// Regression for the active-file rotation race: when the active file is
+    /// rotated between two pagination requests, the segment cursor produced on
+    /// page 1 names the (now-renamed) file's basename, which is the same as the
+    /// new active file. Without the anchor_id check, page 2 would apply the old
+    /// byte offset to the new file and return newly-written events instead of
+    /// the expected older ones.
+    #[test]
+    fn segment_cursor_survives_active_file_rotation_between_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+        let archive = tmp.path().join("trace.20260101-000000.jsonl");
+
+        // Initial active file has 4 events [a, b, c, d].
+        let mut ev_a = make_event("a", None);
+        ev_a.timestamp = "2026-01-01T00:00:00.000Z".into();
+        ev_a.message = Some("ev-a".into());
+        let mut ev_b = make_event("b", None);
+        ev_b.timestamp = "2026-01-01T00:00:01.000Z".into();
+        ev_b.message = Some("ev-b".into());
+        let mut ev_c = make_event("c", None);
+        ev_c.timestamp = "2026-01-01T00:00:02.000Z".into();
+        ev_c.message = Some("ev-c".into());
+        let mut ev_d = make_event("d", None);
+        ev_d.timestamp = "2026-01-01T00:00:03.000Z".into();
+        ev_d.message = Some("ev-d".into());
+        write_jsonl(
+            &active,
+            &[ev_a.clone(), ev_b.clone(), ev_c.clone(), ev_d.clone()],
+        );
+
+        // Page 1: limit 2 → returns [d, c] with a cursor pointing into the
+        // active file before c (i.e., the cursor anchors on ev_c).
+        let page1 = load_page_multi(&active, &[], &LogFilter::default(), 2, None).unwrap();
+        assert_eq!(page1.events.len(), 2);
+        assert_eq!(page1.events[0].message.as_deref(), Some("ev-d"));
+        assert_eq!(page1.events[1].message.as_deref(), Some("ev-c"));
+        let cursor_wire = page1
+            .next_segment_cursor
+            .clone()
+            .expect("cursor must be set");
+
+        // Simulate a rotation: rename the active file to an archive, then write
+        // a new event [e] into a fresh active file with the same basename.
+        std::fs::rename(&active, &archive).unwrap();
+        let archive_mtime = std::fs::metadata(&archive).unwrap().modified().unwrap();
+        let mut ev_e = make_event("e", None);
+        ev_e.timestamp = "2026-01-01T00:00:04.000Z".into();
+        ev_e.message = Some("ev-e".into());
+        write_jsonl(&active, &[ev_e.clone()]);
+
+        // Page 2 with the cursor from page 1. The cursor names "trace.jsonl"
+        // (now a new file) but anchor_id = ev_c.id. The reader should detect
+        // the mismatch and find ev_c in the archive, then return [b, a] — not
+        // [e, d] as the broken pre-fix implementation would.
+        let cursor = SegmentCursor::from_wire(&cursor_wire).expect("valid cursor");
+        let archives = vec![(archive.clone(), archive_mtime)];
+        let page2 =
+            load_page_multi(&active, &archives, &LogFilter::default(), 2, Some(&cursor)).unwrap();
+        assert_eq!(
+            page2.events.len(),
+            2,
+            "expected [b, a] not newly-written events"
+        );
+        assert_eq!(
+            page2.events[0].message.as_deref(),
+            Some("ev-b"),
+            "oldest-of-page-1 must not duplicate into page 2"
+        );
+        assert_eq!(page2.events[1].message.as_deref(), Some("ev-a"));
+        assert!(page2.at_end, "all events seen");
     }
 }
