@@ -2201,6 +2201,15 @@ export interface LogsResponse {
    *  walk older pages deterministically regardless of id ordering.
    *  `null` when the page is empty. */
   next_cursor_line_offset: number | null;
+  /** Segment-aware cursor for the oldest event on the current page, as
+   *  `"<segment_basename>:<byte_offset>"`. Pass back as
+   *  [`LogsQueryParams::until_segment_cursor`] to walk older pages across
+   *  rotated archive segments. Supersedes `next_cursor_line_offset` for
+   *  `rotating`-mode deployments: when the oldest event on a page lives in
+   *  an archive rather than the active file, `next_cursor_line_offset` is
+   *  `null` and only this cursor can advance. `null` when the page is
+   *  empty, or omitted entirely by daemons predating multi-segment reads. */
+  next_segment_cursor?: string | null;
   at_end: boolean;
   daemon_started_at: string;
   /** Canonical attribution-field names the daemon currently emits. Sourced
@@ -2220,6 +2229,11 @@ export interface LogsQueryParams {
    *  this offset so the follow-up page only sees lines strictly older
    *  than the previous one. Independent of id ordering. */
   until_line_offset?: number;
+  /** Segment-aware cursor passed back from the previous page's
+   *  `next_segment_cursor`. Identifies both the segment file and the byte
+   *  offset within it, so pagination continues across rotated archives.
+   *  Takes precedence over `until_line_offset` when both are set. */
+  until_segment_cursor?: string;
   action?: string;
   category?: string;
   outcome?: string;

@@ -46,8 +46,8 @@ valid and are interpreted as an offset into the active file.
 
 Daily rotation keys off the UTC calendar, so its boundary may not line up with
 local midnight in other time zones. These keys are ignored unless
-`log_persistence = "rotating"`, and the `none`, `rolling`, and `full` modes are
-unchanged.
+`log_persistence = "rotating"`. The `none` and `full` modes are unchanged by
+this PR; `rolling` is remapped as described in the compatibility note below.
 
 #### Compatibility note: `rolling` remap
 
@@ -226,7 +226,7 @@ The dashboard's Logs page is the primary surface. Underneath:
 GET /api/logs
 ```
 
-Top-level filters (query params): `since_ts`, `until_ts`, `until_line_offset`, `action`, `category`, `outcome`, `severity_min`, `trace_id`, `q` (substring across `message` + `attributes`), `hide_internal` (drops `event.category = "internal"`), `limit`. The legacy `until_id` field remains available for timestamp/ID cursor compatibility.
+Top-level filters (query params): `since_ts`, `until_ts`, `until_line_offset`, `until_segment_cursor`, `action`, `category`, `outcome`, `severity_min`, `trace_id`, `q` (substring across `message` + `attributes`), `hide_internal` (drops `event.category = "internal"`), `limit`. The legacy `until_id` field remains available for timestamp/ID cursor compatibility.
 
 Every other `?<key>=<value>` is treated as a per-attribution equality
 filter, the gateway validates the key against `is_attribution_field`
@@ -255,9 +255,14 @@ curl "$ZEROCLAW_GATEWAY/api/logs?trace_id=<value-from-a-prior-event>"
 
 </div>
 
-Log pagination walks backward with a byte-offset cursor. While `at_end` is false, pass a non-null `next_cursor_line_offset` back as `until_line_offset` with the same non-cursor filters to load older events without re-reading newer bytes. Restart from the newest page after changing filters. Treat `at_end: true` as the signal to stop requesting older pages for that pagination walk. The legacy `next_cursor: [timestamp, id] | null` response remains for compatibility; using its timestamp/ID pair as `until_ts` and `until_id` for pagination is deprecated because the lexicographic ID tie-break can silently skip events with the same timestamp.
+Log pagination walks backward with a segment-aware cursor. While `at_end` is false:
+1. Prefer `next_segment_cursor` (format `"<segment_basename>:<byte_offset>"`) passed back as `until_segment_cursor`. This cursor identifies the exact archive segment and position, and is the only cursor that can advance once the oldest event in a page is in a rotated archive.
+2. Fall back to `next_cursor_line_offset` passed back as `until_line_offset` when the segment cursor is absent. This is a plain byte offset into the active file and resolves to `null` when the oldest event is in an archive.
+3. The legacy `next_cursor: [timestamp, id] | null` response remains for compatibility; passing it back as `until_ts` + `until_id` is deprecated because the lexicographic ID tie-break can silently skip events with the same timestamp.
 
-`until_line_offset` is a position in the current active file, not a durable event checkpoint. Pure appends preserve it, but rolling trim, archive rotation, startup migration, and a configured path change replace the bytes or active file it refers to. Restart from the newest page after those boundaries rather than reusing an older offset. `/api/logs` reads only the active file; inspect timestamped archives directly when older rotated history is required.
+Restart from the newest page after changing filters. Treat `at_end: true` as the signal to stop requesting older pages for that walk.
+
+`until_line_offset` is a position in the current active file. Archive rotation, startup migration, and a configured path change replace the bytes or active file it refers to; restart from the newest page after those boundaries. `until_segment_cursor` is stable across rotations for retained archives but becomes stale once the named archive is pruned by retention; the reader falls back to a full scan in that case.
 
 The `/api/status` response includes `daemon_started_at: string` (RFC
 3339), so a dashboard can default to "since daemon start" without an

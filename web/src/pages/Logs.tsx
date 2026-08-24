@@ -154,16 +154,16 @@ export default function Logs() {
   const [events, setEvents] = useState<LogEvent[]>([]);
   const [daemonStartedAt, setDaemonStartedAt] = useState('');
   const [attributionKeys, setAttributionKeys] = useState<string[]>([]);
-  // Prefer the byte-offset cursor returned by `next_cursor_line_offset`
-  // because it is independent of id ordering and avoids the legacy
-  // `(until_ts, until_id)` tie-break that can drop earlier-written
-  // events when ids are written in non-lexicographic order. Fall back
-  // to the legacy `[timestamp, id]` cursor when the daemon has not been
-  // upgraded to expose the byte-offset field. The state is normalized
-  // to `number | null` on assignment (omitted vs explicit-null both
-  // deserialize to `null`) so `loadOlder`'s `!== null` check treats an
-  // old-daemon omitted field the same as an explicit-null field and
-  // routes through the legacy cursor branch instead of no-cursor.
+  // Prefer the segment-aware cursor returned by `next_segment_cursor`
+  // (identifies both the segment file and the byte offset within it), which
+  // allows `loadOlder` to paginate across rotated archive files. Fall back to
+  // the plain byte-offset cursor `next_cursor_line_offset` when the segment
+  // cursor is absent (daemon not yet upgraded). Fall back to the legacy
+  // `(until_ts, until_id)` pair as a last resort for very old daemons. The
+  // segment-cursor state is normalized to `string | null` on assignment so
+  // the `!== null` check in `loadOlder` treats an omitted field the same as
+  // explicit-null and routes to the next fallback branch instead of no-cursor.
+  const [cursorOlderSegment, setCursorOlderSegment] = useState<string | null>(null);
   const [cursorOlderOffset, setCursorOlderOffset] = useState<number | null>(null);
   const [cursorOlderLegacy, setCursorOlderLegacy] = useState<[string, string] | null>(null);
   const [atEnd, setAtEnd] = useState(false);
@@ -223,6 +223,7 @@ export default function Logs() {
       // explicit `null`. `loadOlder`'s `!== null` check must treat both
       // the same way — fall back to the legacy cursor — so a missing
       // byte-offset field doesn't degrade pagination to "no cursor".
+      setCursorOlderSegment(response.next_segment_cursor ?? null);
       setCursorOlderOffset(response.next_cursor_line_offset ?? null);
       setCursorOlderLegacy(response.next_cursor);
       setAtEnd(response.at_end);
@@ -287,18 +288,23 @@ export default function Logs() {
   );
 
   const loadOlder = useCallback(async () => {
-    // Prefer the byte-offset cursor (independent of id ordering);
-    // fall back to the legacy `[timestamp, id]` pair when the daemon
-    // has not been upgraded to expose `next_cursor_line_offset`.
+    // Prefer the segment cursor: it is the only cursor that can advance once
+    // the oldest event on a page lives in a rotated archive (the daemon sets
+    // `next_cursor_line_offset` to null in that case). Fall back to the plain
+    // byte-offset cursor, then to the legacy `[timestamp, id]` pair for
+    // daemons predating each field.
+    const hasSegmentCursor = cursorOlderSegment !== null;
     const hasOffsetCursor = cursorOlderOffset !== null;
     const hasLegacyCursor = cursorOlderLegacy !== null;
-    if (!hasOffsetCursor && !hasLegacyCursor) return;
+    if (!hasSegmentCursor && !hasOffsetCursor && !hasLegacyCursor) return;
     if (atEnd || loadingOlder) return;
     setLoadingOlder(true);
     setError(null);
     try {
       const params = buildQueryParams(filterRef.current, {});
-      if (hasOffsetCursor) {
+      if (hasSegmentCursor) {
+        params.until_segment_cursor = cursorOlderSegment!;
+      } else if (hasOffsetCursor) {
         params.until_line_offset = cursorOlderOffset!;
       } else if (hasLegacyCursor) {
         params.until_ts = cursorOlderLegacy![0];
@@ -316,6 +322,7 @@ export default function Logs() {
         return merged.slice(0, RING_CAPACITY);
       });
       // See `initialLoad` for the omitted-vs-null normalization rationale.
+      setCursorOlderSegment(response.next_segment_cursor ?? null);
       setCursorOlderOffset(response.next_cursor_line_offset ?? null);
       setCursorOlderLegacy(response.next_cursor);
       setAtEnd(response.at_end);
@@ -324,7 +331,7 @@ export default function Logs() {
     } finally {
       setLoadingOlder(false);
     }
-  }, [atEnd, cursorOlderOffset, cursorOlderLegacy, loadingOlder]);
+  }, [atEnd, cursorOlderSegment, cursorOlderOffset, cursorOlderLegacy, loadingOlder]);
 
   // Filter changes invalidate the ring — re-base from the new constraints.
   const filterKey = useMemo(() => JSON.stringify(filter), [filter]);
