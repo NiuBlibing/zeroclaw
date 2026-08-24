@@ -1512,26 +1512,37 @@ fn image_format_for_mime(source: &str, mime: &str) -> anyhow::Result<image::Imag
 }
 
 /// Extra bytes per pixel a **still** WebP decode holds on top of its output
-/// buffer. Decoding a lossless non-alpha frame fills a `width * height * 4`
-/// RGBA scratch buffer and only then copies it into the 3-byte-per-pixel
-/// output, so both are live at once (`image-webp` 0.2.4 `src/decoder.rs`,
-/// `read_image`).
-const WEBP_STILL_SCRATCH_BYTES_PER_PIXEL: u64 = 4;
+/// buffer, covering the worst case across alpha and non-alpha shapes.
+///
+/// - *Non-alpha* (`Rgb8`, 3 B/px output): lossless decode allocates a
+///   `width * height * 4` RGBA scratch and converts it to the 3 B/px output.
+///   Scratch = 4 B/px.
+/// - *Alpha* (`Rgba8`, 4 B/px output): `read_alpha_chunk` lossless branch
+///   allocates a `width * height * 4` RGBA buffer and a separate
+///   `width * height * 1` green plane, both live alongside the 4 B/px output.
+///   Scratch = 4 + 1 = 5 B/px.
+///
+/// 5 is used here so a single constant covers both shapes without needing to
+/// inspect `has_alpha` at projection time.
+const WEBP_STILL_SCRATCH_BYTES_PER_PIXEL: u64 = 5;
 
 /// Extra bytes per pixel an **animated** WebP decode holds on top of its
-/// output buffer. Three further full-canvas buffers overlap while a single
-/// frame is produced:
+/// output buffer, covering the worst case across alpha and non-alpha shapes.
 ///
-/// - the decoded frame buffer, 4 bytes per pixel for a lossless or
-///   alpha-carrying frame (`image-webp` 0.2.4 `src/decoder.rs`, `read_frame`);
-/// - the persistent composition canvas, always 4 bytes per pixel, allocated
-///   lazily on the first frame (same function);
-/// - the adapter's per-frame `RgbImage` *and* the `RgbaImage` it converts into
-///   (`image` 0.25.10 `src/codecs/webp/decoder.rs`, `into_frames`) — 3 + 4
-///   bytes per pixel, of which the 3 are already covered by the output charge.
+/// While one frame is produced, these full-canvas buffers overlap
+/// (`image-webp` 0.2.4 `src/decoder.rs` `read_frame`, and `image` 0.25.10
+/// `src/codecs/webp/decoder.rs` `into_frames`):
 ///
-/// That is 4 + 4 + 4 = 12 bytes per pixel beyond the output buffer.
-const WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL: u64 = 12;
+/// - the decoded frame buffer, 4 B/px;
+/// - for an alpha frame, `read_alpha_chunk`'s lossless branch adds a 4 B/px
+///   RGBA buffer plus a 1 B/px green plane;
+/// - the persistent composition canvas, always 4 B/px, allocated lazily on the
+///   first frame;
+/// - the adapter's per-frame `RgbImage` and the `RgbaImage` it converts into —
+///   3 + 4 B/px, of which the 3 are already covered by the output charge.
+///
+/// Worst case (alpha): 4 + 4 + 1 + 4 + 4 = 17 B/px beyond the output buffer.
+const WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL: u64 = 17;
 
 /// Worst-case peak decode allocation for one canvas, derived from the header
 /// alone. Reading the header does not decode pixels, so this is cheap enough
@@ -2095,6 +2106,20 @@ async fn validate_image_content_with_projection(
             projected_allocation,
         )
     })?
+    // Charge the same model admission used. Each branch above reports the
+    // buffer it can actually see — the decoded output, or the cumulative frame
+    // output for an animation — but the peak that admission reserved also
+    // covered decoder scratch that is never visible from out here (the WebP
+    // RGBA/alpha temporaries, the animation canvas and its RGB→RGBA
+    // conversion). Debiting only the visible buffer would let the shared
+    // counter drift below real consumption: with 16 candidates permitted, a
+    // sequence of valid sub-cap WebPs could each reserve their full peak at
+    // admission and refund most of it here, so the request would decode far
+    // more than the aggregate envelope claims. Taking the max keeps the
+    // counter an upper bound on work actually performed, while still charging
+    // the real figure whenever it is the larger of the two (a 16-bit PNG whose
+    // output exceeds the header projection).
+    .map(|actual| actual.max(projected_allocation))
 }
 
 fn detect_mime(
@@ -3760,6 +3785,116 @@ mod tests {
             budget,
             AGGREGATE_DECODE_BUDGET_BYTES - rgb16_bytes * 4,
             "four accepted candidates must debit four real allocations"
+        );
+    }
+
+    #[tokio::test]
+    async fn still_alpha_webp_is_refused_before_allocation_when_peak_exceeds_cap() {
+        // A valid 2800x2800 lossless alpha WebP illustrates the undercount the
+        // prior scratch model had: color_type() returns Rgba8 (4 B/px), so
+        // total_bytes() = 2800²×4 = 31,360,000. The old scratch addend (4 B/px)
+        // gave a projection of 62,720,000, below MAX_DECODED_IMAGE_ALLOC_BYTES
+        // (67,108,864). But read_alpha_chunk's lossless branch allocates another
+        // 2800²×4 RGBA buffer and a 2800²×1 green plane alongside the output, so
+        // the real peak is 2800²×(4+4+1) = 70,560,000. The corrected scratch
+        // (5 B/px) projects 2800²×(4+5) = 70,560,000, now above the cap.
+        //
+        // The fixture is built from a real encoder so the VP8X alpha flag, ALPH
+        // chunk, and VP8 opaque layer are all consistent with what the decoder
+        // checks — a mismatched fixture would fail in a different place.
+        let alpha_webp = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                2800,
+                2800,
+                image::Rgba([255, 0, 0, 128]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::WebP)
+            .expect("test alpha WebP encodes");
+            buf.into_inner()
+        };
+
+        // Sanity: the old projection would have admitted this image.
+        let old_proj = 2800u64 * 2800 * (4 + 4); // output + old scratch
+        assert!(
+            old_proj < MAX_DECODED_IMAGE_ALLOC_BYTES,
+            "old 4B/px scratch would have admitted this: {old_proj} < {MAX_DECODED_IMAGE_ALLOC_BYTES}"
+        );
+        // Sanity: the corrected projection refuses it.
+        let new_proj = 2800u64 * 2800 * (4 + WEBP_STILL_SCRATCH_BYTES_PER_PIXEL);
+        assert!(
+            new_proj >= MAX_DECODED_IMAGE_ALLOC_BYTES,
+            "new scratch must project above the cap: {new_proj} vs {MAX_DECODED_IMAGE_ALLOC_BYTES}"
+        );
+
+        let error = validate_image_content(
+            "alpha.webp",
+            "image/webp",
+            &png_alpha,
+            AGGREGATE_DECODE_BUDGET_BYTES,
+        )
+        .await
+        .expect_err("a 2800x2800 alpha WebP must be refused before pixel allocation");
+
+        assert_eq!(multimodal_error_kind(&error), "corrupt_image");
+        assert!(
+            error.to_string().contains("per-image limit"),
+            "refusal must name the per-image cap: {error}"
+        );
+
+        // Budget must be untouched — no decoder ran.
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        validate_within_budget("alpha.webp", "image/webp", &png_alpha, &mut budget)
+            .await
+            .expect_err("validate_within_budget must also refuse it");
+        assert_eq!(
+            budget, AGGREGATE_DECODE_BUDGET_BYTES,
+            "pre-decode refusal must not charge the shared budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_valid_webps_respect_the_aggregate_budget() {
+        // Regression for the charge/admission mismatch: admission deducts the
+        // projected peak (output + scratch) but the old success path only
+        // returned as_bytes().len() (output alone). With 16 candidates allowed,
+        // eight 3000×3000 non-alpha WebPs could each pass the pre-check while
+        // the counter claimed only ~216 MB consumed, even though the decoder
+        // actually ran at ~63 MB peak each time.
+        //
+        // After the fix the charge is max(actual, projected), so the counter
+        // accurately tracks the peak model. This test drives a real 1×1 still
+        // WebP through validate_within_budget many times and asserts the budget
+        // counter decrements by at least the projected peak each round, not just
+        // the raw output bytes.
+        let webp = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                1,
+                1,
+                image::Rgb([255, 0, 0]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::WebP)
+            .expect("test 1x1 WebP encodes");
+            buf.into_inner()
+        };
+
+        let proj = projected_allocation("ok.webp", "image/webp", &webp)
+            .expect("1x1 WebP must project without error");
+
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        let charged = validate_within_budget("ok.webp", "image/webp", &webp, &mut budget)
+            .await
+            .expect("a valid 1x1 WebP must be accepted");
+
+        assert!(
+            charged >= proj,
+            "charge must be at least the projected peak: charged={charged} proj={proj}"
+        );
+        assert_eq!(
+            budget,
+            AGGREGATE_DECODE_BUDGET_BYTES - charged,
+            "budget must decrease by the reported charge"
         );
     }
 
