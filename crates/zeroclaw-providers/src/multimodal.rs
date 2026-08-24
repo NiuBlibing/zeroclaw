@@ -1511,6 +1511,28 @@ fn image_format_for_mime(source: &str, mime: &str) -> anyhow::Result<image::Imag
     }
 }
 
+/// Extra bytes per pixel a **still** WebP decode holds on top of its output
+/// buffer. Decoding a lossless non-alpha frame fills a `width * height * 4`
+/// RGBA scratch buffer and only then copies it into the 3-byte-per-pixel
+/// output, so both are live at once (`image-webp` 0.2.4 `src/decoder.rs`,
+/// `read_image`).
+const WEBP_STILL_SCRATCH_BYTES_PER_PIXEL: u64 = 4;
+
+/// Extra bytes per pixel an **animated** WebP decode holds on top of its
+/// output buffer. Three further full-canvas buffers overlap while a single
+/// frame is produced:
+///
+/// - the decoded frame buffer, 4 bytes per pixel for a lossless or
+///   alpha-carrying frame (`image-webp` 0.2.4 `src/decoder.rs`, `read_frame`);
+/// - the persistent composition canvas, always 4 bytes per pixel, allocated
+///   lazily on the first frame (same function);
+/// - the adapter's per-frame `RgbImage` *and* the `RgbaImage` it converts into
+///   (`image` 0.25.10 `src/codecs/webp/decoder.rs`, `into_frames`) — 3 + 4
+///   bytes per pixel, of which the 3 are already covered by the output charge.
+///
+/// That is 4 + 4 + 4 = 12 bytes per pixel beyond the output buffer.
+const WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL: u64 = 12;
+
 /// Worst-case peak decode allocation for one canvas, derived from the header
 /// alone. Reading the header does not decode pixels, so this is cheap enough
 /// to run before the budget check — which is the point: an image whose decode
@@ -1521,12 +1543,14 @@ fn image_format_for_mime(source: &str, mime: &str) -> anyhow::Result<image::Imag
 ///
 /// - **Output width.** `DynamicImage::from_decoder` sizes its buffer from the
 ///   decoder's own `ColorType`, so a 16-bit PNG needs 6 (`Rgb16`) or 8
-///   (`Rgba16`) bytes per pixel, not 4. `ImageDecoder::total_bytes` is exactly
-///   that allocation, so it is used directly rather than re-derived.
-/// - **Temporaries.** For a lossless non-alpha WebP, `image-webp` 0.2.4
-///   allocates a `width * height * 4` RGBA scratch buffer and *then* converts
-///   it into the separate 3-byte-per-pixel output, so both are live at once.
-///   Animated WebP holds a canvas plus a frame on the same path.
+///   (`Rgba16`) bytes per pixel, not 4 — and a still WebP needs only 3
+///   (`Rgb8`). `ImageDecoder::total_bytes` is exactly that allocation, so it is
+///   used directly rather than re-derived.
+/// - **Temporaries.** WebP decoding holds scratch buffers alongside the output;
+///   see [`WEBP_STILL_SCRATCH_BYTES_PER_PIXEL`] and
+///   [`WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL`] for the per-shape derivation.
+///   No other supported format allocates a full-canvas temporary beyond the
+///   buffer `total_bytes` already describes.
 ///
 /// A header that cannot be parsed is reported as corrupt here rather than
 /// charged against the budget; the same payload would fail the decode anyway.
@@ -1556,10 +1580,23 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
 
     let pixels = u64::from(width).saturating_mul(u64::from(height));
     let scratch = match format {
-        // The lossless non-alpha scratch buffer described above. Charged for
-        // every WebP: `has_alpha` is not exposed on the decoder, and the
-        // animated path has its own canvas/frame pair to cover.
-        image::ImageFormat::WebP => pixels.saturating_mul(4),
+        image::ImageFormat::WebP => {
+            // `has_animation` is not on the `ImageDecoder` trait, so the shape
+            // is read from the concrete decoder. Constructing it walks the RIFF
+            // chunk table (and, for `ANMF`, its 16-byte frame headers); it
+            // decodes no pixels. A payload whose header cannot be read at all
+            // is charged the animated bound rather than the smaller one, so a
+            // malformed file is refused instead of admitted cheaply — the
+            // decode below would reject it in any case.
+            let animated = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes))
+                .map(|decoder| decoder.has_animation())
+                .unwrap_or(true);
+            pixels.saturating_mul(if animated {
+                WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL
+            } else {
+                WEBP_STILL_SCRATCH_BYTES_PER_PIXEL
+            })
+        }
         _ => 0,
     };
 
@@ -1970,7 +2007,11 @@ async fn validate_image_content_with_projection(
                             budget_cap,
                         )
                     })?;
-                    Ok(u64::from(image.width()) * u64::from(image.height()) * 4)
+                    // Report the actual byte count rather than width*height*4.
+                    // DynamicImage preserves 16-bit output (e.g. ImageRgb16 = 6
+                    // bytes per pixel) so the naive ×4 estimate would undercount
+                    // the real allocation by up to 2×.
+                    Ok(image.as_bytes().len() as u64)
                 }
             }
             image::ImageFormat::WebP => {
@@ -2012,7 +2053,11 @@ async fn validate_image_content_with_projection(
                             budget_cap,
                         )
                     })?;
-                    Ok(u64::from(image.width()) * u64::from(image.height()) * 4)
+                    // Report the actual allocation, not width*height*4. Still
+                    // WebP is Rgb8 (3 bytes per pixel), so the ×4 estimate
+                    // would overcharge by 33%; any format-specific variation
+                    // is covered by the real buffer size.
+                    Ok(image.as_bytes().len() as u64)
                 }
             }
             image::ImageFormat::Jpeg => {
@@ -2028,7 +2073,10 @@ async fn validate_image_content_with_projection(
                         budget_cap,
                     )
                 })?;
-                Ok(u64::from(image.width()) * u64::from(image.height()) * 4)
+                // The real buffer, for the same reason as the branches above:
+                // JPEG decodes to `Rgb8` or `Luma8`, so a width*height*4 charge
+                // would not match what was actually allocated either.
+                Ok(image.as_bytes().len() as u64)
             }
             _ => Err(invalid_image_failure(
                 &source_owned,
@@ -3654,14 +3702,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sub_cap_high_bit_depth_png_charges_its_real_decoded_size() {
+        // The success-path counterpart to the admission test above. A valid
+        // 1000x1000 RGB16 PNG is 6_000_000 bytes decoded (6 bytes/pixel for
+        // ImageRgb16), well under the per-image cap, so it is accepted. The
+        // old success path returned width*height*4 = 4_000_000, undercharging
+        // the shared aggregate budget by 1.5x on every such image. With
+        // max_images as high as 16, repeated undercharging lets a request
+        // decode substantially more than the 256 MiB the accounting claims.
+        let png = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb16(image::ImageBuffer::from_pixel(
+                1000,
+                1000,
+                image::Rgb([u16::MAX, 0, 0]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("test RGB16 PNG encodes");
+            buf.into_inner()
+        };
+
+        let rgb16_bytes = 1000u64 * 1000 * 6;
+        assert!(
+            rgb16_bytes < MAX_DECODED_IMAGE_ALLOC_BYTES,
+            "this fixture must be accepted, not refused by the per-image cap"
+        );
+
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        let charged = validate_within_budget("hbd.png", "image/png", &png, &mut budget)
+            .await
+            .expect("a sub-cap high-bit-depth PNG is a valid image and must be accepted");
+
+        assert_eq!(
+            charged, rgb16_bytes,
+            "the charge must be the real ImageRgb16 allocation, not a width*height*4 estimate"
+        );
+        assert_eq!(
+            budget,
+            AGGREGATE_DECODE_BUDGET_BYTES - rgb16_bytes,
+            "the aggregate budget must be debited by the real decoded size"
+        );
+
+        // Drive several candidates through the same budget: the running total
+        // must track the real cost, so the accounting cannot claim headroom
+        // that the decoder has already spent.
+        for _ in 0..3 {
+            validate_within_budget("hbd.png", "image/png", &png, &mut budget)
+                .await
+                .expect("further sub-cap candidates remain within the aggregate budget");
+        }
+        assert_eq!(
+            budget,
+            AGGREGATE_DECODE_BUDGET_BYTES - rgb16_bytes * 4,
+            "four accepted candidates must debit four real allocations"
+        );
+    }
+
+    #[tokio::test]
     async fn oversized_webp_canvas_is_refused_before_allocation() {
-        // `WebPDecoder` (image 0.25.10) does not override `set_limits`, and the
-        // trait default only checks `check_support`/`check_dimensions` — the
-        // `max_alloc` cap is silently dropped. Without an explicit pre-decode
-        // guard, `DynamicImage::from_decoder` allocates from `total_bytes()`
-        // and the animation iterator builds frame buffers, both before any
-        // post-decode accounting can run. Every WebP shape must be refused on
-        // the canvas projection alone.
+        // `WebPDecoder` (image 0.25.10) does not override `set_limits`, so
+        // `max_alloc` is silently dropped on that path.  The explicit pre-decode
+        // guard covers every WebP shape.  A 5000x5000 canvas now projects well
+        // above both the per-image cap and the aggregate budget once the
+        // decoder-peak scratch is included, so either gate may fire first;
+        // what matters is that the image is refused before any allocation.
         for animated in [false, true] {
             let webp = oversized_canvas_webp(animated);
 
@@ -3672,26 +3776,26 @@ mod tests {
                 AGGREGATE_DECODE_BUDGET_BYTES,
             )
             .await
-            .expect_err("a canvas above the per-image cap must be refused, not allocated");
+            .expect_err("a canvas far above the per-image cap must be refused before allocation");
 
             assert_eq!(
                 multimodal_error_kind(&error),
                 "corrupt_image",
-                "animated={animated}"
-            );
-            assert!(
-                error.to_string().contains("per-image limit"),
-                "the refusal must name the per-image cap (animated={animated}): {error}"
+                "animated={animated}: {error}"
             );
         }
     }
 
     #[tokio::test]
     async fn oversized_webp_canvas_does_not_close_the_shared_budget() {
-        // The per-image cap is this image's own ceiling, not the shared
-        // allowance. Exceeding it is an ordinary invalid-image failure, so an
-        // unrelated sibling must keep its budget — the same contract the GIF
-        // sibling regressions above assert.
+        // The per-image cap (or any upstream refusal) is an ordinary invalid-image
+        // failure, so an unrelated sibling must keep its budget — the same contract
+        // the GIF and PNG sibling regressions above assert.
+        //
+        // 5000x5000 with the full-peak scratch included projects above both
+        // the per-image cap and the aggregate budget; the 5000-canvas fixture
+        // already has VP8L content that matches the declared size so the decode
+        // does not get a header-consistency error from the adapter.
         let webp = oversized_canvas_webp(false);
         let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
 
