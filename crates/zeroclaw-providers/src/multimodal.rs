@@ -1046,6 +1046,30 @@ struct ImageNormalizeCtx<'a> {
     role: &'a str,
 }
 
+/// Structured attributes for a skipped-image event.
+///
+/// The raw reference is deliberately **not** included. `source_kind` carries
+/// the reference class (local / remote / data), which is what an operator
+/// needs to locate the failing path, while the reference itself would leak
+/// untrusted input into logs: a local path exposes workspace or user naming,
+/// a remote URL can carry query credentials or a private endpoint, and a data
+/// URI exposes the image/base64 prefix. `reason` is the sanitized decoder
+/// message, which already has the source scrubbed from it.
+fn skipped_image_log_attrs(
+    ctx: &ImageNormalizeCtx<'_>,
+    reference: &str,
+    error_kind: &str,
+    error_reason: Option<&str>,
+) -> ::serde_json::Value {
+    ::serde_json::json!({
+        "message_index": ctx.message_index,
+        "message_role": ctx.role,
+        "source_kind": image_reference_kind(reference),
+        "error_kind": error_kind,
+        "reason": error_reason.unwrap_or(""),
+    })
+}
+
 async fn normalize_image_references(
     refs: &[String],
     config: &MultimodalConfig,
@@ -1073,18 +1097,9 @@ async fn normalize_image_references(
             Err(error) => {
                 skipped_count += 1;
                 let error_reason = multimodal_error_reason(&error);
-                // Truncate the raw reference so we don't dump a full base64
-                // payload into the log, but keep enough to identify the source.
-                let marker_preview: String = reference.chars().take(120).collect();
                 let error_kind = multimodal_error_kind(&error);
-                let attrs = ::serde_json::json!({
-                    "message_index": ctx.message_index,
-                    "message_role": ctx.role,
-                    "source_kind": image_reference_kind(reference),
-                    "error_kind": error_kind,
-                    "reason": error_reason.as_deref().unwrap_or(""),
-                    "marker_preview": marker_preview,
-                });
+                let attrs =
+                    skipped_image_log_attrs(ctx, reference, error_kind, error_reason.as_deref());
                 let is_tool_role = ctx.role == "tool";
                 let is_recoverable_load_failure = matches!(
                     error_kind,
@@ -1814,7 +1829,14 @@ async fn validate_image_content_with_projection(
     // This is the image's own cap, not the shared allowance, so it is an
     // ordinary invalid-image failure: it must not close the budget for
     // unrelated siblings. Nothing has been decoded yet, hence a zero charge.
-    if projected_allocation > MAX_DECODED_IMAGE_ALLOC_BYTES {
+    // Use `>=` so a canvas that projects to exactly the limit is also refused:
+    // at the equality boundary the decoder's peak is substantially higher.
+    // For WebP lossless non-alpha, `image-webp` 0.2.4 allocates a temporary
+    // RGBA buffer (width × height × 4) and a separate RGB output; at 4096×4096
+    // both together exceed the stated cap. Animated WebP has additional frame
+    // buffers. Nothing is decoded before this check runs, so zero work is
+    // charged regardless of where the projection falls relative to the limit.
+    if projected_allocation >= MAX_DECODED_IMAGE_ALLOC_BYTES {
         return Err(ImageValidationFailure {
             error: MultimodalError::CorruptImage {
                 input: source.to_string(),
@@ -3437,21 +3459,20 @@ mod tests {
         .expect_err("a corrupt later WebP frame must be rejected");
     }
 
-    /// A WebP whose `VP8X` canvas is 5000x5000. That clears the 16,384-pixel
-    /// dimension limit and projects ~100 MB of RGBA — above the 64 MiB
-    /// per-image cap but below the 256 MiB aggregate budget, which is exactly
-    /// the window where `Limits::max_alloc` was the only thing standing
-    /// between the payload and a direct decoder allocation.
+    /// A WebP whose `VP8X` canvas is exactly `dimension` x `dimension`.
     ///
     /// `animated` selects the `ANIM`/`ANMF` form; the frames themselves stay
-    /// 1x1 so the fixture is small, proving the canvas alone is what gets the
-    /// payload refused.
-    fn oversized_canvas_webp(animated: bool) -> Vec<u8> {
+    /// 1x1 so the fixture is small, proving the declared canvas alone is what
+    /// gets the payload refused.
+    fn webp_with_canvas(dimension: u32, animated: bool) -> Vec<u8> {
         // 24-bit little-endian canvas width-1 and height-1.
-        const CANVAS_MINUS_ONE: [u8; 3] = [0x87, 0x13, 0x00]; // 4999 => 5000px
+        let minus_one = dimension - 1;
+        let encoded = minus_one.to_le_bytes();
+        let canvas_minus_one = [encoded[0], encoded[1], encoded[2]];
+
         let mut vp8x = vec![if animated { 0x02 } else { 0x00 }, 0, 0, 0];
-        vp8x.extend_from_slice(&CANVAS_MINUS_ONE);
-        vp8x.extend_from_slice(&CANVAS_MINUS_ONE);
+        vp8x.extend_from_slice(&canvas_minus_one);
+        vp8x.extend_from_slice(&canvas_minus_one);
 
         let mut body = b"WEBP".to_vec();
         append_webp_chunk(&mut body, b"VP8X", &vp8x);
@@ -3473,6 +3494,55 @@ mod tests {
         bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&body);
         bytes
+    }
+
+    /// A WebP whose `VP8X` canvas is 5000x5000 — strictly above the projection
+    /// threshold.
+    fn oversized_canvas_webp(animated: bool) -> Vec<u8> {
+        webp_with_canvas(5000, animated)
+    }
+
+    #[tokio::test]
+    async fn webp_canvas_at_the_per_image_cap_is_refused_before_allocation() {
+        // The equality boundary. 4096x4096x4 is exactly
+        // `MAX_DECODED_IMAGE_ALLOC_BYTES`, so a strict `>` comparison would
+        // admit it — and the projection is not the decoder's peak. For a
+        // lossless non-alpha WebP, `image-webp` 0.2.4 allocates a
+        // width x height x 4 temporary RGBA buffer and converts it into a
+        // separate RGB output owned by `DynamicImage::from_decoder`: 64 MiB
+        // plus another 48 MiB at this size, well past the per-image cap that
+        // `WebPDecoder` cannot itself enforce. Animated WebP adds frame
+        // buffers on the same path. The canvas must therefore be refused at
+        // the cap, not merely above it.
+        const CAP_DIMENSION: u32 = 4096;
+        assert_eq!(
+            u64::from(CAP_DIMENSION) * u64::from(CAP_DIMENSION) * 4,
+            MAX_DECODED_IMAGE_ALLOC_BYTES,
+            "this fixture must sit exactly on the cap for the boundary to be covered"
+        );
+
+        for animated in [false, true] {
+            let webp = webp_with_canvas(CAP_DIMENSION, animated);
+
+            let error = validate_image_content(
+                "boundary.webp",
+                "image/webp",
+                &webp,
+                AGGREGATE_DECODE_BUDGET_BYTES,
+            )
+            .await
+            .expect_err("a canvas landing exactly on the per-image cap must be refused");
+
+            assert_eq!(
+                multimodal_error_kind(&error),
+                "corrupt_image",
+                "animated={animated}"
+            );
+            assert!(
+                error.to_string().contains("per-image limit"),
+                "the refusal must name the per-image cap (animated={animated}): {error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3534,6 +3604,76 @@ mod tests {
             AGGREGATE_DECODE_BUDGET_BYTES - allocation,
             "only the sibling's real decode is charged"
         );
+    }
+
+    #[test]
+    fn skipped_image_log_attrs_never_carry_the_raw_reference() {
+        // The skip event is emitted for untrusted input on a path that now
+        // fires far more often (corrupt payloads, over-cap canvases). It must
+        // carry only the reference *class*, never the reference: a local path
+        // exposes workspace and user naming, a remote URL can carry query
+        // credentials or a private endpoint, and a data URI exposes the
+        // image/base64 prefix.
+        //
+        // Asserting on the attrs value rather than on a captured tracing event
+        // keeps this deterministic: it needs no global subscriber, so it
+        // cannot be silently defeated by whichever test installs one first.
+        let ctx = ImageNormalizeCtx {
+            message_index: 3,
+            role: "user",
+        };
+
+        // One reference per source class, each carrying a distinctive secret
+        // that must not survive into the event, plus the class the event is
+        // still expected to disclose.
+        let cases = [
+            (
+                "/home/alice/s3cr3t-workspace/photo.png",
+                "s3cr3t-workspace",
+                "local",
+            ),
+            (
+                "https://internal.example.com/img?token=s3cr3t-token",
+                "s3cr3t-token",
+                "remote",
+            ),
+            (
+                "data:image/png;base64,czNjcjN0LXBheWxvYWQ=",
+                "czNjcjN0LXBheWxvYWQ",
+                "data",
+            ),
+        ];
+
+        for (reference, secret, expected_kind) in cases {
+            let attrs = skipped_image_log_attrs(
+                &ctx,
+                reference,
+                "corrupt_image",
+                Some("decoded canvas exceeds per-image limit"),
+            );
+            let rendered = attrs.to_string();
+
+            assert!(
+                !rendered.contains(secret),
+                "the skip event leaked {secret:?} from the raw reference: {rendered}"
+            );
+            assert!(
+                !rendered.contains(reference),
+                "the skip event must not carry the reference verbatim: {rendered}"
+            );
+            // The non-sensitive classification must survive, otherwise this
+            // test would pass simply by the event losing all its context.
+            assert_eq!(
+                attrs.get("source_kind").and_then(|v| v.as_str()),
+                Some(expected_kind),
+                "the event must keep its non-sensitive source classification: {rendered}"
+            );
+            assert_eq!(
+                attrs.get("error_kind").and_then(|v| v.as_str()),
+                Some("corrupt_image"),
+                "the event must keep its error classification: {rendered}"
+            );
+        }
     }
 
     #[tokio::test]
