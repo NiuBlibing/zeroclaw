@@ -1511,10 +1511,22 @@ fn image_format_for_mime(source: &str, mime: &str) -> anyhow::Result<image::Imag
     }
 }
 
-/// Admission charge for one decoded canvas, derived from the header alone.
-/// Reading dimensions does not decode pixels, so this is cheap enough to run
-/// before the budget check — which is the point: an image whose first canvas
+/// Worst-case peak decode allocation for one canvas, derived from the header
+/// alone. Reading the header does not decode pixels, so this is cheap enough
+/// to run before the budget check — which is the point: an image whose decode
 /// cannot fit the remaining budget is refused without ever being decoded.
+///
+/// This must bound the decoder's *peak*, not a nominal RGBA canvas. Two ways
+/// the two differ, both of which a `width * height * 4` estimate misses:
+///
+/// - **Output width.** `DynamicImage::from_decoder` sizes its buffer from the
+///   decoder's own `ColorType`, so a 16-bit PNG needs 6 (`Rgb16`) or 8
+///   (`Rgba16`) bytes per pixel, not 4. `ImageDecoder::total_bytes` is exactly
+///   that allocation, so it is used directly rather than re-derived.
+/// - **Temporaries.** For a lossless non-alpha WebP, `image-webp` 0.2.4
+///   allocates a `width * height * 4` RGBA scratch buffer and *then* converts
+///   it into the separate 3-byte-per-pixel output, so both are live at once.
+///   Animated WebP holds a canvas plus a frame on the same path.
 ///
 /// A header that cannot be parsed is reported as corrupt here rather than
 /// charged against the budget; the same payload would fail the decode anyway.
@@ -1530,16 +1542,28 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
     reader.set_format(format);
     reader.limits(limits);
 
-    let (width, height) =
-        reader
-            .into_dimensions()
-            .map_err(|error| MultimodalError::CorruptImage {
-                input: source.to_string(),
-                mime: mime.to_string(),
-                reason: error.to_string(),
-            })?;
+    let corrupt = |error: image::ImageError| MultimodalError::CorruptImage {
+        input: source.to_string(),
+        mime: mime.to_string(),
+        reason: error.to_string(),
+    };
 
-    Ok(u64::from(width) * u64::from(height) * 4)
+    // Header-only: this parses IHDR / RIFF chunk headers / the GIF screen
+    // descriptor, it does not decode pixels.
+    let decoder = reader.into_decoder().map_err(corrupt)?;
+    let (width, height) = image::ImageDecoder::dimensions(&decoder);
+    let output = image::ImageDecoder::total_bytes(&decoder);
+
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    let scratch = match format {
+        // The lossless non-alpha scratch buffer described above. Charged for
+        // every WebP: `has_alpha` is not exposed on the decoder, and the
+        // animated path has its own canvas/frame pair to cover.
+        image::ImageFormat::WebP => pixels.saturating_mul(4),
+        _ => 0,
+    };
+
+    Ok(output.saturating_add(scratch))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1816,26 +1840,22 @@ async fn validate_image_content_with_projection(
         kind: ImageValidationFailureKind::InvalidImage,
     })?;
 
-    // Enforce the per-image allocation cap ourselves, before any decoder can
-    // allocate. `Limits::max_alloc` is not a reliable guard here: the trait's
-    // default `set_limits` only checks `check_support` and `check_dimensions`,
-    // and `WebPDecoder` (image 0.25.10) does not override it, so the cap is
-    // silently dropped on that path. A 5000x5000 WebP clears the dimension
-    // limit and the aggregate budget, yet still projects ~100 MB — above the
-    // per-image cap — and would otherwise reach a direct allocation in
-    // `DynamicImage::from_decoder` or in the animation frame iterator before
-    // the post-decode accounting in `validate_animation_frames` can run.
+    // Enforce the per-image allocation cap before any decoder can allocate.
+    // `projected_allocation` now returns the decoder's worst-case peak — output
+    // bytes from `total_bytes` plus any format-specific temporaries (WebP
+    // lossless scratch). Refusing here prevents both the equality-boundary case
+    // (4096×4096 RGBA = exactly 64 MiB but the decoder also holds temporaries)
+    // and sub-threshold payloads whose actual peak exceeds the cap
+    // (e.g. 4000×4000 lossless WebP: 60 MiB projected but ~112 MiB at peak).
     //
-    // This is the image's own cap, not the shared allowance, so it is an
-    // ordinary invalid-image failure: it must not close the budget for
-    // unrelated siblings. Nothing has been decoded yet, hence a zero charge.
-    // Use `>=` so a canvas that projects to exactly the limit is also refused:
-    // at the equality boundary the decoder's peak is substantially higher.
-    // For WebP lossless non-alpha, `image-webp` 0.2.4 allocates a temporary
-    // RGBA buffer (width × height × 4) and a separate RGB output; at 4096×4096
-    // both together exceed the stated cap. Animated WebP has additional frame
-    // buffers. Nothing is decoded before this check runs, so zero work is
-    // charged regardless of where the projection falls relative to the limit.
+    // `Limits::max_alloc` alone is not sufficient: WebPDecoder (image 0.25.10)
+    // inherits the trait default for `set_limits`, which checks dimensions but
+    // does not enforce the allocation limit, so the cap would be silently
+    // dropped on that path.
+    //
+    // Ordinary invalid-image failure: this is the image's own ceiling, not
+    // the shared allowance, so it must not close the budget for siblings.
+    // Nothing has been decoded yet, hence a zero charge.
     if projected_allocation >= MAX_DECODED_IMAGE_ALLOC_BYTES {
         return Err(ImageValidationFailure {
             error: MultimodalError::CorruptImage {
@@ -3543,6 +3563,94 @@ mod tests {
                 "the refusal must name the per-image cap (animated={animated}): {error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn webp_below_cap_threshold_is_refused_when_decoder_peak_would_exceed_it() {
+        // A 4000x4000 lossless non-alpha WebP projects to 64_000_000 bytes,
+        // which is below MAX_DECODED_IMAGE_ALLOC_BYTES (67_108_864).  The old
+        // width*height*4 projection would therefore admit it.  But
+        // image-webp 0.2.4 allocates a width*height*4 RGBA scratch buffer AND
+        // a separate width*height*3 RGB output before returning, so the actual
+        // peak is ~112 MB — well above the 64 MiB cap.  projected_allocation
+        // now adds the scratch cost, so the image is refused before any
+        // decoder runs.
+        for animated in [false, true] {
+            let webp = webp_with_canvas(4000, animated);
+
+            let error = validate_image_content(
+                "compact.webp",
+                "image/webp",
+                &webp,
+                AGGREGATE_DECODE_BUDGET_BYTES,
+            )
+            .await
+            .expect_err(
+                "a 4000x4000 WebP must be refused even though its projection is below the cap",
+            );
+
+            assert_eq!(
+                multimodal_error_kind(&error),
+                "corrupt_image",
+                "animated={animated}"
+            );
+            assert!(
+                error.to_string().contains("per-image limit"),
+                "refusal must name the per-image cap (animated={animated}): {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn high_bit_depth_png_is_refused_when_output_exceeds_cap() {
+        // A valid 3000x3000 RGB16 PNG projects to 3000*3000*6 = 54_000_000
+        // bytes from the decoder's actual ColorType — above the 64 MiB cap
+        // when accounting for the real output width (6 bytes/pixel for Rgb16,
+        // not 4).  projected_allocation now uses total_bytes(), which returns
+        // the decoder's own output-buffer size, so this is caught before
+        // DynamicImage::from_decoder allocates.
+        let png = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb16(image::ImageBuffer::from_pixel(
+                3000,
+                3000,
+                image::Rgb([u16::MAX, 0, 0]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("test RGB16 PNG encodes");
+            buf.into_inner()
+        };
+
+        // Sanity-check that the output byte count really exceeds the cap.
+        let rgb16_bytes = u64::from(3000u32) * u64::from(3000u32) * 6;
+        assert!(
+            rgb16_bytes > MAX_DECODED_IMAGE_ALLOC_BYTES,
+            "test fixture must project above the cap: {rgb16_bytes} vs {MAX_DECODED_IMAGE_ALLOC_BYTES}"
+        );
+
+        let error =
+            validate_image_content("hbd.png", "image/png", &png, AGGREGATE_DECODE_BUDGET_BYTES)
+                .await
+                .expect_err(
+                    "a 3000x3000 RGB16 PNG must be refused before its output buffer is allocated",
+                );
+
+        assert_eq!(multimodal_error_kind(&error), "corrupt_image");
+        assert!(
+            error.to_string().contains("per-image limit"),
+            "refusal must name the per-image cap: {error}"
+        );
+
+        // An unrelated valid sibling must keep the shared budget intact,
+        // because the pre-decode refusal charges nothing.
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        validate_within_budget("hbd.png", "image/png", &png, &mut budget)
+            .await
+            .expect_err("high-bit-depth PNG must be refused via validate_within_budget too");
+        assert_eq!(
+            budget, AGGREGATE_DECODE_BUDGET_BYTES,
+            "pre-decode refusal must not charge the shared budget"
+        );
     }
 
     #[tokio::test]
