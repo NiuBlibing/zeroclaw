@@ -206,15 +206,7 @@ fn init_from_config_with_migration_and_shutdown_warning<F>(
 
     if policy.storage.is_enabled() {
         let initial_line_count = if policy.max_entries_per_segment > 0 {
-            count_nonempty_lines(&policy.path)
-                .unwrap_or_else(|err| {
-                    tracing::warn!(
-                        target: "zeroclaw_log",
-                        error = ?err,
-                        "log: could not count existing active file lines for entry-count trigger; starting from 0"
-                    );
-                    0
-                }) as u64
+            seed_line_count(&policy.path)
         } else {
             0
         };
@@ -767,6 +759,34 @@ fn count_nonempty_lines(path: &Path) -> Result<usize> {
     Ok(n)
 }
 
+/// Seed the in-memory line counter at worker startup. A missing active file
+/// is the normal state for a fresh workspace and returns `0` silently.
+/// Any other I/O error is logged at `warn` level and also returns `0` so the
+/// worker can start rather than panicking; it will self-correct once enough
+/// events are written to trigger an entry-count rotation.
+fn seed_line_count(path: &Path) -> u64 {
+    match count_nonempty_lines(path) {
+        Ok(n) => n as u64,
+        Err(ref err)
+            if err
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .map(|e| e.kind() == std::io::ErrorKind::NotFound)
+                .unwrap_or(false) =>
+        {
+            0
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "zeroclaw_log",
+                error = ?err,
+                "log: could not seed entry-count from active file; starting from 0"
+            );
+            0
+        }
+    }
+}
+
 /// Rotate the active file to an archive when it has crossed a UTC day boundary
 /// since its last write. No-op when daily rotation is off, the file is absent,
 /// or it was last written today. Returns `true` when a rotation occurred.
@@ -830,7 +850,7 @@ fn maybe_rotate_for_entry_count(state: &Arc<WorkerState>) -> Result<bool> {
         return Ok(false);
     }
     let count = state.line_count.load(Ordering::Relaxed);
-    if count <= cap as u64 {
+    if count < cap as u64 {
         return Ok(false);
     }
     let path = &state.policy.path;
@@ -2052,10 +2072,13 @@ mod tests {
 
         emit("event-1");
         emit("event-2");
-        // Two events reached the cap; the 3rd write must trigger a rotation.
-        assert!(
-            list_archives(&path).unwrap().is_empty(),
-            "no rotation yet after exactly cap events"
+        // The cap is 2; the active file now holds exactly cap entries, so the
+        // next write triggers rotation (count >= cap after the append).
+        let archives_before = list_archives(&path).unwrap();
+        assert_eq!(
+            archives_before.len(),
+            1,
+            "rotation must fire when segment reaches cap (>= cap trigger)"
         );
         emit("event-3");
         let archives = list_archives(&path).unwrap();

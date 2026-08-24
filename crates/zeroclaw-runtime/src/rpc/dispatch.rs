@@ -4035,8 +4035,9 @@ impl RpcDispatcher {
     async fn handle_logs_query(&self, params: &Value) -> RpcResult {
         let p: LogsQueryParams = parse_params(params)?;
 
-        let path = zeroclaw_log::current_log_path()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"))?;
+        let Some((active, archives)) = zeroclaw_log::segment_files() else {
+            return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
+        };
 
         let filter = zeroclaw_log::LogFilter {
             since_ts: p.since_ts,
@@ -4054,9 +4055,19 @@ impl RpcDispatcher {
         };
 
         let limit = p.limit.unwrap_or(200);
+        let segment_cursor = p
+            .until_segment_cursor
+            .as_deref()
+            .and_then(zeroclaw_log::SegmentCursor::from_wire);
 
-        let page = zeroclaw_log::load_page(&path, &filter, limit)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
+        let page = zeroclaw_log::load_page_multi(
+            &active,
+            &archives,
+            &filter,
+            limit,
+            segment_cursor.as_ref(),
+        )
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
 
         let events: Vec<serde_json::Value> = page
             .events
@@ -4068,6 +4079,7 @@ impl RpcDispatcher {
             events,
             next_cursor: page.next_cursor,
             next_cursor_line_offset: page.next_cursor_line_offset,
+            next_segment_cursor: page.next_segment_cursor,
             at_end: page.at_end,
         })
     }

@@ -231,20 +231,31 @@ The on-disk JSON shape (`LogEvent` in `event.rs`):
 
 Do not use Observer output or SSE delivery to prove that every canonical event was retained. Conversely, do not assume a row absent from JSONL was never emitted: it may have reached live broadcast, and the Observer bridge when bound, before the persistence queue dropped or failed it.
 
-## Reader cursors belong to one active file
+## Reader cursors span the active file and retained archives
 
-`GET /api/logs` resolves the writer's current active path and calls `reader::load_page`. The reader scans that one JSONL file, keeps the newest matching window, and returns events newest first. It does not merge rotated archives.
+`GET /api/logs` and `logs/query` call `reader::load_page_multi`, which merges the
+active file plus all retained archive files into one logical event stream. Segments
+are scanned oldest-archive-first and the merged result is returned newest-first,
+identical to the prior single-file semantics. The merge is sequential and
+in-process; no event is re-serialized.
 
-The primary pagination cursor is `next_cursor_line_offset`, the byte offset immediately after the oldest matching event on the current page. A caller passes it back as `until_line_offset`; the next scan stops before that line and returns older matches. Pure appends preserve the prefix addressed by an existing cursor, so later events do not disturb an in-progress walk.
+The primary pagination cursor is `next_segment_cursor`, a composite
+`<segment_basename>:<byte_offset>` string that identifies both the segment file
+and the position within it. Pass it back as `until_segment_cursor` to resume;
+the next scan stops before that line in that segment and returns older matches.
 
-The offset is not a durable event identity or cross-file checkpoint. It becomes stale whenever the active file's bytes are replaced or its path changes:
+The legacy byte-offset cursor `next_cursor_line_offset` / `until_line_offset`
+remains valid and resolves against the active file only. It is `None` when the
+oldest event on the current page is in an archive file. For multi-segment
+deployments, use `next_segment_cursor` instead.
 
-- `rolling` trim streams the retained tail to a temporary file and renames it over the active path.
+The offset is not a durable event identity or cross-file checkpoint. A segment cursor becomes stale when the named archive is pruned by retention before the next request; the reader falls back to a full scan in that case. A byte-offset cursor becomes stale whenever the active file's bytes are replaced or its path changes:
+
 - `rotating` renames the active file to an archive; the next append creates a new active file.
 - schema migration rewrites the active file through a temporary file and atomic rename.
 - a daemon config reload can install a new persistence path.
 
-After one of those boundaries, restart pagination from the newest page. Reusing the old number can duplicate, skip, or return unrelated rows because the API does not attach file identity or generation metadata to the cursor. The legacy timestamp/ID cursor remains for compatibility but is deprecated under [#8012](https://github.com/zeroclaw-labs/zeroclaw/issues/8012) because lexicographic ID ordering can skip tied events.
+After one of those boundaries, restart pagination from the newest page. The legacy timestamp/ID cursor remains for compatibility but is deprecated under [#8012](https://github.com/zeroclaw-labs/zeroclaw/issues/8012) because lexicographic ID ordering can skip tied events.
 
 ## Persistence policy owns rewrites and retention
 
@@ -253,11 +264,11 @@ After one of those boundaries, restart pagination from the newest page. Reusing 
 | Policy | Active-file behavior | Retention owner |
 |---|---|---|
 | `none` | No new JSONL writes. | None. |
-| `rolling` | After an append exceeds `max_entries`, stream only the newest non-empty lines to a temporary file and rename it over the active file. | The writer keeps the configured active-window size. It creates no archives and leaves archives from an earlier `rotating` configuration unmanaged. |
+| `rolling` | Deprecated. Transparently remapped at resolve time to `rotating` with `max_entries_per_segment` set from `max_entries`. A deprecation warning is emitted at startup; update the config to `rotating` to silence it. | See `rotating`. |
 | `full` | Append without writer-managed trim or rotation. | The operator owns file growth and any external rotation. |
-| `rotating` | Before a new UTC day's first append, or after an append reaches the byte threshold, rename the active file to a timestamped archive. | After each successful rotation, the writer prunes matching archives by age and then count. Removal is best-effort and never fails the enclosing append. |
+| `rotating` | Before a new UTC day's first append, or after an append reaches the byte or entry-count threshold, rename the active file to a timestamped archive. | After each successful rotation, the writer prunes matching archives by age and then count. Removal is best-effort and never fails the enclosing append. |
 
-Age and count retention run only after rotation. They do not sweep continuously, do not apply to `full` or `rolling`, and do not delete arbitrary neighboring files: archive discovery accepts only names generated from the active path's timestamped archive shape. The live `/api/logs` reader still sees only the active file; archives are offline diagnostic artifacts.
+Age and count retention run only after rotation. They do not sweep continuously, do not apply to `full`, and do not delete arbitrary neighboring files: archive discovery accepts only names generated from the active path's timestamped archive shape. The live `/api/logs` reader merges the active file with all retained archives; see [Reader cursors](#reader-cursors-span-the-active-file-and-retained-archives).
 
 ## Schema migration is an active-file rewrite
 
@@ -269,7 +280,7 @@ Migration is best-effort. Its cheap schema check stops at the first non-empty ro
 
 ## `LogConfig` vs `ObservabilityConfig`
 
-`zeroclaw-log` defines its own minimal `LogConfig` (in `crates/zeroclaw-log/src/config.rs`): `log_persistence`, `log_persistence_path`, `log_persistence_max_entries`, `log_persistence_max_bytes`, `log_persistence_rotate_daily`, `log_persistence_retention_max_files`, `log_persistence_retention_max_age_days`, `log_tool_io`, `log_tool_io_truncate_bytes`, `log_tool_io_denylist`. This breaks what would otherwise be a dep cycle: `zeroclaw-config::ObservabilityConfig` carries the full schema (with TOML deserialization and validation), and the runtime converts to `LogConfig` at startup and after daemon config reload via `crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config`. The result: `zeroclaw-config` can `record!` without inverting the dep tree, while log persistence and rotation policy changes still take effect on the next daemon reload.
+`zeroclaw-log` defines its own minimal `LogConfig` (in `crates/zeroclaw-log/src/config.rs`): `log_persistence`, `log_persistence_path`, `log_persistence_max_entries`, `log_persistence_max_bytes`, `log_persistence_rotate_daily`, `log_persistence_retention_max_files`, `log_persistence_retention_max_age_days`, `log_persistence_max_entries_per_segment`, `log_tool_io`, `log_tool_io_truncate_bytes`, `log_tool_io_denylist`. This breaks what would otherwise be a dep cycle: `zeroclaw-config::ObservabilityConfig` carries the full schema (with TOML deserialization and validation), and the runtime converts to `LogConfig` at startup and after daemon config reload via `crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config`. The result: `zeroclaw-config` can `record!` without inverting the dep tree, while log persistence and rotation policy changes still take effect on the next daemon reload.
 
 ## Subscriber installation
 

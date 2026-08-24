@@ -9,10 +9,12 @@ the shape of the events, and how to query them.
 
 Defaults: `log_persistence = "rolling"`, `log_persistence_max_entries = 200`,
 `log_tool_io = "redacted"`, `log_tool_io_truncate_bytes = 40960`,
-`log_llm_request_payload = "off"`. A fresh
-install produces a 200-event rolling JSONL at
-`~/.zeroclaw/data/state/runtime-trace.jsonl`, and the dashboard's Logs page
-works without further configuration.
+`log_llm_request_payload = "off"`. A fresh install produces a rolling JSONL at
+`~/.zeroclaw/data/state/runtime-trace.jsonl`. Under the new behavior this means
+`rotating` mode with an entry-count cap of 200 events per segment, so the daemon
+retains up to seven rotated archive files alongside the active file (see
+[Compatibility note](#compatibility-note-rolling-remap) below). The dashboard's
+Logs page works without further configuration.
 
 `log_persistence = "none"` disables persistence entirely but does not gate the broadcast stream used by dashboard SSE. The optional typed `Observer` bridge is also independent of persistence, but it receives canonical log events only when explicitly bound; the current production bootstrap does not install that binding.
 
@@ -20,25 +22,53 @@ Persistence is best-effort rather than a transactional audit guarantee. The Obse
 
 ### Archive rotation (`log_persistence = "rotating"`)
 
-`rotating` applies no entry-count trim to events accepted by the background writer, like `full`, but ZeroClaw manages the active file: it is rotated to a timestamped archive on a size and/or daily boundary, and old archives are pruned by count and age. This differs from `rolling`, which trims old entries out of the active file; rotated events are preserved in archive files for later diagnostics.
+`rotating` retains every event by rotating the active file rather than trimming it. The active file is renamed to a timestamped archive on a size, daily-boundary, or entry-count trigger. Old archives are pruned by count and age after each rotation.
 
 | Key | Default | Effect |
 | --- | --- | --- |
 | `log_persistence_max_bytes` | `0` | Rotate once an append leaves the active file at or above this many bytes. `0` disables size rotation. |
 | `log_persistence_rotate_daily` | `true` | Before the first event of a new UTC day, archive a file whose last write fell on an earlier day. |
+| `log_persistence_max_entries_per_segment` | `0` | Rotate once an append brings the segment's non-empty line count to this cap. `0` disables entry-count rotation. This is the trigger used by the `rolling` compatibility mapping. |
 | `log_persistence_retention_max_files` | `7` | Keep at most this many archives; after a rotation the oldest beyond the cap are deleted. `0` keeps all. |
 | `log_persistence_retention_max_age_days` | `0` | Delete archives older than this many days after a rotation. `0` disables age-based cleanup. |
 
 Archives sit next to the active file and keep its extension, with a sortable
 UTC stamp inserted before that extension. For example, `runtime-trace.jsonl`
-rotates to `runtime-trace.20260624-031500.jsonl`. The dashboard and the
-`/api/logs` endpoint read the active file only, so archives are an on-disk
-record for offline inspection rather than a live query surface.
+rotates to `runtime-trace.20260624-031500.jsonl`.
+
+The dashboard and `GET /api/logs` now read the active file **and** all retained
+archives as one logical event stream, merging them oldest-archive-first and
+returning events newest-first. The API exposes a segment-aware cursor
+(`next_segment_cursor`) alongside the existing byte-offset cursor
+(`next_cursor_line_offset`); pass `?until_segment_cursor=` on subsequent
+requests to paginate across segment boundaries. Old byte-offset cursors remain
+valid and are interpreted as an offset into the active file.
 
 Daily rotation keys off the UTC calendar, so its boundary may not line up with
 local midnight in other time zones. These keys are ignored unless
 `log_persistence = "rotating"`, and the `none`, `rolling`, and `full` modes are
 unchanged.
+
+#### Compatibility note: `rolling` remap
+
+`log_persistence = "rolling"` is now transparently remapped at resolve time to
+`rotating` with `log_persistence_max_entries_per_segment` set from
+`log_persistence_max_entries`. The daemon emits a one-line deprecation warning
+at startup. Existing configurations keep working; update them explicitly to
+silence the warning:
+
+```toml
+[observability]
+log_persistence = "rotating"
+log_persistence_max_entries_per_segment = 200   # previous max_entries value
+log_persistence_retention_max_files = 5         # choose a deliberate disk budget
+```
+
+Note the data-retention difference: `rolling` used to discard the oldest events
+once the cap was reached. The `rotating` path retains them in archives until
+`retention_max_files` prunes them, so disk usage may increase if no retention
+cap is set. Events previously discarded are now available in the dashboard's
+historical log view.
 
 ### GenAI span attributes (`observability-otel`)
 
