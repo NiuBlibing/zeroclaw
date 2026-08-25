@@ -5,9 +5,7 @@ use std::sync::{Arc, Mutex};
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::dispatch::with_exact_dispatch_route;
-use zeroclaw_providers::{
-    ModelProvider, ProviderDispatch, ReliableRejectedCompletionUsage, multimodal,
-};
+use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{ContextLimitsResolver, LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
