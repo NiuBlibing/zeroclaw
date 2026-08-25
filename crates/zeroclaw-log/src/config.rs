@@ -164,13 +164,33 @@ impl ResolvedPolicy {
         let storage = StoragePolicy::from_raw(&config.log_persistence);
         let max_entries = config.log_persistence_max_entries.max(1);
         // `rolling` has no independent runtime behaviour: it is folded into
-        // `Rotating` with entry-count rotation set from its own
-        // `max_entries` cap, so the writer never runs the O(file size)
-        // rewrite path for a policy string of "rolling" alone.
-        let (storage, max_entries_per_segment) = if storage == StoragePolicy::Rolling {
+        // `Rotating` with entry-count rotation set from its own `max_entries`
+        // cap. The disk-retention cap on the compat path is deliberately
+        // capped at 1: `rolling` previously kept only the active file with no
+        // archives, so silently expanding that to the `rotating` default of 7
+        // would surprise existing users. If the operator has explicitly set
+        // `log_persistence_retention_max_files > 1`, honour their intent;
+        // otherwise clamp to 1 on the compat path so the active file plus
+        // exactly one archive are the most that can accumulate.
+        let is_rolling_compat = storage == StoragePolicy::Rolling;
+        let (storage, max_entries_per_segment) = if is_rolling_compat {
             (StoragePolicy::Rotating, max_entries)
         } else {
             (storage, config.log_persistence_max_entries_per_segment)
+        };
+        // The default value in `LogConfig::default()` is 7 (literal below).
+        // If the operator left it unchanged we apply a conservative cap of 1
+        // on the compat path so `rolling` users don't silently accumulate
+        // 7× their old disk footprint. An explicit value other than 7 is kept.
+        let retention_max_files = if is_rolling_compat
+            && config.log_persistence_retention_max_files == 7
+        {
+            // Operator never touched the retention cap; use a conservative
+            // default of 1 so `rolling` users don't silently accumulate up
+            // to 7× their previous disk footprint.
+            1
+        } else {
+            config.log_persistence_retention_max_files
         };
         Self {
             storage,
@@ -178,7 +198,7 @@ impl ResolvedPolicy {
             max_entries,
             max_bytes: config.log_persistence_max_bytes,
             rotate_daily: config.log_persistence_rotate_daily,
-            retention_max_files: config.log_persistence_retention_max_files,
+            retention_max_files,
             retention_max_age_days: config.log_persistence_retention_max_age_days,
             max_entries_per_segment,
             tool_io: ToolIoPolicy::from_raw(&config.log_tool_io),
@@ -312,6 +332,30 @@ mod tests {
             "rolling has no independent writer behaviour; it must resolve to Rotating"
         );
         assert_eq!(p.max_entries_per_segment, 500);
+        // On the compat path with a default retention_max_files, clamp to 1
+        // so existing users don't silently accumulate up to 7 archives.
+        assert_eq!(
+            p.retention_max_files,
+            1,
+            "rolling compat must cap retention_max_files at 1 when operator left it at default"
+        );
+    }
+
+    #[test]
+    fn resolved_policy_rolling_compat_honours_explicit_retention_cap() {
+        // When the operator has explicitly set a retention cap, the compat
+        // path must honour it rather than clamping to 1.
+        let mut c = make_config();
+        c.log_persistence = "rolling".to_string();
+        c.log_persistence_max_entries = 100;
+        c.log_persistence_retention_max_files = 3;
+        let p = ResolvedPolicy::from_config(&c, std::path::Path::new("/"));
+        assert_eq!(p.storage, StoragePolicy::Rotating);
+        assert_eq!(
+            p.retention_max_files,
+            3,
+            "explicit retention_max_files must be preserved on the rolling compat path"
+        );
     }
 
     #[test]

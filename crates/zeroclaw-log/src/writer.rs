@@ -1200,13 +1200,17 @@ mod tests {
     }
 
     #[test]
-    fn append_and_rolling_remaps_to_rotating_and_retains_all_events() {
-        // `rolling` is now transparently remapped to `rotating` with
-        // entry-count rotation at `max_entries`. The old in-place trim is
-        // gone — every event is preserved across the active file + archives.
+    fn append_and_rolling_remaps_to_rotating_without_in_place_trim() {
+        // `rolling` is transparently remapped to `rotating` with entry-count
+        // rotation at `max_entries` and `retention_max_files` clamped to 1
+        // (so existing users don't silently accumulate 7× old disk footprint).
+        //
+        // With cap=3 and 10 events written the writer produces three rotation
+        // cycles; after each rotation the single-archive retention cap prunes
+        // the prior archive. What survives is the active file (1 event) plus
+        // the most recent archive (3 events) = 4 events total.
         let _guard = WRITER_TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
-        // rolling with cap=3: after every 4 events the segment rotates.
         install_writer(tmp.path(), 3);
 
         for i in 0..10 {
@@ -1217,16 +1221,22 @@ mod tests {
 
         flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
-        // All 10 events are preserved across active file + archives.
+
+        // Exactly one archive survives (retention_max_files clamped to 1 on
+        // the rolling compat path). Events come from rotation, never from an
+        // in-place trim: the active file holds a partial segment, not the
+        // trimmed tail of everything.
+        let archives = list_archives(&path).unwrap();
+        assert_eq!(
+            archives.len(),
+            1,
+            "rolling compat must keep exactly 1 archive (retention cap = 1)"
+        );
+        // active (1 event) + 1 archive (3 events) = 4
         assert_eq!(
             total_events(&path),
-            10,
-            "rolling compat must not discard events; all 10 must survive across segments"
-        );
-        // At least one rotation must have happened.
-        assert!(
-            !list_archives(&path).unwrap().is_empty(),
-            "rolling compat must produce archives via entry-count rotation"
+            4,
+            "rolling compat: active + 1 retained archive should hold cap+remainder events"
         );
     }
 

@@ -475,6 +475,10 @@ pub(crate) struct Logs {
     search_active: bool,
     search_buf: String,
     search_query: String, // committed query (applied on Enter)
+    /// Segment-aware cursor from the previous page. Preferred over
+    /// `next_cursor_offset`: it is the only cursor that can advance once
+    /// the oldest event on a page lives in a rotated archive segment.
+    next_cursor_segment: Option<String>,
     next_cursor_offset: Option<u64>,
     next_cursor_legacy: Option<(String, String)>,
     at_end: bool,
@@ -505,6 +509,7 @@ impl Logs {
             search_active: false,
             search_buf: String::new(),
             search_query: String::new(),
+            next_cursor_segment: None,
             next_cursor_offset: None,
             next_cursor_legacy: None,
             at_end: false,
@@ -520,21 +525,39 @@ impl Logs {
         self.rpc.logs_subscribe().await?;
         self.subscribed = true;
         // Load initial history
-        self.load_page(None, None).await;
+        self.load_page(None, None, None).await;
         Ok(())
     }
 
     /// Fetch a page of older events. If `cursor` is None, fetches the newest.
     async fn load_page(
         &mut self,
+        cursor_segment: Option<String>,
         cursor_offset: Option<u64>,
         cursor_legacy: Option<(String, String)>,
     ) {
         self.loading = true;
+        // Cursor precedence: segment cursor first (only one that can cross
+        // into a rotated archive), then plain byte offset, then the legacy
+        // `(ts, id)` pair for daemons predating either field. Send only
+        // the winning cursor to keep the request unambiguous.
+        let has_segment = cursor_segment.is_some();
+        let has_offset = !has_segment && cursor_offset.is_some();
+        let has_legacy = !has_segment && !has_offset && cursor_legacy.is_some();
+        let has_cursor = has_segment || has_offset || has_legacy;
         let params = LogsQueryParams {
-            until_ts: cursor_legacy.as_ref().map(|(ts, _)| ts.clone()),
-            until_id: cursor_legacy.as_ref().map(|(_, id)| id.clone()),
-            until_line_offset: cursor_offset,
+            until_ts: if has_legacy {
+                cursor_legacy.as_ref().map(|(ts, _)| ts.clone())
+            } else {
+                None
+            },
+            until_id: if has_legacy {
+                cursor_legacy.as_ref().map(|(_, id)| id.clone())
+            } else {
+                None
+            },
+            until_line_offset: if has_offset { cursor_offset } else { None },
+            until_segment_cursor: cursor_segment,
             severity_min: Some(self.min_severity),
             q: if self.search_query.is_empty() {
                 None
@@ -542,14 +565,9 @@ impl Logs {
                 Some(self.search_query.clone())
             },
             hide_internal: true,
-            limit: Some(if cursor_offset.is_none() && cursor_legacy.is_none() {
-                INITIAL_LOAD
-            } else {
-                PAGE_SIZE
-            }),
+            limit: Some(if has_cursor { PAGE_SIZE } else { INITIAL_LOAD }),
             ..Default::default()
         };
-        let has_cursor = cursor_offset.is_some() || cursor_legacy.is_some();
         match self.rpc.logs_query(params).await {
             Ok(result) => {
                 // Events come newest-first from the daemon; reverse to chronological
@@ -572,9 +590,11 @@ impl Logs {
                 } else if !has_cursor {
                     self.events = new_entries;
                 }
-                // Prefer the byte-offset cursor (independent of id ordering);
-                // fall back to the legacy `[timestamp, id]` pair when the
-                // daemon has not been upgraded to expose it.
+                // Prefer the segment cursor (crosses rotated archives);
+                // fall back to the byte-offset cursor (independent of id
+                // ordering), then to the legacy `[timestamp, id]` pair when
+                // the daemon has not been upgraded to expose them.
+                self.next_cursor_segment = result.next_segment_cursor;
                 self.next_cursor_offset = result.next_cursor_line_offset;
                 self.next_cursor_legacy = result.next_cursor;
                 self.at_end = result.at_end;
@@ -603,6 +623,7 @@ impl Logs {
 
         // Reset pagination so subsequent scroll-to-top loads can
         // fetch history matching the new filter set.
+        self.next_cursor_segment = None;
         self.next_cursor_offset = None;
         self.next_cursor_legacy = None;
         self.at_end = false;
@@ -1055,10 +1076,16 @@ impl Logs {
         if sel == 0
             && !self.at_end
             && !self.loading
-            && (self.next_cursor_offset.is_some() || self.next_cursor_legacy.is_some())
+            && (self.next_cursor_segment.is_some()
+                || self.next_cursor_offset.is_some()
+                || self.next_cursor_legacy.is_some())
         {
-            self.load_page(self.next_cursor_offset, self.next_cursor_legacy.clone())
-                .await;
+            self.load_page(
+                self.next_cursor_segment.clone(),
+                self.next_cursor_offset,
+                self.next_cursor_legacy.clone(),
+            )
+            .await;
         }
     }
 
