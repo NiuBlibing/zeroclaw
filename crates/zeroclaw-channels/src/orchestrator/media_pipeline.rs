@@ -616,6 +616,7 @@ mod tests {
             file_name: "sticker.webp".to_string(),
             data: b"RIFF\x00\x00\x00\x00WEBPnot-a-real-webp".to_vec(),
             mime_type: Some("image/webp".to_string()),
+            marker: None,
         };
 
         let result = pipeline.process("what is this?", &[sticker]).await;
