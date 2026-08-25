@@ -2657,6 +2657,11 @@ mod tests {
             cached_input_tokens: Some(2),
             output_tokens: Some(3),
             cost_usd: Some(0.01),
+            // This test asserts only that a Usage event produces no ACP
+            // notification; the resolved context limits play no part in that
+            // filtering, so the unresolved variant is the honest fixture here.
+            context_token_budget: None,
+            model_context_window: None,
         };
 
         assert!(notification_for_turn_event("session", &event).is_none());
