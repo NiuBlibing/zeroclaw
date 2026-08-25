@@ -3851,46 +3851,85 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_valid_webps_respect_the_aggregate_budget() {
-        // Regression for the charge/admission mismatch: admission deducts the
-        // projected peak (output + scratch) but the old success path only
-        // returned as_bytes().len() (output alone). With 16 candidates allowed,
-        // eight 3000×3000 non-alpha WebPs could each pass the pre-check while
-        // the counter claimed only ~216 MB consumed, even though the decoder
-        // actually ran at ~63 MB peak each time.
+        // Regression for the charge/admission mismatch. Admission deducts the
+        // projected peak (output + scratch); the old success path returned only
+        // as_bytes().len() (output alone), so the scratch delta was reserved and
+        // never credited back and the counter drifted below real consumption.
         //
-        // After the fix the charge is max(actual, projected), so the counter
-        // accurately tracks the peak model. This test drives a real 1×1 still
-        // WebP through validate_within_budget many times and asserts the budget
-        // counter decrements by at least the projected peak each round, not just
-        // the raw output bytes.
+        // Drive a sequence of candidates through one shared budget, sized so
+        // exhaustion is reached in a handful of rounds, and assert three things
+        // the single-candidate version could not: every accepted candidate
+        // debits at least its projected peak, the running total matches the sum
+        // of the charges, and once the remaining budget can no longer fit the
+        // projection the next candidate is refused *without* decoding.
         let webp = {
             let mut buf = std::io::Cursor::new(Vec::new());
             image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
-                1,
-                1,
+                64,
+                64,
                 image::Rgb([255, 0, 0]),
             ))
             .write_to(&mut buf, image::ImageFormat::WebP)
-            .expect("test 1x1 WebP encodes");
+            .expect("test 64x64 WebP encodes");
             buf.into_inner()
         };
 
         let proj = projected_allocation("ok.webp", "image/webp", &webp)
-            .expect("1x1 WebP must project without error");
+            .expect("64x64 WebP must project without error");
+        assert!(proj > 0, "projection must be non-zero for the maths below");
 
-        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
-        let charged = validate_within_budget("ok.webp", "image/webp", &webp, &mut budget)
-            .await
-            .expect("a valid 1x1 WebP must be accepted");
+        // Room for exactly three candidates, with a remainder too small for a
+        // fourth so the exhaustion branch is reached deterministically.
+        let mut budget = proj * 3 + proj / 2;
+        let starting_budget = budget;
 
-        assert!(
-            charged >= proj,
-            "charge must be at least the projected peak: charged={charged} proj={proj}"
-        );
+        let (charges, decodes) = counting_decodes(async {
+            let mut charges = Vec::new();
+            for _ in 0..3 {
+                let charged = validate_within_budget("ok.webp", "image/webp", &webp, &mut budget)
+                    .await
+                    .expect("each candidate fits the remaining budget");
+                charges.push(charged);
+            }
+            charges
+        })
+        .await;
+
+        for (index, charged) in charges.iter().enumerate() {
+            assert!(
+                *charged >= proj,
+                "candidate {index} must be charged at least its projected peak: \
+                 charged={charged} proj={proj}"
+            );
+        }
+        assert_eq!(decodes, 3, "each accepted candidate decodes exactly once");
+
+        let spent: u64 = charges.iter().sum();
         assert_eq!(
             budget,
-            AGGREGATE_DECODE_BUDGET_BYTES - charged,
-            "budget must decrease by the reported charge"
+            starting_budget - spent,
+            "the running counter must equal the sum of the real charges"
+        );
+        assert!(
+            budget < proj,
+            "the remainder must be too small for another candidate: {budget} vs {proj}"
+        );
+
+        // The next candidate cannot fit. It must be refused by the cheap
+        // projection check, never by entering full validation.
+        let ((), decodes_after) = counting_decodes(async {
+            validate_within_budget("ok.webp", "image/webp", &webp, &mut budget)
+                .await
+                .expect_err("a candidate that no longer fits must be refused");
+        })
+        .await;
+        assert_eq!(
+            decodes_after, 0,
+            "an over-budget candidate must not reach the decoder"
+        );
+        assert_eq!(
+            budget, 0,
+            "aggregate exhaustion closes the budget for the remaining candidates"
         );
     }
 
