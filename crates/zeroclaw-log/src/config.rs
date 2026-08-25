@@ -182,16 +182,15 @@ impl ResolvedPolicy {
         // If the operator left it unchanged we apply a conservative cap of 1
         // on the compat path so `rolling` users don't silently accumulate
         // 7× their old disk footprint. An explicit value other than 7 is kept.
-        let retention_max_files = if is_rolling_compat
-            && config.log_persistence_retention_max_files == 7
-        {
-            // Operator never touched the retention cap; use a conservative
-            // default of 1 so `rolling` users don't silently accumulate up
-            // to 7× their previous disk footprint.
-            1
-        } else {
-            config.log_persistence_retention_max_files
-        };
+        let retention_max_files =
+            if is_rolling_compat && config.log_persistence_retention_max_files == 7 {
+                // Operator never touched the retention cap; use a conservative
+                // default of 1 so `rolling` users don't silently accumulate up
+                // to 7× their previous disk footprint.
+                1
+            } else {
+                config.log_persistence_retention_max_files
+            };
         Self {
             storage,
             path: resolve_path(&config.log_persistence_path, workspace_dir),
@@ -335,8 +334,7 @@ mod tests {
         // On the compat path with a default retention_max_files, clamp to 1
         // so existing users don't silently accumulate up to 7 archives.
         assert_eq!(
-            p.retention_max_files,
-            1,
+            p.retention_max_files, 1,
             "rolling compat must cap retention_max_files at 1 when operator left it at default"
         );
     }
@@ -352,8 +350,7 @@ mod tests {
         let p = ResolvedPolicy::from_config(&c, std::path::Path::new("/"));
         assert_eq!(p.storage, StoragePolicy::Rotating);
         assert_eq!(
-            p.retention_max_files,
-            3,
+            p.retention_max_files, 3,
             "explicit retention_max_files must be preserved on the rolling compat path"
         );
     }
