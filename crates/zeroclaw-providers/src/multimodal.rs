@@ -1668,6 +1668,39 @@ fn aggregate_budget_failure(
     }
 }
 
+/// Classify a header projection that exceeds the independent per-image
+/// allocation ceiling.
+///
+/// This ceiling is the *image's own* limit, unrelated to the shared per-call
+/// allowance: the refusal happens before any decoder is constructed, so no
+/// pixel work is performed and nothing may be charged. Callers must consult
+/// this before the aggregate-budget gate — a projection that exceeds both
+/// ceilings belongs to this one, and reporting it as aggregate exhaustion would
+/// close the shared allowance for siblings that never got to decode.
+fn per_image_cap_refusal(
+    source: &str,
+    mime: &str,
+    projected_allocation: u64,
+) -> Option<ImageValidationFailure> {
+    if projected_allocation < MAX_DECODED_IMAGE_ALLOC_BYTES {
+        return None;
+    }
+
+    Some(ImageValidationFailure {
+        error: MultimodalError::CorruptImage {
+            input: source.to_string(),
+            mime: mime.to_string(),
+            reason: format!(
+                "decoded canvas of {projected_allocation} bytes exceeds per-image limit of \
+                 {MAX_DECODED_IMAGE_ALLOC_BYTES} bytes"
+            ),
+        }
+        .into(),
+        consumed_allocation: 0,
+        kind: ImageValidationFailureKind::RefusedBeforeDecode,
+    })
+}
+
 fn image_error_failure(
     source: &str,
     mime: &str,
@@ -1771,12 +1804,12 @@ fn validate_animation_frames(
 
 /// Validate `bytes` against the aggregate decode budget, then decode.
 ///
-/// The projected allocation is checked *before* the decode so an image that
-/// cannot fit is rejected without spending the work. When the projection does
-/// not fit, the budget is driven to zero: the caller is mid-way through a
-/// sequence of candidates, and leaving a non-zero remainder would let every
-/// subsequent candidate re-attempt validation against a budget that can no
-/// longer accommodate anything.
+/// The per-image cap and the aggregate gate are checked in that order before
+/// any pixel work begins. An image that exceeds only its own per-image ceiling
+/// is refused without touching `remaining_budget` so valid siblings are not
+/// affected; an image whose projection fits the per-image cap but not the
+/// remaining shared allowance drives `remaining_budget` to zero, because at
+/// that point the request has genuinely run out of decode headroom.
 ///
 /// Callers walk candidates newest-first, so exhaustion drops the *oldest*
 /// images — matching [`trim_old_images`], which also sheds oldest-first when
@@ -1792,6 +1825,25 @@ async fn validate_within_budget(
     }
 
     let projected_allocation = projected_allocation(source, mime, bytes)?;
+
+    // Check the per-image ceiling before the aggregate gate.
+    //
+    // A projection that exceeds the independent per-image cap (e.g. an animated
+    // WebP whose scratch model is 17 B/px, giving ~525 MB for a 5000x5000
+    // canvas) must be refused without closing the shared request allowance: the
+    // image is too big on its own merits, not because this request ran out of
+    // budget. Checking the aggregate gate first would zero `remaining_budget`
+    // and skip every later candidate, including unrelated valid siblings that
+    // never got to decode.
+    //
+    // `validate_image_content_with_projection` carries the same guard, but it
+    // is unreachable once the projection also exceeds the aggregate allowance.
+    // Pulling it forward classifies the refusal by the ceiling that actually
+    // caused it, whichever of the two is crossed first.
+    if let Some(failure) = per_image_cap_refusal(source, mime, projected_allocation) {
+        return Err(failure.error);
+    }
+
     if projected_allocation > *remaining_budget {
         *remaining_budget = 0;
         return Err(aggregate_budget_failure(source, mime, 0).error);
@@ -1920,20 +1972,12 @@ async fn validate_image_content_with_projection(
     // Ordinary invalid-image failure: this is the image's own ceiling, not
     // the shared allowance, so it must not close the budget for siblings.
     // Nothing has been decoded yet, hence a zero charge.
-    if projected_allocation >= MAX_DECODED_IMAGE_ALLOC_BYTES {
-        return Err(ImageValidationFailure {
-            error: MultimodalError::CorruptImage {
-                input: source.to_string(),
-                mime: mime.to_string(),
-                reason: format!(
-                    "decoded canvas of {projected_allocation} bytes exceeds per-image limit of \
-                     {MAX_DECODED_IMAGE_ALLOC_BYTES} bytes"
-                ),
-            }
-            .into(),
-            consumed_allocation: 0,
-            kind: ImageValidationFailureKind::RefusedBeforeDecode,
-        });
+    //
+    // `validate_within_budget` applies the same guard before its aggregate
+    // gate, so this is the effective check only for callers that arrive here
+    // directly.
+    if let Some(failure) = per_image_cap_refusal(source, mime, projected_allocation) {
+        return Err(failure);
     }
 
     let source_owned = source.to_string();
@@ -3931,33 +3975,112 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_webp_canvas_does_not_close_the_shared_budget() {
-        // The per-image cap (or any upstream refusal) is an ordinary invalid-image
-        // failure, so an unrelated sibling must keep its budget — the same contract
-        // the GIF and PNG sibling regressions above assert.
+        // The per-image cap refusal is an ordinary invalid-image failure, so an
+        // unrelated sibling must keep its full budget allowance.
         //
-        // 5000x5000 with the full-peak scratch included projects above both
-        // the per-image cap and the aggregate budget; the 5000-canvas fixture
-        // already has VP8L content that matches the declared size so the decode
-        // does not get a header-consistency error from the adapter.
-        let webp = oversized_canvas_webp(false);
-        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        // Two shapes exercise different code paths through `validate_within_budget`:
+        //
+        // Still (animated=false): projected ~200 MB, above the 64 MiB per-image cap
+        // but below the 256 MiB aggregate gate. Without the per-image guard moved
+        // forward the aggregate gate would never be reached, but the refusal
+        // happens at `validate_image_content_with_projection` instead. The budget
+        // must still be untouched.
+        //
+        // Animated (animated=true): projected ~525 MB (17 B/px scratch model),
+        // above BOTH the 64 MiB per-image cap AND the 256 MiB aggregate gate.
+        // Without the per-image guard moved *before* the aggregate check,
+        // `validate_within_budget` would zero the budget on the aggregate branch
+        // and the PNG sibling below would be refused without ever decoding — this
+        // is the specific path the `per_image_cap_refusal` guard was added to fix.
+        for animated in [false, true] {
+            let webp = oversized_canvas_webp(animated);
+            let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
 
-        validate_within_budget("big.webp", "image/webp", &webp, &mut budget)
-            .await
-            .expect_err("an over-cap canvas must be refused");
+            validate_within_budget("big.webp", "image/webp", &webp, &mut budget)
+                .await
+                .expect_err("an over-cap canvas must be refused");
 
-        assert_eq!(
-            budget, AGGREGATE_DECODE_BUDGET_BYTES,
-            "nothing was decoded, so the shared budget must be untouched for siblings"
+            assert_eq!(
+                budget, AGGREGATE_DECODE_BUDGET_BYTES,
+                "animated={animated}: nothing was decoded, so the shared budget must be \
+                 untouched for siblings"
+            );
+
+            let allocation =
+                validate_within_budget("ok.png", "image/png", &valid_png(), &mut budget)
+                    .await
+                    .expect("an unrelated valid sibling must still be admitted");
+            assert_eq!(
+                budget,
+                AGGREGATE_DECODE_BUDGET_BYTES - allocation,
+                "animated={animated}: only the sibling's real decode is charged"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_animated_webp_in_newer_message_does_not_discard_valid_png_sibling() {
+        // Production-path regression for the animated-WebP budget-classification
+        // bug: an animated WebP with a canvas projection above both the per-image
+        // cap and the aggregate allowance is placed in the newer message so
+        // newest-first traversal processes it before the valid PNG in the older
+        // message. The PNG must still reach the prepared payload and only "1 of 2"
+        // images should be reported as skipped.
+        //
+        // Without the per-image guard added before the aggregate gate this test
+        // fails: `validate_within_budget` zeros `remaining_budget` on the aggregate
+        // branch, the PNG then hits the zero-budget early exit and is skipped, and
+        // `contains_images` is false.
+        let temp = tempfile::tempdir().unwrap();
+        let old_png = temp.path().join("old.png");
+        let new_webp = temp.path().join("new.webp");
+        std::fs::write(&old_png, valid_png()).unwrap();
+        // animated=true → projection ≈ 525 MB, above both caps.
+        std::fs::write(&new_webp, oversized_canvas_webp(true)).unwrap();
+
+        let history = vec![
+            ChatMessage::user(format!("photo [IMAGE:{}]", old_png.display())),
+            ChatMessage::user(format!("check this [IMAGE:{}]", new_webp.display())),
+        ];
+        let (prepared, decodes) = counting_decodes(prepare_messages_for_provider(
+            &history,
+            &MultimodalConfig::default(),
+        ))
+        .await;
+        let prepared = prepared.expect("an over-cap animated WebP must not abort preparation");
+
+        assert!(
+            prepared.contains_images,
+            "the valid PNG in the older message must survive the over-cap animated WebP: {:?}",
+            prepared
+                .messages
+                .iter()
+                .map(|m| &m.content)
+                .collect::<Vec<_>>()
         );
-
-        let allocation = validate_within_budget("ok.png", "image/png", &valid_png(), &mut budget)
-            .await
-            .expect("an unrelated valid sibling must still be admitted");
         assert_eq!(
-            budget,
-            AGGREGATE_DECODE_BUDGET_BYTES - allocation,
-            "only the sibling's real decode is charged"
+            prepared.messages.len(),
+            2,
+            "both messages must be present with original order restored"
+        );
+        assert!(
+            prepared
+                .messages
+                .iter()
+                .any(|m| m.content.contains("could not be loaded")),
+            "the newer message must carry the skip note for the over-cap WebP: {:?}",
+            prepared
+                .messages
+                .iter()
+                .map(|m| &m.content)
+                .collect::<Vec<_>>()
+        );
+        // The over-cap WebP must have been refused before any pixel decode, so no
+        // decode call should have been recorded for it.
+        assert_eq!(
+            decodes, 1,
+            "only the valid PNG should have entered a full decode; the animated WebP \
+             must be refused by the per-image header check before decode"
         );
     }
 
