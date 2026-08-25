@@ -623,6 +623,16 @@ pub struct ModelProviderRuntimeOptions {
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
+    /// The configured `[multimodal]` policy.
+    ///
+    /// Providers normalize image markers on their own boundary (a channel can
+    /// call `chat` with raw `[IMAGE:<path>]` markers that never passed through
+    /// the runtime), and that normalization now decodes pixels and applies
+    /// `max_images` / `max_image_size_mb`. Carrying the configured policy here
+    /// keeps that second pass on the same rules the runtime already applied,
+    /// instead of silently reverting to defaults and re-trimming history a
+    /// configured request had legitimately accepted.
+    pub multimodal: zeroclaw_config::schema::MultimodalConfig,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -648,6 +658,7 @@ impl Default for ModelProviderRuntimeOptions {
             vision: None,
             chat_template_kwargs: None,
             tls_ca_cert_path: None,
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
         }
     }
 }
@@ -711,6 +722,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         vision: entry.and_then(|e| e.vision),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
         tls_ca_cert_path,
+        multimodal: config.multimodal.clone(),
     }
 }
 
