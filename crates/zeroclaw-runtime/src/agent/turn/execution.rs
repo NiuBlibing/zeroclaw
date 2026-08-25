@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig, ResolvedContextLimits};
+use zeroclaw_providers::dispatch::with_exact_dispatch_route;
 use zeroclaw_providers::{
     ModelProvider, ProviderDispatch, ReliableRejectedCompletionUsage, multimodal,
 };
@@ -57,20 +58,22 @@ impl ResolvedModelAccess<'_> {
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let result = scope
-            .scope(dispatcher.chat(request, self.dispatch_model, self.temperature))
+            // The route identity records the model that actually serves this
+            // request, while the dispatch call keeps the provider-facing
+            // selector: a routed provider may need `hint:<name>` even though
+            // `model` already records the resolved model behind that hint.
+            .scope(with_exact_dispatch_route(
+                self.provider_name.to_string(),
+                self.model.to_string(),
+                dispatcher.chat(request, self.dispatch_model, self.temperature),
+            ))
             .await;
+        if result.is_ok() {
+            scope.mark_logical_success();
+        }
         let accounting = scope.take();
 
-        // Extract before branching on the provider result: a terminal error
-        // may still contain billed rejected Reliable attempts.
-        let has_accounted_rejections = !accounting.rejected_attempts().is_empty();
-        for rejected in accounting.rejected_attempts() {
-            crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                rejected.provider_ref(),
-                rejected.model(),
-                rejected.usage(),
-            );
-        }
+        let attempts = accounting.attempts();
 
         let accepted_route = accounting.accepted_route().cloned();
         let (served_provider, served_model) = accepted_route
@@ -84,16 +87,14 @@ impl ResolvedModelAccess<'_> {
                 // and successful response telemetry before returning its typed
                 // cause to every one-shot caller.
                 if response.is_semantically_empty_terminal() {
-                    if let Some(usage) = response.usage.as_ref() {
-                        crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                            &served_provider,
-                            &served_model,
-                            usage,
-                        );
-                    }
+                    crate::agent::cost::settle_provider_attempts(attempts, None);
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
                 }
                 zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
+                crate::agent::cost::settle_provider_attempts(
+                    &attempts[..attempts.len().saturating_sub(1)],
+                    None,
+                );
                 // Only a semantically valid result controls accepted context
                 // usage and successful response telemetry.
                 if let Some(usage) = response.usage.as_ref() {
@@ -106,23 +107,7 @@ impl ResolvedModelAccess<'_> {
                 Ok(response)
             }
             Err(error) => {
-                // Accounted dispatch carries rejected usage on failures in the
-                // typed Reliable error chain. Keep the original error intact so
-                // terminal-cause classification remains the provider's source
-                // of truth.
-                if !has_accounted_rejections
-                    && let Some(usage) = error.chain().find_map(|cause| {
-                        cause
-                            .downcast_ref::<ReliableRejectedCompletionUsage>()
-                            .map(|rejected| &rejected.usage)
-                    })
-                {
-                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                        self.provider_name,
-                        self.model,
-                        usage,
-                    );
-                }
+                crate::agent::cost::settle_provider_attempts(attempts, None);
                 Err(error)
             }
         }
