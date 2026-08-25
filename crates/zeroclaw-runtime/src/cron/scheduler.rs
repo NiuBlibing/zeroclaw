@@ -3264,4 +3264,54 @@ mod tests {
         process_due_jobs(&config, vec![job], &component, &event_tx).await;
         // If we got here without panic, the test passes.
     }
+
+    /// Diagnostic test: verify what shell executes `pwd` on this platform and
+    /// what path format it returns relative to a known `TempDir` workspace.
+    /// This is intentionally #[ignore] so it does not run in normal CI —
+    /// dispatch platform-tests.yml with `--include-ignored` to collect evidence.
+    #[tokio::test]
+    #[ignore = "diagnostic only — run with --include-ignored to inspect shell/pwd behaviour on this platform"]
+    async fn diag_windows_pwd_path_format() {
+        use zeroclaw_config::platform::RuntimeAdapter;
+        use zeroclaw_config::schema::NativeRuntime;
+
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("diag-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let runtime = NativeRuntime::new();
+        eprintln!("=DIAG= shell dialect : {:?}", runtime.shell_dialect());
+        eprintln!("=DIAG= workspace (PathBuf): {}", workspace.display());
+        eprintln!(
+            "=DIAG= workspace to_string_lossy: {}",
+            workspace.to_string_lossy()
+        );
+
+        // Execute `pwd` in the workspace directory via the production shell path.
+        let mut cmd = runtime
+            .build_shell_command("pwd", &workspace)
+            .expect("build_shell_command failed");
+        let output = cmd.output().await.expect("shell command failed to spawn");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        eprintln!("=DIAG= pwd stdout (raw)  : {:?}", stdout);
+        eprintln!("=DIAG= pwd stderr (raw)  : {:?}", stderr);
+        eprintln!(
+            "=DIAG= contains(to_string_lossy): {}",
+            stdout.contains(workspace.to_string_lossy().as_ref())
+        );
+
+        // Also try `cd` + `pwd` to rule out shell-startup-dir effects.
+        let cd_pwd = format!("cd {:?} && pwd", workspace);
+        let mut cmd2 = runtime
+            .build_shell_command(&cd_pwd, &workspace)
+            .expect("build_shell_command 2 failed");
+        let out2 = cmd2.output().await.expect("shell command 2 failed");
+        eprintln!(
+            "=DIAG= cd+pwd stdout (raw): {:?}",
+            String::from_utf8_lossy(&out2.stdout)
+        );
+
+        // The test itself never fails — all signal is in the eprintln output.
+    }
 }
