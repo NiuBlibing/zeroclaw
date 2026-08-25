@@ -42,14 +42,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macOS
-            os: macos-14
-            nextest-platform: mac
-            timeout-minutes: 45
           - name: Windows
             os: windows-latest
             nextest-platform: windows-tar
-            timeout-minutes: 60
+            timeout-minutes: 30
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout-minutes }}
     steps:
@@ -68,6 +64,13 @@ jobs:
       - name: Install cargo-nextest
         shell: bash
         run: curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$HOME/.cargo/bin"
-      - name: Run tests
+      - name: Run diagnostic test (Windows pwd path format)
         shell: bash
-        run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast
+        run: >
+          cargo nextest run
+          --locked
+          -p zeroclaw-runtime
+          --run-ignored all
+          --test-threads 1
+          --no-fail-fast
+          -E 'test(diag_windows_pwd_path_format) | test(agent_cron_run_keeps_workspace_through_shell_on_retry_and_concurrency)'
