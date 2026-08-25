@@ -7317,7 +7317,7 @@ mod tests {
             Some(ConversationMessage::Chat(message))
                 if message.role == "assistant" && message.content == "done"
         ));
-        for (index, pair) in agent.history[1..63].chunks_exact(2).enumerate() {
+        for (index, pair) in agent.history[1..63].as_chunks::<2>().0.iter().enumerate() {
             let expected_id = format!("trim-history-call-{}", index + 1);
             match pair {
                 [
