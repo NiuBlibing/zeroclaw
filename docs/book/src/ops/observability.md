@@ -9,12 +9,10 @@ the shape of the events, and how to query them.
 
 Defaults: `log_persistence = "rolling"`, `log_persistence_max_entries = 200`,
 `log_tool_io = "redacted"`, `log_tool_io_truncate_bytes = 40960`,
-`log_llm_request_payload = "off"`. A fresh install produces a rolling JSONL at
-`~/.zeroclaw/data/state/runtime-trace.jsonl`. Under the new behavior this means
-`rotating` mode with an entry-count cap of 200 events per segment, so the daemon
-retains up to seven rotated archive files alongside the active file (see
-[Compatibility note](#compatibility-note-rolling-remap) below). The dashboard's
-Logs page works without further configuration.
+`log_llm_request_payload = "off"`. A fresh
+install produces a 200-event rolling JSONL at
+`~/.zeroclaw/data/state/runtime-trace.jsonl`, and the dashboard's Logs page
+works without further configuration.
 
 `log_persistence = "none"` disables persistence entirely but does not gate the broadcast stream used by dashboard SSE. The optional typed `Observer` bridge is also independent of persistence, but it receives canonical log events only when explicitly bound; the current production bootstrap does not install that binding.
 
@@ -28,7 +26,7 @@ Persistence is best-effort rather than a transactional audit guarantee. The Obse
 | --- | --- | --- |
 | `log_persistence_max_bytes` | `0` | Rotate once an append leaves the active file at or above this many bytes. `0` disables size rotation. |
 | `log_persistence_rotate_daily` | `true` | Before the first event of a new UTC day, archive a file whose last write fell on an earlier day. |
-| `log_persistence_max_entries_per_segment` | `0` | Rotate once an append brings the segment's non-empty line count to this cap. `0` disables entry-count rotation. This is the trigger used by the `rolling` compatibility mapping. |
+| `log_persistence_max_entries_per_segment` | `0` | Rotate once the segment's non-empty line count reaches this cap, so each archive holds exactly this many entries. `0` disables entry-count rotation. |
 | `log_persistence_retention_max_files` | `7` | Keep at most this many archives; after a rotation the oldest beyond the cap are deleted. `0` keeps all. |
 | `log_persistence_retention_max_age_days` | `0` | Delete archives older than this many days after a rotation. `0` disables age-based cleanup. |
 
@@ -46,29 +44,8 @@ valid and are interpreted as an offset into the active file.
 
 Daily rotation keys off the UTC calendar, so its boundary may not line up with
 local midnight in other time zones. These keys are ignored unless
-`log_persistence = "rotating"`. The `none` and `full` modes are unchanged by
-this PR; `rolling` is remapped as described in the compatibility note below.
-
-#### Compatibility note: `rolling` remap
-
-`log_persistence = "rolling"` is now transparently remapped at resolve time to
-`rotating` with `log_persistence_max_entries_per_segment` set from
-`log_persistence_max_entries`. The daemon emits a one-line deprecation warning
-at startup. Existing configurations keep working; update them explicitly to
-silence the warning:
-
-```toml
-[observability]
-log_persistence = "rotating"
-log_persistence_max_entries_per_segment = 200   # previous max_entries value
-log_persistence_retention_max_files = 5         # choose a deliberate disk budget
-```
-
-Note the data-retention difference: `rolling` used to discard the oldest events
-once the cap was reached. The `rotating` path retains them in archives until
-`retention_max_files` prunes them, so disk usage may increase if no retention
-cap is set. Events previously discarded are now available in the dashboard's
-historical log view.
+`log_persistence = "rotating"`, and the `none`, `rolling`, and `full` modes are
+unchanged.
 
 ### GenAI span attributes (`observability-otel`)
 
@@ -256,7 +233,7 @@ curl "$ZEROCLAW_GATEWAY/api/logs?trace_id=<value-from-a-prior-event>"
 </div>
 
 Log pagination walks backward with a segment-aware cursor. While `at_end` is false:
-1. Prefer `next_segment_cursor` (format `"<segment_basename>:<byte_offset>"`) passed back as `until_segment_cursor`. This cursor identifies the exact archive segment and position, and is the only cursor that can advance once the oldest event in a page is in a rotated archive.
+1. Prefer `next_segment_cursor`, passed back unchanged as `until_segment_cursor`. Treat it as an **opaque token**: it encodes the segment, a byte offset, and an anchor event id, and its internal shape may change. Clients must round-trip the returned string verbatim rather than constructing or parsing one — a hand-built cursor loses the anchor and with it the rotation-boundary protection described below. This is the only cursor that can advance once the oldest event in a page is in a rotated archive.
 2. Fall back to `next_cursor_line_offset` passed back as `until_line_offset` when the segment cursor is absent. This is a plain byte offset into the active file and resolves to `null` when the oldest event is in an archive.
 3. The legacy `next_cursor: [timestamp, id] | null` response remains for compatibility; passing it back as `until_ts` + `until_id` is deprecated because the lexicographic ID tie-break can silently skip events with the same timestamp.
 

@@ -169,20 +169,6 @@ fn init_from_config_with_migration_and_shutdown_warning<F>(
     let _reinit_guard = REINIT_LOCK.lock();
     let policy = ResolvedPolicy::from_config(config, workspace_dir);
 
-    if config
-        .log_persistence
-        .trim()
-        .eq_ignore_ascii_case("rolling")
-    {
-        tracing::warn!(
-            target: "zeroclaw_log",
-            "log: log_persistence = \"rolling\" is deprecated; transparently remapped to \
-             \"rotating\" with entry-count rotation (max_entries_per_segment = {}). \
-             Update your config to silence this warning.",
-            policy.max_entries_per_segment
-        );
-    }
-
     // Route writes emitted during reload into a temporary buffer. Taking this
     // lock before removing the old writer closes the race with producers that
     // are about to clone its sender.
@@ -401,8 +387,20 @@ fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
     // Date-boundary rotation runs *before* the append so a new day's
     // first event lands in a fresh file. Idempotent when no rotation
     // is needed.
-    if state.policy.storage == StoragePolicy::Rotating && maybe_rotate_for_date(state)? {
-        state.line_count.store(0, Ordering::Relaxed);
+    if state.policy.storage == StoragePolicy::Rotating {
+        if maybe_rotate_for_date(state)? {
+            state.line_count.store(0, Ordering::Relaxed);
+        }
+        // The counter is seeded from the existing active file at startup, so
+        // a file that already sits at (or above) the cap — an operator
+        // enabling this mode on an existing log, or a reload from another
+        // policy — must rotate *before* this append. Rotating only after the
+        // append would leave `cap + 1` entries in the archive and break the
+        // "maximum N entries per segment" contract. A freshly rotated file
+        // has count 0, so this is a no-op on the steady-state path.
+        if maybe_rotate_for_entry_count(state)? {
+            state.line_count.store(0, Ordering::Relaxed);
+        }
     }
     let mut file = open_active_file(state)?;
     {
@@ -1200,15 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn append_and_rolling_remaps_to_rotating_without_in_place_trim() {
-        // `rolling` is transparently remapped to `rotating` with entry-count
-        // rotation at `max_entries` and `retention_max_files` clamped to 1
-        // (so existing users don't silently accumulate 7× old disk footprint).
-        //
-        // With cap=3 and 10 events written the writer produces three rotation
-        // cycles; after each rotation the single-archive retention cap prunes
-        // the prior archive. What survives is the active file (1 event) plus
-        // the most recent archive (3 events) = 4 events total.
+    fn append_and_rolling_keeps_only_max_entries() {
         let _guard = WRITER_TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         install_writer(tmp.path(), 3);
@@ -1221,23 +1211,14 @@ mod tests {
 
         flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
-
-        // Exactly one archive survives (retention_max_files clamped to 1 on
-        // the rolling compat path). Events come from rotation, never from an
-        // in-place trim: the active file holds a partial segment, not the
-        // trimmed tail of everything.
-        let archives = list_archives(&path).unwrap();
-        assert_eq!(
-            archives.len(),
-            1,
-            "rolling compat must keep exactly 1 archive (retention cap = 1)"
-        );
-        // active (1 event) + 1 archive (3 events) = 4
-        assert_eq!(
-            total_events(&path),
-            4,
-            "rolling compat: active + 1 retained archive should hold cap+remainder events"
-        );
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 3);
+        // Last three should be 7, 8, 9 (oldest to newest order preserved).
+        for (idx, &line) in lines.iter().enumerate() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["message"].as_str().unwrap(), format!("event-{}", idx + 7));
+        }
     }
 
     #[test]
@@ -2105,34 +2086,61 @@ mod tests {
     }
 
     #[test]
-    fn rolling_compat_maps_to_rotating() {
+    fn entry_count_seeded_at_cap_rotates_before_the_next_append() {
+        // An operator enabling entry-count rotation on an existing log (or
+        // reloading from another policy) can start with an active file that
+        // already holds exactly `cap` rows. The counter is seeded from that
+        // file, so the next append must rotate *first*: appending before
+        // rotating would archive `cap + 1` rows and break the documented
+        // "maximum N entries per segment" contract.
         let _guard = WRITER_TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
-        // `rolling` with a cap of 2: after 3 events the active file must be
-        // rotated (O(1) rename), not rewritten in place.
+        const CAP: usize = 3;
+
+        // Seed an active file with exactly CAP non-empty JSONL rows before
+        // any writer is installed.
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let seeded = state_dir.join("runtime-trace.jsonl");
+        let mut seed = String::new();
+        for i in 0..CAP {
+            let ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+            let mut v = serde_json::to_value(&ev).unwrap();
+            v["message"] = serde_json::Value::String(format!("seeded-{i}"));
+            seed.push_str(&serde_json::to_string(&v).unwrap());
+            seed.push('\n');
+        }
+        fs::write(&seeded, &seed).unwrap();
+        assert_eq!(count_nonempty_lines(&seeded).unwrap(), CAP);
+
         let cfg = LogConfig {
-            log_persistence: "rolling".into(),
-            log_persistence_max_entries: 2,
+            log_persistence: "rotating".into(),
+            log_persistence_max_bytes: 0,
             log_persistence_rotate_daily: false,
             log_persistence_retention_max_files: 0,
+            log_persistence_max_entries_per_segment: CAP,
             ..LogConfig::default()
         };
         init_from_config(&cfg, tmp.path());
         let path = runtime_trace_path().unwrap();
+        assert_eq!(path, seeded, "writer must adopt the seeded active file");
 
-        emit("a");
-        emit("b");
-        emit("c");
+        emit("post-seed");
 
-        let archives = list_archives(&path).unwrap();
-        assert!(
-            !archives.is_empty(),
-            "rolling compat must rotate (not trim) after max_entries writes"
-        );
+        // No archive may exceed the cap.
+        for (archive, _) in list_archives(&path).unwrap() {
+            let n = count_nonempty_lines(&archive).unwrap();
+            assert!(
+                n <= CAP,
+                "archive {} holds {n} entries, exceeding the cap of {CAP}",
+                archive.display()
+            );
+        }
+        // Nothing is lost: the seeded rows plus the new one are all on disk.
         assert_eq!(
             total_events(&path),
-            3,
-            "all 3 events must be preserved — rolling compat must not trim"
+            CAP + 1,
+            "seeded rows and the new append must all survive the rotation"
         );
     }
 }

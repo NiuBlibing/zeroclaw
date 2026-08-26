@@ -12148,13 +12148,12 @@ pub struct ObservabilityConfig {
 
     /// Maximum number of log entries (non-empty JSONL lines) per segment file
     /// when `log_persistence = "rotating"`. When the active file's line count
-    /// reaches this cap after an append, it is immediately rotated to an
-    /// archive (an O(1) rename — no content is rewritten), the same mechanism
-    /// as `log_persistence_max_bytes`. `0` disables entry-count rotation.
-    /// Ignored unless `log_persistence = "rotating"`. Note that
-    /// `log_persistence = "rolling"` is remapped at resolve time to
-    /// `rotating` with this field set from `log_persistence_max_entries`
-    /// instead of from this config key; see `LogPersistence::Rolling`.
+    /// reaches this cap, it is rotated to an archive (an O(1) rename — no
+    /// content is rewritten), the same mechanism as
+    /// `log_persistence_max_bytes`, so each archive produced by this trigger
+    /// holds exactly this many entries. `0` disables entry-count rotation.
+    /// Ignored unless `log_persistence = "rotating"`; the `rolling` policy
+    /// keeps its own in-place trim governed by `log_persistence_max_entries`.
     #[serde(default = "default_log_persistence_max_entries_per_segment")]
     pub log_persistence_max_entries_per_segment: usize,
 

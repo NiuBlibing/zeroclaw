@@ -264,11 +264,11 @@ After one of those boundaries, restart pagination from the newest page. The lega
 | Policy | Active-file behavior | Retention owner |
 |---|---|---|
 | `none` | No new JSONL writes. | None. |
-| `rolling` | Deprecated. Transparently remapped at resolve time to `rotating` with `max_entries_per_segment` set from `max_entries`. A deprecation warning is emitted at startup; update the config to `rotating` to silence it. | See `rotating`. |
+| `rolling` | After each append past `max_entries`, rewrite the retained tail entries to a temporary file and rename it over the active file. | The writer keeps the configured active-window size. It creates no archives and leaves archives from an earlier `rotating` configuration unmanaged. |
 | `full` | Append without writer-managed trim or rotation. | The operator owns file growth and any external rotation. |
 | `rotating` | Before a new UTC day's first append, or after an append reaches the byte or entry-count threshold, rename the active file to a timestamped archive. | After each successful rotation, the writer prunes matching archives by age and then count. Removal is best-effort and never fails the enclosing append. |
 
-Age and count retention run only after rotation. They do not sweep continuously, do not apply to `full`, and do not delete arbitrary neighboring files: archive discovery accepts only names generated from the active path's timestamped archive shape. The live `/api/logs` reader merges the active file with all retained archives; see [Reader cursors](#reader-cursors-span-the-active-file-and-retained-archives).
+Age and count retention run only after rotation. They do not sweep continuously, do not apply to `full` or `rolling`, and do not delete arbitrary neighboring files: archive discovery accepts only names generated from the active path's timestamped archive shape. The live `/api/logs` reader merges the active file with all retained archives; see [Reader cursors](#reader-cursors-span-the-active-file-and-retained-archives).
 
 ## Schema migration is an active-file rewrite
 
