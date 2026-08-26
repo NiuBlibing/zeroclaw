@@ -40,7 +40,7 @@ use crate::config::{LlmRequestPayloadPolicy, LogConfig, ResolvedPolicy, StorageP
 use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
-use crate::reader::{is_archive_core, is_stamp, list_archives, split_base_ext};
+use crate::reader::{list_archives, split_base_ext};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
@@ -992,6 +992,10 @@ pub(crate) static WRITER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex:
 mod tests {
     use super::*;
     use crate::event::{EventCategory, Severity};
+    // Archive-name predicates live in `reader`; only the tests below exercise
+    // them directly, so importing them at module scope would be unused in a
+    // non-test build.
+    use crate::reader::{is_archive_core, is_stamp};
 
     fn install_writer(dir: &Path, max_entries: usize) {
         let cfg = LogConfig {
