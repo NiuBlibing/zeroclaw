@@ -1676,11 +1676,25 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
             // header that cannot be read is charged the animated bound, so a
             // malformed payload is refused rather than admitted cheaply — the
             // decode below would reject it in any case.
+            //
+            // APNGs that use `DisposeOp::Background` are assigned a projection
+            // above `MAX_DECODED_IMAGE_ALLOC_BYTES` so the per-image ceiling
+            // refuses them before any decoder is constructed. See
+            // `apng_uses_background_disposal` for why that path cannot be
+            // modelled: the disposal snapshot is an unmetered allocation inside
+            // the decoder, invisible to `Limits`, and can be a multiple of the
+            // canvas for a full-region frame.
             let is_apng = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes))
                 .and_then(|decoder| decoder.is_apng())
                 .unwrap_or(true);
             if is_apng {
-                pixels.saturating_mul(APNG_SCRATCH_BYTES_PER_PIXEL)
+                if apng_uses_background_disposal(bytes) {
+                    // Return a value guaranteed to exceed the per-image cap,
+                    // triggering `per_image_cap_refusal` before any decode.
+                    MAX_DECODED_IMAGE_ALLOC_BYTES.saturating_add(1)
+                } else {
+                    pixels.saturating_mul(APNG_SCRATCH_BYTES_PER_PIXEL)
+                }
             } else {
                 0
             }
@@ -1689,6 +1703,79 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
     };
 
     Ok(output.saturating_add(scratch))
+}
+
+/// `dispose_op` value in an APNG `fcTL` chunk meaning "clear the frame's region
+/// to fully transparent black before compositing the next frame".
+///
+/// `image` 0.25.10 implements this by snapshotting the whole disposal region
+/// into a `Vec` before clearing it — see [`apng_uses_background_disposal`].
+const APNG_DISPOSE_OP_BACKGROUND: u8 = 1;
+
+/// Whether any `fcTL` chunk in `bytes` requests background disposal.
+///
+/// `ApngDecoder::mix_next_frame` handles `DisposeOp::Background` by collecting
+/// the entire disposal region before clearing it
+/// (`image-0.25.10/src/codecs/png.rs:385-401`):
+///
+/// ```ignore
+/// let pixels: Vec<_> = region_current.pixels().collect();
+/// ```
+///
+/// That `Vec<(u32, u32, Rgba<u8>)>` is 12 bytes per region pixel and is **not**
+/// preceded by any `Limits::reserve*` call, so it is invisible to both the
+/// decoder's own allocation cap and to this module's accounting. For a
+/// full-canvas region it is three times the canvas itself, which is enough to
+/// carry an image whose header projection sits under the per-image ceiling well
+/// past it once decoding starts.
+///
+/// The other two disposal modes are bounded: `None` only clones between the two
+/// canvases already accounted for, and `Previous` copies a sub-image back, both
+/// without a per-pixel collection. Rejecting only `Background` therefore closes
+/// the untracked allocation without refusing ordinary animations — inflating the
+/// scratch bound instead would have to assume the worst case for *every* APNG
+/// and would reject valid images that never take this branch.
+///
+/// The scan is header-only: `fcTL` is a fixed 26-byte payload and `dispose_op`
+/// is its 25th byte, so no pixel data is touched. A stream that cannot be walked
+/// is reported as *not* using background disposal; it is malformed and the
+/// decode that follows rejects it on its own terms.
+fn apng_uses_background_disposal(bytes: &[u8]) -> bool {
+    const PNG_SIGNATURE_LEN: usize = 8;
+    const CHUNK_HEADER_LEN: usize = 8; // 4-byte length + 4-byte type
+    const CHUNK_CRC_LEN: usize = 4;
+    const FCTL_PAYLOAD_LEN: usize = 26;
+    const FCTL_DISPOSE_OP_OFFSET: usize = 24;
+
+    let mut offset = PNG_SIGNATURE_LEN;
+    while offset + CHUNK_HEADER_LEN + CHUNK_CRC_LEN <= bytes.len() {
+        let Ok(length_bytes) = <[u8; 4]>::try_from(&bytes[offset..offset + 4]) else {
+            return false;
+        };
+        let length = u32::from_be_bytes(length_bytes) as usize;
+        let kind = &bytes[offset + 4..offset + CHUNK_HEADER_LEN];
+        let payload_start = offset + CHUNK_HEADER_LEN;
+        let Some(chunk_end) = payload_start
+            .checked_add(length)
+            .and_then(|end| end.checked_add(CHUNK_CRC_LEN))
+        else {
+            return false;
+        };
+        if chunk_end > bytes.len() {
+            return false;
+        }
+
+        if kind == b"fcTL"
+            && length == FCTL_PAYLOAD_LEN
+            && bytes[payload_start + FCTL_DISPOSE_OP_OFFSET] == APNG_DISPOSE_OP_BACKGROUND
+        {
+            return true;
+        }
+
+        offset = chunk_end;
+    }
+
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2180,6 +2267,25 @@ async fn validate_image_content_with_projection(
                     )
                 })?;
                 if is_apng {
+                    // Refuse background disposal before the decoder runs: that
+                    // branch snapshots the whole disposal region into an
+                    // unmetered `Vec`, which no projection can bound. See
+                    // `apng_uses_background_disposal`.
+                    if apng_uses_background_disposal(&bytes_owned) {
+                        return Err(ImageValidationFailure {
+                            error: MultimodalError::CorruptImage {
+                                input: source_owned.clone(),
+                                mime: mime_owned.clone(),
+                                reason: "APNG background disposal is not supported: the decoder \
+                                         snapshots the full disposal region into an unbounded \
+                                         buffer"
+                                    .to_string(),
+                            }
+                            .into(),
+                            consumed_allocation: 0,
+                            kind: ImageValidationFailureKind::RefusedBeforeDecode,
+                        });
+                    }
                     let decoder = decoder.apng().map_err(|error| {
                         image_error_failure(
                             &source_owned,
@@ -3875,6 +3981,117 @@ mod tests {
         validate_image_content("rgba8.png", "image/png", &rgba8, u64::MAX)
             .await
             .expect("a valid Rgba8 APNG is still accepted");
+    }
+
+    #[tokio::test]
+    async fn apng_with_background_disposal_is_refused_before_decode() {
+        // `ApngDecoder::mix_next_frame` handles `DisposeOp::Background` by
+        // collecting the full disposal region into a
+        // `Vec<(u32, u32, Rgba<u8>)>` — 12 bytes per pixel — before clearing
+        // it (`image-0.25.10/src/codecs/png.rs:385-401`). That allocation is
+        // not preceded by any `Limits::reserve*`, so it is invisible to both
+        // the per-image decoder limit and the aggregate accounting. A
+        // full-canvas 2000×2000 APNG with dispose_op=Background can therefore
+        // allocate ~48 MiB more than its header projection implies, even when
+        // the frame and canvas dimensions stay below the per-image cap.
+        //
+        // The fix is to refuse any APNG that uses background disposal before
+        // the decoder runs, detected from the raw `fcTL` bytes.
+        //
+        // Build a 1×1 APNG whose first fcTL chunk sets dispose_op=Background.
+        // The `two_frame_apng_with_color` helper stores the frame_control
+        // array directly into the chunk body and the dispose_op sits at byte 24
+        // of that 26-byte payload (offset 24 from the payload start, which is
+        // right after the 4-byte length + 4-byte "fcTL" type in the stream).
+        // Reproduce the minimal fixture here with the disposal byte set.
+        let apng_with_background_disposal = {
+            fn crc32(name: &[u8; 4], data: &[u8]) -> u32 {
+                let mut crc = 0xFFFF_FFFFu32;
+                for byte in name.iter().chain(data) {
+                    crc ^= u32::from(*byte);
+                    for _ in 0..8 {
+                        crc = if crc & 1 == 0 {
+                            crc >> 1
+                        } else {
+                            0xEDB8_8320 ^ (crc >> 1)
+                        };
+                    }
+                }
+                !crc
+            }
+            fn append_chunk(output: &mut Vec<u8>, name: &[u8; 4], data: &[u8]) {
+                output.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                output.extend_from_slice(name);
+                output.extend_from_slice(data);
+                output.extend_from_slice(&crc32(name, data).to_be_bytes());
+            }
+
+            let still = valid_png();
+            let mut idat = Vec::new();
+            let mut offset = 8usize;
+            while offset + 12 <= still.len() {
+                let length =
+                    u32::from_be_bytes(still[offset..offset + 4].try_into().unwrap()) as usize;
+                let chunk_end = offset + 12 + length;
+                if &still[offset + 4..offset + 8] == b"IDAT" {
+                    idat.extend_from_slice(&still[offset + 8..offset + 8 + length]);
+                }
+                offset = chunk_end;
+            }
+
+            let ihdr = [0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0];
+            let mut frame_control = [0u8; 26];
+            frame_control[4..8].copy_from_slice(&1u32.to_be_bytes()); // width
+            frame_control[8..12].copy_from_slice(&1u32.to_be_bytes()); // height
+            frame_control[20..22].copy_from_slice(&1u16.to_be_bytes()); // delay_num
+            frame_control[22..24].copy_from_slice(&100u16.to_be_bytes()); // delay_den
+            frame_control[24] = 1; // DisposeOp::Background
+
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            append_chunk(&mut bytes, b"IHDR", &ihdr);
+            let mut actl = Vec::new();
+            actl.extend_from_slice(&2u32.to_be_bytes()); // num_frames
+            actl.extend_from_slice(&0u32.to_be_bytes()); // num_plays
+            append_chunk(&mut bytes, b"acTL", &actl);
+            append_chunk(&mut bytes, b"fcTL", &frame_control); // dispose_op=Background
+            append_chunk(&mut bytes, b"IDAT", &idat);
+            frame_control[..4].copy_from_slice(&1u32.to_be_bytes()); // next seq
+            frame_control[24] = 0; // second frame uses None so it would decode fine
+            append_chunk(&mut bytes, b"fcTL", &frame_control);
+            let mut fdat = Vec::with_capacity(4 + idat.len());
+            fdat.extend_from_slice(&2u32.to_be_bytes());
+            fdat.extend_from_slice(&idat);
+            append_chunk(&mut bytes, b"fdAT", &fdat);
+            append_chunk(&mut bytes, b"IEND", &[]);
+            bytes
+        };
+
+        // A 1×1 APNG is nowhere near the per-image ceiling, so the only reason
+        // it is refused is the background-disposal check — not a size or decode
+        // error. Without the check this fixture decodes successfully.
+        let error = validate_image_content(
+            "bg.png",
+            "image/png",
+            &apng_with_background_disposal,
+            u64::MAX,
+        )
+        .await
+        .expect_err("an APNG with background disposal must be refused before decode");
+
+        // The refusal drives the projection above the per-image ceiling
+        // (`projected_allocation` returns `MAX_DECODED_IMAGE_ALLOC_BYTES + 1`),
+        // so `per_image_cap_refusal` fires before the decoder is ever entered.
+        let reason = error.to_string();
+        assert!(
+            reason.contains("exceeds per-image limit"),
+            "the refusal must come from the pre-decode ceiling check; got: {reason}"
+        );
+
+        // An APNG without background disposal must still be accepted.
+        let apng_none_disposal = two_frame_apng_with_color(true);
+        validate_image_content("ok.png", "image/png", &apng_none_disposal, u64::MAX)
+            .await
+            .expect("an APNG without background disposal must still be accepted");
     }
 
     fn lossless_webp(pixel: [u8; 3]) -> Vec<u8> {
