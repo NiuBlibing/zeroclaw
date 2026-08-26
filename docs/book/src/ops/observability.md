@@ -26,7 +26,7 @@ Persistence is best-effort rather than a transactional audit guarantee. The Obse
 | --- | --- | --- |
 | `log_persistence_max_bytes` | `0` | Rotate once an append leaves the active file at or above this many bytes. `0` disables size rotation. |
 | `log_persistence_rotate_daily` | `true` | Before the first event of a new UTC day, archive a file whose last write fell on an earlier day. |
-| `log_persistence_max_entries_per_segment` | `0` | Rotate once the segment's non-empty line count reaches this cap, so each archive holds exactly this many entries. `0` disables entry-count rotation. |
+| `log_persistence_max_entries_per_segment` | `0` | Rotate once the segment's non-empty line count reaches this cap. In steady state each archive holds exactly this many entries. When first enabled on an existing log, the file is archived whole (one over-cap transition); steady state resumes on the next rotation. `0` disables entry-count rotation. |
 | `log_persistence_retention_max_files` | `7` | Keep at most this many archives; after a rotation the oldest beyond the cap are deleted. `0` keeps all. |
 | `log_persistence_retention_max_age_days` | `0` | Delete archives older than this many days after a rotation. `0` disables age-based cleanup. |
 

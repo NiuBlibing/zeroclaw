@@ -503,7 +503,15 @@ pub(crate) fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>>
         if !is_archive_core(core) {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(meta) = entry.metadata() else {
+            tracing::warn!(
+                target: "zeroclaw_log",
+                path = %entry.path().display(),
+                "log: could not read archive metadata; this archive is excluded from \
+                 the merged query result and may be inaccessible",
+            );
+            continue;
+        };
         if !meta.is_file() {
             continue;
         }
@@ -511,6 +519,23 @@ pub(crate) fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>>
         out.push((entry.path(), mtime));
     }
     Ok(out)
+}
+
+/// Outcome of a segment-aware page read.
+///
+/// The anchor miss is reported rather than silently absorbed: only the caller
+/// knows whether its segment list came from a listing that could still be
+/// refreshed. `load_page_multi` sees one snapshot and cannot tell "the writer
+/// rotated a moment ago, re-list and I will find it" apart from "retention
+/// pruned this segment for good".
+#[derive(Debug)]
+pub(crate) enum PageOutcome {
+    /// The page was produced, either from a resolved cursor or a full scan.
+    Page(Box<LogPage>),
+    /// The cursor carried an anchor id that is in none of the supplied
+    /// segments. The caller should re-enumerate and retry before falling back
+    /// to a full scan.
+    AnchorMissing,
 }
 
 /// Paginated load across the active file and all retained archive files.
@@ -529,7 +554,7 @@ pub(crate) fn load_page_multi(
     filter: &LogFilter,
     limit: usize,
     segment_cursor: Option<&SegmentCursor>,
-) -> Result<LogPage> {
+) -> Result<PageOutcome> {
     let limit = limit.clamp(1, 10_000);
     let needle = filter.q.as_deref().map(|s| s.to_ascii_lowercase());
 
@@ -594,8 +619,11 @@ pub(crate) fn load_page_multi(
                             Some((anchor_idx, anchor_end_off)) => {
                                 (anchor_idx, Some(anchor_end_off))
                             }
-                            // Anchor not found at all (e.g. pruned): full scan.
-                            None => (segs.len().saturating_sub(1), None),
+                            // The anchored event is in none of these segments.
+                            // Hand that back so the caller can re-enumerate:
+                            // a rotation that landed after its listing puts the
+                            // event in an archive this snapshot never saw.
+                            None => return Ok(PageOutcome::AnchorMissing),
                         }
                     } else {
                         (idx, cursor_off)
@@ -603,6 +631,16 @@ pub(crate) fn load_page_multi(
                 } else {
                     (idx, cursor_off)
                 }
+            }
+            // The cursor names a segment that is not in this listing. If it
+            // carried an anchor, the caller may be holding a stale list; report
+            // the miss so it can re-enumerate. Anchorless legacy cursors have
+            // nothing to re-find, so they fall back to a full scan.
+            None if segment_cursor
+                .and_then(|c| c.anchor_id.as_deref())
+                .is_some() =>
+            {
+                return Ok(PageOutcome::AnchorMissing);
             }
             None => (segs.len().saturating_sub(1), None),
         },
@@ -718,13 +756,13 @@ pub(crate) fn load_page_multi(
     // truncated.
     let at_end = !dropped_older;
 
-    Ok(LogPage {
+    Ok(PageOutcome::Page(Box::new(LogPage {
         events,
         next_cursor,
         next_cursor_line_offset,
         next_segment_cursor,
         at_end,
-    })
+    })))
 }
 
 /// Read one page across the active file and every retained archive.
@@ -745,64 +783,51 @@ pub(crate) fn load_page_multi(
 /// was pruned by retention.
 pub fn query_log_page(
     active: &Path,
+    reads_archives: bool,
     filter: &LogFilter,
     limit: usize,
     segment_cursor: Option<&SegmentCursor>,
 ) -> Result<LogPage> {
-    let archives = list_archives(active).with_context(|| {
+    // Each attempt re-enumerates, so a retry sees any archive created since the
+    // previous attempt's listing. Two attempts cover one rotation landing
+    // anywhere inside the call; a second rotation in the same call, or a
+    // genuinely pruned segment, falls through to the full scan below.
+    for _ in 0..2 {
+        let archives = enumerate_segments(active, reads_archives)?;
+        match load_page_multi(active, &archives, filter, limit, segment_cursor)? {
+            PageOutcome::Page(page) => return Ok(*page),
+            PageOutcome::AnchorMissing => continue,
+        }
+    }
+
+    // The anchor is unreachable across repeated listings: its segment is gone
+    // for good (pruned by retention), not merely missing from a stale snapshot.
+    // Drop the cursor and serve the newest page. Callers that prepend pages to
+    // an existing buffer must deduplicate, since this page is not older history.
+    let archives = enumerate_segments(active, reads_archives)?;
+    match load_page_multi(active, &archives, filter, limit, None)? {
+        PageOutcome::Page(page) => Ok(*page),
+        // Unreachable: a `None` cursor has no anchor to miss.
+        PageOutcome::AnchorMissing => {
+            unreachable!("cursor-less call cannot produce an anchor miss")
+        }
+    }
+}
+
+/// Enumerate the segments that belong to this query's logical stream.
+///
+/// Returns an empty list when the storage policy does not own archives, so the
+/// read covers the active file alone. See [`StoragePolicy::reads_archives`].
+fn enumerate_segments(active: &Path, reads_archives: bool) -> Result<Vec<(PathBuf, SystemTime)>> {
+    if !reads_archives {
+        return Ok(Vec::new());
+    }
+    list_archives(active).with_context(|| {
         format!(
             "enumerating log archives next to {} for a page query",
             active.display()
         )
-    })?;
-
-    // A cursor without an anchor (legacy wire form) has nothing to verify, so
-    // there is no stale-list case to detect and no reason to re-enumerate.
-    let anchored = segment_cursor.and_then(|c| c.anchor_id.as_deref());
-    let Some(anchor) = anchored else {
-        return load_page_multi(active, &archives, filter, limit, segment_cursor);
-    };
-
-    if anchor_reachable(active, &archives, anchor) {
-        return load_page_multi(active, &archives, filter, limit, segment_cursor);
-    }
-
-    // The anchored event is in none of the files just listed. Either the writer
-    // rotated between the listing and now (the archive holding it was created
-    // after the snapshot), or the segment was pruned by retention.
-    // Re-enumerate once: the first case resolves, the second does not.
-    let refreshed = list_archives(active).with_context(|| {
-        format!(
-            "re-enumerating log archives next to {} after an anchor miss",
-            active.display()
-        )
-    })?;
-    load_page_multi(active, &refreshed, filter, limit, segment_cursor)
-}
-
-/// True when `anchor` is present in the active file or any listed archive.
-/// Used to decide whether a segment listing is stale enough to warrant a
-/// re-enumeration. Errors and unreadable files count as "not found" so the
-/// caller re-enumerates rather than trusting a partial answer.
-fn anchor_reachable(active: &Path, archives: &[(PathBuf, SystemTime)], anchor: &str) -> bool {
-    let mut segs: Vec<(PathBuf, String)> = archives
-        .iter()
-        .map(|(p, _)| {
-            let name = p
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_owned();
-            (p.clone(), name)
-        })
-        .collect();
-    let active_name = active
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_owned();
-    segs.push((active.to_path_buf(), active_name));
-    find_anchor_in_segments(&segs, anchor).is_some()
+    })
 }
 
 /// Find one event by id across the active file and every retained archive,
@@ -812,16 +837,17 @@ fn anchor_reachable(active: &Path, archives: &[(PathBuf, SystemTime)], anchor: &
 /// Returns `Ok(None)` when no segment holds the id. An archive that cannot be
 /// read is skipped rather than failing the lookup, so a single unreadable file
 /// does not hide an event that a later segment still has.
-pub fn find_event_across_segments(active: &Path, id: &str) -> Result<Option<LogEvent>> {
+pub fn find_event_across_segments(
+    active: &Path,
+    reads_archives: bool,
+    id: &str,
+) -> Result<Option<LogEvent>> {
     if let Some(event) = find_event_by_id(active, id)? {
         return Ok(Some(event));
     }
-    let mut archives = list_archives(active).with_context(|| {
-        format!(
-            "enumerating log archives next to {} for an id lookup",
-            active.display()
-        )
-    })?;
+    // Same policy boundary as `query_log_page`: an id that is only in an
+    // unmanaged archive is not part of this policy's logical stream.
+    let mut archives = enumerate_segments(active, reads_archives)?;
     // Newest archive first: a recently rotated event is the likely target.
     archives.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
     for (path, _) in archives {
@@ -854,6 +880,17 @@ mod tests {
             let line = serde_json::to_string(event).unwrap();
             file.write_all(line.as_bytes()).unwrap();
             file.write_all(b"\n").unwrap();
+        }
+    }
+
+    /// Unwrap a `PageOutcome` that the test expects to be a real page.
+    /// Panics on `AnchorMissing`, which in tests always signals a setup bug.
+    fn page_of(outcome: PageOutcome) -> LogPage {
+        match outcome {
+            PageOutcome::Page(page) => *page,
+            PageOutcome::AnchorMissing => {
+                panic!("expected a page, got AnchorMissing")
+            }
         }
     }
 
@@ -1423,7 +1460,8 @@ mod tests {
         write_jsonl(&active, &[new_c, new_d]);
 
         let archives = vec![(archive.clone(), archive_mtime)];
-        let page = load_page_multi(&active, &archives, &LogFilter::default(), 10, None).unwrap();
+        let page =
+            page_of(load_page_multi(&active, &archives, &LogFilter::default(), 10, None).unwrap());
 
         assert_eq!(page.events.len(), 4, "all 4 events across segments");
         // Newest first.
@@ -1460,7 +1498,8 @@ mod tests {
         let archives = vec![(archive.clone(), archive_mtime)];
 
         // Page 1: limit 2 → newest two events (from active file).
-        let page1 = load_page_multi(&active, &archives, &LogFilter::default(), 2, None).unwrap();
+        let page1 =
+            page_of(load_page_multi(&active, &archives, &LogFilter::default(), 2, None).unwrap());
         assert_eq!(page1.events.len(), 2);
         assert_eq!(page1.events[0].message.as_deref(), Some("new-d"));
         assert_eq!(page1.events[1].message.as_deref(), Some("new-c"));
@@ -1472,8 +1511,9 @@ mod tests {
 
         // Page 2: using the cursor → should return the two archive events.
         let cursor = SegmentCursor::from_wire(&cursor_wire).expect("valid cursor wire format");
-        let page2 =
-            load_page_multi(&active, &archives, &LogFilter::default(), 2, Some(&cursor)).unwrap();
+        let page2 = page_of(
+            load_page_multi(&active, &archives, &LogFilter::default(), 2, Some(&cursor)).unwrap(),
+        );
         assert_eq!(page2.events.len(), 2);
         assert_eq!(page2.events[0].message.as_deref(), Some("old-b"));
         assert_eq!(page2.events[1].message.as_deref(), Some("old-a"));
@@ -1512,7 +1552,7 @@ mod tests {
 
         // Page 1: limit 2 → returns [d, c] with a cursor pointing into the
         // active file before c (i.e., the cursor anchors on ev_c).
-        let page1 = load_page_multi(&active, &[], &LogFilter::default(), 2, None).unwrap();
+        let page1 = page_of(load_page_multi(&active, &[], &LogFilter::default(), 2, None).unwrap());
         assert_eq!(page1.events.len(), 2);
         assert_eq!(page1.events[0].message.as_deref(), Some("ev-d"));
         assert_eq!(page1.events[1].message.as_deref(), Some("ev-c"));
@@ -1536,8 +1576,9 @@ mod tests {
         // [e, d] as the broken pre-fix implementation would.
         let cursor = SegmentCursor::from_wire(&cursor_wire).expect("valid cursor");
         let archives = vec![(archive.clone(), archive_mtime)];
-        let page2 =
-            load_page_multi(&active, &archives, &LogFilter::default(), 2, Some(&cursor)).unwrap();
+        let page2 = page_of(
+            load_page_multi(&active, &archives, &LogFilter::default(), 2, Some(&cursor)).unwrap(),
+        );
         assert_eq!(
             page2.events.len(),
             2,
@@ -1583,7 +1624,7 @@ mod tests {
 
         // Page 1 over the active file alone: no archives exist yet, so the
         // cursor anchors on ev_c inside `trace.jsonl`.
-        let page1 = query_log_page(&active, &LogFilter::default(), 2, None).unwrap();
+        let page1 = query_log_page(&active, true, &LogFilter::default(), 2, None).unwrap();
         assert_eq!(page1.events[0].message.as_deref(), Some("ev-d"));
         assert_eq!(page1.events[1].message.as_deref(), Some("ev-c"));
         let cursor_wire = page1
@@ -1602,7 +1643,7 @@ mod tests {
         // Page 2 must continue into the rotated-away history, not restart from
         // the replacement active file.
         let cursor = SegmentCursor::from_wire(&cursor_wire).expect("valid cursor");
-        let page2 = query_log_page(&active, &LogFilter::default(), 2, Some(&cursor)).unwrap();
+        let page2 = query_log_page(&active, true, &LogFilter::default(), 2, Some(&cursor)).unwrap();
         assert_eq!(
             page2.events.len(),
             2,
@@ -1637,13 +1678,13 @@ mod tests {
         live.message = Some("in-active".into());
         write_jsonl(&active, &[live]);
 
-        let hit = find_event_across_segments(&active, "live-id").unwrap();
+        let hit = find_event_across_segments(&active, true, "live-id").unwrap();
         assert_eq!(
             hit.expect("active hit").message.as_deref(),
             Some("in-active")
         );
 
-        let hit = find_event_across_segments(&active, "archived-id").unwrap();
+        let hit = find_event_across_segments(&active, true, "archived-id").unwrap();
         assert_eq!(
             hit.expect("archive hit").message.as_deref(),
             Some("in-archive"),
@@ -1651,9 +1692,126 @@ mod tests {
         );
 
         assert!(
-            find_event_across_segments(&active, "no-such-id")
+            find_event_across_segments(&active, true, "no-such-id")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn rolling_scope_does_not_merge_orphaned_archives() {
+        // `rolling` never creates archives, but a path that previously ran
+        // `rotating` still has them on disk, explicitly unmanaged. Merging them
+        // into a rolling query would resurrect events the rolling window is
+        // supposed to have discarded, and nothing would ever prune them since
+        // no rotation runs to trigger retention.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+        let orphan = tmp.path().join("trace.20260101-000000.jsonl");
+
+        let mut old_event = make_event("legacy", None);
+        old_event.id = "orphaned".into();
+        old_event.timestamp = "2026-01-01T00:00:00.000Z".into();
+        old_event.message = Some("from-a-previous-rotating-config".into());
+        write_jsonl(&orphan, &[old_event]);
+
+        let mut live = make_event("current", None);
+        live.id = "live".into();
+        live.timestamp = "2026-01-02T00:00:00.000Z".into();
+        live.message = Some("in-the-rolling-window".into());
+        write_jsonl(&active, &[live]);
+
+        // reads_archives = false: the rolling scope.
+        let page = query_log_page(&active, false, &LogFilter::default(), 10, None).unwrap();
+        assert_eq!(
+            page.events.len(),
+            1,
+            "rolling must read the active file alone, got {:?}",
+            page.events
+                .iter()
+                .map(|e| e.message.as_deref())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            page.events[0].message.as_deref(),
+            Some("in-the-rolling-window")
+        );
+
+        // An id that lives only in the orphaned archive is likewise out of scope.
+        assert!(
+            find_event_across_segments(&active, false, "orphaned")
+                .unwrap()
+                .is_none(),
+            "an orphaned archive's events are not part of the rolling stream"
+        );
+
+        // The same directory under the rotating scope does merge them, which is
+        // what makes the distinction a policy boundary rather than a path one.
+        let page = query_log_page(&active, true, &LogFilter::default(), 10, None).unwrap();
+        assert_eq!(page.events.len(), 2, "rotating merges retained archives");
+        assert!(
+            find_event_across_segments(&active, true, "orphaned")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stale_cursor_anchor_reports_missing_rather_than_full_scanning() {
+        // `load_page_multi` sees one snapshot and cannot tell "the writer
+        // rotated a moment ago, re-list and I will find it" apart from
+        // "retention pruned this segment for good". It reports the miss so the
+        // caller, which can re-enumerate, decides. This is the deterministic
+        // stand-in for the in-call rotation race: rather than injecting timing,
+        // the test hands the reader exactly the stale list such a race produces.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+        let archive = tmp.path().join("trace.20260101-000000.jsonl");
+
+        let mut ev_a = make_event("a", None);
+        ev_a.id = "id-a".into();
+        ev_a.timestamp = "2026-01-01T00:00:00.000Z".into();
+        let mut ev_b = make_event("b", None);
+        ev_b.id = "id-b".into();
+        ev_b.timestamp = "2026-01-01T00:00:01.000Z".into();
+        write_jsonl(&active, &[ev_a, ev_b]);
+
+        // Rotate: the cursor's file becomes an archive, a new active file
+        // takes its basename.
+        std::fs::rename(&active, &archive).unwrap();
+        let mut ev_c = make_event("c", None);
+        ev_c.id = "id-c".into();
+        ev_c.timestamp = "2026-01-01T00:00:02.000Z".into();
+        write_jsonl(&active, &[ev_c]);
+
+        // A cursor anchored on an event that is now in the archive, paired with
+        // the pre-rotation (empty) archive list: exactly the state a rotation
+        // between enumeration and scanning leaves behind.
+        let cursor = SegmentCursor {
+            seg: "trace.jsonl".into(),
+            off: 4096,
+            anchor_id: Some("id-b".into()),
+        };
+        let outcome =
+            load_page_multi(&active, &[], &LogFilter::default(), 2, Some(&cursor)).unwrap();
+        assert!(
+            matches!(outcome, PageOutcome::AnchorMissing),
+            "a stale list must surface the anchor miss, not silently full-scan"
+        );
+
+        // With the archive present, the same cursor resolves normally.
+        let archive_mtime = std::fs::metadata(&archive).unwrap().modified().unwrap();
+        let outcome = load_page_multi(
+            &active,
+            &[(archive.clone(), archive_mtime)],
+            &LogFilter::default(),
+            2,
+            Some(&cursor),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, PageOutcome::Page(_)),
+            "the anchor is reachable once the rotated archive is listed"
         );
     }
 }

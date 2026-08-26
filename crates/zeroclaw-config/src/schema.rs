@@ -12151,7 +12151,9 @@ pub struct ObservabilityConfig {
     /// reaches this cap, it is rotated to an archive (an O(1) rename — no
     /// content is rewritten), the same mechanism as
     /// `log_persistence_max_bytes`, so each archive produced by this trigger
-    /// holds exactly this many entries. `0` disables entry-count rotation.
+    /// holds exactly this many entries in steady state; an existing active
+    /// file that already exceeds the cap when this feature is first enabled
+    /// is archived whole on the next append. `0` disables entry-count rotation.
     /// Ignored unless `log_persistence = "rotating"`; the `rolling` policy
     /// keeps its own in-place trim governed by `log_persistence_max_entries`.
     #[serde(default = "default_log_persistence_max_entries_per_segment")]

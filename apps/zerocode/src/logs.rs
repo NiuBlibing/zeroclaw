@@ -579,13 +579,32 @@ impl Logs {
                     .collect();
                 let prepended = new_entries.len();
                 if has_cursor && prepended > 0 {
-                    // Prepend older events before the existing buffer
-                    let mut combined = new_entries;
-                    combined.append(&mut self.events);
-                    self.events = combined;
-                    // Shift selection to keep the same item visible
-                    if let Some(sel) = self.list_state.selected() {
-                        self.list_state.select(Some(sel + prepended));
+                    // Prepend older events before the existing buffer.
+                    // Deduplicate by id: when a cursor segment is pruned by
+                    // retention, query_log_page falls back to a full scan and
+                    // returns the newest page instead of an older continuation.
+                    // Prepending without deduplication would show the same
+                    // events twice and scramble the chronological order.
+                    let existing_ids: std::collections::HashSet<String> =
+                        self.events.iter().map(|e| e.id.clone()).collect();
+                    let deduped: Vec<LogEntry> = new_entries
+                        .into_iter()
+                        .filter(|e| !existing_ids.contains(&e.id))
+                        .collect();
+                    let actually_prepended = deduped.len();
+                    if actually_prepended > 0 {
+                        let mut combined = deduped;
+                        combined.append(&mut self.events);
+                        self.events = combined;
+                        // Shift selection to keep the same item visible
+                        if let Some(sel) = self.list_state.selected() {
+                            self.list_state.select(Some(sel + actually_prepended));
+                        }
+                    } else {
+                        // Every returned event was a duplicate: the cursor was
+                        // stale and the daemon served the newest page instead of
+                        // older history. Signal "at end" so the UI stops paging.
+                        self.at_end = true;
                     }
                 } else if !has_cursor {
                     self.events = new_entries;

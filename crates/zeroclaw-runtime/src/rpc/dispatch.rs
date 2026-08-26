@@ -4035,7 +4035,7 @@ impl RpcDispatcher {
     async fn handle_logs_query(&self, params: &Value) -> RpcResult {
         let p: LogsQueryParams = parse_params(params)?;
 
-        let Some(active) = zeroclaw_log::active_log_path() else {
+        let Some((active, reads_archives)) = zeroclaw_log::active_log_query_scope() else {
             return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
         };
 
@@ -4060,8 +4060,14 @@ impl RpcDispatcher {
             .as_deref()
             .and_then(zeroclaw_log::SegmentCursor::from_wire);
 
-        let page = zeroclaw_log::query_log_page(&active, &filter, limit, segment_cursor.as_ref())
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
+        let page = zeroclaw_log::query_log_page(
+            &active,
+            reads_archives,
+            &filter,
+            limit,
+            segment_cursor.as_ref(),
+        )
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
 
         let events: Vec<serde_json::Value> = page
             .events
@@ -4086,11 +4092,11 @@ impl RpcDispatcher {
     /// `logs/query` are always findable by id.
     async fn handle_logs_get(&self, params: &Value) -> RpcResult {
         let p: LogsGetParams = parse_params(params)?;
-        let Some(active) = zeroclaw_log::active_log_path() else {
+        let Some((active, reads_archives)) = zeroclaw_log::active_log_query_scope() else {
             return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
         };
 
-        match zeroclaw_log::find_event_across_segments(&active, &p.id)
+        match zeroclaw_log::find_event_across_segments(&active, reads_archives, &p.id)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?
         {
             Some(evt) => {

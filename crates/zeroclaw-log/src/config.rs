@@ -20,7 +20,10 @@ pub struct LogConfig {
     /// Max age (days) of rotated archives in `rotating` mode. `0` disables.
     pub log_persistence_retention_max_age_days: u64,
     /// Rotate the active file once it holds this many non-empty JSONL lines,
-    /// in `rotating` mode, so each archive holds exactly this many entries.
+    /// in `rotating` mode. In steady state each archive holds exactly this
+    /// many entries; an existing active file that already exceeds the cap at
+    /// startup is archived as-is on the next append (one over-cap transition
+    /// archive), after which steady state resumes.
     /// `0` disables entry-count rotation. Ignored by every other policy.
     pub log_persistence_max_entries_per_segment: usize,
     pub log_tool_io: String,
@@ -76,6 +79,21 @@ impl StoragePolicy {
 
     pub fn is_enabled(self) -> bool {
         !matches!(self, Self::None)
+    }
+
+    /// Whether a reader should merge timestamped archives with the active file.
+    ///
+    /// Only `Rotating` owns archives: it creates them and prunes them under
+    /// `retention_max_files` / `retention_max_age_days`. Every other policy
+    /// reads the active file alone. That matters most for `Rolling`, whose
+    /// contract is "the most recent `max_entries` events, older ones
+    /// discarded": if a path previously ran `Rotating`, its archives are still
+    /// on disk but explicitly unmanaged (see the storage-policy table in
+    /// `docs/book/src/architecture/logging.md`). Merging them would resurrect
+    /// events the rolling window is supposed to have dropped, and they would
+    /// never be pruned, since no rotation runs to trigger retention.
+    pub fn reads_archives(self) -> bool {
+        matches!(self, Self::Rotating)
     }
 }
 
@@ -148,9 +166,11 @@ pub struct ResolvedPolicy {
     /// Max age (days) of rotated archives in `Rotating` mode. `0` disables.
     pub retention_max_age_days: u64,
     /// Rotate the active file once it holds this many non-empty JSONL lines,
-    /// in `Rotating` mode. `0` disables entry-count rotation. Each archive
-    /// produced by this trigger therefore holds exactly this many entries.
-    /// Ignored by every other storage policy.
+    /// in `Rotating` mode. In steady state each archive holds exactly this
+    /// many entries; an existing active file that already exceeds the cap at
+    /// first startup or reload is archived as-is (one over-cap transition
+    /// archive), and steady state resumes on the next append.
+    /// `0` disables entry-count rotation. Ignored by every other storage policy.
     pub max_entries_per_segment: usize,
     pub tool_io: ToolIoPolicy,
     pub tool_io_truncate_bytes: usize,

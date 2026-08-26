@@ -479,6 +479,21 @@ pub fn active_log_path() -> Option<PathBuf> {
         .map(|s| s.policy.path.clone())
 }
 
+/// The active log path paired with whether the installed storage policy owns
+/// timestamped archives. `None` when persistence is disabled at the writer
+/// layer, matching [`active_log_path`].
+///
+/// Query entry points need both halves: the path says *where* to read, and the
+/// flag says whether archives next to it are part of this policy's logical
+/// stream. Reading the flag from the same writer state that produced the path
+/// keeps the two consistent; deriving it from a separate config snapshot could
+/// disagree with the writer actually running.
+pub fn active_log_query_scope() -> Option<(PathBuf, bool)> {
+    current_state()
+        .filter(|s| s.policy.storage.is_enabled())
+        .map(|s| (s.policy.path.clone(), s.policy.storage.reads_archives()))
+}
+
 pub fn flush_for_test() -> Result<()> {
     let Some(state) = current_state() else {
         return Ok(());
@@ -2071,5 +2086,75 @@ mod tests {
             CAP + 1,
             "seeded rows and the new append must all survive the rotation"
         );
+    }
+
+    #[test]
+    fn entry_count_seeded_over_cap_archives_the_existing_file_whole() {
+        // The transition case for W1: enabling entry-count rotation on a log
+        // that is already larger than the cap, or reloading after the cap was
+        // lowered. Splitting that file into cap-sized pieces would mean a full
+        // rewrite, which is exactly the O(file size) cost this feature exists to
+        // remove (see #10073: a 208MB runtime-trace was the motivating case).
+        // So the existing file is archived whole, once, and every archive after
+        // it holds exactly `cap` entries.
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        const CAP: usize = 2;
+        const SEEDED: usize = 5; // deliberately over the cap
+
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let seeded = state_dir.join("runtime-trace.jsonl");
+        let mut seed = String::new();
+        for i in 0..SEEDED {
+            let ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+            let mut v = serde_json::to_value(&ev).unwrap();
+            v["message"] = serde_json::Value::String(format!("seeded-{i}"));
+            seed.push_str(&serde_json::to_string(&v).unwrap());
+            seed.push('\n');
+        }
+        fs::write(&seeded, &seed).unwrap();
+
+        let cfg = LogConfig {
+            log_persistence: "rotating".into(),
+            log_persistence_max_bytes: 0,
+            log_persistence_rotate_daily: false,
+            log_persistence_retention_max_files: 0,
+            log_persistence_max_entries_per_segment: CAP,
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+        let path = runtime_trace_path().unwrap();
+
+        emit("post-seed");
+
+        // The transition archive holds the whole over-cap file, not `cap` rows.
+        let archives = list_archives(&path).unwrap();
+        assert_eq!(archives.len(), 1, "the seeded file is archived once");
+        assert_eq!(
+            count_nonempty_lines(&archives[0].0).unwrap(),
+            SEEDED,
+            "the pre-existing file is archived whole rather than split"
+        );
+
+        // Steady state resumes: the next `cap` appends produce a cap-sized archive.
+        for i in 0..CAP {
+            emit(&format!("steady-{i}"));
+        }
+        let archives = list_archives(&path).unwrap();
+        assert_eq!(archives.len(), 2, "a second rotation fired at the cap");
+        let mut sizes: Vec<usize> = archives
+            .iter()
+            .map(|(p, _)| count_nonempty_lines(p).unwrap())
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(
+            sizes,
+            vec![CAP, SEEDED],
+            "after the one-time transition archive, archives are cap-sized"
+        );
+
+        // Nothing is lost across the transition.
+        assert_eq!(total_events(&path), SEEDED + 1 + CAP);
     }
 }
