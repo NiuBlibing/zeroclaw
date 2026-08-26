@@ -1554,12 +1554,25 @@ const WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL: u64 = 17;
 /// persistent full-canvas `non_disposed_frame` (RGBA8, 4 B/px) through
 /// `limits.reserve_buffer` before the first frame and keeps it for the whole
 /// animation, blending each frame against it. It is live at the same time as
-/// the frame buffer the iterator returns, so a GIF's peak is two canvases even
-/// though the yielded `Frame` accounts for only one.
+/// the frame buffer the iterator returns.
+///
+/// A frame that does not cover the whole canvas costs one buffer more. The
+/// iterator decodes the sub-rectangle into `frame_buffer`, and when that frame
+/// is not the full canvas at the origin it allocates a *second*, full-canvas
+/// `image_buffer` to composite into while `frame_buffer` and
+/// `non_disposed_frame` are both still live (`src/codecs/gif.rs:388-415`). The
+/// returned `Frame` is the composited full canvas in either branch, so the
+/// sub-rectangle is invisible from the outside and the two branches cannot be
+/// told apart after the fact.
+///
+/// The bound is therefore the worst branch: the persistent canvas plus a
+/// temporary sub-rectangle of at most one canvas, on top of the returned frame.
+/// Charging 4 B/px would only cover the full-frame branch and would
+/// under-account every partial-frame GIF.
 ///
 /// Every GIF reaching validation is routed through the animation path, so this
 /// applies to single-frame GIFs too.
-const GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL: u64 = 4;
+const GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL: u64 = 8;
 
 /// Extra bytes per pixel an **APNG** decode holds on top of the frame buffer it
 /// yields.
@@ -3180,6 +3193,36 @@ mod tests {
     const GIF_VALID_1X1_LZW: [u8; 5] = [0x02, 0x02, 0x4C, 0x01, 0x00];
     const GIF_TRAILER: u8 = 0x3B;
 
+    /// A valid single-frame GIF whose frame is a 1x1 sub-rectangle of a larger
+    /// logical canvas, placed at a non-zero offset.
+    ///
+    /// This shape takes the *partial-frame* branch of `image` 0.25.10's GIF
+    /// iterator (`src/codecs/gif.rs:388-415`), which allocates a second
+    /// full-canvas buffer to composite into while the temporary sub-rectangle
+    /// and the persistent canvas are both still live. The returned `Frame` is
+    /// the full canvas either way, so this branch is only distinguishable by
+    /// what it allocates, not by its output.
+    fn partial_frame_gif(canvas: u16) -> Vec<u8> {
+        let mut gif = Vec::new();
+        gif.extend_from_slice(b"GIF89a");
+        gif.extend_from_slice(&canvas.to_le_bytes()); // logical width
+        gif.extend_from_slice(&canvas.to_le_bytes()); // logical height
+        gif.extend_from_slice(&[0x80, 0x00, 0x00]); // global color table, 2 entries
+        gif.extend_from_slice(&[0x00, 0x00, 0x00]); // black
+        gif.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // white
+        // Image descriptor: 1x1 frame at offset (1, 1), so it is neither at the
+        // origin nor the size of the canvas.
+        gif.push(0x2C);
+        gif.extend_from_slice(&1u16.to_le_bytes()); // left
+        gif.extend_from_slice(&1u16.to_le_bytes()); // top
+        gif.extend_from_slice(&1u16.to_le_bytes()); // width
+        gif.extend_from_slice(&1u16.to_le_bytes()); // height
+        gif.push(0x00); // no local color table
+        gif.extend_from_slice(&GIF_VALID_1X1_LZW);
+        gif.push(GIF_TRAILER);
+        gif
+    }
+
     /// A two-frame 1x1 animated GIF. `second_frame` supplies the LZW payload
     /// after the second image descriptor, which is where the corrupt variant
     /// differs. No trailer is appended: the corrupt fixture is truncated.
@@ -3326,8 +3369,10 @@ mod tests {
                 .await
                 .expect("a well-formed animated GIF is accepted");
         assert_eq!(
-            allocation, 8,
-            "two 1x1 RGBA frames are charged cumulatively"
+            allocation,
+            4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL,
+            "an accepted GIF is charged its decoder peak (frame output plus the persistent \
+             canvas and the partial-frame composite bound), not the sum of its frame buffers"
         );
     }
 
@@ -3470,6 +3515,70 @@ mod tests {
             decodes, 0,
             "neither candidate may decode: the projected decoder peak exceeds the budget, \
              so both are refused by the pre-decode header check"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_frame_gif_peak_is_accounted_and_bounds_later_candidates() {
+        // A GIF whose frame is a sub-rectangle of the logical canvas takes the
+        // partial-frame branch of `image` 0.25.10's iterator
+        // (`src/codecs/gif.rs:388-415`): it decodes the sub-rectangle into a
+        // temporary buffer and then allocates a *second*, full-canvas buffer to
+        // composite into, while that temporary and the persistent
+        // `non_disposed_frame` canvas are both still live.
+        //
+        // The returned `Frame` is the composited full canvas in both branches,
+        // so this extra buffer is invisible from the outside. Charging only the
+        // returned frame plus one persistent canvas under-accounted every
+        // partial-frame GIF; the bound must cover the worst branch.
+        //
+        // Real peak for an NxN canvas with a 1x1 sub-frame:
+        //   persistent canvas (N*N*4) + temporary sub-rect (4) + composite (N*N*4)
+        const CANVAS: u16 = 4;
+        let gif = partial_frame_gif(CANVAS);
+        let pixels = u64::from(CANVAS) * u64::from(CANVAS);
+
+        let charge_per_candidate = pixels * 4 + pixels * GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL;
+        let real_peak = (pixels * 4) + 4 + (pixels * 4);
+        assert!(
+            charge_per_candidate >= real_peak,
+            "the charge ({charge_per_candidate}) must cover the decoder's real peak \
+             ({real_peak}) for a partial-frame GIF"
+        );
+
+        // Budget for exactly two candidates, so the third proves the envelope
+        // is enforced with the corrected accounting.
+        let mut budget = charge_per_candidate * 2;
+
+        let charged = validate_within_budget("first.gif", "image/gif", &gif, &mut budget)
+            .await
+            .expect("a valid partial-frame GIF within budget is accepted");
+        assert_eq!(
+            charged, charge_per_candidate,
+            "a partial-frame GIF must be charged the bound covering its composite buffer"
+        );
+
+        validate_within_budget("second.gif", "image/gif", &gif, &mut budget)
+            .await
+            .expect("the second candidate exactly consumes the remaining budget");
+        assert_eq!(
+            budget, 0,
+            "the envelope is fully spent after two candidates"
+        );
+
+        // The third candidate must be refused before decoding. Under the old
+        // 4 B/px charge the same budget would still have reported headroom here
+        // and admitted another full decode.
+        let ((), decodes) = counting_decodes(async {
+            let mut spent = budget;
+            validate_within_budget("third.gif", "image/gif", &gif, &mut spent)
+                .await
+                .expect_err("a candidate arriving after the envelope is spent must be refused");
+        })
+        .await;
+        assert_eq!(
+            decodes, 0,
+            "the refused candidate must not decode; the envelope is enforced before decode"
         );
     }
 
