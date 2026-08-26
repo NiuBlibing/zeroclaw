@@ -233,16 +233,18 @@ Do not use Observer output or SSE delivery to prove that every canonical event w
 
 ## Reader cursors span the active file and retained archives
 
-`GET /api/logs` and `logs/query` call `reader::load_page_multi`, which merges the
+`GET /api/logs` and `logs/query` call `reader::query_log_page`, which owns archive
+enumeration and merges the
 active file plus all retained archive files into one logical event stream. Segments
 are scanned oldest-archive-first and the merged result is returned newest-first,
 identical to the prior single-file semantics. The merge is sequential and
 in-process; no event is re-serialized.
 
-The primary pagination cursor is `next_segment_cursor`, a composite
-`<segment_basename>:<byte_offset>` string that identifies both the segment file
-and the position within it. Pass it back as `until_segment_cursor` to resume;
-the next scan stops before that line in that segment and returns older matches.
+The primary pagination cursor is `next_segment_cursor`, an opaque string that
+encodes the segment basename, a byte offset, and an anchor event id. Pass it
+back verbatim as `until_segment_cursor` to resume; do not construct or parse it.
+The anchor lets the reader detect an active-file rotation between requests and
+rebase the cursor to the archive that now contains the anchored event.
 
 The legacy byte-offset cursor `next_cursor_line_offset` / `until_line_offset`
 remains valid and resolves against the active file only. It is `None` when the

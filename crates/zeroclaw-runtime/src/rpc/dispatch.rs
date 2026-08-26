@@ -4035,7 +4035,7 @@ impl RpcDispatcher {
     async fn handle_logs_query(&self, params: &Value) -> RpcResult {
         let p: LogsQueryParams = parse_params(params)?;
 
-        let Some((active, archives)) = zeroclaw_log::segment_files() else {
+        let Some(active) = zeroclaw_log::active_log_path() else {
             return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
         };
 
@@ -4060,14 +4060,8 @@ impl RpcDispatcher {
             .as_deref()
             .and_then(zeroclaw_log::SegmentCursor::from_wire);
 
-        let page = zeroclaw_log::load_page_multi(
-            &active,
-            &archives,
-            &filter,
-            limit,
-            segment_cursor.as_ref(),
-        )
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
+        let page = zeroclaw_log::query_log_page(&active, &filter, limit, segment_cursor.as_ref())
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
 
         let events: Vec<serde_json::Value> = page
             .events
@@ -4092,35 +4086,24 @@ impl RpcDispatcher {
     /// `logs/query` are always findable by id.
     async fn handle_logs_get(&self, params: &Value) -> RpcResult {
         let p: LogsGetParams = parse_params(params)?;
-        let Some((active, mut archives)) = zeroclaw_log::segment_files() else {
+        let Some(active) = zeroclaw_log::active_log_path() else {
             return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
         };
 
-        // Search active file first (most recent events), then archives
-        // oldest-first. Stop as soon as the event is found.
-        let mut search_paths: Vec<std::path::PathBuf> = vec![active];
-        archives.sort_by_key(|(_, mtime)| *mtime);
-        search_paths.extend(archives.into_iter().map(|(p, _)| p));
-
-        for path in &search_paths {
-            match zeroclaw_log::find_event_by_id(path, &p.id) {
-                Ok(Some(evt)) => {
-                    let event = serde_json::to_value(evt).map_err(|e| {
-                        rpc_err(INTERNAL_ERROR, format!("Failed to serialize event: {e}"))
-                    })?;
-                    return to_result(LogsGetResult { event });
-                }
-                Ok(None) => continue,
-                Err(e) => {
-                    return Err(rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")));
-                }
+        match zeroclaw_log::find_event_across_segments(&active, &p.id)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?
+        {
+            Some(evt) => {
+                let event = serde_json::to_value(evt).map_err(|e| {
+                    rpc_err(INTERNAL_ERROR, format!("Failed to serialize event: {e}"))
+                })?;
+                to_result(LogsGetResult { event })
             }
+            None => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("Log id `{}` not found", p.id),
+            )),
         }
-
-        Err(rpc_err(
-            INTERNAL_ERROR,
-            format!("Log id `{}` not found", p.id),
-        ))
     }
 
     // ── File attachment handler ────────────────────────────────

@@ -87,7 +87,7 @@ pub async fn handle_api_logs(
         return e.into_response();
     }
 
-    let Some((active, archives)) = zeroclaw_log::segment_files() else {
+    let Some(active) = zeroclaw_log::active_log_path() else {
         return Json(LogsResponse {
             events: Vec::new(),
             next_cursor: None,
@@ -163,13 +163,7 @@ pub async fn handle_api_logs(
         next_cursor_line_offset,
         next_segment_cursor,
         at_end,
-    } = match zeroclaw_log::load_page_multi(
-        &active,
-        &archives,
-        &filter,
-        limit,
-        segment_cursor.as_ref(),
-    ) {
+    } = match zeroclaw_log::query_log_page(&active, &filter, limit, segment_cursor.as_ref()) {
         Ok(page) => page,
         Err(err) => {
             return (

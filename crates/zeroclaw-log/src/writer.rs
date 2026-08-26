@@ -40,6 +40,7 @@ use crate::config::{LlmRequestPayloadPolicy, LogConfig, ResolvedPolicy, StorageP
 use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
+use crate::reader::{is_archive_core, is_stamp, list_archives, split_base_ext};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
@@ -911,82 +912,6 @@ fn archive_path(path: &Path, when: DateTime<Utc>) -> Result<PathBuf> {
 /// dot (or is empty). The split is on the *last* dot so multi-dot names keep
 /// only their final extension: `runtime-trace.jsonl` → `("runtime-trace",
 /// ".jsonl")`; `a.b.jsonl` → `("a.b", ".jsonl")`; `trace` → `("trace", "")`.
-fn split_base_ext(file_name: &str) -> (&str, &str) {
-    match file_name.rfind('.') {
-        Some(i) if i > 0 => (&file_name[..i], &file_name[i..]),
-        _ => (file_name, ""),
-    }
-}
-
-/// True when `s` is exactly a `YYYYMMDD-HHMMSS` stamp: 8 digits, `-`, 6 digits.
-fn is_stamp(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() == 15
-        && b[..8].iter().all(u8::is_ascii_digit)
-        && b[8] == b'-'
-        && b[9..].iter().all(u8::is_ascii_digit)
-}
-
-fn is_archive_core(core: &str) -> bool {
-    match core.split_once('.') {
-        // `<stamp>.<counter>` — counter must be a non-empty run of digits.
-        Some((stamp, counter)) => {
-            !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit()) && is_stamp(stamp)
-        }
-        // `<stamp>`
-        None => is_stamp(core),
-    }
-}
-
-fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>> {
-    let dir = active.parent().unwrap_or_else(|| Path::new("."));
-    let active_name = active
-        .file_name()
-        .and_then(|s| s.to_str())
-        .context("log path has no file name")?;
-    let (base, ext) = split_base_ext(active_name);
-    let prefix = format!("{base}.");
-
-    let mut out = Vec::new();
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-        Err(err) => {
-            return Err(err).with_context(|| format!("reading log dir {}", dir.display()));
-        }
-    };
-    for entry in entries {
-        let entry = entry.with_context(|| format!("reading entry in {}", dir.display()))?;
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if name == active_name {
-            continue;
-        }
-        let Some(suffix) = name.strip_prefix(&prefix) else {
-            continue;
-        };
-        let core = if ext.is_empty() {
-            suffix
-        } else {
-            let Some(core) = suffix.strip_suffix(ext) else {
-                continue;
-            };
-            core
-        };
-        if !is_archive_core(core) {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
-            continue;
-        }
-        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        out.push((entry.path(), mtime));
-    }
-    Ok(out)
-}
-
 /// Prune rotated archives by age then by count. Best-effort: a removal failure
 /// is logged but never fails the enclosing append, since retention is
 /// housekeeping rather than part of the durability contract.

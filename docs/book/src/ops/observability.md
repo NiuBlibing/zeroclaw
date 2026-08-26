@@ -233,7 +233,7 @@ curl "$ZEROCLAW_GATEWAY/api/logs?trace_id=<value-from-a-prior-event>"
 </div>
 
 Log pagination walks backward with a segment-aware cursor. While `at_end` is false:
-1. Prefer `next_segment_cursor`, passed back unchanged as `until_segment_cursor`. Treat it as an **opaque token**: it encodes the segment, a byte offset, and an anchor event id, and its internal shape may change. Clients must round-trip the returned string verbatim rather than constructing or parsing one — a hand-built cursor loses the anchor and with it the rotation-boundary protection described below. This is the only cursor that can advance once the oldest event in a page is in a rotated archive.
+1. Prefer `next_segment_cursor`, passed back unchanged as `until_segment_cursor`. Treat it as an **opaque token**: it encodes the segment, a byte offset, and an anchor event id, and its internal shape may change. Clients must round-trip the returned string verbatim rather than constructing or parsing one; a hand-built cursor loses the anchor and with it the rotation-boundary protection described below. This is the only cursor that can advance once the oldest event in a page is in a rotated archive.
 2. Fall back to `next_cursor_line_offset` passed back as `until_line_offset` when the segment cursor is absent. This is a plain byte offset into the active file and resolves to `null` when the oldest event is in an archive.
 3. The legacy `next_cursor: [timestamp, id] | null` response remains for compatibility; passing it back as `until_ts` + `until_id` is deprecated because the lexicographic ID tie-break can silently skip events with the same timestamp.
 

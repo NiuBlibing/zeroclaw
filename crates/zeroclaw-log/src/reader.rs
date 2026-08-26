@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -427,6 +428,91 @@ pub fn current_log_path() -> Option<PathBuf> {
     crate::writer::runtime_trace_path()
 }
 
+/// Split `foo.jsonl` into `("foo", ".jsonl")`. A name with no dot, or one
+/// whose only dot is leading, keeps an empty extension.
+pub(crate) fn split_base_ext(file_name: &str) -> (&str, &str) {
+    match file_name.rfind('.') {
+        Some(i) if i > 0 => (&file_name[..i], &file_name[i..]),
+        _ => (file_name, ""),
+    }
+}
+
+/// True when `s` is exactly a `YYYYMMDD-HHMMSS` stamp: 8 digits, `-`, 6 digits.
+pub(crate) fn is_stamp(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 15
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'-'
+        && b[9..].iter().all(u8::is_ascii_digit)
+}
+
+/// True when `core` is a stamp this writer generates, optionally with a
+/// same-second disambiguation counter appended.
+pub(crate) fn is_archive_core(core: &str) -> bool {
+    match core.split_once('.') {
+        // `<stamp>.<counter>`: counter must be a non-empty run of digits.
+        Some((stamp, counter)) => {
+            !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit()) && is_stamp(stamp)
+        }
+        // `<stamp>`
+        None => is_stamp(core),
+    }
+}
+
+/// Enumerate the archive files that belong to `active`, as `(path, mtime)`.
+/// Matching is restricted to names this writer generates, so unrelated
+/// siblings in the same directory are never returned. The active file itself
+/// is excluded. Order is unspecified; callers that need chronological order
+/// sort by mtime.
+pub(crate) fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>> {
+    let dir = active.parent().unwrap_or_else(|| Path::new("."));
+    let active_name = active
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("log path has no file name")?;
+    let (base, ext) = split_base_ext(active_name);
+    let prefix = format!("{base}.");
+
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading log dir {}", dir.display()));
+        }
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading entry in {}", dir.display()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name == active_name {
+            continue;
+        }
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let core = if ext.is_empty() {
+            suffix
+        } else {
+            let Some(core) = suffix.strip_suffix(ext) else {
+                continue;
+            };
+            core
+        };
+        if !is_archive_core(core) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        out.push((entry.path(), mtime));
+    }
+    Ok(out)
+}
+
 /// Paginated load across the active file and all retained archive files.
 ///
 /// Segments are scanned in ascending time order (oldest archive first, active
@@ -437,7 +523,7 @@ pub fn current_log_path() -> Option<PathBuf> {
 /// old `filter.until_line_offset` field is honoured when `segment_cursor` is
 /// absent, interpreted as a cursor into the active file only.
 #[allow(deprecated)]
-pub fn load_page_multi(
+pub(crate) fn load_page_multi(
     active: &Path,
     archives: &[(PathBuf, std::time::SystemTime)],
     filter: &LogFilter,
@@ -639,6 +725,121 @@ pub fn load_page_multi(
         next_segment_cursor,
         at_end,
     })
+}
+
+/// Read one page across the active file and every retained archive.
+///
+/// This is the entry point for `/api/logs` and the `logs/query` RPC. It owns
+/// archive enumeration so callers never hold a segment list of their own: a
+/// list captured outside this call can go stale the moment the writer rotates,
+/// and a cursor pointing into the rotated-away file would then resolve against
+/// an unrelated new file with the same basename.
+///
+/// Rotation still races enumeration inside this function, so when an anchored
+/// cursor's event is missing from the first snapshot the archives are
+/// enumerated once more before giving up. The freshly created archive is
+/// present in that second listing, which is what makes a cursor issued just
+/// before a rotation resolve correctly instead of silently restarting from the
+/// newest page. A single retry covers one rotation; a second rotation inside
+/// the same call falls back to a full scan, the same as a cursor whose segment
+/// was pruned by retention.
+pub fn query_log_page(
+    active: &Path,
+    filter: &LogFilter,
+    limit: usize,
+    segment_cursor: Option<&SegmentCursor>,
+) -> Result<LogPage> {
+    let archives = list_archives(active).with_context(|| {
+        format!(
+            "enumerating log archives next to {} for a page query",
+            active.display()
+        )
+    })?;
+
+    // A cursor without an anchor (legacy wire form) has nothing to verify, so
+    // there is no stale-list case to detect and no reason to re-enumerate.
+    let anchored = segment_cursor.and_then(|c| c.anchor_id.as_deref());
+    let Some(anchor) = anchored else {
+        return load_page_multi(active, &archives, filter, limit, segment_cursor);
+    };
+
+    if anchor_reachable(active, &archives, anchor) {
+        return load_page_multi(active, &archives, filter, limit, segment_cursor);
+    }
+
+    // The anchored event is in none of the files just listed. Either the writer
+    // rotated between the listing and now (the archive holding it was created
+    // after the snapshot), or the segment was pruned by retention.
+    // Re-enumerate once: the first case resolves, the second does not.
+    let refreshed = list_archives(active).with_context(|| {
+        format!(
+            "re-enumerating log archives next to {} after an anchor miss",
+            active.display()
+        )
+    })?;
+    load_page_multi(active, &refreshed, filter, limit, segment_cursor)
+}
+
+/// True when `anchor` is present in the active file or any listed archive.
+/// Used to decide whether a segment listing is stale enough to warrant a
+/// re-enumeration. Errors and unreadable files count as "not found" so the
+/// caller re-enumerates rather than trusting a partial answer.
+fn anchor_reachable(active: &Path, archives: &[(PathBuf, SystemTime)], anchor: &str) -> bool {
+    let mut segs: Vec<(PathBuf, String)> = archives
+        .iter()
+        .map(|(p, _)| {
+            let name = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            (p.clone(), name)
+        })
+        .collect();
+    let active_name = active
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    segs.push((active.to_path_buf(), active_name));
+    find_anchor_in_segments(&segs, anchor).is_some()
+}
+
+/// Find one event by id across the active file and every retained archive,
+/// newest source first. Owns archive enumeration for the same reason as
+/// [`query_log_page`]: the caller never holds a segment list that can go stale.
+///
+/// Returns `Ok(None)` when no segment holds the id. An archive that cannot be
+/// read is skipped rather than failing the lookup, so a single unreadable file
+/// does not hide an event that a later segment still has.
+pub fn find_event_across_segments(active: &Path, id: &str) -> Result<Option<LogEvent>> {
+    if let Some(event) = find_event_by_id(active, id)? {
+        return Ok(Some(event));
+    }
+    let mut archives = list_archives(active).with_context(|| {
+        format!(
+            "enumerating log archives next to {} for an id lookup",
+            active.display()
+        )
+    })?;
+    // Newest archive first: a recently rotated event is the likely target.
+    archives.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
+    for (path, _) in archives {
+        match find_event_by_id(&path, id) {
+            Ok(Some(event)) => return Ok(Some(event)),
+            Ok(None) => continue,
+            Err(err) => {
+                tracing::warn!(
+                    target: "zeroclaw_log",
+                    error = ?err,
+                    path = %path.display(),
+                    "log: skipping unreadable archive during id lookup"
+                );
+                continue;
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1349,5 +1550,110 @@ mod tests {
         );
         assert_eq!(page2.events[1].message.as_deref(), Some("ev-a"));
         assert!(page2.at_end, "all events seen");
+    }
+
+    #[test]
+    fn query_log_page_recovers_when_rotation_races_enumeration() {
+        // The stale-segment-list race: a caller enumerates archives, the writer
+        // rotates the active file, and only then does the read happen. The
+        // archive holding the anchored event did not exist at enumeration time,
+        // so a reader that trusts its input list cannot find the anchor and
+        // silently restarts from the newest page.
+        //
+        // `query_log_page` owns enumeration, so its own listing is taken after
+        // the rotation and this scenario resolves. The test drives the public
+        // entry point exactly as the gateway does: it never hands in a list.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+        let archive = tmp.path().join("trace.20260101-000000.jsonl");
+
+        let mut ev_a = make_event("a", None);
+        ev_a.timestamp = "2026-01-01T00:00:00.000Z".into();
+        ev_a.message = Some("ev-a".into());
+        let mut ev_b = make_event("b", None);
+        ev_b.timestamp = "2026-01-01T00:00:01.000Z".into();
+        ev_b.message = Some("ev-b".into());
+        let mut ev_c = make_event("c", None);
+        ev_c.timestamp = "2026-01-01T00:00:02.000Z".into();
+        ev_c.message = Some("ev-c".into());
+        let mut ev_d = make_event("d", None);
+        ev_d.timestamp = "2026-01-01T00:00:03.000Z".into();
+        ev_d.message = Some("ev-d".into());
+        write_jsonl(&active, &[ev_a, ev_b, ev_c, ev_d]);
+
+        // Page 1 over the active file alone: no archives exist yet, so the
+        // cursor anchors on ev_c inside `trace.jsonl`.
+        let page1 = query_log_page(&active, &LogFilter::default(), 2, None).unwrap();
+        assert_eq!(page1.events[0].message.as_deref(), Some("ev-d"));
+        assert_eq!(page1.events[1].message.as_deref(), Some("ev-c"));
+        let cursor_wire = page1
+            .next_segment_cursor
+            .clone()
+            .expect("cursor must be set");
+
+        // The writer rotates: the file the cursor names becomes an archive, and
+        // a brand-new `trace.jsonl` holding unrelated content takes its place.
+        std::fs::rename(&active, &archive).unwrap();
+        let mut ev_e = make_event("e", None);
+        ev_e.timestamp = "2026-01-01T00:00:04.000Z".into();
+        ev_e.message = Some("ev-e".into());
+        write_jsonl(&active, &[ev_e]);
+
+        // Page 2 must continue into the rotated-away history, not restart from
+        // the replacement active file.
+        let cursor = SegmentCursor::from_wire(&cursor_wire).expect("valid cursor");
+        let page2 = query_log_page(&active, &LogFilter::default(), 2, Some(&cursor)).unwrap();
+        assert_eq!(
+            page2.events.len(),
+            2,
+            "expected the two older events, got {:?}",
+            page2
+                .events
+                .iter()
+                .map(|e| e.message.as_deref())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            page2.events[0].message.as_deref(),
+            Some("ev-b"),
+            "page 2 must resume below the anchor, not return post-rotation writes"
+        );
+        assert_eq!(page2.events[1].message.as_deref(), Some("ev-a"));
+    }
+
+    #[test]
+    fn find_event_across_segments_searches_active_then_archives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+        let archive = tmp.path().join("trace.20260101-000000.jsonl");
+
+        let mut archived = make_event("find-test", None);
+        archived.id = "archived-id".into();
+        archived.message = Some("in-archive".into());
+        write_jsonl(&archive, &[archived]);
+
+        let mut live = make_event("find-test", None);
+        live.id = "live-id".into();
+        live.message = Some("in-active".into());
+        write_jsonl(&active, &[live]);
+
+        let hit = find_event_across_segments(&active, "live-id").unwrap();
+        assert_eq!(
+            hit.expect("active hit").message.as_deref(),
+            Some("in-active")
+        );
+
+        let hit = find_event_across_segments(&active, "archived-id").unwrap();
+        assert_eq!(
+            hit.expect("archive hit").message.as_deref(),
+            Some("in-archive"),
+            "an id that has rotated out of the active file must still resolve"
+        );
+
+        assert!(
+            find_event_across_segments(&active, "no-such-id")
+                .unwrap()
+                .is_none()
+        );
     }
 }
