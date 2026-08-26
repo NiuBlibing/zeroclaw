@@ -1575,16 +1575,27 @@ const WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL: u64 = 17;
 const GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL: u64 = 8;
 
 /// Extra bytes per pixel an **APNG** decode holds on top of the frame buffer it
-/// yields.
+/// yields, covering the worst-case color type accepted by
+/// [`ApngDecoder::animatable_color_type`].
 ///
-/// `image` 0.25.10's `ApngDecoder` (`src/codecs/png.rs`) allocates two
-/// persistent full canvases through `limits.reserve_buffer` — `current` and
-/// `previous` (both RGBA8, 4 B/px) — and retains them across the animation.
-/// `into_frames` then clones `current` into the returned `Frame`, so at least
-/// three canvases are live while a frame is produced. The per-frame `source`
-/// buffer overlaps them briefly but is freed before the clone, so the two
-/// persistent canvases are the durable term.
-const APNG_SCRATCH_BYTES_PER_PIXEL: u64 = 8;
+/// `image` 0.25.10's `ApngDecoder` (`src/codecs/png.rs`) keeps two persistent
+/// RGBA8 canvases, `current` and `previous`, live across the animation
+/// (4 B/px each). While each frame is composited, it also reads a raw frame
+/// buffer and converts it to RGBA8 before blending it into `current`:
+///
+/// - `Rgba8`: raw `buffer` and `source` are the same allocation (from_raw);
+///   no extra bytes beyond the two persistent canvases.
+/// - `L8`:   raw = 1 B/px, source = 4 B/px; both live during conversion.
+/// - `La8`:  raw = 2 B/px, source = 4 B/px.
+/// - `Rgb8`: raw = 3 B/px, source = 4 B/px — the worst case.
+///
+/// The per-frame peak beyond the returned frame is therefore:
+///   `current(4) + previous(4) + raw(3) + source(4) = 15 B/px`
+/// while the returned `Frame` (`current.clone()`) provides only 4 B/px.
+/// Scratch = 15 - output(4) = 11 for `Rgba8`, rising to 11 for `Rgb8` when
+/// `total_bytes()` returns 3 B/px.  The conservative value covering all
+/// accepted types is **12 B/px** (15 peak − 3 min output).
+const APNG_SCRATCH_BYTES_PER_PIXEL: u64 = 12;
 
 /// Worst-case peak decode allocation for one canvas, derived from the header
 /// alone. Reading the header does not decode pixels, so this is cheap enough
@@ -2105,6 +2116,25 @@ async fn validate_image_content_with_projection(
                 // `GifDecoder` starts with `Limits::no_limits()`. Apply limits
                 // before frame iteration so an oversized canvas/frame is
                 // refused by the decoder before its output buffer is allocated.
+                //
+                // The per-frame buffer is sized from the GIF *image descriptor*,
+                // not the logical screen: `next_frame` calls
+                // `local_limits.reserve_buffer(frame.width, frame.height, ...)`
+                // with the descriptor's dimensions (`src/codecs/gif.rs:326-331`).
+                // A descriptor may declare a frame larger than the logical
+                // screen, and the frame the iterator yields is the composited
+                // *screen-sized* canvas, so an oversized descriptor is invisible
+                // both to `projected_allocation` (which reads the logical
+                // screen) and to the returned-frame accounting.
+                //
+                // Clamping the dimension limits to the logical screen closes
+                // that gap: the decoder refuses a descriptor exceeding the
+                // canvas before the buffer for it is allocated. A GIF whose
+                // frames stay within the screen is unaffected, which is every
+                // ordinary GIF — the format composites frames onto that canvas.
+                let (screen_width, screen_height) = image::ImageDecoder::dimensions(&decoder);
+                limits.max_image_width = Some(screen_width.min(MAX_DECODED_IMAGE_DIMENSION));
+                limits.max_image_height = Some(screen_height.min(MAX_DECODED_IMAGE_DIMENSION));
                 image::ImageDecoder::set_limits(&mut decoder, limits).map_err(|error| {
                     image_error_failure(
                         &source_owned,
@@ -3651,6 +3681,19 @@ mod tests {
     }
 
     fn two_frame_apng() -> Vec<u8> {
+        two_frame_apng_with_color(true)
+    }
+
+    /// A two-frame APNG with a configurable color type.
+    ///
+    /// When `rgba` is `true` the frames use `ColorType::Rgba8` (the default).
+    /// When `rgba` is `false` the frames use `ColorType::Rgb8`, which exercises
+    /// the color-conversion path in `ApngDecoder::mix_next_frame`: the decoder
+    /// reads a raw `Rgb8` frame buffer and allocates a separate `Rgba8` source
+    /// before blending it into `current`. Both the raw and source buffers are
+    /// live simultaneously, so the `Rgb8` path peaks at more bytes per pixel
+    /// than the `Rgba8` path where `from_raw` reuses the same buffer.
+    fn two_frame_apng_with_color(rgba: bool) -> Vec<u8> {
         fn crc32(name: &[u8; 4], data: &[u8]) -> u32 {
             let mut crc = 0xFFFF_FFFFu32;
             for byte in name.iter().chain(data) {
@@ -3676,7 +3719,19 @@ mod tests {
         // Reuse the encoder-backed still fixture's compressed scanline as each
         // APNG frame. This keeps the test dependency-free while constructing a
         // standards-shaped two-frame stream with explicit animation chunks.
-        let still = valid_png();
+        let still = if rgba {
+            valid_png()
+        } else {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                1,
+                1,
+                image::Rgb([255, 0, 0]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("test PNG encodes");
+            buf.into_inner()
+        };
         let mut idat = Vec::new();
         let mut offset = 8usize;
         while offset + 12 <= still.len() {
@@ -3695,9 +3750,19 @@ mod tests {
         assert!(!idat.is_empty(), "test PNG contains compressed image data");
 
         let ihdr = [
-            0, 0, 0, 1, // width
-            0, 0, 0, 1, // height
-            8, 6, 0, 0, 0, // RGBA8, compression, filter, interlace
+            0,
+            0,
+            0,
+            1, // width
+            0,
+            0,
+            0,
+            1, // height
+            8,
+            if rgba { 6 } else { 2 }, // bit depth, color type (RGBA8 / RGB8)
+            0,
+            0,
+            0, // compression, filter, interlace
         ];
         let mut frame_control = [0u8; 26];
         frame_control[4..8].copy_from_slice(&1u32.to_be_bytes());
@@ -3758,7 +3823,8 @@ mod tests {
         .expect("a valid two-frame APNG is accepted");
         // The charge is the decoder's peak for one frame, not the sum of the
         // frame buffers: 4 B of frame output plus the two persistent canvases
-        // `ApngDecoder` retains (`APNG_SCRATCH_BYTES_PER_PIXEL` = 8 B/px).
+        // `ApngDecoder` retains and the conversion buffers for non-RGBA frames
+        // (`APNG_SCRATCH_BYTES_PER_PIXEL` = 12 B/px for the worst-case Rgb8 path).
         assert_eq!(
             allocation,
             4 + APNG_SCRATCH_BYTES_PER_PIXEL,
@@ -3775,6 +3841,40 @@ mod tests {
         )
         .await
         .expect_err("a corrupt later APNG frame must be rejected");
+    }
+
+    #[tokio::test]
+    async fn non_rgba_apng_conversion_buffers_are_accounted() {
+        // `ApngDecoder::mix_next_frame` keeps `current` and `previous` RGBA
+        // canvases live, then for a non-RGBA color type it reads a raw frame
+        // buffer *and* allocates a separate RGBA `source` to convert into
+        // before blending (`image-0.25.10/src/codecs/png.rs:456-479`). Both are
+        // live at once, so an Rgb8 APNG peaks at
+        // `current(4) + previous(4) + raw(3) + source(4) = 15 B/px` while its
+        // `total_bytes()` output is only 3 B/px.
+        //
+        // Charging 8 B/px of scratch covered only the two persistent canvases
+        // and under-accounted every non-RGBA APNG. The bound must cover the
+        // worst accepted color type, which is Rgb8.
+        let rgb8 = two_frame_apng_with_color(false);
+
+        let charged = validate_image_content("rgb8.png", "image/png", &rgb8, u64::MAX)
+            .await
+            .expect("a valid Rgb8 APNG is accepted");
+
+        // The real Rgb8 peak, from the source-confirmed allocation list above.
+        let real_peak = 4 + 4 + 3 + 4;
+        assert!(
+            charged >= real_peak,
+            "an Rgb8 APNG must be charged at least its decoder peak ({real_peak} B for 1x1); \
+             got {charged}"
+        );
+
+        // The RGBA8 shape must keep working; it simply has no conversion pair.
+        let rgba8 = two_frame_apng_with_color(true);
+        validate_image_content("rgba8.png", "image/png", &rgba8, u64::MAX)
+            .await
+            .expect("a valid Rgba8 APNG is still accepted");
     }
 
     fn lossless_webp(pixel: [u8; 3]) -> Vec<u8> {
@@ -5378,5 +5478,81 @@ mod tests {
             "expected empty string, got: {cleaned:?}"
         );
         assert_eq!(refs.len(), 1);
+    }
+    /// A GIF whose image descriptor claims a frame larger than the logical screen.
+    ///
+    /// The LZW payload is 1×1 (the same `GIF_VALID_1X1_LZW` data), but the
+    /// image descriptor advertises `frame_dim × frame_dim`. This exercises the
+    /// path where the decoder's `local_limits.reserve_buffer(frame.width,
+    /// frame.height)` uses the descriptor size rather than the logical screen
+    /// size. The GIF decoder accepts this header; whether the allocation
+    /// succeeds depends on whether the limits already clamp to the screen.
+    fn oversized_descriptor_gif(screen: u16, frame_dim: u16) -> Vec<u8> {
+        let mut gif = Vec::new();
+        gif.extend_from_slice(b"GIF89a");
+        gif.extend_from_slice(&screen.to_le_bytes()); // logical width
+        gif.extend_from_slice(&screen.to_le_bytes()); // logical height
+        gif.extend_from_slice(&[0x80, 0x00, 0x00]); // global color table, 2 entries
+        gif.extend_from_slice(&[0x00, 0x00, 0x00]); // black
+        gif.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // white
+        gif.push(0x2C); // image separator
+        gif.extend_from_slice(&0u16.to_le_bytes()); // left
+        gif.extend_from_slice(&0u16.to_le_bytes()); // top
+        gif.extend_from_slice(&frame_dim.to_le_bytes()); // frame width (oversized)
+        gif.extend_from_slice(&frame_dim.to_le_bytes()); // frame height (oversized)
+        gif.push(0x00); // no local color table
+        gif.extend_from_slice(&GIF_VALID_1X1_LZW);
+        gif.push(GIF_TRAILER);
+        gif
+    }
+
+    #[tokio::test]
+    async fn gif_frame_descriptor_exceeding_logical_screen_is_rejected() {
+        // A GIF image descriptor may claim frame dimensions larger than the
+        // logical screen. In `image` 0.25.10, the per-frame buffer is sized
+        // from the descriptor (`src/codecs/gif.rs:326-331`) rather than the
+        // logical screen, so a 4×4 frame in a 2×2 screen allocates 4×4×4 = 64
+        // bytes while `projected_allocation` and the returned `Frame` see only
+        // 2×2. The aggregate charge would therefore be 16 bytes (2×2 screen
+        // peak) while 64 bytes were actually allocated.
+        //
+        // Clamping `max_image_width/height` to the logical screen before
+        // `set_limits` causes the decoder to refuse the descriptor before its
+        // buffer is allocated. A GIF whose frames stay within the screen is
+        // unaffected.
+        //
+        // Screen=2, frame=4: frame buffer = 4*4*4 = 64 B; screen = 2*2*4 = 16 B.
+        let gif = oversized_descriptor_gif(2, 4);
+        let error = validate_image_content("big-frame.gif", "image/gif", &gif, u64::MAX)
+            .await
+            .expect_err(
+                "a GIF whose frame descriptor exceeds the logical screen must be rejected \
+                 before the oversized buffer is allocated",
+            );
+
+        // The *reason* is what matters here, not merely that it failed.
+        //
+        // In `image` 0.25.10 the order is: `local_limits.reserve_buffer(...)`
+        // (the limit check), then `vec![0; buffer_size]` (the allocation), then
+        // `read_into_buffer` (which is where a short LZW stream reports EOF).
+        // Without the screen clamp the descriptor passes the limit check and
+        // the oversized buffer is allocated, and the failure surfaces later as
+        // a truncation error — after the memory was already taken. Asserting on
+        // the limit message is what pins the rejection to the pre-allocation
+        // check rather than to the decode that follows it.
+        let reason = error.to_string();
+        assert!(
+            reason.contains("Image size exceeds limit"),
+            "the descriptor must be refused by the dimension limit before allocation, \
+             not by a later decode failure; got: {reason}"
+        );
+
+        // A normal animated GIF whose frames stay within the logical screen must
+        // still be accepted: the dimension clamp must not break ordinary GIFs.
+        let mut ordinary = two_frame_gif(&GIF_VALID_1X1_LZW);
+        ordinary.push(GIF_TRAILER);
+        validate_image_content("ordinary.gif", "image/gif", &ordinary, u64::MAX)
+            .await
+            .expect("an animated GIF whose frames match the logical screen must be accepted");
     }
 }
