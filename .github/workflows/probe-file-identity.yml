@@ -4,9 +4,13 @@ name: Probe File Identity
 # model holds on Windows and macOS, not just Linux. Deleted once the design
 # question is settled; nothing in the product depends on it.
 #
-# Manual dispatch only, so it never runs on push or PR.
+# Manual dispatch needs the workflow on the default branch, which this scratch
+# branch is not, so it triggers on push to the probe branch itself instead.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - "probe/**"
 
 permissions:
   contents: read
