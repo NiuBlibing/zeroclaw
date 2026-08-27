@@ -177,16 +177,53 @@ fn identity(path: &Path) -> Result<(u64, u64), String> {
 
 #[cfg(windows)]
 fn identity(path: &Path) -> Result<(u64, u64), String> {
-    use std::os::windows::fs::MetadataExt;
-    let m = fs::metadata(path).map_err(|e| format!("metadata: {e}"))?;
-    // Available on stable since 1.75 as volume_serial_number/file_index, both
-    // Option-returning. If either is None on this toolchain the dedupe step
-    // needs a different source.
-    let volume = m
-        .volume_serial_number()
-        .ok_or("volume_serial_number() returned None")?;
-    let index = m.file_index().ok_or("file_index() returned None")?;
-    Ok((volume as u64, index))
+    // `std::os::windows::fs::MetadataExt::{volume_serial_number, file_index}`
+    // is still behind the unstable `windows_by_handle` feature
+    // (rust-lang/rust issue 63010), so it cannot be used on the MSRV
+    // toolchain. Call GetFileInformationByHandle directly instead, which is
+    // what those accessors wrap.
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            handle: *mut std::ffi::c_void,
+            info: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let file = File::open(path).map_err(|e| format!("open for identity: {e}"))?;
+    let mut info = ByHandleFileInformation::default();
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as *mut _, &mut info) };
+    if ok == 0 {
+        return Err(format!(
+            "GetFileInformationByHandle failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let index = ((info.file_index_high as u64) << 32) | (info.file_index_low as u64);
+    Ok((info.volume_serial_number as u64, index))
 }
 
 /// Q4: the ordering the reader intends to use. Open the active file FIRST, then
