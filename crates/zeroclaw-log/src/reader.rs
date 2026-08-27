@@ -774,7 +774,7 @@ pub(crate) enum PageOutcome {
 /// Paginated load across an already-opened segment set.
 ///
 /// `segs` must arrive in stream order, oldest first with the active file last;
-/// [`open_segment_set`] is what establishes that. This function does not sort
+/// `open_segment_set` is what establishes that. This function does not sort
 /// or open anything, so it cannot re-resolve a path that has since been
 /// renamed.
 ///
@@ -982,7 +982,7 @@ pub(crate) fn load_page_multi(
 ///
 /// Rotation racing this function is handled by the segment set itself, not by
 /// retrying: order comes from the sequence numbers in the archive names, and
-/// content is pinned by the open handles. See [`open_segment_set`]. Any number
+/// content is pinned by the open handles. See `open_segment_set`. Any number
 /// of rotations can land during the read without reordering or truncating the
 /// result.
 ///
