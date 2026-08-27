@@ -499,11 +499,13 @@ pub(crate) fn is_archive_core(core: &str) -> bool {
     }
 }
 
-/// Enumerate the archive files that belong to `active`, as `(path, mtime)`.
+/// Enumerate the archive files that belong to `active`, each paired with its
+/// [`ArchiveOrder`] key.
+///
 /// Matching is restricted to names this writer generates, so unrelated
 /// siblings in the same directory are never returned. The active file itself
-/// is excluded. Order is unspecified; callers that need chronological order
-/// sort by mtime.
+/// is excluded. Order is unspecified; callers that need stream order sort by
+/// the returned key.
 pub(crate) fn list_archives(active: &Path) -> Result<Vec<(PathBuf, ArchiveOrder)>> {
     let dir = active.parent().unwrap_or_else(|| Path::new("."));
     let active_name = active
@@ -603,15 +605,29 @@ impl OpenSegment {
 /// Open every segment of the logical stream, oldest first with the active file
 /// last.
 ///
-/// The active file is opened *before* the archives are enumerated, and that
-/// order is what makes the result complete under a concurrent rotation:
+/// Two separate properties are needed here, and they are handled by two
+/// different mechanisms:
+///
+///   - *Order* comes from the sequence number in each archive's name, applied
+///     by the sort below. It is fixed at rotation time, so no amount of
+///     enumeration-time confusion can misorder the result.
+///   - *Content stability* comes from holding the handles. A path is re-bound
+///     by a rename; an open handle is not. Scanning through these handles is
+///     what stops a rotation landing mid-scan from substituting a different
+///     file under the same basename.
+///
+/// The active file is opened *before* the archives are enumerated, which is
+/// what keeps the set complete under a concurrent rotation:
 ///
 ///   - Rotation lands before the open: the archive it created is already on
 ///     disk when the listing runs, so it shows up as an ordinary archive.
 ///   - Rotation lands after the open: the handle already points at the file
 ///     that was rotated away, so its content stays reachable. The listing then
 ///     also reports that same file under its new archive name, which is why
-///     identities are compared and the duplicate dropped.
+///     identities are compared and the duplicate dropped. The sequence number
+///     does not help there: the archive genuinely exists and its number is
+///     valid, so only the file identity reveals that it is the pinned handle
+///     seen twice.
 ///
 /// Either way no segment is lost and none is read twice. Reversing the order
 /// would leave a window where a rotation is invisible to both steps.
@@ -647,7 +663,9 @@ fn open_segment_set(active: &Path, reads_archives: bool) -> Result<Vec<OpenSegme
     } else {
         Vec::new()
     };
-    archives.sort_by_key(|(_, mtime)| *mtime);
+    // Sort by the name-derived ordering key, not by mtime: the key is fixed at
+    // rotation time, so it stays correct no matter when this listing ran.
+    archives.sort_by_key(|(_, order)| *order);
 
     let mut segs = Vec::with_capacity(archives.len() + 1);
     for (path, _) in archives {
@@ -718,10 +736,14 @@ pub(crate) enum PageOutcome {
     AnchorMissing,
 }
 
-/// Paginated load across the active file and all retained archive files.
+/// Paginated load across an already-opened segment set.
 ///
-/// Segments are scanned in ascending time order (oldest archive first, active
-/// last). The result is returned newest-first, identical to [`load_page`].
+/// `segs` must arrive in stream order, oldest first with the active file last;
+/// [`open_segment_set`] is what establishes that. This function does not sort
+/// or open anything, so it cannot re-resolve a path that has since been
+/// renamed.
+///
+/// The result is returned newest-first, identical to [`load_page`].
 ///
 /// `segment_cursor` is the composite cursor returned by a prior call as
 /// `LogPage::next_segment_cursor`. When absent the full stream is scanned. The
@@ -918,19 +940,24 @@ pub(crate) fn load_page_multi(
 /// Read one page across the active file and every retained archive.
 ///
 /// This is the entry point for `/api/logs` and the `logs/query` RPC. It owns
-/// archive enumeration so callers never hold a segment list of their own: a
-/// list captured outside this call can go stale the moment the writer rotates,
-/// and a cursor pointing into the rotated-away file would then resolve against
-/// an unrelated new file with the same basename.
+/// segment enumeration so callers never hold a list of their own: a list
+/// captured outside this call can go stale the moment the writer rotates, and
+/// a cursor pointing into the rotated-away file would then resolve against an
+/// unrelated new file with the same basename.
 ///
-/// Rotation still races enumeration inside this function, so when an anchored
-/// cursor's event is missing from the first snapshot the archives are
-/// enumerated once more before giving up. The freshly created archive is
-/// present in that second listing, which is what makes a cursor issued just
-/// before a rotation resolve correctly instead of silently restarting from the
-/// newest page. A single retry covers one rotation; a second rotation inside
-/// the same call falls back to a full scan, the same as a cursor whose segment
-/// was pruned by retention.
+/// Rotation racing this function is handled by the segment set itself, not by
+/// retrying: order comes from the sequence numbers in the archive names, and
+/// content is pinned by the open handles. See [`open_segment_set`]. Any number
+/// of rotations can land during the read without reordering or truncating the
+/// result.
+///
+/// The one case retrying still covers is an anchored cursor whose event is in
+/// none of the opened segments. That is ambiguous from a single snapshot: the
+/// segment may have been created after the listing, or retention may have
+/// pruned it for good. Re-opening distinguishes the two, since a newly rotated
+/// archive is present the second time. A miss that survives the re-open means
+/// the segment is genuinely gone, and the cursor is dropped in favour of the
+/// newest page.
 pub fn query_log_page(
     active: &Path,
     reads_archives: bool,
@@ -938,11 +965,8 @@ pub fn query_log_page(
     limit: usize,
     segment_cursor: Option<&SegmentCursor>,
 ) -> Result<LogPage> {
-    // One open per attempt. Every byte of the page is then read through those
-    // handles, so a rotation landing mid-scan cannot substitute a different
-    // file: the handle keeps pointing at the bytes it was opened on. See
-    // `open_segment_set` for why the active file is pinned before the archives
-    // are listed.
+    // The opened set is self-consistent: ordered by name-embedded sequence and
+    // pinned by handle. See `open_segment_set`.
     let segs = open_segment_set(active, reads_archives)?;
     match load_page_multi(&segs, filter, limit, segment_cursor)? {
         PageOutcome::Page(page) => return Ok(*page),
