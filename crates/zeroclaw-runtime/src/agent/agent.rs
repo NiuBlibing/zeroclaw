@@ -12320,9 +12320,7 @@ model_provider = "custom.primary"
                 _options: zeroclaw_providers::traits::StreamOptions,
             ) -> futures_util::stream::BoxStream<
                 'static,
-                zeroclaw_providers::traits::StreamResult<
-                    zeroclaw_api::model_provider::StreamEvent,
-                >,
+                zeroclaw_providers::traits::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
             > {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Box::pin(futures_util::stream::iter(vec![
