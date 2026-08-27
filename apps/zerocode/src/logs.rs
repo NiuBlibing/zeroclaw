@@ -537,6 +537,10 @@ impl Logs {
         cursor_legacy: Option<(String, String)>,
     ) {
         self.loading = true;
+        // Set when a cursor-bearing response turns out to contain only events
+        // already in the buffer, which means the cursor's segment is gone and
+        // the daemon served the newest page instead of older history.
+        let mut stale_cursor_no_progress = false;
         // Cursor precedence: segment cursor first (only one that can cross
         // into a rotated archive), then plain byte offset, then the legacy
         // `(ts, id)` pair for daemons predating either field. Send only
@@ -603,9 +607,16 @@ impl Logs {
                     } else {
                         // Every returned event was a duplicate: the cursor was
                         // stale and the daemon served the newest page instead of
-                        // older history. Signal "at end" so the UI stops paging.
-                        self.at_end = true;
-                        return; // Skip the cursor + at_end update below.
+                        // older history. Stop paging rather than treating this
+                        // as an ordinary older page.
+                        //
+                        // Recorded as a flag rather than returning early: the
+                        // cleanup at the end of this function clears
+                        // `self.loading`, and skipping it would leave the pane
+                        // on its loading indicator forever, with
+                        // `maybe_load_older`'s `!self.loading` guard blocking
+                        // every later attempt.
+                        stale_cursor_no_progress = true;
                     }
                 } else if !has_cursor {
                     self.events = new_entries;
@@ -617,7 +628,10 @@ impl Logs {
                 self.next_cursor_segment = result.next_segment_cursor;
                 self.next_cursor_offset = result.next_cursor_line_offset;
                 self.next_cursor_legacy = result.next_cursor;
-                self.at_end = result.at_end;
+                // A no-progress page means the history this cursor pointed at
+                // is gone, so `result.at_end` (which describes the newest page
+                // the daemon fell back to) must not re-enable paging.
+                self.at_end = result.at_end || stale_cursor_no_progress;
             }
             Err(_) => {
                 // Query unavailable (old daemon without logs/query, or no log file).

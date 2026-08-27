@@ -436,15 +436,65 @@ pub(crate) fn is_stamp(s: &str) -> bool {
         && b[9..].iter().all(u8::is_ascii_digit)
 }
 
+/// Width of the zero-padded sequence prefix in a numbered archive name.
+///
+/// Ten digits keeps the prefix distinguishable from a bare `YYYYMMDD` stamp
+/// (eight digits) and leaves headroom far beyond any realistic rotation count.
+pub(crate) const SEQ_WIDTH: usize = 10;
+
+/// Ordering key for one archive, derived from its name rather than its mtime.
+///
+/// Rotation writes the sequence number into the archive name, so segment order
+/// is fixed at write time and does not depend on when a reader enumerates the
+/// directory. That is what makes the order survive several rotations landing
+/// during a single read: an mtime-based key is an observation made at
+/// enumeration time, and two rotations can leave it describing an order that
+/// no longer holds.
+///
+/// Archives written before sequence numbers existed carry no number. They are
+/// ordered by mtime and sort before every numbered archive, which is correct
+/// because they can only predate the upgrade that introduced numbering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ArchiveOrder {
+    /// Pre-numbering archive, ordered by mtime. Sorts before all numbered ones.
+    Legacy(SystemTime),
+    /// Sequence number taken from the archive name.
+    Seq(u64),
+}
+
+/// Parse the sequence number out of an archive name core.
+///
+/// Accepts the numbered form `<seq>-<stamp>`; returns `None` for the legacy
+/// `<stamp>` and `<stamp>.<counter>` forms, which carry no number.
+pub(crate) fn archive_seq(core: &str) -> Option<u64> {
+    let (seq, rest) = core.split_once('-')?;
+    // A stamp is `YYYYMMDD-HHMMSS`, whose own first segment is 8 digits. The
+    // sequence prefix is zero-padded to 10, so the two cannot be confused.
+    if seq.len() != SEQ_WIDTH || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // The remainder must be a bare stamp; otherwise the leading digits are
+    // part of something else and this is not a numbered archive.
+    if !is_stamp(rest) {
+        return None;
+    }
+    seq.parse().ok()
+}
+
 /// True when `core` is a stamp this writer generates, optionally with a
 /// same-second disambiguation counter appended.
 pub(crate) fn is_archive_core(core: &str) -> bool {
+    // Current form: `<seq>-<stamp>`, where the sequence number fixes segment
+    // order at write time.
+    if archive_seq(core).is_some() {
+        return true;
+    }
+    // Legacy forms, still readable so an upgrade does not orphan existing
+    // archives: `<stamp>` and `<stamp>.<counter>`.
     match core.split_once('.') {
-        // `<stamp>.<counter>`: counter must be a non-empty run of digits.
         Some((stamp, counter)) => {
             !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit()) && is_stamp(stamp)
         }
-        // `<stamp>`
         None => is_stamp(core),
     }
 }
@@ -454,7 +504,7 @@ pub(crate) fn is_archive_core(core: &str) -> bool {
 /// siblings in the same directory are never returned. The active file itself
 /// is excluded. Order is unspecified; callers that need chronological order
 /// sort by mtime.
-pub(crate) fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>> {
+pub(crate) fn list_archives(active: &Path) -> Result<Vec<(PathBuf, ArchiveOrder)>> {
     let dir = active.parent().unwrap_or_else(|| Path::new("."));
     let active_name = active
         .file_name()
@@ -505,8 +555,13 @@ pub(crate) fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>>
         if !meta.is_file() {
             continue;
         }
-        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        out.push((entry.path(), mtime));
+        // Prefer the sequence number in the name; fall back to mtime only for
+        // archives written before numbering existed.
+        let order = match archive_seq(core) {
+            Some(seq) => ArchiveOrder::Seq(seq),
+            None => ArchiveOrder::Legacy(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
+        };
+        out.push((entry.path(), order));
     }
     Ok(out)
 }
@@ -974,6 +1029,17 @@ mod tests {
             file.write_all(line.as_bytes()).unwrap();
             file.write_all(b"\n").unwrap();
         }
+    }
+
+    /// Set a file's mtime so a test can make the name-derived and
+    /// mtime-derived ordering keys disagree deliberately.
+    fn set_mtime(path: &Path, when: SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
     }
 
     /// Unwrap a `PageOutcome` that the test expects to be a real page.
@@ -1985,6 +2051,115 @@ mod tests {
         assert!(
             matches!(outcome, PageOutcome::Page(_)),
             "the anchor is reachable once the rotated archive is listed"
+        );
+    }
+
+    #[test]
+    fn segment_order_survives_multiple_rotations_during_one_read() {
+        // The case an mtime-derived ordering key cannot handle. Two rotations
+        // land while a reader is assembling its snapshot:
+        //
+        //   open A  ->  A rotates to an archive
+        //           ->  B becomes active, then rotates too
+        //           ->  C becomes active
+        //
+        // Ordering by enumeration-time mtime can place the newer archive
+        // before the older pinned one, and the reader then reverses the merged
+        // result into the wrong newest-first order. The sequence number is
+        // written into the name at rotation time, so it describes the order
+        // regardless of when or in what order a reader observes the files.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+
+        // Archives as rotation would leave them, created newest-first on disk
+        // so that mtime order is the reverse of true segment order.
+        let seg_b = tmp.path().join("trace.0000000002-20260101-000200.jsonl");
+        let seg_a = tmp.path().join("trace.0000000001-20260101-000100.jsonl");
+
+        let mut ev_b = make_event("b", None);
+        ev_b.id = "id-b".into();
+        ev_b.timestamp = "2026-01-01T00:02:00.000Z".into();
+        ev_b.message = Some("segment-b".into());
+        write_jsonl(&seg_b, &[ev_b]);
+
+        let mut ev_a = make_event("a", None);
+        ev_a.id = "id-a".into();
+        ev_a.timestamp = "2026-01-01T00:01:00.000Z".into();
+        ev_a.message = Some("segment-a".into());
+        write_jsonl(&seg_a, &[ev_a]);
+
+        let mut ev_c = make_event("c", None);
+        ev_c.id = "id-c".into();
+        ev_c.timestamp = "2026-01-01T00:03:00.000Z".into();
+        ev_c.message = Some("segment-c".into());
+        write_jsonl(&active, &[ev_c]);
+
+        // Force the two keys to disagree, rather than relying on write order
+        // and filesystem timestamp resolution to produce a difference. The
+        // lower-sequence segment is given the *newer* mtime, so ordering by
+        // mtime yields the opposite result to ordering by sequence and the
+        // assertion below can tell the two apart.
+        let base = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        set_mtime(&seg_b, base);
+        set_mtime(&seg_a, base + std::time::Duration::from_secs(3600));
+        let a_mtime = std::fs::metadata(&seg_a).unwrap().modified().unwrap();
+        let b_mtime = std::fs::metadata(&seg_b).unwrap().modified().unwrap();
+        assert!(
+            a_mtime > b_mtime,
+            "test setup: the lower-sequence segment must carry the newer mtime"
+        );
+
+        let page = query_log_page(&active, true, &LogFilter::default(), 10, None).unwrap();
+        let seen: Vec<&str> = page
+            .events
+            .iter()
+            .map(|e| e.message.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            seen,
+            vec!["segment-c", "segment-b", "segment-a"],
+            "segments must be merged newest-first by sequence, not by mtime"
+        );
+    }
+
+    #[test]
+    fn legacy_archives_sort_before_numbered_ones() {
+        // Archives written before sequence numbering existed carry no number.
+        // They can only predate the upgrade, so they belong at the start of the
+        // stream regardless of what their mtimes say.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+        let legacy = tmp.path().join("trace.20260101-000000.jsonl");
+        let numbered = tmp.path().join("trace.0000000001-20260101-000100.jsonl");
+
+        let mut ev_old = make_event("old", None);
+        ev_old.id = "id-old".into();
+        ev_old.timestamp = "2026-01-01T00:00:00.000Z".into();
+        ev_old.message = Some("legacy".into());
+        write_jsonl(&legacy, &[ev_old]);
+
+        let mut ev_new = make_event("new", None);
+        ev_new.id = "id-new".into();
+        ev_new.timestamp = "2026-01-01T00:01:00.000Z".into();
+        ev_new.message = Some("numbered".into());
+        write_jsonl(&numbered, &[ev_new]);
+
+        let mut ev_live = make_event("live", None);
+        ev_live.id = "id-live".into();
+        ev_live.timestamp = "2026-01-01T00:02:00.000Z".into();
+        ev_live.message = Some("active".into());
+        write_jsonl(&active, &[ev_live]);
+
+        let page = query_log_page(&active, true, &LogFilter::default(), 10, None).unwrap();
+        let seen: Vec<&str> = page
+            .events
+            .iter()
+            .map(|e| e.message.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            seen,
+            vec!["active", "numbered", "legacy"],
+            "a legacy archive must read as older than every numbered archive"
         );
     }
 }

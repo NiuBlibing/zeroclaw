@@ -40,7 +40,7 @@ use crate::config::{LlmRequestPayloadPolicy, LogConfig, ResolvedPolicy, StorageP
 use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
-use crate::reader::{list_archives, split_base_ext};
+use crate::reader::{ArchiveOrder, SEQ_WIDTH, list_archives, split_base_ext};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
@@ -116,6 +116,13 @@ struct WorkerState {
     /// counting the existing active file so a restart resumes the correct
     /// count instead of rotating prematurely (or too late) after reload.
     line_count: AtomicU64,
+    /// Sequence number for the next archive this writer creates.
+    ///
+    /// Stamped into the archive name so segment order is fixed at write time
+    /// rather than inferred by a reader from mtimes. Seeded at startup from
+    /// the highest number already on disk, so the series keeps increasing
+    /// across restarts and reloads even though nothing persists it directly.
+    next_archive_seq: AtomicU64,
 }
 
 /// Producer-facing state. The `tx` sender is NOT shared with the worker
@@ -201,6 +208,7 @@ fn init_from_config_with_migration_and_shutdown_warning<F>(
             policy: policy.clone(),
             worker_dead: Arc::clone(&worker_dead),
             line_count: AtomicU64::new(initial_line_count),
+            next_archive_seq: AtomicU64::new(seed_archive_seq(&policy.path)),
         });
         spawn_worker(rx, worker_state);
     } else {
@@ -886,7 +894,10 @@ fn maybe_rotate_for_entry_count(state: &Arc<WorkerState>) -> Result<bool> {
 
 fn rotate_active(state: &Arc<WorkerState>, when: DateTime<Utc>) -> Result<()> {
     let path = &state.policy.path;
-    let archive = archive_path(path, when)?;
+    // Claim the next number before renaming so the archive name records where
+    // this segment falls in the series.
+    let seq = state.next_archive_seq.fetch_add(1, Ordering::Relaxed);
+    let archive = archive_path(path, when, seq)?;
     fs::rename(path, &archive)
         .with_context(|| format!("rotating log {} → {}", path.display(), archive.display()))?;
 
@@ -902,7 +913,46 @@ fn rotate_active(state: &Arc<WorkerState>, when: DateTime<Utc>) -> Result<()> {
 
 /// Build the archive path for `path`, stamping the timestamp before the
 /// extension and disambiguating same-second rotations with a numeric suffix.
-fn archive_path(path: &Path, when: DateTime<Utc>) -> Result<PathBuf> {
+/// Highest archive sequence number already on disk, plus one.
+///
+/// Nothing persists the counter directly, so it is recovered from the archive
+/// names at startup. That keeps the series increasing across restarts and
+/// policy reloads: a writer that restarted mid-day must not reuse a number an
+/// existing archive already carries, or a reader would order the two by an
+/// ambiguous key.
+///
+/// Legacy archives written before numbering existed contribute nothing here.
+/// They sort before every numbered archive, so starting a fresh series at 1
+/// alongside them is correct.
+fn seed_archive_seq(active: &Path) -> u64 {
+    let highest = match list_archives(active) {
+        Ok(archives) => archives
+            .iter()
+            .filter_map(|(_, order)| match order {
+                ArchiveOrder::Seq(n) => Some(*n),
+                ArchiveOrder::Legacy(_) => None,
+            })
+            .max()
+            .unwrap_or(0),
+        Err(err) => {
+            // A directory that cannot be listed is reported by the query path
+            // as well; here it only means the series restarts. Rotation still
+            // works, and the reader falls back to mtime for anything it cannot
+            // order by name.
+            tracing::warn!(
+                target: "zeroclaw_log",
+                error = ?err,
+                path = %active.display(),
+                "log: could not read existing archives to seed the rotation sequence; \
+                 starting from 1",
+            );
+            0
+        }
+    };
+    highest.saturating_add(1)
+}
+
+fn archive_path(path: &Path, when: DateTime<Utc>, seq: u64) -> Result<PathBuf> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -911,14 +961,22 @@ fn archive_path(path: &Path, when: DateTime<Utc>) -> Result<PathBuf> {
     let (base, ext) = split_base_ext(file_name);
     let stamp = when.format("%Y%m%d-%H%M%S").to_string();
 
-    // The existence check and subsequent `fs::rename` are called from
-    // the single-threaded worker, so the check-then-rename has no
-    // in-process race.
-    let mut candidate = dir.join(format!("{base}.{stamp}{ext}"));
-    let mut n = 1u32;
+    // The sequence number leads so the name itself carries segment order: a
+    // reader sorts by it and never has to infer order from mtimes, which are
+    // an observation made at enumeration time and can misorder segments when
+    // several rotations land during one read. The stamp stays for operators
+    // reading the directory.
+    //
+    // The existence check and the subsequent `fs::rename` both run on the
+    // single-threaded worker, so this check-then-rename has no in-process
+    // race. A collision here means the seeded series overlapped something on
+    // disk; bumping the sequence keeps names unique and order intact.
+    let mut seq = seq;
+    let width = SEQ_WIDTH;
+    let mut candidate = dir.join(format!("{base}.{seq:0width$}-{stamp}{ext}"));
     while candidate.exists() {
-        candidate = dir.join(format!("{base}.{stamp}.{n}{ext}"));
-        n += 1;
+        seq = seq.saturating_add(1);
+        candidate = dir.join(format!("{base}.{seq:0width$}-{stamp}{ext}"));
     }
     Ok(candidate)
 }
@@ -948,16 +1006,24 @@ fn run_retention(policy: &ResolvedPolicy) {
             return;
         }
     };
-    // Newest first, so a later count cap keeps the most recent archives.
-    archives.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
+    // Newest first, so a later count cap keeps the most recent archives. The
+    // ordering key comes from the archive name where available, so it stays
+    // correct even if a file's mtime was touched after it was written.
+    archives.sort_by_key(|(_, order)| std::cmp::Reverse(*order));
 
-    // Age-based cleanup.
+    // Age-based cleanup. This one genuinely needs wall-clock age, so it reads
+    // mtime from the filesystem rather than the name-derived ordering key. An
+    // archive whose mtime cannot be read is kept: deleting a file we failed to
+    // measure would be the more destructive choice.
     if max_age_days > 0
         && let Some(cutoff) =
             SystemTime::now().checked_sub(Duration::from_secs(max_age_days.saturating_mul(86_400)))
     {
-        archives.retain(|(p, mtime)| {
-            if *mtime < cutoff {
+        archives.retain(|(p, _)| {
+            let Ok(mtime) = fs::metadata(p).and_then(|m| m.modified()) else {
+                return true;
+            };
+            if mtime < cutoff {
                 remove_archive(p);
                 false
             } else {
@@ -983,22 +1049,6 @@ fn remove_archive(path: &Path) {
             "log: pruning rotated archive failed",
         );
     }
-}
-
-/// Return the active log path and all retained archive files. Archives are
-/// sorted oldest-first by mtime; the active file is not included in the
-/// archive list. Returns `None` when no writer is installed or persistence is
-/// disabled. Used by the gateway's `/api/logs` multi-segment reader.
-pub fn segment_files() -> Option<(PathBuf, Vec<(PathBuf, std::time::SystemTime)>)> {
-    let state = current_state()?;
-    if !state.policy.storage.is_enabled() {
-        return None;
-    }
-    let active = state.policy.path.clone();
-    let mut archives = list_archives(&active).unwrap_or_default();
-    // Oldest first so the caller can scan in chronological order.
-    archives.sort_by_key(|(_, mtime)| *mtime);
-    Some((active, archives))
 }
 
 pub(crate) static WRITER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -1781,23 +1831,55 @@ mod tests {
     }
 
     #[test]
-    fn archive_path_places_stamp_before_extension_and_dedupes() {
+    fn archive_path_leads_with_the_sequence_and_dedupes_on_collision() {
         use chrono::TimeZone;
         let tmp = tempfile::tempdir().unwrap();
         let active = tmp.path().join("runtime-trace.jsonl");
         let when = Utc.with_ymd_and_hms(2026, 6, 24, 3, 15, 0).unwrap();
 
-        let a1 = archive_path(&active, when).unwrap();
+        // The sequence leads the name so readers can order segments by name
+        // alone; the stamp stays for operators reading the directory.
+        let a1 = archive_path(&active, when, 1).unwrap();
         assert_eq!(
             a1.file_name().unwrap().to_str().unwrap(),
-            "runtime-trace.20260624-031500.jsonl"
+            "runtime-trace.0000000001-20260624-031500.jsonl"
         );
-        // A same-second collision is disambiguated with a numeric suffix.
+
+        // A number already taken on disk is skipped rather than reused, so two
+        // archives never share an ordering key.
         fs::write(&a1, "x").unwrap();
-        let a2 = archive_path(&active, when).unwrap();
+        let a2 = archive_path(&active, when, 1).unwrap();
         assert_eq!(
             a2.file_name().unwrap().to_str().unwrap(),
-            "runtime-trace.20260624-031500.1.jsonl"
+            "runtime-trace.0000000002-20260624-031500.jsonl"
+        );
+    }
+
+    #[test]
+    fn archive_sequence_resumes_above_existing_archives() {
+        // Nothing persists the counter, so a restart recovers it from the
+        // names on disk. Reusing a number would leave two archives ordered by
+        // an ambiguous key.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("runtime-trace.jsonl");
+        fs::write(&active, "").unwrap();
+        fs::write(
+            tmp.path()
+                .join("runtime-trace.0000000007-20260624-031500.jsonl"),
+            "x\n",
+        )
+        .unwrap();
+        // A legacy archive contributes no number and must not disturb seeding.
+        fs::write(
+            tmp.path().join("runtime-trace.20260101-000000.jsonl"),
+            "y\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            seed_archive_seq(&active),
+            8,
+            "the series must resume above the highest number already on disk"
         );
     }
 

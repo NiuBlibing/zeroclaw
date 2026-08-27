@@ -233,12 +233,23 @@ Do not use Observer output or SSE delivery to prove that every canonical event w
 
 ## Reader cursors span the active file and retained archives
 
-`GET /api/logs` and `logs/query` call `reader::query_log_page`, which owns archive
-enumeration and merges the
-active file plus all retained archive files into one logical event stream. Segments
-are scanned oldest-archive-first and the merged result is returned newest-first,
-identical to the prior single-file semantics. The merge is sequential and
-in-process; no event is re-serialized.
+`GET /api/logs` and `logs/query` call `reader::query_log_page`, which owns segment
+enumeration. What it merges depends on the installed storage policy: only
+`rotating` owns archives, so only under `rotating` does the reader merge the
+active file with retained archives into one logical event stream. Under
+`rolling`, `full`, and `none` it reads the active file alone, even when
+timestamped files from an earlier `rotating` configuration are still present
+beside it; those are unmanaged and not part of the policy's logical stream.
+Segments are scanned oldest-archive-first and the merged result is returned
+newest-first, identical to the prior single-file semantics. The merge is
+sequential and in-process; no event is re-serialized.
+
+Segment order comes from a sequence number written into each archive name at
+rotation time, not from file mtimes. Ordering by mtime would be an observation
+made at enumeration time, and several rotations landing during one read can
+leave it describing an order that no longer holds. Archives written before
+sequence numbering existed carry no number; they are ordered by mtime and sort
+before every numbered archive.
 
 The primary pagination cursor is `next_segment_cursor`, an opaque string that
 encodes the segment basename, a byte offset, and an anchor event id. Pass it
@@ -270,7 +281,7 @@ After one of those boundaries, restart pagination from the newest page. The lega
 | `full` | Append without writer-managed trim or rotation. | The operator owns file growth and any external rotation. |
 | `rotating` | Before a new UTC day's first append, or after an append reaches the byte or entry-count threshold, rename the active file to a timestamped archive. | After each successful rotation, the writer prunes matching archives by age and then count. Removal is best-effort and never fails the enclosing append. |
 
-Age and count retention run only after rotation. They do not sweep continuously, do not apply to `full` or `rolling`, and do not delete arbitrary neighboring files: archive discovery accepts only names generated from the active path's timestamped archive shape. The live `/api/logs` reader merges the active file with all retained archives; see [Reader cursors](#reader-cursors-span-the-active-file-and-retained-archives).
+Age and count retention run only after rotation. They do not sweep continuously, do not apply to `full` or `rolling`, and do not delete arbitrary neighboring files: archive discovery accepts only names generated from the active path's archive shape. Under `rotating`, the live `/api/logs` reader merges the active file with all retained archives; under the other policies it reads the active file alone. See [Reader cursors](#reader-cursors-span-the-active-file-and-retained-archives).
 
 ## Schema migration is an active-file rewrite
 
