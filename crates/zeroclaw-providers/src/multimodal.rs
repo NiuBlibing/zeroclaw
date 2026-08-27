@@ -1891,13 +1891,18 @@ fn image_error_failure(
 
 /// Validate every frame of an animation under the per-image and caller budgets.
 ///
-/// Returns the decoder's **peak** allocation, not the sum of the frame buffers
-/// it yielded. Animation decoders retain full-canvas state that never appears in
-/// a returned `Frame`: GIF keeps a persistent composition canvas, and APNG keeps
-/// `current` plus `previous`. Charging only the yielded bytes would let a
-/// sequence of valid sub-cap animations run the request far past the aggregate
-/// envelope while the counter still reported headroom, so `scratch_per_pixel`
-/// carries the same decoder-specific model that admission already applied.
+/// Returns the charge for the caller's aggregate budget: the larger of the
+/// cumulative frame work (every frame buffer the decoder produced, plus the
+/// state it holds across the whole animation) and the largest single-frame
+/// peak. Animation decoders retain full-canvas state that never appears in a
+/// returned `Frame` — GIF keeps a persistent composition canvas, APNG keeps
+/// `current` plus `previous` — which is what `scratch_per_pixel` models, using
+/// the same decoder-specific figure admission already applied.
+///
+/// Charging only the single-frame peak was a real under-count: a long animation
+/// decodes every frame's pixels but would debit just one frame's worth, letting
+/// a sequence of accepted animations run past the aggregate envelope while the
+/// counter still reported headroom.
 fn validate_animation_frames(
     frames: image::Frames<'_>,
     source: &str,
@@ -1912,6 +1917,10 @@ fn validate_animation_frames(
     // Largest single-frame peak seen: the frame's own buffer plus the
     // full-canvas decoder state live alongside it.
     let mut peak = 0u64;
+    // Scratch for the largest frame seen. The decoder's cross-frame state is
+    // sized from the canvas, so the largest frame's scratch is the bound for
+    // what stays live across the whole animation.
+    let mut persistent_scratch = 0u64;
 
     for frame in frames {
         let frame = match frame {
@@ -1949,8 +1958,12 @@ fn validate_animation_frames(
         // What the decoder actually holds while producing this frame: the
         // frame buffer plus its retained full-canvas state.
         let frame_pixels = u64::from(buffer.width()).saturating_mul(u64::from(buffer.height()));
-        let frame_peak =
-            frame_allocation.saturating_add(frame_pixels.saturating_mul(scratch_per_pixel));
+        let frame_scratch = frame_pixels.saturating_mul(scratch_per_pixel);
+        let frame_peak = frame_allocation.saturating_add(frame_scratch);
+        // Track the largest frame's scratch: persistent decoder state is sized
+        // from the canvas, so the largest frame's scratch is the right term to
+        // add to the cumulative total when charging the aggregate budget.
+        persistent_scratch = persistent_scratch.max(frame_scratch);
         peak = peak.max(frame_peak);
 
         let next_total = total.saturating_add(frame_allocation);
@@ -1987,14 +2000,28 @@ fn validate_animation_frames(
         ));
     }
 
-    // Return the decoder's peak, not the sum of yielded frame bytes.
-    // `total` counts only the frame buffers returned by the iterator; the
-    // persistent decoder state (GIF's `non_disposed_frame`, APNG's `current`
-    // and `previous` canvases) lives alongside those buffers but never appears
-    // in a `Frame`. `peak` already captured the per-frame high-water mark
-    // (frame bytes + scratch), so it is the correct charge for the caller's
-    // aggregate budget.
-    Ok(peak)
+    // Charge the **larger** of two quantities:
+    //
+    // 1. `total + persistent_scratch`: cumulative frame-pixel work plus the
+    //    decoder state that stays live for the whole animation. `total` is the
+    //    sum of the returned frame buffers — every pixel the decoder produced,
+    //    serially — so as the frame count grows this grows with it and the
+    //    aggregate budget drains accordingly. `persistent_scratch` is one
+    //    canvas worth of per-format scratch, covering the buffers the decoder
+    //    holds across frames rather than per frame (GIF's `non_disposed_frame`;
+    //    APNG's `current` and `previous`; WebP's composition canvas and alpha
+    //    buffers).
+    //
+    // 2. `peak`: the largest single-frame allocation seen (frame buffer plus
+    //    that frame's scratch). For a single-frame animation this equals
+    //    option 1; for a long animation option 1 is larger.
+    //
+    // Taking the max keeps a lone oversized frame honestly charged while making
+    // cumulative work the binding term once an animation has many frames.
+    // Returning `peak` alone was the bug: a 100-frame animation decoded 100
+    // frames' worth of pixels but debited only one frame's peak.
+    let cumulative_charge = total.saturating_add(persistent_scratch);
+    Ok(cumulative_charge.max(peak))
 }
 
 /// Validate `bytes` against the aggregate decode budget, then decode.
@@ -3504,11 +3531,15 @@ mod tests {
             validate_image_content("anim.gif", "image/gif", &gif, MAX_DECODED_IMAGE_ALLOC_BYTES)
                 .await
                 .expect("a well-formed animated GIF is accepted");
+        // The charge is cumulative frame work plus the state the decoder holds
+        // across the animation, not a single frame's peak: two 1x1 frames give
+        // `total = 2 * 4` and one canvas of scratch
+        // (`GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL`).
         assert_eq!(
             allocation,
-            4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL,
-            "an accepted GIF is charged its decoder peak (frame output plus the persistent \
-             canvas and the partial-frame composite bound), not the sum of its frame buffers"
+            2 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL,
+            "an accepted GIF is charged cumulative frame work plus its persistent canvas, \
+             so a longer animation drains more of the aggregate budget"
         );
     }
 
@@ -3602,15 +3633,16 @@ mod tests {
         let mut gif = two_frame_gif(&GIF_VALID_1X1_LZW);
         gif.push(GIF_TRAILER);
 
-        // Exactly the projected peak: admission passes, so the frame loop is
-        // entered and its own accounting decides the outcome.
+        // The cap admits the header projection, so the frame loop is entered
+        // and its own accounting decides the outcome.
         let projected = 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL;
         let allocation = validate_image_content("anim.gif", "image/gif", &gif, projected)
             .await
             .expect("a GIF whose peak fits the cap is accepted");
         assert_eq!(
-            allocation, projected,
-            "an accepted GIF is charged its decoder peak, not the sum of its frame buffers"
+            allocation,
+            2 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL,
+            "the accepted GIF is charged cumulative frame work plus its persistent canvas"
         );
     }
 
@@ -3718,56 +3750,125 @@ mod tests {
         );
     }
 
+    /// A single-frame 1x1 GIF repeated `frames` times over a 1x1 logical screen.
+    ///
+    /// Each frame is a full-canvas 1x1 image, so every frame decodes to 4 bytes
+    /// of RGBA. Used to prove that cumulative frame work — not just one frame's
+    /// peak — is charged against the aggregate budget.
+    fn many_frame_gif(frames: usize) -> Vec<u8> {
+        let mut gif = gif_prefix_with_one_frame();
+        for _ in 1..frames {
+            gif.extend_from_slice(&GIF_IMAGE_DESCRIPTOR_1X1);
+            gif.extend_from_slice(&GIF_VALID_1X1_LZW);
+        }
+        gif.push(GIF_TRAILER);
+        gif
+    }
+
+    #[tokio::test]
+    async fn long_animation_is_charged_cumulative_frame_work() {
+        // The aggregate budget is documented as bounding *cumulative* decoded
+        // allocations. Charging one frame's peak per animation broke that: a
+        // long animation decodes every frame's pixels but debited only the
+        // largest single frame, so a run of accepted animations could perform
+        // far more cumulative decode work than the envelope claims.
+        //
+        // A 1x1 GIF with N frames does `N * 4` bytes of frame decoding, plus
+        // one canvas of persistent scratch that stays live across the run. The
+        // charge must therefore scale with frame count.
+        let two = many_frame_gif(2);
+        let twenty = many_frame_gif(20);
+
+        let charge_two = validate_image_content("two.gif", "image/gif", &two, u64::MAX)
+            .await
+            .expect("a valid 2-frame GIF is accepted");
+        let charge_twenty = validate_image_content("twenty.gif", "image/gif", &twenty, u64::MAX)
+            .await
+            .expect("a valid 20-frame GIF is accepted");
+
+        assert_eq!(
+            charge_two,
+            2 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL,
+            "a 2-frame GIF is charged its cumulative frame work plus one canvas of scratch"
+        );
+        assert_eq!(
+            charge_twenty,
+            20 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL,
+            "a 20-frame GIF is charged 20 frames of work, not one frame's peak"
+        );
+        assert!(
+            charge_twenty > charge_two,
+            "cumulative charging must scale with frame count: {charge_twenty} vs {charge_two}"
+        );
+
+        // Request level: a budget sized for exactly one 20-frame animation must
+        // admit it and then refuse the next candidate before it decodes. Under
+        // peak-only charging the first animation would debit just 12 bytes and
+        // leave headroom for many more, so the second candidate would decode.
+        let mut budget = 20 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL;
+        let charged = validate_within_budget("first.gif", "image/gif", &twenty, &mut budget)
+            .await
+            .expect("the long animation fits a budget sized for its cumulative work");
+        assert_eq!(charged, 20 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL);
+        assert_eq!(
+            budget, 0,
+            "the long animation's cumulative work consumes the whole envelope"
+        );
+
+        let ((), decodes) = counting_decodes(async {
+            let mut spent = budget;
+            validate_within_budget("second.gif", "image/gif", &two, &mut spent)
+                .await
+                .expect_err("the next candidate must be refused against the spent envelope");
+        })
+        .await;
+        assert_eq!(
+            decodes, 0,
+            "the refused candidate must not decode: cumulative charging closed the envelope"
+        );
+    }
+
     #[tokio::test]
     async fn multiple_valid_animations_respect_the_aggregate_budget() {
-        // Request-level regression for animation peak accounting.
+        // Request-level regression for animation accounting across candidates.
         //
-        // Each accepted animation must debit the decoder's peak — the frame
-        // buffer plus the full-canvas state the decoder retains — not just the
-        // bytes of the frames it yielded. Charging only the yielded bytes let a
-        // run of valid sub-cap animations decode far past the aggregate
-        // envelope while the counter still reported headroom: a GIF holds a
-        // persistent composition canvas (4 B/px on top of its 4 B/px frame) and
-        // an APNG holds `current` plus `previous` (8 B/px on top).
+        // Each accepted animation debits its cumulative frame work plus the
+        // canvas state the decoder holds for the whole run, so two identical
+        // animations consume exactly twice one animation's charge and a third
+        // is refused against the spent envelope.
         //
-        // GIF is fully exercised here: its projection already covers its peak
-        // (frame output + persistent canvas), so the charge equals the
-        // projection. The test verifies that the aggregate counter is debited
-        // by the peak rather than the bare frame sum.
-        //
-        // APNG is covered separately via `apng_validates_every_frame`, which
-        // checks the returned allocation. Multi-candidate APNG is not combined
-        // here because `image`'s PNG decoder uses internal row/zlib buffers
-        // that are charged against the `effective_cap` through `Limits`; those
-        // buffers are slightly above the 12-byte 1×1 canvas projection, so
-        // the fixture cannot cheaply land the budget exactly at the APNG peak.
-        // The per-format regression is the right place to pin that.
+        // APNG and animated WebP use the same `validate_animation_frames` path;
+        // their per-format charges are pinned by `apng_validates_every_frame`
+        // and `animated_webp_validates_every_frame`. This test uses GIF because
+        // its projection and charge can be landed exactly, while `image`'s PNG
+        // decoder holds internal row/zlib buffers that make an exact APNG
+        // budget boundary awkward to express in a fixture.
         let mut gif = two_frame_gif(&GIF_VALID_1X1_LZW);
         gif.push(GIF_TRAILER);
 
-        let gif_peak = 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL;
+        // Two 1x1 frames plus one canvas of persistent scratch.
+        let gif_charge = 2 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL;
 
         // Room for exactly two GIFs, with nothing left over, to prove the
         // third candidate is refused by the closed budget rather than admitted.
-        let initial_budget = gif_peak * 2;
-        let mut budget = initial_budget;
+        let mut budget = gif_charge * 2;
 
         let charged1 = validate_within_budget("first.gif", "image/gif", &gif, &mut budget)
             .await
             .expect("the first GIF fits the budget");
         assert_eq!(
-            charged1, gif_peak,
-            "an accepted GIF must be charged its decoder peak, not its bare frame bytes"
+            charged1, gif_charge,
+            "an accepted GIF must be charged its cumulative frame work plus persistent canvas"
         );
-        assert_eq!(budget, gif_peak, "the first GIF's peak is debited in full");
+        assert_eq!(
+            budget, gif_charge,
+            "the first GIF's charge is debited in full"
+        );
 
         let charged2 = validate_within_budget("second.gif", "image/gif", &gif, &mut budget)
             .await
             .expect("the second GIF exactly consumes the remainder");
-        assert_eq!(
-            charged2, gif_peak,
-            "the second GIF is also charged its peak"
-        );
+        assert_eq!(charged2, gif_charge, "the second GIF is charged the same");
         assert_eq!(budget, 0, "the envelope is now fully spent");
 
         // A third candidate must be refused without decoding: the budget is
@@ -3927,14 +4028,13 @@ mod tests {
         )
         .await
         .expect("a valid two-frame APNG is accepted");
-        // The charge is the decoder's peak for one frame, not the sum of the
-        // frame buffers: 4 B of frame output plus the two persistent canvases
-        // `ApngDecoder` retains and the conversion buffers for non-RGBA frames
-        // (`APNG_SCRATCH_BYTES_PER_PIXEL` = 12 B/px for the worst-case Rgb8 path).
+        // The charge is cumulative frame work plus the state the decoder holds
+        // across the animation: two 1x1 frames give `total = 2 * 4` and one
+        // canvas of APNG scratch.
         assert_eq!(
             allocation,
-            4 + APNG_SCRATCH_BYTES_PER_PIXEL,
-            "an APNG is charged its decoder peak, including the retained canvases"
+            2 * 4 + APNG_SCRATCH_BYTES_PER_PIXEL,
+            "an accepted APNG is charged cumulative frame work plus its persistent canvases"
         );
 
         let mut corrupt = valid;
@@ -4171,13 +4271,14 @@ mod tests {
         )
         .await
         .expect("a valid two-frame animated WebP is accepted");
-        // The charge is the decoder's peak for one frame: 4 B of frame output
-        // plus the persistent canvas and scratch buffers the animated WebP
-        // decoder holds alongside it (`WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL` = 17 B/px).
+        // The charge is cumulative frame work plus the state the decoder holds
+        // across the animation: two 1x1 frames give `total = 2 * 4` and one
+        // canvas of animated-WebP scratch.
         assert_eq!(
             allocation,
-            4 + WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL,
-            "an animated WebP is charged its decoder peak, including animated scratch"
+            2 * 4 + WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL,
+            "an accepted animated WebP is charged cumulative frame work plus its \
+             persistent canvas and scratch"
         );
 
         let mut corrupt = valid;
