@@ -12337,7 +12337,9 @@ mod tests {
     #[tokio::test]
     async fn config_set_refresh_stale_gen_replaced_during_provider_build() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let dispatcher = Arc::new(make_config_set_test_dispatcher(
+            make_model_refresh_test_config(&tmp),
+        ));
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
@@ -12347,17 +12349,22 @@ mod tests {
         let sessions = Arc::clone(&dispatcher.ctx.sessions);
         let (entered, release, done) = sessions.set_test_gated_op_pause();
 
-        // Trigger config/set — schedules an async refresh that will
-        // snapshot, lock, build provider, then block at apply_model_provider.
-        let res = dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.model",
-                "value": "refreshed-model"
-            }))
-            .await;
-        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+        // Drive config/set on a task: this branch awaits the live-session
+        // refresh INLINE (that inline await is the acknowledgement boundary
+        // the route-generation transaction requires), so the call does not
+        // return until the refresh completes. Awaiting it here would block on
+        // the gate below and deadlock.
+        let config_set_dispatcher = Arc::clone(&dispatcher);
+        let config_set = zeroclaw_spawn::spawn!(async move {
+            config_set_dispatcher
+                .handle_config_set(&json!({
+                    "prop": "providers.models.openai.test-provider.model",
+                    "value": "refreshed-model"
+                }))
+                .await
+        });
 
-        // Wait for the async refresh to reach the gate (snapshot captured,
+        // Wait for the inline refresh to reach the gate (snapshot captured,
         // provider built, apply pending).
         entered.notified().await;
 
@@ -12387,6 +12394,10 @@ mod tests {
         done.notified().await;
         sessions.clear_test_gated_op_pause();
 
+        // The inline refresh has run its course, so config/set can now settle.
+        let res = config_set.await.expect("config/set task must complete");
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
         // Successor must be untouched by the stale refresh — it was
         // created from config with model "old-model". The refresh tried
         // to change it to "refreshed-model"; gen-gating must prevent that.
@@ -12408,9 +12419,9 @@ mod tests {
         );
     }
 
-    /// Deterministic race: config/set triggers an async refresh that pauses
-    /// at `apply_model_provider` after capturing the old generation. While
-    /// paused, the session is replaced through ACP rehydration
+    /// Deterministic race: config/set commits a live-session refresh that
+    /// pauses at `apply_model_provider` after capturing the old generation.
+    /// While paused, the session is replaced through ACP rehydration
     /// (`rehydrate_reaped_session`), which installs a same-ID successor via
     /// `SessionStore::insert`. The stale refresh must skip the rehydrated
     /// successor.
@@ -12421,6 +12432,7 @@ mod tests {
         let data_dir = config.data_dir.clone();
         let (dispatcher, sessions, _chat_backend, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
+        let dispatcher = Arc::new(dispatcher);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
@@ -12436,17 +12448,25 @@ mod tests {
 
         let (entered, release, done) = sessions.set_test_gated_op_pause();
 
-        // Trigger config/set — schedules an async refresh that pauses at
-        // apply_model_provider after capturing the old generation.
-        let res = dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.model",
-                "value": "refreshed-model"
-            }))
-            .await;
-        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+        // Drive config/set on a task. This branch commits the live-session
+        // refresh INLINE, inside `handle_config_set`, so the call does not
+        // return until the refresh finishes — that is the acknowledgement
+        // boundary the route-generation transaction requires. Awaiting it
+        // directly here would therefore block on the gate below and deadlock
+        // the test. (On the pre-merge shape the refresh was spawned and this
+        // call returned immediately, which is why the original form awaited
+        // it in place.)
+        let config_set_dispatcher = Arc::clone(&dispatcher);
+        let config_set = zeroclaw_spawn::spawn!(async move {
+            config_set_dispatcher
+                .handle_config_set(&json!({
+                    "prop": "providers.models.openai.test-provider.model",
+                    "value": "refreshed-model"
+                }))
+                .await
+        });
 
-        // Wait for the async refresh to reach the gate.
+        // Wait for the inline refresh to reach the gate.
         entered.notified().await;
 
         // Rewind the provider model so the rehydrated successor is built
@@ -12476,6 +12496,10 @@ mod tests {
         release.notify_one();
         done.notified().await;
         sessions.clear_test_gated_op_pause();
+
+        // The inline refresh has run its course, so config/set can now settle.
+        let res = config_set.await.expect("config/set task must complete");
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
         // The rehydrated successor must retain its provider, model, and
         // temperature — untouched by the stale config/set refresh.
