@@ -725,7 +725,7 @@ pub(crate) fn load_page_multi(
                         // expected anchor event: rotation occurred. Search all
                         // segments for the anchor event and rebase the cursor
                         // to the byte offset immediately after it.
-                        match find_anchor_in_segments(&segs, anchor) {
+                        match find_anchor_in_segments(segs, anchor) {
                             Some((anchor_idx, anchor_end_off)) => {
                                 (anchor_idx, Some(anchor_end_off))
                             }
