@@ -1854,6 +1854,83 @@ impl RpcDispatcher {
             )
             .await
             .ok()?;
+
+        // Reconcile the rehydrated session with the live config generation.
+        //
+        // `Agent::from_live_config_with_tui_env` clones config once at the
+        // start of rehydration and builds the provider/resolver from that
+        // snapshot. A route-affecting config transaction can commit a new
+        // generation between that clone and this insert — specifically, the
+        // transaction's `list_ids()` snapshot (taken before it commits) cannot
+        // include a session that has not been inserted yet, so the transaction
+        // never refreshes a reaped-then-rehydrating session.
+        //
+        // After insert the session is publicly visible, but `sync_config_generation`
+        // (called at turn entry) only refreshes the limit-resolution cell — it
+        // never rebuilds `model_provider` or `model_route_resolver`. Without this
+        // step the session would remain mixed-generation indefinitely: limits read
+        // from the live config, dispatch from the construction-time snapshot.
+        //
+        // Fix: after insert, re-resolve provider/resolver/generation from the
+        // current live config and apply them atomically through `apply_model_provider`,
+        // the same entry point the transaction uses. This is a best-effort repair
+        // with no new locks, and it runs before the `session/prompt` ordering
+        // barrier, so the turn that triggered rehydration observes the result.
+        {
+            // Clone the live generation once, then drop the read guard before
+            // any `.await`: the config lock is a `parking_lot` primitive and
+            // must never be held across a suspension point.
+            let config_generation = Arc::new(self.ctx.config.read().clone());
+            let agent_cfg = config_generation
+                .resolved_agent_config(&data.agent_alias)
+                .or_else(|| config_generation.agent(&data.agent_alias).cloned());
+            let resolved = agent_cfg.as_ref().and_then(|cfg| {
+                crate::agent::agent::build_session_model_provider(
+                    &config_generation,
+                    cfg.model_provider.as_str(),
+                    None,
+                )
+                .ok()
+                .map(|tuple| (cfg.clone(), tuple))
+            });
+            match resolved {
+                Some((
+                    cfg,
+                    (model_provider, model_provider_name, model_name, model_route_resolver),
+                )) => {
+                    let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
+                        &cfg,
+                        model_provider.as_ref(),
+                        &model_name,
+                    );
+                    self.ctx
+                        .sessions
+                        .apply_model_provider(
+                            sid,
+                            model_provider,
+                            model_provider_name,
+                            model_name,
+                            model_route_resolver,
+                            tool_dispatcher,
+                            config_generation,
+                        )
+                        .await;
+                }
+                None => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_id": sid,
+                                "agent_alias": data.agent_alias,
+                            })),
+                        "rehydrated session: could not re-resolve provider against the live config generation"
+                    );
+                }
+            }
+        }
         let seed_event = self
             .ctx
             .sessions

@@ -12194,6 +12194,268 @@ vision_model_provider = "custom.vision"
         );
     }
 
+    /// A reliable fallback that serves a DIFFERENT alias must report ITS
+    /// capacity, not the requested route's.
+    ///
+    /// Regression for the mixed-generation split inside one `ServedRoute`:
+    /// limits were resolved pre-dispatch from the requested route, while
+    /// `provider_name`/`model` were updated post-dispatch from `accepted_route`.
+    /// A 200k primary failing over to an 8k backup therefore reported the
+    /// backup's identity against the primary's 200k window, and the loop's own
+    /// trim/recovery arithmetic kept using the wide budget for a model that
+    /// only holds 8k.
+    #[tokio::test]
+    async fn served_limits_follow_the_accepted_reliable_fallback_route() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_providers::reliable::ReliableModelProvider;
+
+        // 200k primary that always fails, 8k backup that answers. Both are
+        // configured aliases, so each resolves to a real `context_window`.
+        //
+        // The backup alias deliberately pins no `model`: reliable serves a
+        // fallback entry with the REQUESTED model name, and
+        // `resolved_model_context_window_for_route` only honors an alias's
+        // window when the alias either pins no model or pins the selected one.
+        // Leaving it unpinned is what a fallback alias looks like in practice,
+        // and it keeps this test asserting the thing under repair — capacity
+        // keyed on the ACCEPTED alias — rather than model-pin mechanics.
+        let config: zeroclaw_config::schema::Config = toml::from_str(
+            r#"
+schema_version = 3
+[providers.models.custom.primary]
+model = "primary-model"
+context_window = 200000
+[providers.models.custom.backup]
+context_window = 8000
+[agents.coder]
+enabled = true
+model_provider = "custom.primary"
+"#,
+        )
+        .expect("config parses");
+
+        struct AlwaysFails;
+        #[async_trait]
+        impl ModelProvider for AlwaysFails {
+            async fn chat_with_system(
+                &self,
+                _s: Option<&str>,
+                _m: &str,
+                _model: &str,
+                _t: Option<f64>,
+            ) -> Result<String> {
+                anyhow::bail!("primary is down")
+            }
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _t: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                anyhow::bail!("primary is down")
+            }
+            // Deliberately does NOT support streaming so that reliable's
+            // `stream_chat` skips entry 0 and routes to the backup entry.
+            // That makes `entry_index != 0` true for the backup, which is
+            // what marks it as a fallback and produces an `accepted_route`
+            // carrying "custom.backup" into the call-provider accounting.
+            fn supports_streaming(&self) -> bool {
+                false
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for AlwaysFails {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "primary"
+            }
+        }
+
+        // Answers WITHOUT usage via streaming, so the terminal snapshot is the
+        // only frame carrying limits — exactly the path the stale pair corrupted.
+        // Streaming is required so that `scope_provider_fallback` establishes the
+        // reliable accounting task-local; the non-streaming path does not scope it
+        // and `accepted_route` would be None, which is a separate, pre-existing gap.
+        struct BackupAnswers {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl ModelProvider for BackupAnswers {
+            async fn chat_with_system(
+                &self,
+                _s: Option<&str>,
+                _m: &str,
+                _model: &str,
+                _t: Option<f64>,
+            ) -> Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _t: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("backup answered".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat(
+                &self,
+                _request: zeroclaw_providers::ChatRequest<'_>,
+                _model: &str,
+                _t: Option<f64>,
+                _options: zeroclaw_providers::traits::StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<
+                    zeroclaw_api::model_provider::StreamEvent,
+                >,
+            > {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(zeroclaw_api::model_provider::StreamEvent::TextDelta(
+                        zeroclaw_api::model_provider::StreamChunk {
+                            delta: "backup answered".to_string(),
+                            reasoning: None,
+                            is_final: false,
+                            token_count: 0,
+                        },
+                    )),
+                    Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+                ]))
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for BackupAnswers {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "backup"
+            }
+        }
+
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        // `new` keys each entry's candidate identity on its display name, so the
+        // accepted route reports `custom.backup` — the alias the config resolver
+        // needs in order to find the 8k window.
+        let reliable = ReliableModelProvider::new(
+            "custom.primary",
+            vec![
+                (
+                    "custom.primary".to_string(),
+                    Box::new(AlwaysFails) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "custom.backup".to_string(),
+                    Box::new(BackupAnswers {
+                        calls: Arc::clone(&backup_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, temp.path(), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(reliable))
+            .tools(vec![])
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .memory(mem)
+            .observer(observer)
+            .workspace_dir(temp.path().to_path_buf())
+            .agent_alias("coder".into())
+            .model_provider_name("custom.primary".into())
+            .model_name("primary-model".into())
+            .provider_switch_config(ProviderSwitchConfig {
+                config: Some(Arc::new(config.clone())),
+                live: None,
+            })
+            .build()
+            .expect("agent builder should succeed with valid config");
+        let limit_config = Arc::new(config);
+        agent.context_limits_resolver = Some(Arc::new(move |provider_ref, model| {
+            limit_config.resolved_context_limits_for_route("coder", provider_ref, model)
+        }));
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", event_tx, None, None)
+            .await
+            .expect("the backup must carry the turn");
+
+        assert_eq!(
+            backup_calls.load(Ordering::SeqCst),
+            1,
+            "the backup entry must have served the call after the primary failed"
+        );
+
+        // Identity: the accepted fallback, not the requested primary.
+        assert_eq!(
+            outcome.provider_name, "custom.backup",
+            "the outcome must attribute the route that actually answered"
+        );
+
+        // The limits must be re-resolved for THAT identity. Before the fix these
+        // stayed the primary's 200k pair while the identity above already said
+        // `custom.backup` — one `ServedRoute` holding two generations.
+        let final_limits = outcome
+            .final_context_limits
+            .expect("a served call must publish final limits");
+        assert_eq!(
+            final_limits.model_context_window, 8_000,
+            "capacity must come from the accepted fallback's alias, not the requested primary's"
+        );
+        assert_eq!(
+            final_limits.context_token_budget, 8_000,
+            "the fallback's 8k capacity must clamp the effective trim budget"
+        );
+
+        // The wire frame consumers actually read must agree with the outcome.
+        let mut terminal = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                context_token_budget,
+                model_context_window,
+                ..
+            } = ev
+            {
+                terminal = Some((context_token_budget, model_context_window));
+            }
+        }
+        assert_eq!(
+            terminal,
+            Some((Some(8_000), Some(8_000))),
+            "the usage-less fallback must publish a terminal snapshot carrying ITS window"
+        );
+    }
+
     fn build_test_agent(
         initial_provider_name: &str,
         initial_model_name: &str,

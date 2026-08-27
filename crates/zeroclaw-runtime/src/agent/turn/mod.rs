@@ -1005,10 +1005,56 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         // Reliable reports its actually served candidate; direct providers
         // intentionally retain the requested route as the accounting fallback.
+        // Owned, not borrowed from `accepted_route`: the rebound `ctx` below
+        // carries this pair to the end of the iteration, while `accepted_route`
+        // is consumed by `commit_accepted_provider_route` partway through.
         let (served_provider, served_model) = accepted_route
             .as_ref()
-            .map(|route| (route.provider_ref(), route.model()))
-            .unwrap_or((ctx.provider_name, provider_request_model));
+            .map(|route| (route.provider_ref().to_string(), route.model().to_string()))
+            .unwrap_or_else(|| {
+                (
+                    ctx.provider_name.to_string(),
+                    provider_request_model.to_string(),
+                )
+            });
+
+        // A reliable fallback can serve a DIFFERENT configured alias than the
+        // one this iteration resolved limits for at dispatch time. Capacity and
+        // budget are properties of the route that actually answered, so re-key
+        // them through the same canonical resolver rather than reporting the
+        // pre-dispatch pair against a post-dispatch identity. `AcceptedRoute`
+        // deliberately carries identity only — capacity lives in config, which
+        // the provider layer must not know about — so the pair is re-resolved
+        // here instead of being threaded through dispatch.
+        //
+        // Gated on the ALIAS changing, not on `accepted_route` merely being
+        // present. A direct call through a router reports an accepted route
+        // whose `model()` is the dispatch-facing wire selector (it can still
+        // carry a `hint:` prefix), which is neither an attribution name nor a
+        // valid resolver key; that case names the same alias we dispatched to,
+        // so it stays out of this branch and the pre-dispatch pair stands.
+        let served_route_changed = served_provider != ctx.provider_name;
+        let served_context_limits = if served_route_changed {
+            resolve_context_limits_for_call(
+                context_limits_resolver.as_ref(),
+                config,
+                agent_alias,
+                &served_provider,
+                &served_model,
+                active_context_limits,
+            )
+        } else {
+            active_context_limits
+        };
+        // Rebind so everything downstream of acceptance — the per-call usage
+        // frame, recovery arithmetic, and the terminal snapshot — reads limits
+        // for the route that actually answered. A no-op when the alias did not
+        // change, since `served_context_limits` is then the pair already bound.
+        let ctx = base_ctx.for_route(
+            active_model_provider_name,
+            active_model,
+            served_context_limits,
+        );
 
         // Reliable providers classify this before retries and fallback. Keep
         // the turn-level guard for direct/unwrapped providers: a transport
@@ -1038,8 +1084,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
                     &ctx,
-                    served_provider,
-                    served_model,
+                    &served_provider,
+                    &served_model,
                     resp,
                     &provider_request_messages,
                     &iteration_tool_specs,
@@ -1183,8 +1229,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         );
         record_accepted_chat_response(
             &ctx,
-            served_provider,
-            served_model,
+            &served_provider,
+            &served_model,
             &response_text,
             &native_tool_calls,
             tool_calls.len(),
@@ -1198,9 +1244,23 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Backfill the final served route only after protocol classification
         // accepts the response. Accepted usage emits the per-call frame above;
         // an accepted usage-less response needs the terminal context snapshot.
+        //
+        // When a reliable fallback answered from a different alias, the whole
+        // triple is rewritten here, not just `reported_usage`: the sink was
+        // seeded pre-dispatch with the REQUESTED route, so leaving it would let
+        // the terminal gateway frame report the served alias against the
+        // requested route's capacity. Same gate as the limit re-key above, so a
+        // direct call keeps the seeded attribution pair (its accepted route
+        // names the alias we dispatched to, and its `model()` is the wire
+        // selector rather than an attribution name).
         if let Some(sink) = served_route_sink.as_ref()
             && let Some(served) = sink.lock().expect("served-route sink lock").as_mut()
         {
+            if served_route_changed {
+                served.provider_name = served_provider.clone();
+                served.model = served_model.clone();
+                served.context_limits = served_context_limits;
+            }
             served.reported_usage = ctx.event_tx.is_some() && response_usage.is_some();
         }
 
