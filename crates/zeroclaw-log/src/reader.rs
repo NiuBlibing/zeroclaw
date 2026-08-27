@@ -442,6 +442,15 @@ pub(crate) fn is_stamp(s: &str) -> bool {
 /// (eight digits) and leaves headroom far beyond any realistic rotation count.
 pub(crate) const SEQ_WIDTH: usize = 10;
 
+/// Most segments one read may hold open at once, active file included.
+///
+/// Matches the shape of a default install: the active file plus the seven
+/// archives `log_persistence_retention_max_files` keeps by default. Operators
+/// who raise that cap, or set it to `0` for unlimited retention, get a
+/// truncated view of the oldest history rather than a query that tries to open
+/// an unbounded number of descriptors.
+const MAX_OPEN_SEGMENTS: usize = 8;
+
 /// Ordering key for one archive, derived from its name rather than its mtime.
 ///
 /// Rotation writes the sequence number into the archive name, so segment order
@@ -666,6 +675,32 @@ fn open_segment_set(active: &Path, reads_archives: bool) -> Result<Vec<OpenSegme
     // Sort by the name-derived ordering key, not by mtime: the key is fixed at
     // rotation time, so it stays correct no matter when this listing ran.
     archives.sort_by_key(|(_, order)| *order);
+
+    // Cap how many segments a single read may hold open. `retention_max_files`
+    // usually bounds this, but `0` means "keep everything", and a long-lived
+    // instance can then accumulate hundreds of archives that every query would
+    // try to open at once. sd-journal has the same cap for the same reason,
+    // and shipped without one long enough to produce fd-exhaustion reports
+    // from its consumers.
+    //
+    // Truncation happens here, before any archive is opened, so the descriptors
+    // are never allocated rather than opened and discarded. The newest segments
+    // are kept: paging walks backwards from the newest event, so dropping the
+    // oldest tail costs the least. A cursor into a dropped segment resolves as
+    // `AnchorMissing` and degrades to the newest page, the same as a segment
+    // retention pruned.
+    let dropped = archives.len().saturating_sub(MAX_OPEN_SEGMENTS - 1);
+    if dropped > 0 {
+        tracing::warn!(
+            target: "zeroclaw_log",
+            dropped,
+            kept = MAX_OPEN_SEGMENTS - 1,
+            "log: too many archive segments for one read; the oldest are \
+             excluded from this query. Set log_persistence_retention_max_files \
+             to bound archive growth.",
+        );
+        archives.drain(..dropped);
+    }
 
     let mut segs = Vec::with_capacity(archives.len() + 1);
     for (path, _) in archives {
@@ -2185,5 +2220,82 @@ mod tests {
             vec!["active", "numbered", "legacy"],
             "a legacy archive must read as older than every numbered archive"
         );
+    }
+
+    #[test]
+    fn open_segment_set_caps_how_many_segments_it_opens() {
+        // `retention_max_files = 0` means "keep everything", so nothing else
+        // bounds the archive count. Without a cap here, a query on a long-lived
+        // instance would try to open every archive at once. sd-journal shipped
+        // without this cap long enough to produce fd-exhaustion reports.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+
+        // Twenty archives, well past the cap, numbered so their order is
+        // unambiguous.
+        for seq in 1..=20u64 {
+            let path = tmp
+                .path()
+                .join(format!("trace.{seq:010}-20260101-000000.jsonl"));
+            let mut ev = make_event("archived", None);
+            ev.id = format!("id-{seq}");
+            ev.timestamp = format!("2026-01-01T00:00:{:02}.000Z", seq % 60);
+            ev.message = Some(format!("seg-{seq}"));
+            write_jsonl(&path, &[ev]);
+        }
+        let mut live = make_event("live", None);
+        live.id = "id-live".into();
+        live.timestamp = "2026-01-02T00:00:00.000Z".into();
+        live.message = Some("active".into());
+        write_jsonl(&active, &[live]);
+
+        let segs = open_segment_set(&active, true).unwrap();
+        assert_eq!(
+            segs.len(),
+            MAX_OPEN_SEGMENTS,
+            "a read must not hold more than the cap open at once"
+        );
+
+        // The newest archives are the ones kept: paging walks backwards from
+        // the newest event, so the oldest tail is what costs least to drop.
+        let kept: Vec<&str> = segs.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            kept.last().unwrap().ends_with("trace.jsonl"),
+            "the active file is always last, got {kept:?}"
+        );
+        assert!(
+            kept[0].contains("0000000014"),
+            "the kept window should start at archive 14 (20 total, 7 archive \
+             slots plus the active file), got {kept:?}"
+        );
+        assert!(
+            kept.iter().any(|n| n.contains("0000000020")),
+            "the newest archive must be kept, got {kept:?}"
+        );
+    }
+
+    #[test]
+    fn segment_cap_does_not_apply_when_archives_are_out_of_scope() {
+        // A policy that does not own archives reads the active file alone, so
+        // the cap never comes into play and never costs a listing.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+        for seq in 1..=12u64 {
+            let path = tmp
+                .path()
+                .join(format!("trace.{seq:010}-20260101-000000.jsonl"));
+            let mut ev = make_event("archived", None);
+            ev.id = format!("id-{seq}");
+            ev.message = Some(format!("seg-{seq}"));
+            write_jsonl(&path, &[ev]);
+        }
+        let mut live = make_event("live", None);
+        live.id = "id-live".into();
+        live.message = Some("active".into());
+        write_jsonl(&active, &[live]);
+
+        let segs = open_segment_set(&active, false).unwrap();
+        assert_eq!(segs.len(), 1, "only the active file is in scope");
+        assert!(segs[0].is_active);
     }
 }
