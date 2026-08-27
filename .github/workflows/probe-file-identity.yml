@@ -1,0 +1,42 @@
+name: Probe File Identity
+
+# Scratch workflow for PR #10214: checks whether the fd-binding segment read
+# model holds on Windows and macOS, not just Linux. Deleted once the design
+# question is settled; nothing in the product depends on it.
+#
+# Manual dispatch only, so it never runs on push or PR.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Probe (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          # Pinned to the repository MSRV: part of the question is whether the
+          # Windows file-identity API is usable on the declared floor, not just
+          # on current stable.
+          toolchain: 1.96.1
+      - name: Compile probe
+        shell: bash
+        run: rustc -O probe_file_identity.rs -o probe
+      - name: Run probe
+        shell: bash
+        run: ./probe
