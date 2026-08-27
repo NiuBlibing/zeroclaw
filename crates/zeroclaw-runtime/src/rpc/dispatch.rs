@@ -4055,10 +4055,18 @@ impl RpcDispatcher {
         };
 
         let limit = p.limit.unwrap_or(200);
-        let segment_cursor = p
-            .until_segment_cursor
-            .as_deref()
-            .and_then(zeroclaw_log::SegmentCursor::from_wire);
+        let segment_cursor = match p.until_segment_cursor.as_deref() {
+            None | Some("") => None,
+            Some(raw) => match zeroclaw_log::SegmentCursor::from_wire(raw) {
+                Some(c) => Some(c),
+                None => {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        "invalid until_segment_cursor: value is not a valid segment cursor",
+                    ));
+                }
+            },
+        };
 
         let page = zeroclaw_log::query_log_page(
             &active,

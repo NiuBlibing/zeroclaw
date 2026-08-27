@@ -118,9 +118,24 @@ pub async fn handle_api_logs(
     let until_line_offset = params
         .get("until_line_offset")
         .and_then(|raw| raw.parse::<u64>().ok());
-    let segment_cursor: Option<zeroclaw_log::SegmentCursor> = params
+    let segment_cursor: Option<zeroclaw_log::SegmentCursor> = match params
         .get("until_segment_cursor")
-        .and_then(|s| zeroclaw_log::SegmentCursor::from_wire(s));
+        .map(|s| s.as_str())
+    {
+        None | Some("") => None,
+        Some(raw) => match zeroclaw_log::SegmentCursor::from_wire(raw) {
+            Some(c) => Some(c),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid until_segment_cursor: value is not a valid segment cursor",
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
 
     let mut field_eq: BTreeMap<String, String> = BTreeMap::new();
     for (key, value) in &params {
