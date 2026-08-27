@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::event::LogEvent;
+use crate::file_id::{FileId, file_id};
 
 #[derive(Debug, Clone, Default)]
 pub struct LogFilter {
@@ -317,13 +318,7 @@ fn matches_filter(event: &LogEvent, filter: &LogFilter, needle: Option<&str>) ->
 /// Check whether the event at or after `anchor_off` in `seg_path` has the
 /// expected `anchor_id`. Returns `false` on any I/O or parse error, on a
 /// missing file, or when the first non-empty JSON line found does not match.
-fn anchor_matches_offset(seg_path: &Path, anchor_off: u64, anchor_id: &str) -> bool {
-    let file = match std::fs::File::open(seg_path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    use std::io::Seek;
-    let mut reader = BufReader::new(file);
+fn anchor_matches_offset(seg: &OpenSegment, anchor_off: u64, anchor_id: &str) -> bool {
     // Seek to the line that ends at anchor_off: that line starts somewhere
     // before it. To find the exact line, seek to anchor_off minus a generous
     // window (line is always ≤ 128 KiB) and scan forward. For simplicity,
@@ -331,9 +326,9 @@ fn anchor_matches_offset(seg_path: &Path, anchor_off: u64, anchor_id: &str) -> b
     // the cursor was produced as the byte-end of the oldest-matching line,
     // so the line itself ends exactly at anchor_off — we seek before it.
     let seek_pos = anchor_off.saturating_sub(512 * 1024);
-    if reader.seek(std::io::SeekFrom::Start(seek_pos)).is_err() {
+    let Ok(mut reader) = seg.reader_at(seek_pos) else {
         return false;
-    }
+    };
     let mut buf = String::new();
     let mut byte_off = seek_pos;
     loop {
@@ -364,16 +359,11 @@ fn anchor_matches_offset(seg_path: &Path, anchor_off: u64, anchor_id: &str) -> b
 /// segment index and the byte-end offset of that line, suitable for
 /// use as a new `(cursor_idx, cursor_off)` that excludes the anchor
 /// event itself (so the next page returns events older than it).
-fn find_anchor_in_segments(segs: &[(PathBuf, String)], anchor_id: &str) -> Option<(usize, u64)> {
-    for (i, (seg_path, _)) in segs.iter().enumerate() {
-        if !seg_path.exists() {
+fn find_anchor_in_segments(segs: &[OpenSegment], anchor_id: &str) -> Option<(usize, u64)> {
+    for (i, seg) in segs.iter().enumerate() {
+        let Ok(mut reader) = seg.reader_at(0) else {
             continue;
-        }
-        let file = match std::fs::File::open(seg_path) {
-            Ok(f) => f,
-            Err(_) => continue,
         };
-        let mut reader = BufReader::new(file);
         let mut byte_off: u64 = 0;
         let mut buf = String::new();
         loop {
@@ -521,6 +511,141 @@ pub(crate) fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>>
     Ok(out)
 }
 
+/// A log segment held open for the duration of one read.
+///
+/// Holding the handle is the point. The writer replaces the active file by
+/// rename in three places (archive rotation, the rolling trim, and schema
+/// migration), and a reader that re-resolves a path mid-read can be handed a
+/// different file than the one it enumerated. Reading every byte through these
+/// handles removes that possibility instead of trying to detect it afterwards.
+pub(crate) struct OpenSegment {
+    file: File,
+    /// Basename at the time of opening. Cursors are issued and resolved
+    /// against this name, so it is captured once rather than re-read.
+    name: String,
+    /// Identity of the underlying file, used to recognise one file reachable
+    /// under two names at once.
+    id: FileId,
+    /// True for the segment that was the active file when this set was opened.
+    /// Only that segment can produce a legacy `next_cursor_line_offset`.
+    is_active: bool,
+}
+
+impl OpenSegment {
+    /// A reader over this segment positioned at `from`.
+    ///
+    /// Seeking is explicit because several passes (anchor validation, anchor
+    /// search, the page scan) share one handle and each needs its own start.
+    fn reader_at(&self, from: u64) -> Result<BufReader<&File>> {
+        use std::io::Seek;
+        (&self.file)
+            .seek(std::io::SeekFrom::Start(from))
+            .with_context(|| format!("seeking segment {} to byte {from}", self.name))?;
+        Ok(BufReader::new(&self.file))
+    }
+}
+
+/// Open every segment of the logical stream, oldest first with the active file
+/// last.
+///
+/// The active file is opened *before* the archives are enumerated, and that
+/// order is what makes the result complete under a concurrent rotation:
+///
+///   - Rotation lands before the open: the archive it created is already on
+///     disk when the listing runs, so it shows up as an ordinary archive.
+///   - Rotation lands after the open: the handle already points at the file
+///     that was rotated away, so its content stays reachable. The listing then
+///     also reports that same file under its new archive name, which is why
+///     identities are compared and the duplicate dropped.
+///
+/// Either way no segment is lost and none is read twice. Reversing the order
+/// would leave a window where a rotation is invisible to both steps.
+fn open_segment_set(active: &Path, reads_archives: bool) -> Result<Vec<OpenSegment>> {
+    let active_name = active
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_owned();
+
+    // Pin the active file first. A missing active file is the normal state on a
+    // fresh workspace, and archives may still hold history worth returning.
+    let active_seg = match File::open(active) {
+        Ok(file) => {
+            let id = file_id(&file)
+                .with_context(|| format!("identifying active log {}", active.display()))?;
+            Some(OpenSegment {
+                file,
+                name: active_name,
+                id,
+                is_active: true,
+            })
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err).with_context(|| format!("opening active log {}", active.display()));
+        }
+    };
+
+    let mut archives = if reads_archives {
+        list_archives(active)
+            .with_context(|| format!("enumerating archives next to {}", active.display()))?
+    } else {
+        Vec::new()
+    };
+    archives.sort_by_key(|(_, mtime)| *mtime);
+
+    let mut segs = Vec::with_capacity(archives.len() + 1);
+    for (path, _) in archives {
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::warn!(
+                    target: "zeroclaw_log",
+                    error = ?err,
+                    path = %path.display(),
+                    "log: could not open archive segment; excluded from this read",
+                );
+                continue;
+            }
+        };
+        let id = match file_id(&file) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::warn!(
+                    target: "zeroclaw_log",
+                    error = ?err,
+                    path = %path.display(),
+                    "log: could not identify archive segment; excluded from this read",
+                );
+                continue;
+            }
+        };
+        // This archive and the active handle are the same file when a rotation
+        // landed between the two steps above. Reading it again would duplicate
+        // every event it holds.
+        if active_seg.as_ref().is_some_and(|a| a.id == id) {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        segs.push(OpenSegment {
+            file,
+            name,
+            id,
+            is_active: false,
+        });
+    }
+
+    // Active file last: it holds the newest events.
+    if let Some(active_seg) = active_seg {
+        segs.push(active_seg);
+    }
+    Ok(segs)
+}
+
 /// Outcome of a segment-aware page read.
 ///
 /// The anchor miss is reported rather than silently absorbed: only the caller
@@ -549,8 +674,7 @@ pub(crate) enum PageOutcome {
 /// absent, interpreted as a cursor into the active file only.
 #[allow(deprecated)]
 pub(crate) fn load_page_multi(
-    active: &Path,
-    archives: &[(PathBuf, std::time::SystemTime)],
+    segs: &[OpenSegment],
     filter: &LogFilter,
     limit: usize,
     segment_cursor: Option<&SegmentCursor>,
@@ -558,28 +682,14 @@ pub(crate) fn load_page_multi(
     let limit = limit.clamp(1, 10_000);
     let needle = filter.q.as_deref().map(|s| s.to_ascii_lowercase());
 
-    // Build the ordered segment list: oldest archive first, active last.
-    let mut segs: Vec<(PathBuf, String)> = {
-        let mut sorted = archives.to_vec();
-        sorted.sort_by_key(|(_, mtime)| *mtime);
-        sorted
-            .into_iter()
-            .map(|(p, _)| {
-                let name = p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_owned();
-                (p, name)
-            })
-            .collect()
-    };
-    let active_name = active
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_owned();
-    segs.push((active.to_path_buf(), active_name.clone()));
+    // Segments arrive oldest first with the active file last; see
+    // `open_segment_set`. The active basename is what a legacy byte-offset
+    // cursor addresses, and the only segment that can issue one.
+    let active_name = segs
+        .iter()
+        .find(|s| s.is_active)
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
 
     // Determine cursor segment name and byte offset.
     let (cursor_seg, cursor_off): (Option<&str>, Option<u64>) = match segment_cursor {
@@ -605,12 +715,12 @@ pub(crate) fn load_page_multi(
     // page starts cleanly from the right position.
     let (cursor_idx, cursor_off): (usize, Option<u64>) = match cursor_seg {
         None => (segs.len().saturating_sub(1), None),
-        Some(name) => match segs.iter().rposition(|(_, n)| n == name) {
+        Some(name) => match segs.iter().rposition(|s| s.name == name) {
             Some(idx) => {
                 // Check whether a rotation invalidated an active-file cursor.
                 let anchor_id = segment_cursor.and_then(|c| c.anchor_id.as_deref());
                 if let (Some(anchor), Some(off)) = (anchor_id, cursor_off) {
-                    if !anchor_matches_offset(&segs[idx].0, off, anchor) {
+                    if !anchor_matches_offset(&segs[idx], off, anchor) {
                         // The file at this basename no longer contains the
                         // expected anchor event: rotation occurred. Search all
                         // segments for the anchor event and rebase the cursor
@@ -652,29 +762,14 @@ pub(crate) fn load_page_multi(
     let mut window: VecDeque<(LogEvent, String, u64)> = VecDeque::with_capacity(limit + 1);
     let mut dropped_older = false;
 
-    for (i, (seg_path, seg_name)) in segs.iter().enumerate() {
+    for (i, seg) in segs.iter().enumerate() {
         if i > cursor_idx {
             // Segment is newer than the cursor; skip entirely.
             break;
         }
         let seg_until_line_offset = if i == cursor_idx { cursor_off } else { None };
 
-        if !seg_path.exists() {
-            continue;
-        }
-        let file = match std::fs::File::open(seg_path) {
-            Ok(f) => f,
-            Err(err) => {
-                tracing::warn!(
-                    target: "zeroclaw_log",
-                    error = ?err,
-                    path = %seg_path.display(),
-                    "log: load_page_multi could not open segment; skipping"
-                );
-                continue;
-            }
-        };
-        let mut reader = BufReader::new(file);
+        let mut reader = seg.reader_at(0)?;
         let mut next_byte_offset: u64 = 0;
         let mut buf = String::new();
 
@@ -715,7 +810,7 @@ pub(crate) fn load_page_multi(
                 continue;
             }
 
-            window.push_back((event, seg_name.clone(), line_byte_end));
+            window.push_back((event, seg.name.clone(), line_byte_end));
             if window.len() > limit {
                 window.pop_front();
                 dropped_older = true;
@@ -788,46 +883,35 @@ pub fn query_log_page(
     limit: usize,
     segment_cursor: Option<&SegmentCursor>,
 ) -> Result<LogPage> {
-    // Each attempt re-enumerates, so a retry sees any archive created since the
-    // previous attempt's listing. Two attempts cover one rotation landing
-    // anywhere inside the call; a second rotation in the same call, or a
-    // genuinely pruned segment, falls through to the full scan below.
-    for _ in 0..2 {
-        let archives = enumerate_segments(active, reads_archives)?;
-        match load_page_multi(active, &archives, filter, limit, segment_cursor)? {
-            PageOutcome::Page(page) => return Ok(*page),
-            PageOutcome::AnchorMissing => continue,
-        }
+    // One open per attempt. Every byte of the page is then read through those
+    // handles, so a rotation landing mid-scan cannot substitute a different
+    // file: the handle keeps pointing at the bytes it was opened on. See
+    // `open_segment_set` for why the active file is pinned before the archives
+    // are listed.
+    let segs = open_segment_set(active, reads_archives)?;
+    match load_page_multi(&segs, filter, limit, segment_cursor)? {
+        PageOutcome::Page(page) => return Ok(*page),
+        // The anchored event is in none of the files that were open. Either the
+        // segment was pruned by retention, or it was created between this
+        // process's last listing and now. Re-open the whole set once: a newly
+        // rotated archive is present in the second listing.
+        PageOutcome::AnchorMissing => {}
     }
 
-    // The anchor is unreachable across repeated listings: its segment is gone
-    // for good (pruned by retention), not merely missing from a stale snapshot.
-    // Drop the cursor and serve the newest page. Callers that prepend pages to
-    // an existing buffer must deduplicate, since this page is not older history.
-    let archives = enumerate_segments(active, reads_archives)?;
-    match load_page_multi(active, &archives, filter, limit, None)? {
+    let segs = open_segment_set(active, reads_archives)?;
+    match load_page_multi(&segs, filter, limit, segment_cursor)? {
         PageOutcome::Page(page) => Ok(*page),
-        // Unreachable: a `None` cursor has no anchor to miss.
-        PageOutcome::AnchorMissing => {
-            unreachable!("cursor-less call cannot produce an anchor miss")
-        }
+        // Still unreachable after a fresh open: the segment is genuinely gone.
+        // Drop the cursor and serve the newest page. Callers that prepend pages
+        // to an existing buffer must deduplicate, since this is not older
+        // history.
+        PageOutcome::AnchorMissing => match load_page_multi(&segs, filter, limit, None)? {
+            PageOutcome::Page(page) => Ok(*page),
+            PageOutcome::AnchorMissing => {
+                unreachable!("cursor-less call cannot produce an anchor miss")
+            }
+        },
     }
-}
-
-/// Enumerate the segments that belong to this query's logical stream.
-///
-/// Returns an empty list when the storage policy does not own archives, so the
-/// read covers the active file alone. See [`StoragePolicy::reads_archives`].
-fn enumerate_segments(active: &Path, reads_archives: bool) -> Result<Vec<(PathBuf, SystemTime)>> {
-    if !reads_archives {
-        return Ok(Vec::new());
-    }
-    list_archives(active).with_context(|| {
-        format!(
-            "enumerating log archives next to {} for a page query",
-            active.display()
-        )
-    })
 }
 
 /// Find one event by id across the active file and every retained archive,
@@ -842,26 +926,35 @@ pub fn find_event_across_segments(
     reads_archives: bool,
     id: &str,
 ) -> Result<Option<LogEvent>> {
-    if let Some(event) = find_event_by_id(active, id)? {
-        return Ok(Some(event));
-    }
-    // Same policy boundary as `query_log_page`: an id that is only in an
-    // unmanaged archive is not part of this policy's logical stream.
-    let mut archives = enumerate_segments(active, reads_archives)?;
-    // Newest archive first: a recently rotated event is the likely target.
-    archives.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
-    for (path, _) in archives {
-        match find_event_by_id(&path, id) {
-            Ok(Some(event)) => return Ok(Some(event)),
-            Ok(None) => continue,
+    // Same handle-based read as `query_log_page`, and the same policy boundary:
+    // an id that only exists in an unmanaged archive is not part of this
+    // policy's logical stream.
+    let segs = open_segment_set(active, reads_archives)?;
+    // Newest first (active file, then archives newest to oldest), since a
+    // recently rotated event is the likelier target.
+    for seg in segs.iter().rev() {
+        let reader = match seg.reader_at(0) {
+            Ok(reader) => reader,
             Err(err) => {
                 tracing::warn!(
                     target: "zeroclaw_log",
                     error = ?err,
-                    path = %path.display(),
-                    "log: skipping unreadable archive during id lookup"
+                    segment = %seg.name,
+                    "log: skipping unreadable segment during id lookup"
                 );
                 continue;
+            }
+        };
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(event) = serde_json::from_str::<LogEvent>(trimmed)
+                && event.id == id
+            {
+                return Ok(Some(event));
             }
         }
     }
@@ -892,6 +985,54 @@ mod tests {
                 panic!("expected a page, got AnchorMissing")
             }
         }
+    }
+
+    /// Build an `OpenSegment` slice from paths, mirroring how
+    /// `open_segment_set` works but taking an explicit archive list so
+    /// white-box tests can control exactly which files are visible (e.g. to
+    /// reproduce the stale-listing race by omitting a file from the list).
+    fn segs_from(
+        active: &Path,
+        archives: &[(std::path::PathBuf, std::time::SystemTime)],
+    ) -> Vec<OpenSegment> {
+        let mut segs = Vec::new();
+        let mut sorted = archives.to_vec();
+        sorted.sort_by_key(|(_, mtime)| *mtime);
+        for (path, _) in &sorted {
+            let file = std::fs::File::open(path)
+                .unwrap_or_else(|e| panic!("segs_from: open {}: {e}", path.display()));
+            let id =
+                file_id(&file).unwrap_or_else(|e| panic!("segs_from: id {}: {e}", path.display()));
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            segs.push(OpenSegment {
+                file,
+                name,
+                id,
+                is_active: false,
+            });
+        }
+        if active.exists() {
+            let file = std::fs::File::open(active)
+                .unwrap_or_else(|e| panic!("segs_from: open active {}: {e}", active.display()));
+            let id = file_id(&file)
+                .unwrap_or_else(|e| panic!("segs_from: id active {}: {e}", active.display()));
+            let name = active
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            segs.push(OpenSegment {
+                file,
+                name,
+                id,
+                is_active: true,
+            });
+        }
+        segs
     }
 
     fn make_event(action: &str, agent: Option<&str>) -> LogEvent {
@@ -1460,8 +1601,15 @@ mod tests {
         write_jsonl(&active, &[new_c, new_d]);
 
         let archives = vec![(archive.clone(), archive_mtime)];
-        let page =
-            page_of(load_page_multi(&active, &archives, &LogFilter::default(), 10, None).unwrap());
+        let page = page_of(
+            load_page_multi(
+                &segs_from(&active, &archives),
+                &LogFilter::default(),
+                10,
+                None,
+            )
+            .unwrap(),
+        );
 
         assert_eq!(page.events.len(), 4, "all 4 events across segments");
         // Newest first.
@@ -1498,8 +1646,15 @@ mod tests {
         let archives = vec![(archive.clone(), archive_mtime)];
 
         // Page 1: limit 2 → newest two events (from active file).
-        let page1 =
-            page_of(load_page_multi(&active, &archives, &LogFilter::default(), 2, None).unwrap());
+        let page1 = page_of(
+            load_page_multi(
+                &segs_from(&active, &archives),
+                &LogFilter::default(),
+                2,
+                None,
+            )
+            .unwrap(),
+        );
         assert_eq!(page1.events.len(), 2);
         assert_eq!(page1.events[0].message.as_deref(), Some("new-d"));
         assert_eq!(page1.events[1].message.as_deref(), Some("new-c"));
@@ -1512,7 +1667,13 @@ mod tests {
         // Page 2: using the cursor → should return the two archive events.
         let cursor = SegmentCursor::from_wire(&cursor_wire).expect("valid cursor wire format");
         let page2 = page_of(
-            load_page_multi(&active, &archives, &LogFilter::default(), 2, Some(&cursor)).unwrap(),
+            load_page_multi(
+                &segs_from(&active, &archives),
+                &LogFilter::default(),
+                2,
+                Some(&cursor),
+            )
+            .unwrap(),
         );
         assert_eq!(page2.events.len(), 2);
         assert_eq!(page2.events[0].message.as_deref(), Some("old-b"));
@@ -1552,7 +1713,9 @@ mod tests {
 
         // Page 1: limit 2 → returns [d, c] with a cursor pointing into the
         // active file before c (i.e., the cursor anchors on ev_c).
-        let page1 = page_of(load_page_multi(&active, &[], &LogFilter::default(), 2, None).unwrap());
+        let page1 = page_of(
+            load_page_multi(&segs_from(&active, &[]), &LogFilter::default(), 2, None).unwrap(),
+        );
         assert_eq!(page1.events.len(), 2);
         assert_eq!(page1.events[0].message.as_deref(), Some("ev-d"));
         assert_eq!(page1.events[1].message.as_deref(), Some("ev-c"));
@@ -1577,7 +1740,13 @@ mod tests {
         let cursor = SegmentCursor::from_wire(&cursor_wire).expect("valid cursor");
         let archives = vec![(archive.clone(), archive_mtime)];
         let page2 = page_of(
-            load_page_multi(&active, &archives, &LogFilter::default(), 2, Some(&cursor)).unwrap(),
+            load_page_multi(
+                &segs_from(&active, &archives),
+                &LogFilter::default(),
+                2,
+                Some(&cursor),
+            )
+            .unwrap(),
         );
         assert_eq!(
             page2.events.len(),
@@ -1792,8 +1961,13 @@ mod tests {
             off: 4096,
             anchor_id: Some("id-b".into()),
         };
-        let outcome =
-            load_page_multi(&active, &[], &LogFilter::default(), 2, Some(&cursor)).unwrap();
+        let outcome = load_page_multi(
+            &segs_from(&active, &[]),
+            &LogFilter::default(),
+            2,
+            Some(&cursor),
+        )
+        .unwrap();
         assert!(
             matches!(outcome, PageOutcome::AnchorMissing),
             "a stale list must surface the anchor miss, not silently full-scan"
@@ -1802,8 +1976,7 @@ mod tests {
         // With the archive present, the same cursor resolves normally.
         let archive_mtime = std::fs::metadata(&archive).unwrap().modified().unwrap();
         let outcome = load_page_multi(
-            &active,
-            &[(archive.clone(), archive_mtime)],
+            &segs_from(&active, &[(archive.clone(), archive_mtime)]),
             &LogFilter::default(),
             2,
             Some(&cursor),

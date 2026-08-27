@@ -2090,13 +2090,12 @@ mod tests {
 
     #[test]
     fn entry_count_seeded_over_cap_archives_the_existing_file_whole() {
-        // The transition case for W1: enabling entry-count rotation on a log
-        // that is already larger than the cap, or reloading after the cap was
-        // lowered. Splitting that file into cap-sized pieces would mean a full
-        // rewrite, which is exactly the O(file size) cost this feature exists to
-        // remove (see #10073: a 208MB runtime-trace was the motivating case).
-        // So the existing file is archived whole, once, and every archive after
-        // it holds exactly `cap` entries.
+        // Transition case: enabling entry-count rotation on a log that is
+        // already larger than the cap, or reloading after the cap was lowered.
+        // Splitting that file into cap-sized pieces would mean a full rewrite,
+        // which is the O(file size) cost this trigger exists to avoid, so the
+        // existing file is archived whole, once. Every archive after it holds
+        // exactly `cap` entries.
         let _guard = WRITER_TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         const CAP: usize = 2;

@@ -4,6 +4,7 @@ pub mod broadcast;
 pub mod chain;
 pub mod config;
 pub mod event;
+mod file_id;
 pub mod layer;
 pub mod migrate;
 pub mod observer_bridge;

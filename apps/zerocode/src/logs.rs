@@ -605,6 +605,7 @@ impl Logs {
                         // stale and the daemon served the newest page instead of
                         // older history. Signal "at end" so the UI stops paging.
                         self.at_end = true;
+                        return; // Skip the cursor + at_end update below.
                     }
                 } else if !has_cursor {
                     self.events = new_entries;
