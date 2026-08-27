@@ -1630,12 +1630,22 @@ const GIF_ANIMATION_SCRATCH_MODEL: AnimationScratchModel = AnimationScratchModel
     per_frame: 4,
 };
 
-/// APNG: `current` and `previous` (4 B/px each) persist across the animation;
-/// the raw frame buffer and its converted RGBA source are allocated and freed
-/// inside every `mix_next_frame` (`src/codecs/png.rs:282-339`, `:456-479`).
+/// APNG: `current` and `previous` (4 B/px each) persist across the animation.
+///
+/// The recurring term covers two buffers that are simultaneously live inside
+/// every `mix_next_frame` (`src/codecs/png.rs:418-425`, `:456-479`): the raw
+/// frame buffer sized from the source color type, and the RGBA `source` that
+/// the conversion allocates from it. `from_raw` consumes the raw buffer and
+/// `into_rgba8()` allocates a *new* 4 B/px buffer, and the raw allocation is
+/// released only afterwards by `free_usize`, so both are held at once.
+///
+/// The worst accepted color type is `Rgb8`: raw 3 B/px + converted 4 B/px =
+/// 7 B/px per frame. (`Rgba8` is cheaper — `from_raw` reuses the buffer with no
+/// conversion — and `L8`/`La8` allocate smaller raw buffers, so 7 bounds them
+/// all.)
 const APNG_SCRATCH_MODEL: AnimationScratchModel = AnimationScratchModel {
     persistent: 8,
-    per_frame: 4,
+    per_frame: 7,
 };
 
 /// Animated WebP: only the composition canvas (4 B/px) persists; the decoded
@@ -2026,16 +2036,25 @@ fn validate_animation_frames(
         peak = peak.max(frame_peak);
 
         let next_total = total.saturating_add(frame_allocation);
-        // Admit against the peak, not the running frame sum: a single frame
-        // whose canvas plus scratch exceeds the ceiling must be refused even
-        // when the frames decoded so far are small.
-        if next_total > effective_cap || frame_peak > effective_cap {
+        // Enforce every bound *before* advancing the iterator, so an animation
+        // that cannot fit is rejected mid-decode rather than after all its
+        // frames have been decoded:
+        //
+        // - `next_total`  — the returned frame buffers alone.
+        // - `frame_peak`  — this one frame's simultaneous allocation, so a
+        //   single oversized frame is refused even when the run so far is small.
+        // - `cumulative + persistent_scratch` — the running modeled charge.
+        //   Without this the loop would decode every frame and only report the
+        //   over-budget total on return, which is exactly the work the budget
+        //   exists to prevent.
+        let running_charge = cumulative.saturating_add(persistent_scratch);
+        if next_total > effective_cap
+            || frame_peak > effective_cap
+            || running_charge > effective_cap
+        {
+            let observed = next_total.max(frame_peak).max(running_charge);
             if aggregate_cap_is_tighter {
-                return Err(aggregate_budget_failure(
-                    source,
-                    mime,
-                    next_total.max(frame_peak),
-                ));
+                return Err(aggregate_budget_failure(source, mime, observed));
             }
             return Err(invalid_image_failure(
                 source,
@@ -2044,7 +2063,7 @@ fn validate_animation_frames(
                     "cumulative frame allocation exceeds per-image limit of \
                      {MAX_DECODED_IMAGE_ALLOC_BYTES} bytes"
                 ),
-                next_total.max(frame_peak),
+                observed,
             ));
         }
         total = next_total;
@@ -3675,27 +3694,39 @@ mod tests {
 
     #[tokio::test]
     async fn gif_cumulative_frames_are_enforced_live_during_decode() {
-        // The in-frame enforcement path: a GIF admitted by the header
-        // projection must still be checked while its frames are decoded, so a
-        // payload whose real per-frame peak exceeds the per-image ceiling is
-        // caught mid-iteration rather than after the fact.
+        // In-loop enforcement: an animation admitted by the *header* projection
+        // must still be rejected mid-iteration once its running cumulative
+        // charge crosses the cap, rather than decoding every frame and only
+        // then reporting an over-budget total.
         //
-        // `validate_image_content` is called with a budget cap that admits the
-        // projection but is below the cumulative frame work, exercising the
-        // live check inside `validate_animation_frames` directly.
+        // The header projection sees one canvas (`4 + scratch`), but a 2-frame
+        // GIF's real charge is `2 * (4 + per_frame) + persistent`. A cap sized
+        // to the projection therefore admits the animation at the door and must
+        // stop it partway through.
         let mut gif = two_frame_gif(&GIF_VALID_1X1_LZW);
         gif.push(GIF_TRAILER);
 
-        // The cap admits the header projection, so the frame loop is entered
-        // and its own accounting decides the outcome.
         let projected = 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL;
-        let allocation = validate_image_content("anim.gif", "image/gif", &gif, projected)
+        let cumulative = 2 * (4 + GIF_ANIMATION_SCRATCH_MODEL.per_frame)
+            + GIF_ANIMATION_SCRATCH_MODEL.persistent;
+        assert!(
+            projected < cumulative,
+            "the fixture must sit in the gap between header projection and cumulative charge"
+        );
+
+        let error = validate_image_content("anim.gif", "image/gif", &gif, projected)
             .await
-            .expect("a GIF whose peak fits the cap is accepted");
+            .expect_err("a GIF whose cumulative charge exceeds the cap must be rejected");
+        assert_eq!(multimodal_error_kind(&error), "corrupt_image");
+
+        // With the cap raised to the real cumulative charge the same GIF is
+        // accepted, proving the rejection above is the budget and not the
+        // payload.
+        let allocation = validate_image_content("anim.gif", "image/gif", &gif, cumulative)
+            .await
+            .expect("the same GIF is accepted when the cap covers its cumulative charge");
         assert_eq!(
-            allocation,
-            2 * (4 + GIF_ANIMATION_SCRATCH_MODEL.per_frame)
-                + GIF_ANIMATION_SCRATCH_MODEL.persistent,
+            allocation, cumulative,
             "the accepted GIF charges every frame's output+transient plus one persistent canvas"
         );
     }
@@ -3890,6 +3921,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn animation_between_projection_and_cumulative_charge_is_rejected_mid_decode() {
+        // The interval the previous regressions missed.
+        //
+        // A long animation's *header* projection is one canvas, but its real
+        // charge is `N * (output + per_frame) + persistent`. A budget sitting
+        // between those two values passes admission at the door, so the only
+        // thing that can stop it is the in-loop cumulative check. Without that
+        // check the decoder walked all 20 frames and the over-budget charge was
+        // reported only on return — after the work had already been done.
+        let twenty = many_frame_gif(20);
+
+        let projected = projected_allocation("many.gif", "image/gif", &twenty)
+            .expect("the header projection is readable");
+        let cumulative = 20 * (4 + GIF_ANIMATION_SCRATCH_MODEL.per_frame)
+            + GIF_ANIMATION_SCRATCH_MODEL.persistent;
+        assert!(
+            projected < cumulative,
+            "the fixture must have a projection below its cumulative charge \
+             ({projected} vs {cumulative})"
+        );
+
+        // Strictly between the two: admitted by the header check, over budget
+        // partway through the frame loop.
+        let between = (projected + cumulative) / 2;
+        let mut budget = between;
+        let error = validate_within_budget("many.gif", "image/gif", &twenty, &mut budget)
+            .await
+            .expect_err(
+                "an animation whose cumulative charge exceeds the remaining budget must be \
+                 rejected, not accepted after decoding every frame",
+            );
+        assert_eq!(multimodal_error_kind(&error), "corrupt_image");
+        assert_eq!(
+            budget, 0,
+            "an aggregate-budget rejection closes the envelope for later candidates"
+        );
+
+        // The same animation is accepted once the budget covers its real charge,
+        // proving the rejection above is the budget rather than the payload.
+        let mut ample = cumulative;
+        let charged = validate_within_budget("many.gif", "image/gif", &twenty, &mut ample)
+            .await
+            .expect("the same animation is accepted when the budget covers its cumulative charge");
+        assert_eq!(charged, cumulative);
+    }
+
+    #[tokio::test]
     async fn multiple_valid_animations_respect_the_aggregate_budget() {
         // Request-level regression for animation accounting across candidates.
         //
@@ -4018,15 +4096,41 @@ mod tests {
         // RGB8 APNG regression: the decoder reads a raw Rgb8 frame buffer and
         // allocates a separate Rgba8 source before blending. Both are live
         // simultaneously, and both recur on every frame, so they accumulate.
+
+        // Anchor the expectation to the decoder's *actual* allocations rather
+        // than to `APNG_SCRATCH_MODEL.per_frame`. Deriving the expected charge
+        // from the constant makes the test pass at whatever value the constant
+        // happens to hold, which is exactly how an undercount survives review.
         //
-        // `APNG_SCRATCH_MODEL.per_frame` covers the raw+source peak.
-        // A multi-frame RGB8 APNG should charge N*(output+per_frame)+persistent,
-        // and a later candidate must be refused when that work exhausts the envelope.
+        // From `image` 0.25.10 `src/codecs/png.rs`:
+        //   - `:418-425` allocates the raw frame buffer, 3 B/px for `Rgb8`;
+        //   - `:456-470` allocates the converted RGBA `source`, 4 B/px;
+        //   - `:477-479` frees the raw buffer only *after* that conversion.
+        // So the recurring cost is 3 + 4 = 7 B/px, and the two persistent
+        // canvases (`current`, `previous`) are 4 + 4 = 8 B/px.
+        const APNG_RGB8_RAW_BYTES_PER_PIXEL: u64 = 3;
+        const APNG_CONVERTED_SOURCE_BYTES_PER_PIXEL: u64 = 4;
+        const APNG_PERSISTENT_CANVASES_BYTES_PER_PIXEL: u64 = 8;
+        const APNG_REAL_PER_FRAME_BYTES_PER_PIXEL: u64 =
+            APNG_RGB8_RAW_BYTES_PER_PIXEL + APNG_CONVERTED_SOURCE_BYTES_PER_PIXEL;
+
+        // Compile-time facts about the pinned decoder, so lowering either term
+        // below what the decoder really allocates fails the build rather than
+        // waiting for this test to run.
+        const _: () = assert!(
+            APNG_SCRATCH_MODEL.per_frame >= APNG_REAL_PER_FRAME_BYTES_PER_PIXEL,
+            "the APNG recurring term must cover the decoder's simultaneously live raw and \
+             converted RGBA buffers (3 + 4 = 7 B/px for Rgb8)"
+        );
+        const _: () = assert!(
+            APNG_SCRATCH_MODEL.persistent >= APNG_PERSISTENT_CANVASES_BYTES_PER_PIXEL,
+            "the APNG persistent term must cover both retained canvases (4 + 4 = 8 B/px)"
+        );
 
         let rgb_apng = two_frame_apng_with_color(false); // Rgb8, not Rgba8
 
-        // Two 1×1 Rgb8 frames. Each frame: 4 B output (decoder always yields Rgba8),
-        // plus per_frame scratch (raw Rgb8 buffer + converted Rgba8 source).
+        // Two 1×1 Rgb8 frames: 4 B output each (the decoder yields RGBA8),
+        // plus the recurring raw+source pair, plus the canvases once.
         let cumulative = 2 * (4 + APNG_SCRATCH_MODEL.per_frame) + APNG_SCRATCH_MODEL.persistent;
 
         let mut budget = cumulative;
