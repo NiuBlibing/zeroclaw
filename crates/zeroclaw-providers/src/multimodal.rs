@@ -1597,6 +1597,56 @@ const GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL: u64 = 8;
 /// accepted types is **12 B/px** (15 peak − 3 min output).
 const APNG_SCRATCH_BYTES_PER_PIXEL: u64 = 12;
 
+/// How each format's animation scratch splits between state the decoder keeps
+/// for the whole animation and work it redoes for every frame.
+///
+/// [`GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL`], [`APNG_SCRATCH_BYTES_PER_PIXEL`],
+/// and [`WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL`] each bound the *simultaneous*
+/// scratch while one frame is in flight, which is the right figure for the
+/// per-image ceiling and for admission. They are the wrong figure for the
+/// aggregate budget on their own, because they mix two different lifetimes:
+/// some of those buffers are allocated once and live across the run, while the
+/// rest are allocated and dropped on every iteration. Charging the whole
+/// constant once undercounts an N-frame animation by roughly `N - 1` times the
+/// recurring part.
+///
+/// `persistent` is charged once per animation; `per_frame` is charged for every
+/// frame the decoder yields. Their sum is the original constant, so the
+/// per-frame peak model is unchanged.
+struct AnimationScratchModel {
+    /// Buffers allocated once and kept alive for the whole animation.
+    persistent: u64,
+    /// Buffers re-allocated and dropped on every frame.
+    per_frame: u64,
+}
+
+/// GIF: the persistent `non_disposed_frame` composition canvas (4 B/px) is
+/// allocated once before the first frame; the partial-frame branch's temporary
+/// sub-rectangle (up to 4 B/px) is allocated and dropped inside every
+/// `next()` (`image` 0.25.10 `src/codecs/gif.rs:276-291`, `:326-341`,
+/// `:388-415`).
+const GIF_ANIMATION_SCRATCH_MODEL: AnimationScratchModel = AnimationScratchModel {
+    persistent: 4,
+    per_frame: 4,
+};
+
+/// APNG: `current` and `previous` (4 B/px each) persist across the animation;
+/// the raw frame buffer and its converted RGBA source are allocated and freed
+/// inside every `mix_next_frame` (`src/codecs/png.rs:282-339`, `:456-479`).
+const APNG_SCRATCH_MODEL: AnimationScratchModel = AnimationScratchModel {
+    persistent: 8,
+    per_frame: 4,
+};
+
+/// Animated WebP: only the composition canvas (4 B/px) persists; the decoded
+/// frame, alpha planes, and the adapter's conversion buffers are per-frame
+/// (`image-webp` 0.2.4 `src/decoder.rs` `read_frame`, `image` 0.25.10
+/// `src/codecs/webp/decoder.rs:127-148`).
+const WEBP_ANIMATED_SCRATCH_MODEL: AnimationScratchModel = AnimationScratchModel {
+    persistent: 4,
+    per_frame: 13,
+};
+
 /// Worst-case peak decode allocation for one canvas, derived from the header
 /// alone. Reading the header does not decode pixels, so this is cheap enough
 /// to run before the budget check — which is the point: an image whose decode
@@ -1909,17 +1959,23 @@ fn validate_animation_frames(
     mime: &str,
     projected_allocation: u64,
     budget_cap: u64,
-    scratch_per_pixel: u64,
+    scratch: AnimationScratchModel,
 ) -> Result<u64, ImageValidationFailure> {
+    let scratch_per_pixel = scratch.persistent.saturating_add(scratch.per_frame);
     let effective_cap = MAX_DECODED_IMAGE_ALLOC_BYTES.min(budget_cap);
     let aggregate_cap_is_tighter = budget_cap <= MAX_DECODED_IMAGE_ALLOC_BYTES;
+    // Cumulative work: every frame's output buffer plus the scratch the decoder
+    // re-allocates for that frame. Both recur per frame, so both accumulate.
+    let mut cumulative = 0u64;
+    // Sum of the returned frame buffers alone, used for the per-image ceiling
+    // check that predates the cumulative model.
     let mut total = 0u64;
     // Largest single-frame peak seen: the frame's own buffer plus the
     // full-canvas decoder state live alongside it.
     let mut peak = 0u64;
-    // Scratch for the largest frame seen. The decoder's cross-frame state is
-    // sized from the canvas, so the largest frame's scratch is the bound for
-    // what stays live across the whole animation.
+    // One canvas of the state the decoder keeps for the whole animation,
+    // charged once rather than per frame. Sized from the largest frame, since
+    // that state is allocated from the canvas dimensions.
     let mut persistent_scratch = 0u64;
 
     for frame in frames {
@@ -1960,10 +2016,13 @@ fn validate_animation_frames(
         let frame_pixels = u64::from(buffer.width()).saturating_mul(u64::from(buffer.height()));
         let frame_scratch = frame_pixels.saturating_mul(scratch_per_pixel);
         let frame_peak = frame_allocation.saturating_add(frame_scratch);
-        // Track the largest frame's scratch: persistent decoder state is sized
-        // from the canvas, so the largest frame's scratch is the right term to
-        // add to the cumulative total when charging the aggregate budget.
-        persistent_scratch = persistent_scratch.max(frame_scratch);
+        // The persistent term is charged once, so track the largest frame's
+        // share of it; the recurring term is charged for this frame.
+        persistent_scratch =
+            persistent_scratch.max(frame_pixels.saturating_mul(scratch.persistent));
+        cumulative = cumulative
+            .saturating_add(frame_allocation)
+            .saturating_add(frame_pixels.saturating_mul(scratch.per_frame));
         peak = peak.max(frame_peak);
 
         let next_total = total.saturating_add(frame_allocation);
@@ -2002,26 +2061,20 @@ fn validate_animation_frames(
 
     // Charge the **larger** of two quantities:
     //
-    // 1. `total + persistent_scratch`: cumulative frame-pixel work plus the
-    //    decoder state that stays live for the whole animation. `total` is the
-    //    sum of the returned frame buffers — every pixel the decoder produced,
-    //    serially — so as the frame count grows this grows with it and the
-    //    aggregate budget drains accordingly. `persistent_scratch` is one
-    //    canvas worth of per-format scratch, covering the buffers the decoder
-    //    holds across frames rather than per frame (GIF's `non_disposed_frame`;
-    //    APNG's `current` and `previous`; WebP's composition canvas and alpha
-    //    buffers).
+    // 1. `cumulative + persistent_scratch` — every frame's output buffer plus
+    //    its per-frame transient scratch (e.g. the GIF sub-rectangle, the APNG
+    //    raw+conversion pair, the WebP frame/alpha/adapter buffers — all
+    //    re-allocated and freed on every iteration), with one canvas of state
+    //    that stays live for the whole run (GIF's `non_disposed_frame`; APNG's
+    //    `current` and `previous`; WebP's composition canvas). The recurring
+    //    part scales with frame count; the persistent part is charged once.
     //
-    // 2. `peak`: the largest single-frame allocation seen (frame buffer plus
-    //    that frame's scratch). For a single-frame animation this equals
-    //    option 1; for a long animation option 1 is larger.
+    // 2. `peak` — the largest single-frame allocation (frame output + all
+    //    scratch). For a single-frame animation these are equal; for a long
+    //    animation option 1 is larger and becomes the binding term.
     //
-    // Taking the max keeps a lone oversized frame honestly charged while making
-    // cumulative work the binding term once an animation has many frames.
-    // Returning `peak` alone was the bug: a 100-frame animation decoded 100
-    // frames' worth of pixels but debited only one frame's peak.
-    let cumulative_charge = total.saturating_add(persistent_scratch);
-    Ok(cumulative_charge.max(peak))
+    // Taking the max keeps a lone oversized frame honestly charged.
+    Ok(cumulative.saturating_add(persistent_scratch).max(peak))
 }
 
 /// Validate `bytes` against the aggregate decode budget, then decode.
@@ -2264,7 +2317,7 @@ async fn validate_image_content_with_projection(
                     &mime_owned,
                     projected_allocation,
                     budget_cap,
-                    GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL,
+                    GIF_ANIMATION_SCRATCH_MODEL,
                 )
             }
             image::ImageFormat::Png => {
@@ -2328,7 +2381,7 @@ async fn validate_image_content_with_projection(
                         &mime_owned,
                         projected_allocation,
                         budget_cap,
-                        APNG_SCRATCH_BYTES_PER_PIXEL,
+                        APNG_SCRATCH_MODEL,
                     )
                 } else {
                     let image = image::DynamicImage::from_decoder(decoder).map_err(|error| {
@@ -2375,7 +2428,7 @@ async fn validate_image_content_with_projection(
                         &mime_owned,
                         projected_allocation,
                         budget_cap,
-                        WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL,
+                        WEBP_ANIMATED_SCRATCH_MODEL,
                     )
                 } else {
                     let image = image::DynamicImage::from_decoder(decoder).map_err(|error| {
@@ -3537,9 +3590,9 @@ mod tests {
         // (`GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL`).
         assert_eq!(
             allocation,
-            2 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL,
-            "an accepted GIF is charged cumulative frame work plus its persistent canvas, \
-             so a longer animation drains more of the aggregate budget"
+            2 * (4 + GIF_ANIMATION_SCRATCH_MODEL.per_frame)
+                + GIF_ANIMATION_SCRATCH_MODEL.persistent,
+            "an accepted GIF charges every frame's output+transient work plus one canvas of persistent state"
         );
     }
 
@@ -3641,8 +3694,9 @@ mod tests {
             .expect("a GIF whose peak fits the cap is accepted");
         assert_eq!(
             allocation,
-            2 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL,
-            "the accepted GIF is charged cumulative frame work plus its persistent canvas"
+            2 * (4 + GIF_ANIMATION_SCRATCH_MODEL.per_frame)
+                + GIF_ANIMATION_SCRATCH_MODEL.persistent,
+            "the accepted GIF charges every frame's output+transient plus one persistent canvas"
         );
     }
 
@@ -3788,13 +3842,15 @@ mod tests {
 
         assert_eq!(
             charge_two,
-            2 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL,
-            "a 2-frame GIF is charged its cumulative frame work plus one canvas of scratch"
+            2 * (4 + GIF_ANIMATION_SCRATCH_MODEL.per_frame)
+                + GIF_ANIMATION_SCRATCH_MODEL.persistent,
+            "a 2-frame GIF is charged every frame's output+transient work plus one persistent canvas"
         );
         assert_eq!(
             charge_twenty,
-            20 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL,
-            "a 20-frame GIF is charged 20 frames of work, not one frame's peak"
+            20 * (4 + GIF_ANIMATION_SCRATCH_MODEL.per_frame)
+                + GIF_ANIMATION_SCRATCH_MODEL.persistent,
+            "a 20-frame GIF is charged 20 frames of work (output+transient each), not just one peak"
         );
         assert!(
             charge_twenty > charge_two,
@@ -3805,11 +3861,16 @@ mod tests {
         // admit it and then refuse the next candidate before it decodes. Under
         // peak-only charging the first animation would debit just 12 bytes and
         // leave headroom for many more, so the second candidate would decode.
-        let mut budget = 20 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL;
+        let mut budget = 20 * (4 + GIF_ANIMATION_SCRATCH_MODEL.per_frame)
+            + GIF_ANIMATION_SCRATCH_MODEL.persistent;
         let charged = validate_within_budget("first.gif", "image/gif", &twenty, &mut budget)
             .await
             .expect("the long animation fits a budget sized for its cumulative work");
-        assert_eq!(charged, 20 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL);
+        assert_eq!(
+            charged,
+            20 * (4 + GIF_ANIMATION_SCRATCH_MODEL.per_frame)
+                + GIF_ANIMATION_SCRATCH_MODEL.persistent
+        );
         assert_eq!(
             budget, 0,
             "the long animation's cumulative work consumes the whole envelope"
@@ -3847,7 +3908,8 @@ mod tests {
         gif.push(GIF_TRAILER);
 
         // Two 1x1 frames plus one canvas of persistent scratch.
-        let gif_charge = 2 * 4 + GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL;
+        let gif_charge = 2 * (4 + GIF_ANIMATION_SCRATCH_MODEL.per_frame)
+            + GIF_ANIMATION_SCRATCH_MODEL.persistent;
 
         // Room for exactly two GIFs, with nothing left over, to prove the
         // third candidate is refused by the closed budget rather than admitted.
@@ -3884,6 +3946,112 @@ mod tests {
         assert_eq!(
             decodes, 0,
             "the refused candidate must not decode; the envelope is enforced before decode"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_frame_gif_charges_recurring_sub_rectangle() {
+        // Partial-frame GIF regression: the decoder's temporary sub-rectangle
+        // buffer is allocated and freed on every `next()`, so it accumulates.
+        //
+        // `GIF_ANIMATION_SCRATCH_MODEL.per_frame` includes this 4 B/px term.
+        // A multi-frame partial GIF should charge N*(output+per_frame)+persistent,
+        // and a later candidate must be refused when that cumulative work exhausts
+        // the envelope.
+
+        // Build a 2-frame 2×2 partial GIF: each frame is a 1×1 sub-rectangle at
+        // different positions, forcing the partial-frame branch on every iteration.
+        let mut partial = Vec::new();
+        partial.extend_from_slice(b"GIF89a");
+        partial.extend_from_slice(&[2u8, 0, 2, 0]); // logical screen 2×2
+        partial.extend_from_slice(&[0xF0, 0, 0]); // global color table flags, bg, aspect
+        // Global color table: 2 colors
+        partial.extend_from_slice(&[0, 0, 0, 255, 255, 255]);
+        partial.push(0x21); // graphics control extension
+        partial.extend_from_slice(&[0xF9, 4, 0, 0, 0, 0, 0]);
+        partial.push(0x2C); // image descriptor
+        partial.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0, 0]); // sub-rect at (0,0) 1×1
+        partial.push(2); // LZW min code size
+        partial.extend_from_slice(&[2, 0x8C, 0x2D, 0]); // minimal LZW data + block terminator
+
+        partial.push(0x21); // second frame
+        partial.extend_from_slice(&[0xF9, 4, 0, 0, 0, 0, 0]);
+        partial.push(0x2C);
+        partial.extend_from_slice(&[1, 0, 1, 0, 1, 0, 1, 0, 0]); // sub-rect at (1,1) 1×1
+        partial.push(2);
+        partial.extend_from_slice(&[2, 0x8C, 0x2D, 0]);
+
+        partial.push(0x3B); // trailer
+
+        // Canvas is 2×2 = 4 px. Two frames at 4 B/px output each = 8 B total.
+        // Per-frame transient = 4 B/px * 4 px = 16 B per frame.
+        // Persistent = 4 B/px * 4 px = 16 B once.
+        // Cumulative = 2*(4*4 + 16) + 16 = 2*32 + 16 = 80 B.
+        let cumulative = 2 * (4 * 4 + GIF_ANIMATION_SCRATCH_MODEL.per_frame * 4)
+            + GIF_ANIMATION_SCRATCH_MODEL.persistent * 4;
+
+        let mut budget = cumulative;
+        let charged = validate_within_budget("partial.gif", "image/gif", &partial, &mut budget)
+            .await
+            .expect("the partial GIF fits a budget sized for its cumulative transient work");
+        assert_eq!(
+            charged, cumulative,
+            "the partial GIF is charged every frame's sub-rectangle plus persistent canvas"
+        );
+        assert_eq!(budget, 0, "the cumulative work consumes the envelope");
+
+        let ((), decodes) = counting_decodes(async {
+            let mut spent = budget;
+            validate_within_budget("next.gif", "image/gif", &partial, &mut spent)
+                .await
+                .expect_err("the next candidate is refused against the spent envelope");
+        })
+        .await;
+        assert_eq!(
+            decodes, 0,
+            "the refused candidate does not decode: recurring transient work closed the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_rgba_apng_charges_recurring_conversion() {
+        // RGB8 APNG regression: the decoder reads a raw Rgb8 frame buffer and
+        // allocates a separate Rgba8 source before blending. Both are live
+        // simultaneously, and both recur on every frame, so they accumulate.
+        //
+        // `APNG_SCRATCH_MODEL.per_frame` covers the raw+source peak.
+        // A multi-frame RGB8 APNG should charge N*(output+per_frame)+persistent,
+        // and a later candidate must be refused when that work exhausts the envelope.
+
+        let rgb_apng = two_frame_apng_with_color(false); // Rgb8, not Rgba8
+
+        // Two 1×1 Rgb8 frames. Each frame: 4 B output (decoder always yields Rgba8),
+        // plus per_frame scratch (raw Rgb8 buffer + converted Rgba8 source).
+        let cumulative = 2 * (4 + APNG_SCRATCH_MODEL.per_frame) + APNG_SCRATCH_MODEL.persistent;
+
+        let mut budget = cumulative;
+        let charged = validate_within_budget("rgb.png", "image/png", &rgb_apng, &mut budget)
+            .await
+            .expect("the RGB8 APNG fits a budget sized for its recurring conversion work");
+        assert_eq!(
+            charged, cumulative,
+            "the RGB8 APNG is charged every frame's raw+source buffers plus persistent canvases"
+        );
+        assert_eq!(
+            budget, 0,
+            "the cumulative conversion work consumes the envelope"
+        );
+
+        let ((), decodes) = counting_decodes(async {
+            let mut spent = budget;
+            validate_within_budget("next.png", "image/png", &rgb_apng, &mut spent)
+                .await
+                .expect_err("the next candidate is refused against the spent envelope");
+        })
+        .await;
+        assert_eq!(
+            decodes, 0,
+            "the refused candidate does not decode: recurring per-frame conversion closed the budget"
         );
     }
 
@@ -4033,8 +4201,8 @@ mod tests {
         // canvas of APNG scratch.
         assert_eq!(
             allocation,
-            2 * 4 + APNG_SCRATCH_BYTES_PER_PIXEL,
-            "an accepted APNG is charged cumulative frame work plus its persistent canvases"
+            2 * (4 + APNG_SCRATCH_MODEL.per_frame) + APNG_SCRATCH_MODEL.persistent,
+            "an accepted APNG charges every frame's output+transient plus its persistent canvases"
         );
 
         let mut corrupt = valid;
@@ -4276,9 +4444,9 @@ mod tests {
         // canvas of animated-WebP scratch.
         assert_eq!(
             allocation,
-            2 * 4 + WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL,
-            "an accepted animated WebP is charged cumulative frame work plus its \
-             persistent canvas and scratch"
+            2 * (4 + WEBP_ANIMATED_SCRATCH_MODEL.per_frame)
+                + WEBP_ANIMATED_SCRATCH_MODEL.persistent,
+            "an accepted animated WebP charges every frame's output+transient plus its persistent canvas"
         );
 
         let mut corrupt = valid;
