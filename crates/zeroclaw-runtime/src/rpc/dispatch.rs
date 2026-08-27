@@ -557,6 +557,11 @@ impl LiveSessionRefreshScope {
 /// travels with the values until they are published after the config commit.
 struct PreparedLiveSessionRefresh {
     session_id: String,
+    /// Session-identity generation captured BEFORE the provider box was built.
+    /// `apply_model_provider` rejects the write if the session was replaced
+    /// under the same ID in the meantime (`session/new`, ACP rehydration), so
+    /// stale work cannot mutate a successor session.
+    session_generation: u64,
     _model_provider_update: tokio::sync::OwnedMutexGuard<()>,
     model_provider: Box<dyn zeroclaw_providers::ModelProvider>,
     model_provider_name: String,
@@ -1812,23 +1817,33 @@ impl RpcDispatcher {
             .as_deref()
             .and_then(|id| self.ctx.tui_registry.get_env(id));
         let exclude_memory = true;
-        // Rehydration is a reader in the route-generation transaction, exactly
-        // like `session/new`. Hold the config writer gate from the first config
-        // read through insertion so a route-affecting commit can neither miss
-        // this session (its `list_ids()` snapshot runs while this guard is held,
-        // so it either sees the session or has not started) nor publish a newer
-        // generation midway through Agent construction.
+        // Rehydration is a reader in the route-generation transaction, like
+        // `session/new`. Take the config writer gate so the Agent is built and
+        // inserted against one config generation: a route-affecting commit then
+        // either runs entirely before this (and the Agent is built from the
+        // committed generation) or entirely after insertion (and its
+        // `list_ids()` snapshot contains this session, so it refreshes it under
+        // the per-session update guard).
         //
-        // Ordering, not repair, is what closes the split: `sync_config_generation`
-        // at turn entry republishes only the limits cell and never rebuilds
-        // `model_provider`/`model_route_resolver`, so a session that misses the
-        // transaction stays mixed for every later turn. Reconciling after
-        // insertion cannot fix that — an unguarded post-insert apply can land
-        // after a newer commit and overwrite it with the older generation.
+        // `try_lock`, NOT a blocking acquire: this path is reached from
+        // `session/prompt`, and a route-affecting `config/set` awaits its
+        // live-session refresh inline while holding this same gate. Blocking
+        // here would deadlock a rehydration that races such a commit — the
+        // commit cannot finish until the refresh completes, and the refresh
+        // cannot observe a session whose insertion is waiting on the gate.
         //
-        // The durable-store lookup above does not read config and deliberately
-        // stays outside this boundary, matching `session/new`.
-        let config_generation_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        // Losing the gate is safe rather than merely tolerable, because the
+        // session-identity generation fence covers the contended case from the
+        // other side: `SessionStore::insert` stamps a fresh generation, so an
+        // in-flight refresh holding the pre-rehydration generation is rejected
+        // by `apply_model_provider` and cannot clobber the successor. The gate
+        // is the uncontended fast path; the fence is the contended one.
+        //
+        // The durable-store lookup above reads no config and deliberately stays
+        // outside this boundary, matching `session/new`.
+        let config_generation_guard = Arc::clone(&self.ctx.config_write_lock)
+            .try_lock_owned()
+            .ok();
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
         let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
@@ -1872,11 +1887,9 @@ impl RpcDispatcher {
             .await
             .ok()?;
 
-        // Insertion completes this session's participation in the transaction:
-        // it becomes visible to `prepare_live_sessions_refresh` only while the
-        // writer gate is still held, so any later route-affecting commit sees
-        // it and refreshes it under the per-session update guard. Release the
-        // gate only after the session is published.
+        // Release only after the session is published, so a commit that starts
+        // next sees it in `list_ids()`. A no-op when the gate was contended and
+        // `try_lock` returned `None`; the generation fence covers that case.
         drop(config_generation_guard);
 
         let seed_event = self
@@ -2339,12 +2352,31 @@ impl RpcDispatcher {
     async fn handle_session_configure(&self, params: &Value) -> RpcResult {
         let req: SessionConfigureParams = parse_params(params)?;
         validate_session_configure_overrides(&req.overrides)?;
+
+        // Capture the session generation /before/ acquiring the per-session
+        // update lock. If the session is replaced while we wait for the lock,
+        // the re-verification below will detect the mismatch and reject the
+        // stale configure.
+        let session_generation = self
+            .ctx
+            .sessions
+            .get_generation(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        // Acquire the per-session ordering boundary.
         let _model_provider_update = self
             .ctx
             .sessions
             .lock_model_provider_update(&req.session_id)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        // Re-verify the session has not been replaced while we waited for
+        // the lock. If replaced, this configure is stale — reject it.
+        if self.ctx.sessions.get_generation(&req.session_id).await != Some(session_generation) {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
 
         let merged = self
             .ctx
@@ -2410,7 +2442,7 @@ impl RpcDispatcher {
         let merged = self
             .ctx
             .sessions
-            .set_overrides(&req.session_id, req.overrides)
+            .set_overrides_gated(&req.session_id, session_generation, req.overrides)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
@@ -2427,12 +2459,16 @@ impl RpcDispatcher {
                 .sessions
                 .apply_model_provider(
                     &req.session_id,
+                    session_generation,
                     model_provider,
                     model_provider_name,
                     model_name,
                     model_route_resolver,
                     tool_dispatcher,
                     config_generation,
+                    // Temperature is already committed through
+                    // `set_overrides_gated` on this path.
+                    None,
                 )
                 .await
                 .then_some(())
@@ -3202,11 +3238,37 @@ impl RpcDispatcher {
         let session_ids = ctx.sessions.list_ids().await;
         let mut prepared = Vec::new();
         for session_id in session_ids {
+            // Capture the generation before acquiring the lock so we can
+            // detect same-ID replacement while waiting.
+            let Some(session_generation) = ctx.sessions.get_generation(&session_id).await else {
+                continue;
+            };
+
+            // Acquire the per-session ordering boundary. This serialises
+            // with session/configure so the state we read afterwards
+            // reflects any configure that committed before this point.
+            // The guard is BOUND (not dropped): it is moved into
+            // `PreparedLiveSessionRefresh` and held through publication, so
+            // preparation and apply are one ordered transition.
             let Some(model_provider_update) =
                 ctx.sessions.lock_model_provider_update(&session_id).await
             else {
                 continue;
             };
+
+            // Re-verify the session has not been replaced while we waited
+            // for the lock.
+            let Some(current_gen) = ctx.sessions.get_generation(&session_id).await else {
+                continue;
+            };
+            if current_gen != session_generation {
+                continue;
+            };
+
+            // Re-read alias and overrides inside the ordering boundary.
+            // A session/configure may have committed new overrides on the
+            // same generation while we were waiting for the lock; reading
+            // here ensures the refresh acts on the latest state.
             let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
                 continue;
             };
@@ -3270,6 +3332,7 @@ impl RpcDispatcher {
             );
             prepared.push(PreparedLiveSessionRefresh {
                 session_id,
+                session_generation,
                 _model_provider_update: model_provider_update,
                 model_provider,
                 model_provider_name,
@@ -3298,6 +3361,7 @@ impl RpcDispatcher {
         for refresh in prepared {
             let PreparedLiveSessionRefresh {
                 session_id,
+                session_generation,
                 _model_provider_update,
                 model_provider,
                 model_provider_name,
@@ -3315,22 +3379,23 @@ impl RpcDispatcher {
                     .migrate_model_provider_override(&session_id, new_ref)
                     .await;
             }
-            if ctx
-                .sessions
+            ctx.sessions
                 .apply_model_provider(
                     &session_id,
+                    session_generation,
                     model_provider,
                     model_provider_name,
                     model_name,
                     model_route_resolver,
                     tool_dispatcher,
                     Arc::clone(&config_generation),
+                    // Temperature travels in the same state transition as the
+                    // provider box rather than a follow-up `set_temperature`,
+                    // so a session cannot briefly show the new provider with
+                    // the old profile temperature.
+                    Some(temperature),
                 )
-                .await
-                && let Some(agent) = ctx.sessions.get_agent(&session_id).await
-            {
-                agent.lock().await.set_temperature(temperature);
-            }
+                .await;
         }
     }
 
@@ -9064,6 +9129,17 @@ mod tests {
         dispatcher
     }
 
+    fn make_shared_sessions_dispatcher(
+        config: zeroclaw_config::schema::Config,
+        sessions: Arc<crate::rpc::session::SessionStore>,
+    ) -> RpcDispatcher {
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+        dispatcher
+    }
+
     fn make_secret_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         let mut cfg = zeroclaw_config::schema::Config {
             config_path: tmp.path().join("config.toml"),
@@ -12139,6 +12215,389 @@ mod tests {
         assert!(
             !on_disk.contains("[agents.alpha]"),
             "old alias must not survive on disk:\n{on_disk}"
+        );
+    }
+
+    // ── generation-gated stale-refresh in-flight race tests ──
+    //
+    // These tests use a SessionStore test-only gate to pause stale work
+    // after the generation is captured but before the gated method commits,
+    // then replace the session through session/new while the stale work is
+    // paused. After releasing the gate they wait for the gated method to
+    // exit (done notification), then assert the successor is untouched.
+
+    /// Deterministic race: `session/configure` captures the original
+    /// generation, enters the gated method, then the session is replaced
+    /// via `session/new` while the stale configure is paused. The stale
+    /// work must be rejected and the successor must remain untouched.
+    #[tokio::test]
+    async fn session_configure_stale_gen_replaced_during_provider_build() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        let sessions = Arc::clone(&dispatcher.ctx.sessions);
+        let (entered, release, done) = sessions.set_test_gated_op_pause();
+        let sid = session_id.clone();
+        let workspace = tmp.path().join("workspace");
+
+        // Spawn the configure handler — it will capture the generation,
+        // acquire the per-session lock, build the provider, then block at
+        // the gate inside set_overrides_gated.
+        let handle = zeroclaw_spawn::spawn!(async move {
+            dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": sid,
+                    "overrides": {
+                        "model_provider": "openai.test-provider",
+                        "model": "intruder-model",
+                        "temperature": 0.99,
+                    }
+                }))
+                .await
+        });
+
+        // Wait for the handler to enter the gate (generation captured,
+        // commit pending).
+        entered.notified().await;
+
+        // Replace the session via session/new while the stale configure
+        // is paused — this is caller-supplied same-ID replacement.
+        let dispatcher2 = make_shared_sessions_dispatcher(
+            make_model_refresh_test_config(&tmp),
+            Arc::clone(&sessions),
+        );
+        let replace_res = dispatcher2
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "cwd": workspace,
+                "session_id": session_id,
+            }))
+            .await;
+        assert!(
+            replace_res.is_ok(),
+            "session/new replacement must succeed: {replace_res:?}"
+        );
+
+        // Release the gate — stale work sees the generation mismatch.
+        release.notify_one();
+
+        // Wait for the gated method to exit.
+        done.notified().await;
+        sessions.clear_test_gated_op_pause();
+
+        let res = handle.await.expect("spawned configure must not panic");
+        assert!(
+            res.is_err(),
+            "stale-generation configure after replacement must fail; got: {res:?}"
+        );
+
+        // Successor must be completely untouched — it was created from
+        // config by session/new and must still have its original values.
+        let overrides = sessions
+            .get_overrides(&session_id)
+            .await
+            .expect("successor still exists");
+        assert_eq!(overrides.model_provider, None);
+        assert_eq!(overrides.model, None);
+        assert_eq!(overrides.temperature, None);
+
+        let agent = sessions
+            .get_agent(&session_id)
+            .await
+            .expect("successor agent exists");
+        let guard = agent.lock().await;
+        let (_, provider_name, model_name) = guard.attribution_fields();
+        // Successor was built from the test config with
+        // model_provider = "openai.test-provider", model = "old-model".
+        // The stale configure tried to change these to "intruder-model";
+        // if the generation gate held, the successor keeps its original
+        // config values.
+        assert_eq!(
+            model_name, "old-model",
+            "successor model must not be overwritten by stale configure"
+        );
+        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(
+            guard.temperature_for_test(),
+            Some(0.2),
+            "successor temperature must not be overwritten"
+        );
+    }
+
+    /// Deterministic race: config/set triggers an async refresh. The
+    /// refresh snapshots the session identity, acquires the per-session
+    /// lock, builds the provider, then blocks at `apply_model_provider`.
+    /// The session is replaced via `session/new` while paused. The stale
+    /// refresh must skip the successor.
+    #[tokio::test]
+    async fn config_set_refresh_stale_gen_replaced_during_provider_build() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        let sessions = Arc::clone(&dispatcher.ctx.sessions);
+        let (entered, release, done) = sessions.set_test_gated_op_pause();
+
+        // Trigger config/set — schedules an async refresh that will
+        // snapshot, lock, build provider, then block at apply_model_provider.
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "refreshed-model"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        // Wait for the async refresh to reach the gate (snapshot captured,
+        // provider built, apply pending).
+        entered.notified().await;
+
+        // Replace the session via session/new while the stale refresh is
+        // paused.
+        let dispatcher2 = make_shared_sessions_dispatcher(
+            make_model_refresh_test_config(&tmp),
+            Arc::clone(&sessions),
+        );
+        let workspace = tmp.path().join("workspace");
+        let replace_res = dispatcher2
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "cwd": workspace,
+                "session_id": session_id,
+            }))
+            .await;
+        assert!(
+            replace_res.is_ok(),
+            "session/new replacement must succeed: {replace_res:?}"
+        );
+
+        // Release the gate — stale refresh sees generation mismatch.
+        release.notify_one();
+
+        // Wait for the gated method to exit, then clean up.
+        done.notified().await;
+        sessions.clear_test_gated_op_pause();
+
+        // Successor must be untouched by the stale refresh — it was
+        // created from config with model "old-model". The refresh tried
+        // to change it to "refreshed-model"; gen-gating must prevent that.
+        let agent = sessions
+            .get_agent(&session_id)
+            .await
+            .expect("successor agent exists");
+        let guard = agent.lock().await;
+        let (_, provider_name, model_name) = guard.attribution_fields();
+        assert_eq!(
+            model_name, "old-model",
+            "successor model must not be overwritten by stale config/set refresh"
+        );
+        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(
+            guard.temperature_for_test(),
+            Some(0.2),
+            "successor temperature must not be overwritten"
+        );
+    }
+
+    /// Deterministic race: config/set triggers an async refresh that pauses
+    /// at `apply_model_provider` after capturing the old generation. While
+    /// paused, the session is replaced through ACP rehydration
+    /// (`rehydrate_reaped_session`), which installs a same-ID successor via
+    /// `SessionStore::insert`. The stale refresh must skip the rehydrated
+    /// successor.
+    #[tokio::test]
+    async fn config_set_refresh_stale_gen_replaced_by_acp_rehydration() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_model_refresh_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        // Persist a restorable ACP row for the same session ID so
+        // rehydrate_reaped_session can reinstall it under the same ID.
+        let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
+        acp_store
+            .create_session(&session_id, "test-agent", &workspace)
+            .expect("ACP session row must be created");
+
+        let (entered, release, done) = sessions.set_test_gated_op_pause();
+
+        // Trigger config/set — schedules an async refresh that pauses at
+        // apply_model_provider after capturing the old generation.
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "refreshed-model"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        // Wait for the async refresh to reach the gate.
+        entered.notified().await;
+
+        // Rewind the provider model so the rehydrated successor is built
+        // from "old-model" while the paused refresh still targets
+        // "refreshed-model". This makes the two distinguishable: if the
+        // stale refresh leaks through, the successor would flip to
+        // "refreshed-model".
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("openai.test-provider slot exists")
+            .model = Some("old-model".into());
+
+        // Replace the session via ACP rehydration while the stale refresh
+        // is paused. This installs a same-ID successor via SessionStore::insert.
+        let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
+        assert!(
+            rehydrated.is_some(),
+            "ACP rehydration must install the same-ID successor"
+        );
+
+        // Release the gate — the stale refresh sees the generation mismatch.
+        release.notify_one();
+        done.notified().await;
+        sessions.clear_test_gated_op_pause();
+
+        // The rehydrated successor must retain its provider, model, and
+        // temperature — untouched by the stale config/set refresh.
+        let agent = sessions
+            .get_agent(&session_id)
+            .await
+            .expect("rehydrated successor exists");
+        let guard = agent.lock().await;
+        let (_, provider_name, model_name) = guard.attribution_fields();
+        assert_eq!(
+            model_name, "old-model",
+            "rehydrated successor model must not be overwritten by stale config/set refresh"
+        );
+        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(
+            guard.temperature_for_test(),
+            Some(0.2),
+            "rehydrated successor temperature must not be overwritten"
+        );
+    }
+
+    /// Reverse-order regression: `session/configure` queues before a provider
+    /// refresh. The configure commits a `model_provider` override, then the
+    /// refresh — which captured its generation before blocking on the
+    /// ordering lock — must re-read the committed override inside the lock
+    /// and skip the session instead of applying a stale pre-lock snapshot.
+    #[tokio::test]
+    async fn model_provider_update_queued_refresh_reads_newer_configure_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+        let other = cfg
+            .providers
+            .models
+            .ensure("openai", "other-provider")
+            .expect("openai provider slot exists");
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("other-model".into());
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        // Hold the per-session ordering lock so both configure and refresh
+        // queue behind it.
+        let update_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        // Point the agent at other-provider so a refresh that does NOT see
+        // the configure override would rebuild the agent to other-model.
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.other-provider".into();
+
+        // Queue configure FIRST — it will commit a model_provider override.
+        let configure_dispatcher = Arc::new(dispatcher);
+        let configure_task_dispatcher = Arc::clone(&configure_dispatcher);
+        let configure_session_id = session_id.clone();
+        let configure_waiting = configure_dispatcher
+            .ctx
+            .sessions
+            .model_provider_update_waiting();
+        let configure_wait = configure_waiting.notified();
+        let configure = zeroclaw_spawn::spawn!(async move {
+            configure_task_dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": configure_session_id,
+                    "overrides": { "model_provider": "openai.test-provider" }
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), configure_wait)
+            .await
+            .expect("session/configure must queue first on the provider update boundary");
+
+        // Queue refresh SECOND — it captures its generation then blocks on
+        // the same ordering lock behind configure.
+        let refresh_ctx = Arc::clone(&configure_dispatcher.ctx);
+        let refresh_waiting = configure_dispatcher
+            .ctx
+            .sessions
+            .model_provider_update_waiting();
+        let refresh_wait = refresh_waiting.notified();
+        let refresh = zeroclaw_spawn::spawn!(async move {
+            let _ = RpcDispatcher::refresh_live_sessions_for_agent(refresh_ctx, "test-agent").await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), refresh_wait)
+            .await
+            .expect("agent refresh must queue behind the configure");
+
+        drop(update_guard);
+
+        configure
+            .await
+            .expect("session/configure task must complete")
+            .expect("session/configure must commit the override");
+        refresh.await.expect("agent refresh task must complete");
+
+        // The refresh must resolve the committed configure override and skip
+        // the session, preserving the newer override instead of applying its
+        // stale pre-lock snapshot.
+        assert_eq!(
+            model_name_for_session(&configure_dispatcher, &session_id).await,
+            "old-model",
+            "a later refresh must not overwrite a configure override that committed first"
+        );
+        assert_eq!(
+            configure_dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|overrides| overrides.model_provider),
+            Some("openai.test-provider".to_string())
         );
     }
 }
