@@ -43,6 +43,9 @@ fn main() {
     if let Err(e) = probe_reader_ordering(&dir) {
         failures.push(format!("Q4 (open-then-enumerate ordering): {e}"));
     }
+    if let Err(e) = probe_delete_while_reading(&dir) {
+        failures.push(format!("Q5 (delete/rotate while reading): {e}"));
+    }
 
     let _ = fs::remove_dir_all(&dir);
 
@@ -224,6 +227,183 @@ fn identity(path: &Path) -> Result<(u64, u64), String> {
     }
     let index = ((info.file_index_high as u64) << 32) | (info.file_index_low as u64);
     Ok((info.volume_serial_number as u64, index))
+}
+
+
+/// Identity read from a live handle, which is what the reader does. The
+/// path-based `identity` above opens its own handle; this one proves the same
+/// call works while many handles are already held.
+#[cfg(unix)]
+fn identity_of(file: &File) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata().map_err(|e| format!("metadata: {e}"))?;
+    Ok((m.dev(), m.ino()))
+}
+
+#[cfg(windows)]
+fn identity_of(file: &File) -> Result<(u64, u64), String> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            handle: *mut std::ffi::c_void,
+            info: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut info = ByHandleFileInformation::default();
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as *mut _, &mut info) };
+    if ok == 0 {
+        return Err(format!(
+            "GetFileInformationByHandle failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let index = ((info.file_index_high as u64) << 32) | (info.file_index_low as u64);
+    Ok((info.volume_serial_number as u64, index))
+}
+
+/// Q5: can the writer's retention delete an archive that a reader currently
+/// holds open?
+///
+/// This is the question the segment cap raised. A read holds up to eight
+/// segment handles for its whole duration, and `run_retention` may want to
+/// prune one of those archives in that window.
+///
+/// POSIX unlink only drops the directory entry, so the reader keeps reading the
+/// inode and nothing conflicts. Windows only permits deletion when every open
+/// handle was opened with FILE_SHARE_DELETE. If Rust's `File::open` does not
+/// request it, `fs::remove_file` fails while a reader is running, and since
+/// `remove_archive` is best-effort and only logs a warning, the visible symptom
+/// is archives that never get pruned and a disk that grows without bound for as
+/// long as queries keep arriving. That would be worse than the bug the handles
+/// were introduced to fix, so it has to be measured rather than assumed.
+fn probe_delete_while_reading(dir: &Path) -> Result<(), String> {
+    println!();
+    println!("== Q5: retention deleting an archive held open by a reader ==");
+
+    let work = dir.join("retention");
+    fs::create_dir_all(&work).map_err(|e| format!("mkdir: {e}"))?;
+
+    // A realistic set: the active file plus seven archives, matching a default
+    // install's retention window and the reader's open cap.
+    let active = work.join("trace.jsonl");
+    fs::write(&active, "live-1\n").map_err(|e| format!("write active: {e}"))?;
+    let mut archives = Vec::new();
+    for seq in 1..=7u64 {
+        let path = work.join(format!("trace.{seq:010}-20260101-000000.jsonl"));
+        fs::write(&path, format!("archived-{seq}\n"))
+            .map_err(|e| format!("write archive {seq}: {e}"))?;
+        archives.push(path);
+    }
+
+    // The reader opens everything it intends to scan, as `open_segment_set`
+    // does, and keeps the handles alive for the rest of this function.
+    let mut handles = Vec::new();
+    handles.push(File::open(&active).map_err(|e| format!("open active: {e}"))?);
+    for path in &archives {
+        handles.push(File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?);
+    }
+    println!("  reader holds {} handles open", handles.len());
+
+    // Identity is read through a live handle here, which is what the reader
+    // does; the earlier probes only exercised that with a single file open.
+    for (i, handle) in handles.iter().enumerate() {
+        identity_of(handle).map_err(|e| format!("identity of handle {i}: {e}"))?;
+    }
+    println!("  identity readable for every open handle");
+
+    // Retention prunes the oldest archive while those handles are live.
+    let victim = &archives[0];
+    match fs::remove_file(victim) {
+        Ok(()) => println!("  retention deleted an open archive (Q5 OK)"),
+        Err(e) => {
+            return Err(format!(
+                "deleting an open archive FAILED: {e}. On this platform a \
+                 running query would block retention, so archives would \
+                 accumulate while reads are in flight."
+            ));
+        }
+    }
+
+    // The reader must keep working on the deleted file's handle. Its handle is
+    // index 1: index 0 is the active file.
+    let mut via_handle = String::new();
+    handles[1]
+        .read_to_string(&mut via_handle)
+        .map_err(|e| format!("read deleted archive via handle: {e}"))?;
+    if via_handle != "archived-1\n" {
+        return Err(format!(
+            "handle on the deleted archive read {via_handle:?}, expected \
+             \"archived-1\\n\""
+        ));
+    }
+    println!("  the deleted archive is still readable through its open handle");
+
+    // And it is really gone from the directory.
+    if victim.exists() {
+        return Err("the deleted archive still resolves by path".into());
+    }
+    println!("  the deleted archive no longer resolves by path");
+
+    // Rotation must still work with the whole set held open, since retention
+    // runs right after a rotation.
+    let rotated = work.join("trace.0000000008-20260101-000000.jsonl");
+    match fs::rename(&active, &rotated) {
+        Ok(()) => println!("  rotation succeeded with all handles open"),
+        Err(e) => {
+            return Err(format!(
+                "rotation was BLOCKED while handles were open: {e}"
+            ));
+        }
+    }
+
+    // Deleting the file that was just rotated away, while the reader still
+    // holds its pre-rotation handle, is the combination retention actually
+    // performs after a rotation.
+    match fs::remove_file(&rotated) {
+        Ok(()) => println!("  a rotated-then-pruned archive deletes cleanly (Q5 OK)"),
+        Err(e) => {
+            return Err(format!(
+                "deleting a rotated archive still held open FAILED: {e}"
+            ));
+        }
+    }
+
+    let mut still_live = String::new();
+    handles[0]
+        .read_to_string(&mut still_live)
+        .map_err(|e| format!("read rotated-and-deleted file via handle: {e}"))?;
+    if still_live != "live-1\n" {
+        return Err(format!(
+            "handle read {still_live:?} after its file was rotated and deleted"
+        ));
+    }
+    println!("  content stays readable after rotate-then-delete");
+
+    Ok(())
 }
 
 /// Q4: the ordering the reader intends to use. Open the active file FIRST, then
