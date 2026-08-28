@@ -1872,25 +1872,33 @@ impl RpcDispatcher {
         agent.channel_handles().register_channel("rpc", approval_ch);
 
         let message_count = data.messages.len();
+        // Contended gate means this session may be excluded from an in-flight
+        // refresh transaction's `list_ids()` snapshot, so it is published with
+        // a PROVISIONAL binding: live, but bound to a config generation that is
+        // not yet confirmed. `session/prompt` and `session/configure` await
+        // this before proceeding, and the reconciliation task below clears it
+        // on both outcomes.
+        let try_lock_failed = config_generation_guard.is_none();
+        let pending_generation = try_lock_failed.then(|| Arc::new(tokio::sync::Notify::new()));
+        let session = super::session::RpcSession::new(
+            agent,
+            &data.agent_alias,
+            &data.workspace_dir,
+            crate::rpc::types::ChatMode::Acp,
+        )
+        .with_owner(self.tui_id.clone());
+        let session = match pending_generation.as_ref() {
+            Some(notify) => session.with_pending_generation(Arc::clone(notify)),
+            None => session,
+        };
         self.ctx
             .sessions
-            .insert(
-                sid.to_string(),
-                super::session::RpcSession::new(
-                    agent,
-                    &data.agent_alias,
-                    &data.workspace_dir,
-                    crate::rpc::types::ChatMode::Acp,
-                )
-                .with_owner(self.tui_id.clone()),
-            )
+            .insert(sid.to_string(), session)
             .await
             .ok()?;
 
         // Release only after the session is published, so a commit that starts
-        // next sees it in `list_ids()`. A no-op when the gate was contended and
-        // `try_lock` returned `None`; the generation fence covers that case.
-        let try_lock_failed = config_generation_guard.is_none();
+        // next sees it in `list_ids()`.
         drop(config_generation_guard);
 
         // Pending-generation reconciliation when the config writer gate was
@@ -1916,117 +1924,28 @@ impl RpcDispatcher {
         // a further `session/new` or `rehydrate_reaped_session` replacing the
         // session again before the task runs.
         //
-        // The spawned task runs asynchronously; the first `session/prompt` on
-        // this session MAY dispatch through the construction-time provider if
-        // it wins the race against the task. That is the same single-turn
-        // partial-generation risk present on all other paths when rehydration
-        // is concurrent with a config commit — limited to one ACP turn for a
-        // session whose prior incarnation was already reaped.
+        // The session was published carrying a pending-generation marker, so
+        // `session/prompt` and `session/configure` park until this task
+        // finishes rather than dispatching through the provisional binding.
         if try_lock_failed {
             let rehydrate_ctx = Arc::clone(&self.ctx);
             let rehydrate_sid = sid.to_string();
             let rehydrate_alias = data.agent_alias.clone();
             zeroclaw_spawn::spawn!(async move {
-                // Acquire the gate (blocking) so we are guaranteed to read a
-                // config that is at least as new as whatever committed while
-                // we were building the agent above.
-                let _gate = Arc::clone(&rehydrate_ctx.config_write_lock)
-                    .lock_owned()
-                    .await;
-                // Take the per-session ordering boundary for the whole
-                // publication, the same guard `prepare_live_sessions_refresh`
-                // holds. Without it this repair is the only live-provider
-                // writer in the file that does not serialize with
-                // `session/configure`, so the two could interleave field by
-                // field instead of composing as one transition.
-                let _session_guard = rehydrate_ctx
-                    .sessions
-                    .lock_model_provider_update(&rehydrate_sid)
-                    .await;
-                // Capture generation inside the gate so it matches the config
-                // we are about to read.
-                let session_generation =
-                    match rehydrate_ctx.sessions.get_generation(&rehydrate_sid).await {
-                        Some(g) => g,
-                        None => return, // session was removed before we ran
-                    };
-                let config_generation = Arc::new(rehydrate_ctx.config.read().clone());
-                let agent_cfg = config_generation
-                    .resolved_agent_config(&rehydrate_alias)
-                    .or_else(|| config_generation.agent(&rehydrate_alias).cloned());
-                let resolved = agent_cfg.as_ref().and_then(|cfg| {
-                    crate::agent::agent::build_session_model_provider(
-                        &config_generation,
-                        cfg.model_provider.as_str(),
-                        None,
-                    )
-                    .ok()
-                    .map(|tuple| (cfg.model_provider.clone(), cfg.clone(), tuple))
-                });
-                let Some((model_provider_ref, cfg, (provider, provider_name, model, resolver))) =
-                    resolved
-                else {
-                    // The alias is unresolvable against the committed config.
-                    // Leave the construction-time box in place — it is the last
-                    // known-good binding — and record it, because this session
-                    // will not converge until a later refresh includes it.
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "session_id": rehydrate_sid,
-                                "agent_alias": rehydrate_alias,
-                            })),
-                        "rehydrated session: post-insert reconciliation could not resolve the \
-                         agent's provider against the committed config generation; the session \
-                         stays on its construction-time provider"
-                    );
-                    return;
-                };
-                let dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
-                    &cfg,
-                    provider.as_ref(),
-                    &model,
-                );
-                // Temperature belongs to the same state transition as the
-                // provider box. Resolve it exactly as the ordinary refresh
-                // path does (`overrides.temperature.or(provider_temperature)`)
-                // and publish it here: nothing re-derives temperature at turn
-                // entry — neither `sync_config_generation` nor
-                // `try_apply_model_switch` touches `Agent::temperature` — so
-                // passing `None` would leave a repaired session on the
-                // pre-commit profile temperature while its provider, resolver,
-                // and limits are all on the committed generation.
-                let provider_temperature = model_provider_ref.split_once('.').and_then(
-                    |(provider_type, provider_alias)| {
-                        config_generation
-                            .providers
-                            .models
-                            .find(provider_type, provider_alias)
-                            .and_then(|entry| entry.temperature)
-                    },
-                );
-                let temperature = rehydrate_ctx
-                    .sessions
-                    .get_overrides(&rehydrate_sid)
-                    .await
-                    .and_then(|overrides| overrides.temperature)
-                    .or(provider_temperature);
+                Self::reconcile_rehydrated_session(
+                    Arc::clone(&rehydrate_ctx),
+                    &rehydrate_sid,
+                    &rehydrate_alias,
+                )
+                .await;
+                // Unconditional: every exit path of the reconciliation —
+                // published, session gone, or unresolvable alias — must release
+                // the waiters. An abandoned repair leaves the session on its
+                // last known-good construction-time binding, which is strictly
+                // better than parking prompts on convergence that never comes.
                 rehydrate_ctx
                     .sessions
-                    .apply_model_provider(
-                        &rehydrate_sid,
-                        session_generation,
-                        provider,
-                        provider_name,
-                        model,
-                        resolver,
-                        dispatcher,
-                        config_generation,
-                        Some(temperature),
-                    )
+                    .clear_pending_generation(&rehydrate_sid)
                     .await;
             });
         }
@@ -2053,6 +1972,112 @@ impl RpcDispatcher {
         );
 
         self.ctx.sessions.get_agent(sid).await
+    }
+
+    /// Re-derive and publish a rehydrated session's provider binding from the
+    /// committed config generation.
+    ///
+    /// Runs only for a session inserted while `config_write_lock` was
+    /// contended, i.e. one that an in-flight refresh transaction may have
+    /// excluded from its `list_ids()` snapshot. Blocking on the writer gate is
+    /// what makes the read authoritative: it cannot return until the commit
+    /// that owned the gate has finished.
+    ///
+    /// The caller clears the session's pending-generation marker after this
+    /// returns, on every path — this function must therefore never park
+    /// indefinitely, and returns rather than retrying when the binding cannot
+    /// be resolved.
+    async fn reconcile_rehydrated_session(
+        ctx: Arc<RpcContext>,
+        session_id: &str,
+        agent_alias: &str,
+    ) {
+        // Acquire the gate (blocking) so we are guaranteed to read a config at
+        // least as new as whatever committed while the Agent was being built.
+        let _gate = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        // Take the per-session ordering boundary for the whole publication,
+        // the same guard `prepare_live_sessions_refresh` holds. Without it this
+        // repair would be the only live-provider writer in the file that does
+        // not serialize with `session/configure`, so the two could interleave
+        // field by field instead of composing as one transition.
+        let _session_guard = ctx.sessions.lock_model_provider_update(session_id).await;
+        // Capture generation inside the gate so it matches the config below.
+        let Some(session_generation) = ctx.sessions.get_generation(session_id).await else {
+            return; // session was removed before we ran
+        };
+        let config_generation = Arc::new(ctx.config.read().clone());
+        let agent_cfg = config_generation
+            .resolved_agent_config(agent_alias)
+            .or_else(|| config_generation.agent(agent_alias).cloned());
+        let resolved = agent_cfg.as_ref().and_then(|cfg| {
+            crate::agent::agent::build_session_model_provider(
+                &config_generation,
+                cfg.model_provider.as_str(),
+                None,
+            )
+            .ok()
+            .map(|tuple| (cfg.model_provider.clone(), cfg.clone(), tuple))
+        });
+        let Some((model_provider_ref, cfg, (provider, provider_name, model, resolver))) = resolved
+        else {
+            // The alias is unresolvable against the committed config. Leave the
+            // construction-time box in place — it is the last known-good
+            // binding — and record it, because this session will not converge
+            // until a later refresh includes it.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": session_id,
+                        "agent_alias": agent_alias,
+                    })),
+                "rehydrated session: post-insert reconciliation could not resolve the agent's \
+                 provider against the committed config generation; the session stays on its \
+                 construction-time provider"
+            );
+            return;
+        };
+        let dispatcher =
+            crate::agent::agent::tool_dispatcher_for_provider(&cfg, provider.as_ref(), &model);
+        // Temperature belongs to the same state transition as the provider box.
+        // Resolve it exactly as the ordinary refresh path does
+        // (`overrides.temperature.or(provider_temperature)`) and publish it
+        // here: nothing re-derives temperature at turn entry — neither
+        // `sync_config_generation` nor `try_apply_model_switch` touches
+        // `Agent::temperature` — so passing `None` would leave a repaired
+        // session on the pre-commit profile temperature while its provider,
+        // resolver, and limits are all on the committed generation.
+        let provider_temperature =
+            model_provider_ref
+                .split_once('.')
+                .and_then(|(provider_type, provider_alias)| {
+                    config_generation
+                        .providers
+                        .models
+                        .find(provider_type, provider_alias)
+                        .and_then(|entry| entry.temperature)
+                });
+        let temperature = ctx
+            .sessions
+            .get_overrides(session_id)
+            .await
+            .and_then(|overrides| overrides.temperature)
+            .or(provider_temperature);
+        ctx.sessions
+            .apply_model_provider(
+                session_id,
+                session_generation,
+                provider,
+                provider_name,
+                model,
+                resolver,
+                dispatcher,
+                config_generation,
+                Some(temperature),
+            )
+            .await;
     }
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
@@ -2130,6 +2155,34 @@ impl RpcDispatcher {
             .acquire(sid)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+
+        // Wait for a provisional binding to be confirmed before entering the
+        // turn. A session rehydrated while a route-affecting commit held the
+        // config writer gate is live but bound to an unconfirmed generation;
+        // dispatching now would use the construction-time provider while
+        // canonical config has already moved on.
+        //
+        // This MUST precede the ordering lock below: the reconciliation task
+        // takes that same per-session guard, so acquiring it first would block
+        // the very task this waits on. A no-op for every session without a
+        // pending marker, which is all of them outside this narrow window.
+        match self
+            .ctx
+            .sessions
+            .await_pending_generation(sid, std::time::Duration::from_secs(30))
+            .await
+        {
+            Ok(()) => {}
+            Err(crate::rpc::session::WaitForProviderUpdateError::SessionNotFound) => {
+                return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+            }
+            Err(crate::rpc::session::WaitForProviderUpdateError::Timeout) => {
+                return Err(rpc_err(
+                    SESSION_BUSY,
+                    "session generation reconciliation in progress; retry shortly",
+                ));
+            }
+        }
 
         // Own the live-session provider generation through this turn. A
         // route-affecting config transaction holds the same lock while it
@@ -2491,6 +2544,30 @@ impl RpcDispatcher {
     async fn handle_session_configure(&self, params: &Value) -> RpcResult {
         let req: SessionConfigureParams = parse_params(params)?;
         validate_session_configure_overrides(&req.overrides)?;
+
+        // Wait for a provisional binding to be confirmed, for the same reason
+        // `session/prompt` does: a session rehydrated during a route-affecting
+        // commit is live but unconfirmed, and committing an override against
+        // it would compose with a binding the reconciliation is about to
+        // replace. Precedes the ordering lock because the reconciliation task
+        // holds that same guard.
+        match self
+            .ctx
+            .sessions
+            .await_pending_generation(&req.session_id, std::time::Duration::from_secs(30))
+            .await
+        {
+            Ok(()) => {}
+            Err(crate::rpc::session::WaitForProviderUpdateError::SessionNotFound) => {
+                return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+            }
+            Err(crate::rpc::session::WaitForProviderUpdateError::Timeout) => {
+                return Err(rpc_err(
+                    SESSION_BUSY,
+                    "session generation reconciliation in progress; retry shortly",
+                ));
+            }
+        }
 
         // Capture the session generation /before/ acquiring the per-session
         // update lock. If the session is replaced while we wait for the lock,
@@ -12701,6 +12778,121 @@ mod tests {
             Some(0.2),
             "rehydrated successor temperature must not be overwritten"
         );
+    }
+
+    /// The FIRST prompt on a rehydrated session must dispatch on the committed
+    /// generation, never the provisional one.
+    ///
+    /// This is the ordering the pending-generation marker exists to enforce. A
+    /// session rehydrated while a route-affecting commit held the config writer
+    /// gate is live but bound to an unconfirmed generation. Without the marker,
+    /// `session/prompt` acquires the per-session lock and enters the turn while
+    /// the reconciliation task is still queued behind the commit, dispatching
+    /// on the construction-time provider after canonical config has moved on.
+    ///
+    /// The assertion is the model on the wire, not timing: a prompt that is
+    /// merely slow is indistinguishable from one that is correctly parked, but
+    /// the model the provider actually received is unambiguous.
+    #[tokio::test]
+    async fn first_prompt_after_rehydration_dispatches_the_committed_model() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        // 500 keeps the turn short; the request body is the evidence.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("test provider exists")
+            .uri = Some(server.uri());
+        let data_dir = config.data_dir.clone();
+        let after_snapshot = Arc::new(tokio::sync::Notify::new());
+        let (dispatcher, sessions, acp_store) = make_persistence_test_dispatcher_with_snapshot_hook(
+            config,
+            &data_dir,
+            Arc::clone(&after_snapshot),
+        );
+        let dispatcher = Arc::new(dispatcher);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
+        acp_store
+            .create_session(&session_id, "test-agent", &workspace)
+            .expect("ACP session row must be created");
+        sessions.remove(&session_id).await;
+
+        // Drive a route-affecting commit and rehydrate inside its snapshot
+        // window, so the session is published with a provisional binding on
+        // the pre-commit model.
+        let snapshot_signal = Arc::clone(&after_snapshot);
+        let config_set_dispatcher = Arc::clone(&dispatcher);
+        let config_set = zeroclaw_spawn::spawn!(async move {
+            config_set_dispatcher
+                .handle_config_set(&json!({
+                    "prop": "providers.models.openai.test-provider.model",
+                    "value": "refreshed-model"
+                }))
+                .await
+        });
+        snapshot_signal.notified().await;
+
+        let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
+        assert!(rehydrated.is_some(), "rehydration must install the session");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model",
+            "harness invariant: the provisional binding must still be the \
+             pre-commit model, otherwise this test cannot distinguish the two"
+        );
+
+        let res = config_set.await.expect("config/set task must complete");
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        // The first prompt races the reconciliation task. Whichever wins, the
+        // dispatched model must be the committed one.
+        let prompt_dispatcher = Arc::clone(&dispatcher);
+        let prompt_sid = session_id.clone();
+        let prompt_result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            prompt_dispatcher.handle_session_prompt(&json!({
+                "session_id": prompt_sid,
+                "prompt": "hello",
+            })),
+        )
+        .await
+        .expect("session/prompt must not hang on the pending marker");
+        assert!(
+            prompt_result.is_err(),
+            "the mock intentionally returns a provider error"
+        );
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock server must retain received requests");
+        assert!(
+            !requests.is_empty(),
+            "the prompt must have reached the provider"
+        );
+        for request in requests {
+            let body: Value = serde_json::from_slice(&request.body)
+                .expect("OpenAI request body must be valid JSON");
+            assert_eq!(
+                body.get("model").and_then(Value::as_str),
+                Some("refreshed-model"),
+                "the first prompt on a rehydrated session must dispatch the \
+                 committed model; `old-model` here means it entered the turn on \
+                 the provisional binding before reconciliation published"
+            );
+        }
     }
 
     /// The post-insert reconciliation must publish the committed profile

@@ -81,6 +81,24 @@ pub struct RpcSession {
     /// and pass it to `SessionStore::apply_model_provider` so stale work
     /// cannot mutate a successor installed under the same session ID.
     pub generation: u64,
+    /// Set when this session was published with a provider/resolver binding
+    /// whose config generation is not yet confirmed — today, an ACP
+    /// rehydration that lost the race for `config_write_lock` and was
+    /// therefore excluded from an in-flight refresh transaction's
+    /// `list_ids()` snapshot.
+    ///
+    /// Between insertion and reconciliation the session is live but its
+    /// binding is provisional: dispatch would use the construction-time
+    /// provider while canonical config has already moved on. Consumers that
+    /// must observe one coherent generation (`session/prompt`,
+    /// `session/configure`) await this before proceeding; the reconciliation
+    /// task clears it and wakes them once it has published, or abandoned, the
+    /// committed binding.
+    ///
+    /// `None` is the steady state — a session inserted with a confirmed
+    /// binding never carries one, so the common path costs one `Option`
+    /// check.
+    pending_generation: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl RpcSession {
@@ -103,7 +121,17 @@ impl RpcSession {
             chat_mode,
             owner_tui_id: None,
             generation: 0,
+            pending_generation: None,
         }
+    }
+
+    /// Mark this session as published with a provisional binding. The
+    /// returned notifier is handed to the reconciliation task, which calls
+    /// `SessionStore::clear_pending_generation` once it has published (or
+    /// abandoned) the committed binding.
+    pub fn with_pending_generation(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.pending_generation = Some(notify);
+        self
     }
 
     /// Bind this session to a TUI owner.
@@ -214,6 +242,73 @@ impl SessionStore {
     #[cfg(test)]
     pub(crate) fn model_provider_update_waiting(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.model_provider_update_waiting)
+    }
+
+    /// Await confirmation of a session's provisional binding, waiting at most
+    /// `timeout`.
+    ///
+    /// Returns immediately for the steady state — a session with no pending
+    /// generation, which is every session except one being reconciled after a
+    /// contended ACP rehydration. Otherwise it parks on the notifier the
+    /// reconciliation task will fire, so the caller observes one coherent
+    /// provider/resolver/limits generation instead of dispatching through the
+    /// construction-time binding while canonical config has moved on.
+    ///
+    /// A missing session is `Ok(())`, not an error: absence is the caller's
+    /// own lookup to report, and every call site here already handles it.
+    /// `Err(Timeout)` should surface as a retryable busy error rather than
+    /// proceeding on the provisional binding.
+    pub(crate) async fn await_pending_generation(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), WaitForProviderUpdateError> {
+        let Some(pending) = self
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .and_then(|session| session.pending_generation.clone())
+        else {
+            return Ok(());
+        };
+        // Register interest BEFORE re-checking, so a reconciliation that
+        // completes between the lookup above and the wait below cannot leave
+        // this caller parked on a notifier nobody will fire again.
+        let notified = pending.notified();
+        tokio::pin!(notified);
+        if self
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .is_none_or(|session| session.pending_generation.is_none())
+        {
+            return Ok(());
+        }
+        tokio::time::timeout(timeout, notified)
+            .await
+            .map_err(|_| WaitForProviderUpdateError::Timeout)
+    }
+
+    /// Confirm a session's binding and wake everyone awaiting it.
+    ///
+    /// Called by the reconciliation task on BOTH outcomes — a published
+    /// committed binding and an abandoned repair. An abandoned repair leaves
+    /// the session on its last known-good construction-time binding, which is
+    /// strictly better than parking prompts forever on a convergence that will
+    /// never arrive.
+    pub(crate) async fn clear_pending_generation(&self, id: &str) {
+        let notify = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get_mut(id) {
+                Some(session) => session.pending_generation.take(),
+                None => None,
+            }
+        };
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
     }
 
     /// Lock the provider generation for a prompt, waiting at most `timeout`.
