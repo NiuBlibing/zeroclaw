@@ -32,7 +32,11 @@ Persistence is best-effort rather than a transactional audit guarantee. The Obse
 
 Archives sit next to the active file and keep its extension, with a sortable
 UTC stamp inserted before that extension. For example, `runtime-trace.jsonl`
-rotates to `runtime-trace.20260624-031500.jsonl`.
+rotates to `runtime-trace.0000000001-20260624-031500.jsonl`. The sequence
+prefix (`0000000001`) is written at rotation time and determines reader-side
+ordering; it never repeats across restarts. Archives written before sequence
+numbering existed keep their old shape (`runtime-trace.20260624-031500.jsonl`)
+and sort before every numbered archive.
 
 The dashboard and `GET /api/logs` now read the active file **and** all retained
 archives as one logical event stream, merging them oldest-archive-first and
