@@ -26,6 +26,16 @@ const MAX_DECODED_IMAGE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
 /// when many images are present in history.
 const AGGREGATE_DECODE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Slack added to the base64 length ceiling in [`normalize_data_uri`].
+///
+/// The ceiling is derived from the configured decoded limit, so it must never
+/// reject a payload that `validate_size` would have accepted. Base64 rounds up
+/// to a 4-character group and adds up to two padding characters, and a data URI
+/// may carry incidental whitespace inside the payload. A small fixed allowance
+/// absorbs all of that; the decoded size is still checked exactly afterwards, so
+/// this only affects which of the two errors an over-limit payload reports.
+const BASE64_LENGTH_SLACK_BYTES: usize = 64;
+
 // Counts full decodes performed by `validate_image_content`.
 //
 // Budget exhaustion is observable two ways — an image can be skipped because it
@@ -1278,6 +1288,34 @@ async fn normalize_data_uri(
 
     validate_mime(source, &mime)?;
 
+    // Reject on the *encoded* length before decoding.
+    //
+    // `STANDARD.decode` allocates its output buffer from the length of the
+    // input it is given, so decoding first and size-checking afterwards lets an
+    // oversized marker allocate before any limit applies. This runs on the
+    // async preparation task, outside the `spawn_blocking` boundary that
+    // isolates pixel decoding, so it is the one allocation on this path that
+    // nothing else bounds.
+    //
+    // Base64 encodes 3 bytes as 4 characters, so `max_bytes` decoded needs at
+    // most `ceil(max_bytes / 3) * 4` characters. Padding and any embedded
+    // whitespace are covered by rounding up, which keeps the ceiling generous
+    // enough never to reject a payload that would have passed `validate_size`.
+    let max_encoded_len = max_bytes
+        .div_ceil(3)
+        .saturating_mul(4)
+        .saturating_add(BASE64_LENGTH_SLACK_BYTES);
+    if payload.len() > max_encoded_len {
+        // Report the ceiling rather than a decoded size: nothing was decoded,
+        // so there is no decoded size to report.
+        return Err(MultimodalError::ImageTooLarge {
+            input: source.to_string(),
+            size_bytes: payload.len(),
+            max_bytes: max_encoded_len,
+        }
+        .into());
+    }
+
     let decoded = STANDARD
         .decode(payload)
         .map_err(|error| MultimodalError::InvalidMarker {
@@ -1992,12 +2030,22 @@ fn validate_animation_frames(
         let frame = match frame {
             Ok(frame) => frame,
             Err(error) => {
-                // Animation decoders normally allocate or reuse a canvas before
-                // discovering corrupt frame data. Charge one attempted canvas
-                // in addition to the frames that completed, but do not close
-                // the entire shared budget unless the decoder identified its
-                // allocation limit as the cause.
-                let attempted = total.saturating_add(projected_allocation);
+                // Charge what the decoder actually did before failing.
+                //
+                // `cumulative` already holds every completed frame's output plus
+                // its recurring scratch, and `persistent_scratch` the state held
+                // across them; using `total` here would drop the recurring term
+                // for every valid frame that preceded the corrupt one, so a long
+                // valid prefix followed by a bad frame would leave the budget
+                // reporting headroom the decoder had already spent.
+                //
+                // The failed frame itself also allocated before the error
+                // surfaced — decoders reserve a canvas or frame buffer before
+                // discovering corrupt data — so add one header projection for
+                // that attempt on top of the completed work.
+                let attempted = cumulative
+                    .saturating_add(persistent_scratch)
+                    .saturating_add(projected_allocation);
                 return Err(image_error_failure(
                     source, mime, error, attempted, budget_cap,
                 ));
@@ -2016,7 +2064,9 @@ fn validate_animation_frames(
                     buffer.width(),
                     buffer.height()
                 ),
-                total.saturating_add(projected_allocation),
+                cumulative
+                    .saturating_add(persistent_scratch)
+                    .saturating_add(projected_allocation),
             ));
         }
 
@@ -3035,6 +3085,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_data_uri_is_refused_before_base64_decoding() {
+        // `STANDARD.decode` sizes its output buffer from the input length, so
+        // decoding first and size-checking afterwards lets an oversized marker
+        // allocate before any limit applies — on the async preparation task,
+        // outside the `spawn_blocking` boundary that isolates pixel decoding.
+        //
+        // The encoded-length ceiling must reject the payload before
+        // `STANDARD.decode` is reached, and must not consume any of the shared
+        // decode budget.
+        //
+        // `MultimodalConfig::default()` has `max_image_size_mb = 20`.
+        // `effective_limits()` returns `(max_images, max_image_bytes)`.
+        let cfg = MultimodalConfig::default();
+        let (_, max_bytes) = cfg.effective_limits();
+
+        // Build a base64 payload well above the derived encoded ceiling.
+        let oversized = "A".repeat(max_bytes * 4 + 256);
+        let uri = format!("data:image/png;base64,{oversized}");
+
+        let (result, decodes) = counting_decodes(async {
+            prepare_messages_for_provider(&[ChatMessage::user(uri)], &cfg)
+                .await
+                .expect("provider preparation does not hard-fail on a refused image")
+        })
+        .await;
+
+        assert!(
+            !result.contains_images,
+            "the oversized data URI must be skipped before base64 decoding; got images in output"
+        );
+        assert_eq!(
+            decodes, 0,
+            "no pixel decode must fire when the encoded-length ceiling rejects the payload first"
+        );
+    }
+
+    #[tokio::test]
     async fn validate_image_content_rejects_empty_payload() {
         // Zero-byte files pass `validate_size`, which only has an upper bound.
         let err = validate_image_content("src", "image/png", &[], MAX_DECODED_IMAGE_ALLOC_BYTES)
@@ -3537,6 +3624,49 @@ mod tests {
                 .iter()
                 .map(|message| &message.content)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_frame_valid_prefix_followed_by_corrupt_frame_charges_completed_work() {
+        // When an animation fails mid-iteration the error arm must charge the
+        // work already completed. Using only `total` (returned frame bytes)
+        // dropped the recurring per-frame scratch accumulated for every valid
+        // frame, so the budget kept headroom the decoder had already spent.
+        //
+        // A two-frame fixture cannot catch this — its numbers happen to
+        // overcharge — so this uses a long valid prefix before the corrupt
+        // frame, where the omitted recurring term dominates.
+        const VALID_FRAMES: usize = 5;
+
+        let mut gif = Vec::new();
+        gif.extend_from_slice(b"GIF89a");
+        gif.extend_from_slice(&[1u8, 0, 1, 0]); // 1x1 logical screen
+        gif.extend_from_slice(&[0xF0, 0, 0]); // global color table, 2 entries
+        gif.extend_from_slice(&[0, 0, 0, 255, 255, 255]);
+        for _ in 0..VALID_FRAMES {
+            gif.extend_from_slice(&GIF_IMAGE_DESCRIPTOR_1X1);
+            gif.extend_from_slice(&GIF_VALID_1X1_LZW);
+        }
+        // Corrupt final frame: the sub-block claims more LZW bytes than follow.
+        gif.extend_from_slice(&GIF_IMAGE_DESCRIPTOR_1X1);
+        gif.extend_from_slice(&[0x02, 0x04, 0xAA]);
+
+        // Work genuinely completed before the corrupt frame, under the same
+        // model the success path uses.
+        let completed = VALID_FRAMES as u64 * (4 + GIF_ANIMATION_SCRATCH_MODEL.per_frame)
+            + GIF_ANIMATION_SCRATCH_MODEL.persistent;
+
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        validate_within_budget("prefix.gif", "image/gif", &gif, &mut budget)
+            .await
+            .expect_err("an animation with a corrupt final frame must be refused");
+
+        let charged = AGGREGATE_DECODE_BUDGET_BYTES - budget;
+        assert!(
+            charged >= completed,
+            "a corrupt animation must be charged at least the work its valid prefix completed \
+             ({completed} B for {VALID_FRAMES} frames); only {charged} B was debited"
         );
     }
 
