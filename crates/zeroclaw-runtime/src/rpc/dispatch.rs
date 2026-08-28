@@ -1890,7 +1890,93 @@ impl RpcDispatcher {
         // Release only after the session is published, so a commit that starts
         // next sees it in `list_ids()`. A no-op when the gate was contended and
         // `try_lock` returned `None`; the generation fence covers that case.
+        let try_lock_failed = config_generation_guard.is_none();
         drop(config_generation_guard);
+
+        // Pending-generation reconciliation when the config writer gate was
+        // contended and `try_lock_owned` returned `None`.
+        //
+        // When the gate was available (`try_lock` succeeded), the session was
+        // built from and inserted under the current config generation — any
+        // later route-affecting commit will include this session in its
+        // `list_ids()` snapshot and refresh it under the per-session guard.
+        //
+        // When the gate was contended, a route-affecting `config/set` was
+        // already holding the lock and may have run `list_ids()` before
+        // `sessions.insert` returned. That snapshot excluded this session, so
+        // the commit will not refresh it, and `apply_model_provider`'s
+        // generation fence never fires — there is no old generation to compare
+        // against because the session did not exist yet when the snapshot ran.
+        //
+        // Repair: spawn a task that blocks until the config writer gate is
+        // available (i.e. the in-flight commit has finished), then re-derives
+        // provider/resolver/generation from the now-current live config and
+        // applies them through `apply_model_provider`. The session-identity
+        // generation fence in `apply_model_provider` guards this path against
+        // a further `session/new` or `rehydrate_reaped_session` replacing the
+        // session again before the task runs.
+        //
+        // The spawned task runs asynchronously; the first `session/prompt` on
+        // this session MAY dispatch through the construction-time provider if
+        // it wins the race against the task. That is the same single-turn
+        // partial-generation risk present on all other paths when rehydration
+        // is concurrent with a config commit — limited to one ACP turn for a
+        // session whose prior incarnation was already reaped.
+        if try_lock_failed {
+            let rehydrate_ctx = Arc::clone(&self.ctx);
+            let rehydrate_sid = sid.to_string();
+            let rehydrate_alias = data.agent_alias.clone();
+            zeroclaw_spawn::spawn!(async move {
+                // Acquire the gate (blocking) so we are guaranteed to read a
+                // config that is at least as new as whatever committed while
+                // we were building the agent above.
+                let _gate = Arc::clone(&rehydrate_ctx.config_write_lock)
+                    .lock_owned()
+                    .await;
+                // Capture generation inside the gate so it matches the config
+                // we are about to read.
+                let session_generation =
+                    match rehydrate_ctx.sessions.get_generation(&rehydrate_sid).await {
+                        Some(g) => g,
+                        None => return, // session was removed before we ran
+                    };
+                let config_generation = Arc::new(rehydrate_ctx.config.read().clone());
+                let agent_cfg = config_generation
+                    .resolved_agent_config(&rehydrate_alias)
+                    .or_else(|| config_generation.agent(&rehydrate_alias).cloned());
+                let resolved = agent_cfg.as_ref().and_then(|cfg| {
+                    crate::agent::agent::build_session_model_provider(
+                        &config_generation,
+                        cfg.model_provider.as_str(),
+                        None,
+                    )
+                    .ok()
+                    .map(|tuple| (cfg.clone(), tuple))
+                });
+                let Some((cfg, (provider, provider_name, model, resolver))) = resolved else {
+                    return; // unresolvable alias; leave construction-time box
+                };
+                let dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
+                    &cfg,
+                    provider.as_ref(),
+                    &model,
+                );
+                rehydrate_ctx
+                    .sessions
+                    .apply_model_provider(
+                        &rehydrate_sid,
+                        session_generation,
+                        provider,
+                        provider_name,
+                        model,
+                        resolver,
+                        dispatcher,
+                        config_generation,
+                        None, // temperature unchanged; profile applies at turn entry
+                    )
+                    .await;
+            });
+        }
 
         let seed_event = self
             .ctx
@@ -3376,7 +3462,7 @@ impl RpcDispatcher {
             // for the whole publication, still under this session's guard.
             if let Some(new_ref) = override_migration {
                 ctx.sessions
-                    .migrate_model_provider_override(&session_id, new_ref)
+                    .migrate_model_provider_override(&session_id, session_generation, new_ref)
                     .await;
             }
             ctx.sessions

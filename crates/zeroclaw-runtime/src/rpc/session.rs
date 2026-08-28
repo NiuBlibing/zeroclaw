@@ -498,14 +498,28 @@ impl SessionStore {
     /// back to compatibility values or fail while rebuilding the old
     /// reference. Called from the live-refresh publication step while that
     /// session's `model_provider_update` guard is held.
-    pub async fn migrate_model_provider_override(&self, id: &str, new_ref: String) -> bool {
+    ///
+    /// `generation` must match the session's current generation (same
+    /// contract as `apply_model_provider`). A same-ID successor inserted
+    /// by `session/new` or ACP rehydration while this refresh was in flight
+    /// would have a different generation, and the migration must be rejected
+    /// for it: the successor never requested an alias rename, and a stale
+    /// refresh must not write its override. Returns `true` when the migration
+    /// applied, `false` when the session was absent or its generation did not
+    /// match.
+    pub async fn migrate_model_provider_override(
+        &self,
+        id: &str,
+        generation: u64,
+        new_ref: String,
+    ) -> bool {
         let mut sessions = self.sessions.lock().await;
         match sessions.get_mut(id) {
-            Some(session) => {
+            Some(session) if session.generation == generation => {
                 session.overrides.model_provider = Some(new_ref);
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
