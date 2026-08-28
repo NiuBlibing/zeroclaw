@@ -1933,6 +1933,16 @@ impl RpcDispatcher {
                 let _gate = Arc::clone(&rehydrate_ctx.config_write_lock)
                     .lock_owned()
                     .await;
+                // Take the per-session ordering boundary for the whole
+                // publication, the same guard `prepare_live_sessions_refresh`
+                // holds. Without it this repair is the only live-provider
+                // writer in the file that does not serialize with
+                // `session/configure`, so the two could interleave field by
+                // field instead of composing as one transition.
+                let _session_guard = rehydrate_ctx
+                    .sessions
+                    .lock_model_provider_update(&rehydrate_sid)
+                    .await;
                 // Capture generation inside the gate so it matches the config
                 // we are about to read.
                 let session_generation =
@@ -1951,16 +1961,59 @@ impl RpcDispatcher {
                         None,
                     )
                     .ok()
-                    .map(|tuple| (cfg.clone(), tuple))
+                    .map(|tuple| (cfg.model_provider.clone(), cfg.clone(), tuple))
                 });
-                let Some((cfg, (provider, provider_name, model, resolver))) = resolved else {
-                    return; // unresolvable alias; leave construction-time box
+                let Some((model_provider_ref, cfg, (provider, provider_name, model, resolver))) =
+                    resolved
+                else {
+                    // The alias is unresolvable against the committed config.
+                    // Leave the construction-time box in place — it is the last
+                    // known-good binding — and record it, because this session
+                    // will not converge until a later refresh includes it.
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_id": rehydrate_sid,
+                                "agent_alias": rehydrate_alias,
+                            })),
+                        "rehydrated session: post-insert reconciliation could not resolve the \
+                         agent's provider against the committed config generation; the session \
+                         stays on its construction-time provider"
+                    );
+                    return;
                 };
                 let dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
                     &cfg,
                     provider.as_ref(),
                     &model,
                 );
+                // Temperature belongs to the same state transition as the
+                // provider box. Resolve it exactly as the ordinary refresh
+                // path does (`overrides.temperature.or(provider_temperature)`)
+                // and publish it here: nothing re-derives temperature at turn
+                // entry — neither `sync_config_generation` nor
+                // `try_apply_model_switch` touches `Agent::temperature` — so
+                // passing `None` would leave a repaired session on the
+                // pre-commit profile temperature while its provider, resolver,
+                // and limits are all on the committed generation.
+                let provider_temperature = model_provider_ref.split_once('.').and_then(
+                    |(provider_type, provider_alias)| {
+                        config_generation
+                            .providers
+                            .models
+                            .find(provider_type, provider_alias)
+                            .and_then(|entry| entry.temperature)
+                    },
+                );
+                let temperature = rehydrate_ctx
+                    .sessions
+                    .get_overrides(&rehydrate_sid)
+                    .await
+                    .and_then(|overrides| overrides.temperature)
+                    .or(provider_temperature);
                 rehydrate_ctx
                     .sessions
                     .apply_model_provider(
@@ -1972,7 +2025,7 @@ impl RpcDispatcher {
                         resolver,
                         dispatcher,
                         config_generation,
-                        None, // temperature unchanged; profile applies at turn entry
+                        Some(temperature),
                     )
                     .await;
             });
@@ -12647,6 +12700,84 @@ mod tests {
             guard.temperature_for_test(),
             Some(0.2),
             "rehydrated successor temperature must not be overwritten"
+        );
+    }
+
+    /// The post-insert reconciliation must publish the committed profile
+    /// temperature alongside the provider it repairs.
+    ///
+    /// Nothing re-derives temperature at turn entry: `sync_config_generation`
+    /// updates only the config-generation cell, and `try_apply_model_switch`
+    /// is a no-op unless the resolved route actually changes. So a repair that
+    /// passes `temperature: None` fixes the provider/resolver/limits while
+    /// silently leaving the session on the pre-commit profile temperature —
+    /// an asymmetry with the ordinary refresh path, which resolves
+    /// `overrides.temperature.or(provider_temperature)` and publishes it in the
+    /// same transition.
+    #[tokio::test]
+    async fn acp_rehydration_reconciliation_publishes_committed_temperature() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_model_refresh_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let after_snapshot = Arc::new(tokio::sync::Notify::new());
+        let (dispatcher, sessions, acp_store) = make_persistence_test_dispatcher_with_snapshot_hook(
+            config,
+            &data_dir,
+            Arc::clone(&after_snapshot),
+        );
+        let dispatcher = Arc::new(dispatcher);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.2),
+            "harness invariant: the session starts on the profile temperature"
+        );
+
+        let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
+        acp_store
+            .create_session(&session_id, "test-agent", &workspace)
+            .expect("ACP session row must be created");
+        sessions.remove(&session_id).await;
+
+        // Change ONLY the temperature, so the assertion cannot pass by way of
+        // the provider repair.
+        let snapshot_signal = Arc::clone(&after_snapshot);
+        let config_set_dispatcher = Arc::clone(&dispatcher);
+        let config_set = zeroclaw_spawn::spawn!(async move {
+            config_set_dispatcher
+                .handle_config_set(&json!({
+                    "prop": "providers.models.openai.test-provider.temperature",
+                    "value": 0.7
+                }))
+                .await
+        });
+
+        // Rehydrate inside the snapshot window: the session is absent when
+        // `list_ids()` runs, so the refresh never prepares it, and
+        // `try_lock_owned` fails so the Agent is built at the old 0.2.
+        snapshot_signal.notified().await;
+        let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
+        assert!(rehydrated.is_some(), "rehydration must install the session");
+
+        let res = config_set.await.expect("config/set task must complete");
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        // The reconcile task blocks on the writer gate, so it can only run once
+        // the commit released it. Poll for convergence.
+        let mut converged = None;
+        for _ in 0..200 {
+            converged = temperature_for_session(&dispatcher, &session_id).await;
+            if converged == Some(0.7) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            converged,
+            Some(0.7),
+            "the repair must publish the committed profile temperature; leaving it \
+             at the construction-time 0.2 strands the session on a value nothing \
+             else re-derives"
         );
     }
 

@@ -12454,6 +12454,240 @@ model_provider = "custom.primary"
         );
     }
 
+    /// A same-alias `fallback_models` failover must re-key the context limits
+    /// to the model that actually served.
+    ///
+    /// `push_pinned_entries` builds the primary and every `fallback_models`
+    /// entry under ONE provider alias (one shared `cooldown_key`), differing
+    /// only in the pinned model. `AcceptedRoute.provider_ref` is that shared
+    /// key, so an alias-only comparison reports "route unchanged" even though a
+    /// different model answered. The limits, the terminal snapshot, and the
+    /// recovery arithmetic would then all keep the primary model's capacity.
+    ///
+    /// Observable difference: `context_window` describes only the model
+    /// configured on the alias, so the fallback model resolves to the explicit
+    /// compatibility fallback rather than borrowing the primary's 200k. Before
+    /// the fix the terminal frame reported the primary's 200,000-token window
+    /// while naming `small-model`.
+    #[tokio::test]
+    async fn served_limits_follow_a_same_alias_pinned_model_fallback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // One alias. `model` pins the primary and carries the only configured
+        // capacity; `fallback_models` adds a second pinned entry under the very
+        // same alias.
+        let config: zeroclaw_config::schema::Config = toml::from_str(
+            r#"
+schema_version = 3
+[providers.models.custom.only]
+model = "large-model"
+context_window = 200000
+fallback_models = ["small-model"]
+[agents.coder]
+enabled = true
+model_provider = "custom.only"
+"#,
+        )
+        .expect("config parses");
+
+        // Fails for the primary pinned model, answers for the fallback one.
+        // Streaming, because that is the path that records an accepted route.
+        struct PinnedByModel {
+            small_calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl ModelProvider for PinnedByModel {
+            async fn chat_with_system(
+                &self,
+                _s: Option<&str>,
+                _m: &str,
+                _model: &str,
+                _t: Option<f64>,
+            ) -> Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                model: &str,
+                _t: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                if model == "small-model" {
+                    self.small_calls.fetch_add(1, Ordering::SeqCst);
+                    return Ok(zeroclaw_providers::ChatResponse {
+                        text: Some("fallback model answered".to_string()),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                        reasoning_content: None,
+                    });
+                }
+                anyhow::bail!("large-model is down")
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat(
+                &self,
+                _request: zeroclaw_providers::ChatRequest<'_>,
+                model: &str,
+                _t: Option<f64>,
+                _options: zeroclaw_providers::traits::StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+            > {
+                if model == "small-model" {
+                    self.small_calls.fetch_add(1, Ordering::SeqCst);
+                    return Box::pin(futures_util::stream::iter(vec![
+                        Ok(zeroclaw_api::model_provider::StreamEvent::TextDelta(
+                            zeroclaw_api::model_provider::StreamChunk {
+                                delta: "fallback model answered".to_string(),
+                                reasoning: None,
+                                is_final: false,
+                                token_count: 0,
+                            },
+                        )),
+                        Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+                    ]));
+                }
+                Box::pin(futures_util::stream::iter(vec![Err(
+                    zeroclaw_api::model_provider::StreamError::ModelProvider(
+                        "large-model is down".to_string(),
+                    ),
+                )]))
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PinnedByModel {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "only"
+            }
+        }
+
+        let small_calls = Arc::new(AtomicUsize::new(0));
+        let inner: Arc<dyn ModelProvider> = Arc::new(PinnedByModel {
+            small_calls: Arc::clone(&small_calls),
+        });
+        // Mirror `push_pinned_entries`: both entries share ONE cooldown key
+        // (the alias) and differ only in the pinned model.
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new_pinned_for_test(
+            "custom.only",
+            vec![
+                ("custom.only", "only", "large-model", Arc::clone(&inner)),
+                ("custom.only", "only", "small-model", Arc::clone(&inner)),
+            ],
+            0,
+            1,
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, temp.path(), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(reliable))
+            .tools(vec![])
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .memory(mem)
+            .observer(observer)
+            .workspace_dir(temp.path().to_path_buf())
+            .agent_alias("coder".into())
+            .model_provider_name("custom.only".into())
+            .model_name("large-model".into())
+            .provider_switch_config(ProviderSwitchConfig {
+                config: Some(Arc::new(config.clone())),
+                live: None,
+            })
+            .build()
+            .expect("agent builder should succeed with valid config");
+        let limit_config = Arc::new(config);
+        agent.context_limits_resolver = Some(Arc::new(move |provider_ref, model| {
+            limit_config.resolved_context_limits_for_route("coder", provider_ref, model)
+        }));
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", event_tx, None, None)
+            .await
+            .expect("the pinned fallback model must carry the turn");
+
+        assert_eq!(
+            small_calls.load(Ordering::SeqCst),
+            1,
+            "the small-model entry must have served the call"
+        );
+
+        // The alias is unchanged by construction — that is the whole point.
+        assert_eq!(
+            outcome.provider_name, "custom.only",
+            "harness invariant: both pinned entries share one alias, so an \
+             alias-only comparison cannot detect this failover"
+        );
+        assert_eq!(
+            outcome.model, "small-model",
+            "the outcome must attribute the pinned model that actually answered"
+        );
+
+        // `context_window` describes only `large-model`, so the served
+        // `small-model` route resolves to the explicit compatibility fallback.
+        // Before the fix this was the primary's 200_000.
+        let final_limits = outcome
+            .final_context_limits
+            .expect("a served call must publish final limits");
+        assert_ne!(
+            final_limits.model_context_window, 200_000,
+            "the primary's capacity must not be reported for a different served model"
+        );
+        assert_eq!(
+            final_limits.model_context_window_source,
+            zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+            "an unconfigured served model must be explicit compatibility fallback, \
+             never borrowed metadata from the alias's configured model"
+        );
+        assert_eq!(
+            final_limits.configured_model_context_window(),
+            None,
+            "unknown capacity must be omitted from the wire rather than presented \
+             as model truth"
+        );
+
+        // The terminal frame consumers read must agree with the outcome.
+        let mut terminal = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                context_token_budget,
+                model_context_window,
+                ..
+            } = ev
+            {
+                terminal = Some((context_token_budget, model_context_window));
+            }
+        }
+        let (budget, window) = terminal.expect("the usage-less fallback must publish a snapshot");
+        assert_eq!(
+            window, None,
+            "the terminal frame must omit capacity for the served model rather \
+             than carrying the primary's window"
+        );
+        assert_eq!(
+            budget,
+            Some(final_limits.context_token_budget as u64),
+            "the terminal budget must agree with the re-keyed served limits"
+        );
+    }
+
     fn build_test_agent(
         initial_provider_name: &str,
         initial_model_name: &str,

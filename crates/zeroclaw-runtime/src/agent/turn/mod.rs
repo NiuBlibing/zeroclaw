@@ -1027,20 +1027,37 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // the provider layer must not know about — so the pair is re-resolved
         // here instead of being threaded through dispatch.
         //
-        // Gated on the ALIAS changing, not on `accepted_route` merely being
-        // present. A direct call through a router reports an accepted route
-        // whose `model()` is the dispatch-facing wire selector (it can still
-        // carry a `hint:` prefix), which is neither an attribution name nor a
-        // valid resolver key; that case names the same alias we dispatched to,
-        // so it stays out of this branch and the pre-dispatch pair stands.
-        let served_route_changed = served_provider != ctx.provider_name;
+        // Gated on the served ROUTE differing from the dispatched one, in
+        // either component. Two distinct fallback shapes reach here:
+        //
+        //   - `fallback` (cross-alias): the accepted route names a different
+        //     configured alias, so the alias comparison catches it.
+        //   - `fallback_models` (same-alias): `push_pinned_entries` builds the
+        //     primary and every fallback under ONE alias, differing only in the
+        //     pinned model, and `served_model()` reports that pinned model. The
+        //     alias is unchanged, so only the model comparison catches it.
+        //
+        // The model comparison ignores a `hint:` selector. A direct call
+        // through a router reports an accepted route whose `model()` is the
+        // dispatch-facing wire selector, which is neither an attribution name
+        // nor a valid resolver key; comparing it raw would fire on every hinted
+        // call even though the route never changed. Pinned-fallback models from
+        // the reliable layer are never `hint:`-prefixed, so stripping the
+        // prefix keeps this branch closed for hint routing while leaving it
+        // open for a real pinned-model fallback.
+        let served_model_key = served_model
+            .strip_prefix("hint:")
+            .map(|_| active_model)
+            .unwrap_or(served_model.as_str());
+        let served_route_changed =
+            served_provider != ctx.provider_name || served_model_key != active_model;
         let served_context_limits = if served_route_changed {
             resolve_context_limits_for_call(
                 context_limits_resolver.as_ref(),
                 config,
                 agent_alias,
                 &served_provider,
-                &served_model,
+                served_model_key,
                 active_context_limits,
             )
         } else {
@@ -1258,7 +1275,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         {
             if served_route_changed {
                 served.provider_name = served_provider.clone();
-                served.model = served_model.clone();
+                // The normalized key, not the raw accepted model: the terminal
+                // frame is attribution, and a `hint:` wire selector is not an
+                // attribution name.
+                served.model = served_model_key.to_string();
                 served.context_limits = served_context_limits;
             }
             served.reported_usage = ctx.event_tx.is_some() && response_usage.is_some();
