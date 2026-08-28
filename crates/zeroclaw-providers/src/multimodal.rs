@@ -52,12 +52,25 @@ const BASE64_LENGTH_SLACK_BYTES: usize = 64;
 #[cfg(test)]
 tokio::task_local! {
     static DECODE_CALLS: std::sync::atomic::AtomicUsize;
+    /// Counts calls to `STANDARD.decode` inside `normalize_data_uri` — a seam
+    /// that is distinct from the pixel-decoder counter. The encoded-length
+    /// ceiling must fire before this is incremented; if it does not, any
+    /// oversized input would arrive here and be charged to this counter.
+    static BASE64_DECODE_CALLS: std::sync::atomic::AtomicUsize;
 }
 
 /// Records one decode against the ambient counter, if a test installed one.
 #[cfg(test)]
 fn record_decode_call() {
     let _ = DECODE_CALLS.try_with(|calls| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+/// Records one base64-decode call against the ambient counter, if installed.
+#[cfg(test)]
+fn record_base64_decode_call() {
+    let _ = BASE64_DECODE_CALLS.try_with(|calls| {
         calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
 }
@@ -1306,15 +1319,20 @@ async fn normalize_data_uri(
         .saturating_mul(4)
         .saturating_add(BASE64_LENGTH_SLACK_BYTES);
     if payload.len() > max_encoded_len {
-        // Report the ceiling rather than a decoded size: nothing was decoded,
-        // so there is no decoded size to report.
+        // Report the ceiling in terms of the encoded length, not the payload
+        // itself. Copying the attacker-controlled source into the error message
+        // would allocate a full second copy of the oversized input; using a
+        // category label keeps the rejection bounded.
         return Err(MultimodalError::ImageTooLarge {
-            input: source.to_string(),
+            input: "[data URI]".to_string(),
             size_bytes: payload.len(),
             max_bytes: max_encoded_len,
         }
         .into());
     }
+
+    #[cfg(test)]
+    record_base64_decode_call();
 
     let decoded = STANDARD
         .decode(payload)
@@ -3091,20 +3109,26 @@ mod tests {
         // allocate before any limit applies — on the async preparation task,
         // outside the `spawn_blocking` boundary that isolates pixel decoding.
         //
-        // The encoded-length ceiling must reject the payload before
-        // `STANDARD.decode` is reached, and must not consume any of the shared
-        // decode budget.
-        //
-        // `MultimodalConfig::default()` has `max_image_size_mb = 20`.
-        // `effective_limits()` returns `(max_images, max_image_bytes)`.
+        // The assertion here is deliberately on the *base64* seam, not the
+        // pixel-decode counter. An oversized data URI never reaches the pixel
+        // decoder either way: the old ordering decoded the base64, then failed
+        // in `validate_size`, so a `DECODE_CALLS == 0` assertion holds both
+        // before and after this fix and proves nothing. `BASE64_DECODE_CALLS`
+        // is incremented immediately before `STANDARD.decode`, so it is zero
+        // only if the encoded-length ceiling refused the payload first.
+        // `effective_limits()` returns `(max_images, max_image_size_mb)` — the
+        // second value is MEGABYTES, not bytes.
         let cfg = MultimodalConfig::default();
-        let (_, max_bytes) = cfg.effective_limits();
+        let (_, max_mb) = cfg.effective_limits();
+        let max_bytes = max_mb * 1024 * 1024;
 
-        // Build a base64 payload well above the derived encoded ceiling.
-        let oversized = "A".repeat(max_bytes * 4 + 256);
-        let uri = format!("data:image/png;base64,{oversized}");
+        // Comfortably above `ceil(max_bytes / 3) * 4 + slack`. All-`A` is valid
+        // base64, so the old path would have decoded it successfully and only
+        // then failed the size check — exactly the allocation being prevented.
+        let oversized = "A".repeat(max_bytes / 3 * 4 + 4096);
+        let uri = format!("[IMAGE:data:image/png;base64,{oversized}]");
 
-        let (result, decodes) = counting_decodes(async {
+        let (result, base64_decodes) = counting_base64_decodes(async {
             prepare_messages_for_provider(&[ChatMessage::user(uri)], &cfg)
                 .await
                 .expect("provider preparation does not hard-fail on a refused image")
@@ -3113,14 +3137,34 @@ mod tests {
 
         assert!(
             !result.contains_images,
-            "the oversized data URI must be skipped before base64 decoding; got images in output"
+            "the oversized data URI must be skipped; it reached the prepared payload instead"
         );
         assert_eq!(
-            decodes, 0,
-            "no pixel decode must fire when the encoded-length ceiling rejects the payload first"
+            base64_decodes, 0,
+            "the encoded-length ceiling must refuse the payload before `STANDARD.decode` runs"
+        );
+
+        // A payload inside the ceiling must still decode, so the guard is not
+        // simply rejecting everything.
+        let valid_uri = format!(
+            "[IMAGE:data:image/png;base64,{}]",
+            STANDARD.encode(valid_png())
+        );
+        let (ok_result, ok_base64_decodes) = counting_base64_decodes(async {
+            prepare_messages_for_provider(&[ChatMessage::user(valid_uri)], &cfg)
+                .await
+                .expect("a within-ceiling data URI is accepted")
+        })
+        .await;
+        assert!(
+            ok_result.contains_images,
+            "a data URI within the ceiling must still reach the provider"
+        );
+        assert_eq!(
+            ok_base64_decodes, 1,
+            "the within-ceiling payload must actually be base64-decoded"
         );
     }
-
     #[tokio::test]
     async fn validate_image_content_rejects_empty_payload() {
         // Zero-byte files pass `validate_size`, which only has an upper bound.
@@ -3343,6 +3387,29 @@ mod tests {
                 let value = body.await;
                 let count =
                     DECODE_CALLS.with(|calls| calls.load(std::sync::atomic::Ordering::Relaxed));
+                (value, count)
+            })
+            .await
+    }
+
+    /// Runs `body` with a fresh [`BASE64_DECODE_CALLS`] counter scoped to it,
+    /// and returns `(body's value, base64 decodes observed)`.
+    ///
+    /// Distinct from [`counting_decodes`]: that counter only observes the
+    /// *pixel* decoder, which an oversized data URI never reaches whether it is
+    /// rejected before or after `STANDARD.decode`. This one observes the base64
+    /// decode itself, which is the allocation the encoded-length ceiling exists
+    /// to prevent.
+    async fn counting_base64_decodes<F, T>(body: F) -> (T, usize)
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        BASE64_DECODE_CALLS
+            .scope(counter, async move {
+                let value = body.await;
+                let count = BASE64_DECODE_CALLS
+                    .with(|calls| calls.load(std::sync::atomic::Ordering::Relaxed));
                 (value, count)
             })
             .await
