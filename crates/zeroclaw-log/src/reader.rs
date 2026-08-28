@@ -89,16 +89,14 @@ impl SegmentCursor {
         if let Some(rest) = s.strip_prefix("active:") {
             // rest is either "<off>" or "<off>:<anchor_id>"
             return match rest.split_once(':') {
-                Some((off_str, anchor)) if !anchor.is_empty() => Some(Self {
+                // An explicit trailing colon with no anchor (`active:10:`) is
+                // malformed. Rejecting it rather than normalising to
+                // `active:10` keeps a client-side construction bug visible.
+                Some((_, "")) => None,
+                Some((off_str, anchor)) => Some(Self {
                     kind: CursorKind::Active {
                         off: off_str.parse().ok()?,
                         anchor_id: Some(anchor.to_owned()),
-                    },
-                }),
-                Some((off_str, _)) => Some(Self {
-                    kind: CursorKind::Active {
-                        off: off_str.parse().ok()?,
-                        anchor_id: None,
                     },
                 }),
                 None => Some(Self {
@@ -840,47 +838,17 @@ fn find_anchor_offset(seg: &SegmentMeta, anchor_id: &str) -> Option<u64> {
 /// the sequence numbers in archive names, so it can never be scrambled, and the
 /// worst case is that one rotation's worth of events is first visible on the
 /// next request.
+/// Scan `segs` up to and including `cursor_idx`, stopping at `cursor_off`
+/// bytes inside that segment. Returns the assembled `LogPage`.
 #[allow(deprecated)]
-pub fn query_log_page(
-    active: &Path,
-    reads_archives: bool,
+fn do_scan(
+    segs: &[SegmentMeta],
     filter: &LogFilter,
+    needle: Option<&str>,
     limit: usize,
-    segment_cursor: Option<&SegmentCursor>,
+    cursor_idx: usize,
+    cursor_off: Option<u64>,
 ) -> Result<LogPage> {
-    let limit = limit.clamp(1, 10_000);
-    let needle = filter.q.as_deref().map(|s| s.to_ascii_lowercase());
-    let segs = enumerate_segment_metas(active, reads_archives)?;
-
-    // Where to stop, as an index into `segs` plus a byte cap inside that
-    // segment. Segments newer than the cursor are skipped entirely.
-    let (cursor_idx, cursor_off) = match segment_cursor {
-        Some(cursor) => match resolve_cursor(&segs, cursor) {
-            Some((idx, off)) => (idx, Some(off)),
-            // The cursor addresses history that no longer exists. Returning an
-            // empty page with `at_end` keeps a paging client where it is,
-            // rather than silently restarting it at the newest events.
-            None => {
-                return Ok(LogPage {
-                    events: Vec::new(),
-                    next_cursor: None,
-                    next_cursor_line_offset: None,
-                    next_segment_cursor: None,
-                    at_end: true,
-                });
-            }
-        },
-        // No segment cursor: honour the legacy byte offset against the active
-        // file, otherwise scan the whole stream.
-        None => match (
-            filter.until_line_offset,
-            segs.iter().position(|s| s.is_active),
-        ) {
-            (Some(off), Some(idx)) => (idx, Some(off)),
-            _ => (segs.len().saturating_sub(1), None),
-        },
-    };
-
     let mut window: VecDeque<(LogEvent, SegmentRef, u64)> = VecDeque::with_capacity(limit + 1);
     let mut dropped_older = false;
 
@@ -892,7 +860,7 @@ pub fn query_log_page(
         scan_segment(
             seg,
             filter,
-            needle.as_deref(),
+            needle,
             limit,
             until_off,
             &mut window,
@@ -902,6 +870,10 @@ pub fn query_log_page(
 
     // The cursor for the next page addresses the oldest event on this one.
     let oldest = window.front();
+    // Captured before `window` is consumed: a legacy archive has no sequence
+    // number, so the page boundary it produces cannot be addressed by any
+    // cursor. `at_end` below uses this to avoid promising a resumable walk.
+    let window_front_was_legacy_archive = matches!(oldest, Some((_, SegmentRef::Archive(None), _)));
     let next_segment_cursor = oldest.and_then(|(evt, seg_ref, off)| match seg_ref {
         SegmentRef::Active => Some(
             SegmentCursor {
@@ -940,7 +912,16 @@ pub fn query_log_page(
     // older match can exist is if the sliding window evicted one. Hitting the
     // cursor mid-segment truncates that segment's *newer* tail, which says
     // nothing about older events and deliberately does not feed this decision.
-    let at_end = !dropped_older;
+    //
+    // One exception: when the oldest event on this page came from a legacy
+    // archive, no stable cursor can address it (those names carry no sequence
+    // number), so `next_segment_cursor` is `None`. Reporting `at_end: false`
+    // there would tell the client to keep paging with a token that cannot
+    // resume deterministically, and the deprecated timestamp/id fallback can
+    // skip same-timestamp events. Reporting the end of the walk is the honest
+    // answer: pagination genuinely cannot continue past this boundary.
+    let unaddressable_boundary = window_front_was_legacy_archive && next_segment_cursor.is_none();
+    let at_end = !dropped_older || unaddressable_boundary;
 
     Ok(LogPage {
         events,
@@ -949,6 +930,107 @@ pub fn query_log_page(
         next_segment_cursor,
         at_end,
     })
+}
+
+/// Resolve a cursor against `segs` and return `(cursor_idx, cursor_off)`.
+/// Returns `None` when the cursor addresses history that no longer exists.
+/// Returns `Err` with an at-end empty page sentinel to short-circuit the caller.
+fn resolve_or_at_end(
+    segs: &[SegmentMeta],
+    segment_cursor: Option<&SegmentCursor>,
+    filter: &LogFilter,
+) -> Result<(usize, Option<u64>), LogPage> {
+    match segment_cursor {
+        Some(cursor) => match resolve_cursor(segs, cursor) {
+            Some((idx, off)) => Ok((idx, Some(off))),
+            #[allow(deprecated)]
+            None => Err(LogPage {
+                events: Vec::new(),
+                next_cursor: None,
+                next_cursor_line_offset: None,
+                next_segment_cursor: None,
+                at_end: true,
+            }),
+        },
+        None => match (
+            filter.until_line_offset,
+            segs.iter().position(|s| s.is_active),
+        ) {
+            (Some(off), Some(idx)) => Ok((idx, Some(off))),
+            _ => Ok((segs.len().saturating_sub(1), None)),
+        },
+    }
+}
+
+/// Read one page across the active file and every retained archive.
+///
+/// This is the entry point for `/api/logs` and the `logs/query` RPC. It owns
+/// segment enumeration so callers never hold a list of their own, which could
+/// go stale the moment the writer rotates.
+///
+/// Segments are opened one at a time as the scan reaches them, so a query holds
+/// a single descriptor regardless of how much history is retained. A rotation
+/// landing between enumeration and scan can cause the new active file to be
+/// opened in place of the pre-rotation content. When that happens the page
+/// reports `at_end: true` (the new active file is empty or small) while the
+/// rotated-away content is absent. To defend against a false `at_end`, the
+/// function re-enumerates after the first scan and retries once when new
+/// segments have appeared: the rotated archive is now listed and its events
+/// can be included. A second rotation inside the retry is accepted; at that
+/// point the rotated content will appear on the next request.
+pub fn query_log_page(
+    active: &Path,
+    reads_archives: bool,
+    filter: &LogFilter,
+    limit: usize,
+    segment_cursor: Option<&SegmentCursor>,
+) -> Result<LogPage> {
+    let limit = limit.clamp(1, 10_000);
+    let needle = filter.q.as_deref().map(|s| s.to_ascii_lowercase());
+    let segs = enumerate_segment_metas(active, reads_archives)?;
+
+    let (cursor_idx, cursor_off) = match resolve_or_at_end(&segs, segment_cursor, filter) {
+        Ok(pair) => pair,
+        Err(at_end_page) => return Ok(at_end_page),
+    };
+
+    let page = do_scan(
+        &segs,
+        filter,
+        needle.as_deref(),
+        limit,
+        cursor_idx,
+        cursor_off,
+    )?;
+
+    // Re-enumerate once when the page claims to be complete (`at_end: true`)
+    // and archives are in scope. A false `at_end` is the main symptom of a
+    // rotation between enumeration and scan: the rotated-away active file
+    // becomes a new archive that was absent from the first snapshot.
+    //
+    // If re-enumeration discovers new segments, retry the scan with the fresh
+    // list. One retry is enough to cover one rotation; a second rotation inside
+    // the retry is accepted and will be picked up on the next request.
+    if reads_archives && page.at_end {
+        let segs2 = enumerate_segment_metas(active, reads_archives)?;
+        if segs2.len() > segs.len() {
+            let (cursor_idx2, cursor_off2) = match resolve_or_at_end(&segs2, segment_cursor, filter)
+            {
+                Ok(pair) => pair,
+                Err(at_end_page) => return Ok(at_end_page),
+            };
+            return do_scan(
+                &segs2,
+                filter,
+                needle.as_deref(),
+                limit,
+                cursor_idx2,
+                cursor_off2,
+            );
+        }
+    }
+
+    Ok(page)
 }
 
 /// Find one event by id across the active file and every retained archive,
@@ -2078,6 +2160,128 @@ mod tests {
             vec!["active", "numbered", "legacy"],
             "a legacy archive must read as older than every numbered archive"
         );
+    }
+    #[test]
+    fn cursor_wire_format_round_trips_and_rejects_malformed_tokens() {
+        // Archive cursors are two integers; active cursors carry the fixed
+        // "active:" prefix. Both forms must survive a round trip unchanged so a
+        // client that echoes the token back lands on the same position.
+        let archive = SegmentCursor {
+            kind: CursorKind::Archive { seq: 7, off: 4096 },
+        };
+        assert_eq!(archive.to_wire(), "7:4096");
+        assert_eq!(SegmentCursor::from_wire("7:4096"), Some(archive));
+
+        let active = SegmentCursor {
+            kind: CursorKind::Active {
+                off: 512,
+                anchor_id: Some("evt-1".into()),
+            },
+        };
+        assert_eq!(active.to_wire(), "active:512:evt-1");
+        assert_eq!(SegmentCursor::from_wire("active:512:evt-1"), Some(active));
+
+        // An anchorless active cursor is the legacy shape and stays supported.
+        let bare = SegmentCursor {
+            kind: CursorKind::Active {
+                off: 512,
+                anchor_id: None,
+            },
+        };
+        assert_eq!(bare.to_wire(), "active:512");
+        assert_eq!(SegmentCursor::from_wire("active:512"), Some(bare));
+
+        // A trailing colon with no anchor is malformed. Accepting it would
+        // silently normalise to `active:512` and hide a client-side bug, so the
+        // parser rejects it and the HTTP/RPC layers turn that into an
+        // invalid-parameter response.
+        assert_eq!(SegmentCursor::from_wire("active:512:"), None);
+
+        // Non-numeric offsets are rejected in both forms.
+        assert_eq!(SegmentCursor::from_wire("active:abc"), None);
+        assert_eq!(SegmentCursor::from_wire("active:abc:evt-1"), None);
+        assert_eq!(SegmentCursor::from_wire(""), None);
+    }
+
+    #[test]
+    fn query_returns_all_segments_even_when_active_is_empty_after_rotation() {
+        // After a rotation the active file is empty (or has very few events)
+        // and all pre-rotation events live in a numbered archive. A cursorless
+        // request that sees only the new empty active on the first scan would
+        // report `at_end: true` with zero events while history is sitting in
+        // the archive. This verifies that the archive is included in the result
+        // regardless — which the re-enumeration retry defends against in the
+        // concurrent case and which is the baseline for any non-racy layout.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+        let archive = tmp.path().join("trace.0000000001-20260101-000000.jsonl");
+
+        let mut ev_a = make_event("a", None);
+        ev_a.id = "id-a".into();
+        ev_a.timestamp = "2026-01-01T00:00:00.000Z".into();
+        ev_a.message = Some("archived-a".into());
+        let mut ev_b = make_event("b", None);
+        ev_b.id = "id-b".into();
+        ev_b.timestamp = "2026-01-01T00:00:01.000Z".into();
+        ev_b.message = Some("archived-b".into());
+        write_jsonl(&archive, &[ev_a, ev_b]);
+
+        // Empty active file — the state right after a rotation.
+        std::fs::write(&active, b"").unwrap();
+
+        let page = query_log_page(&active, true, &LogFilter::default(), 10, None).unwrap();
+        let messages: Vec<&str> = page
+            .events
+            .iter()
+            .map(|e| e.message.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            messages,
+            vec!["archived-b", "archived-a"],
+            "archive events must appear even when the active file is empty"
+        );
+        assert!(page.at_end);
+    }
+
+    #[test]
+    fn re_enumeration_detects_new_segment_that_appeared_after_first_snapshot() {
+        // Proves that `enumerate_segment_metas` produces a larger list when a
+        // new numbered archive exists on the second call, which is exactly the
+        // condition the retry uses to decide whether to re-scan. This is a
+        // direct property test of the detection mechanism rather than of the
+        // concurrent race (which cannot be injected deterministically).
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+
+        let mut live = make_event("live", None);
+        live.id = "id-live".into();
+        live.message = Some("active".into());
+        write_jsonl(&active, &[live]);
+
+        let before = enumerate_segment_metas(&active, true).unwrap();
+        assert_eq!(before.len(), 1, "only the active file before rotation");
+
+        // Simulate rotation: the old active becomes a numbered archive and
+        // a fresh active file is written.
+        let archive = tmp.path().join("trace.0000000001-20260101-000000.jsonl");
+        std::fs::rename(&active, &archive).unwrap();
+        let mut new_live = make_event("new", None);
+        new_live.id = "id-new".into();
+        new_live.message = Some("new-active".into());
+        write_jsonl(&active, &[new_live]);
+
+        let after = enumerate_segment_metas(&active, true).unwrap();
+        assert_eq!(
+            after.len(),
+            2,
+            "the archive created by rotation must appear in the second enumeration"
+        );
+        assert!(
+            after.iter().any(|s| s.path == archive),
+            "the rotated archive must be in the new snapshot"
+        );
+        // The retry condition `segs2.len() > segs.len()` holds.
+        assert!(after.len() > before.len());
     }
 
     #[test]
