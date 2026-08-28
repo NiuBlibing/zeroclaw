@@ -3322,6 +3322,12 @@ impl RpcDispatcher {
         scope: &LiveSessionRefreshScope,
     ) -> Result<Vec<PreparedLiveSessionRefresh>, JsonRpcError> {
         let session_ids = ctx.sessions.list_ids().await;
+        // Test-only hook: notify after the snapshot so a regression test can
+        // insert a session between list_ids() and the commit boundary.
+        #[cfg(test)]
+        if let Some(n) = ctx.after_list_ids_notify.as_ref() {
+            n.notify_one();
+        }
         let mut prepared = Vec::new();
         for session_id in session_ids {
             // Capture the generation before acquiring the lock so we can
@@ -8468,6 +8474,40 @@ mod tests {
         (dispatcher, sessions, chat_backend, acp_store)
     }
 
+    /// Like `make_persistence_test_dispatcher`, but arms the test-only
+    /// `after_list_ids_notify` hook so a regression can act inside the refresh
+    /// snapshot window (after `list_ids()`, before the commit releases the
+    /// config writer gate).
+    fn make_persistence_test_dispatcher_with_snapshot_hook(
+        config: zeroclaw_config::schema::Config,
+        data_dir: &std::path::Path,
+        after_list_ids: Arc<tokio::sync::Notify>,
+    ) -> (
+        RpcDispatcher,
+        Arc<crate::rpc::session::SessionStore>,
+        Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(data_dir).unwrap());
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(data_dir).unwrap());
+        let mut ctx_inner = Arc::try_unwrap(RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(Arc::clone(&acp_store)),
+        ))
+        .unwrap_or_else(|_| panic!("freshly constructed ctx must be uniquely owned"));
+        ctx_inner.after_list_ids_notify = Some(after_list_ids);
+        let ctx = Arc::new(ctx_inner);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        (dispatcher, sessions, acp_store)
+    }
+
     #[tokio::test]
     async fn seed_trim_event_is_forwarded_exactly_once() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11589,6 +11629,7 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let ctx = Arc::new(crate::rpc::context::RpcContext {
+            after_list_ids_notify: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -11632,6 +11673,7 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let ctx = Arc::new(crate::rpc::context::RpcContext {
+            after_list_ids_notify: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -11732,6 +11774,7 @@ mod tests {
         runner.register(Box::new(_hook));
 
         let ctx = Arc::new(crate::rpc::context::RpcContext {
+            after_list_ids_notify: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -12604,6 +12647,112 @@ mod tests {
             guard.temperature_for_test(),
             Some(0.2),
             "rehydrated successor temperature must not be overwritten"
+        );
+    }
+
+    /// An ACP session rehydrated INSIDE the refresh snapshot window must still
+    /// converge onto the committed config generation.
+    ///
+    /// This is the gap the session-identity generation fence cannot cover on
+    /// its own. `prepare_live_sessions_refresh` snapshots `list_ids()` while
+    /// holding `config_write_lock`. If `rehydrate_reaped_session` runs after
+    /// that snapshot, its `try_lock_owned` fails (the commit owns the gate), so
+    /// it builds the Agent from the still-installed OLD config and inserts a
+    /// session the refresh will never prepare. `apply_model_provider`'s fence
+    /// never fires for it either: there is no captured prior generation to
+    /// compare against for a session that did not exist at snapshot time.
+    ///
+    /// Without the post-insert reconcile task the session would stay on the
+    /// construction-time provider indefinitely, because `sync_config_generation`
+    /// at turn entry republishes only the limits cell and never rebuilds
+    /// `model_provider` / `model_route_resolver`.
+    #[tokio::test]
+    async fn acp_rehydration_inside_snapshot_window_converges_on_committed_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_model_refresh_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let after_snapshot = Arc::new(tokio::sync::Notify::new());
+        let (dispatcher, sessions, acp_store) = make_persistence_test_dispatcher_with_snapshot_hook(
+            config,
+            &data_dir,
+            Arc::clone(&after_snapshot),
+        );
+        let dispatcher = Arc::new(dispatcher);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        // Persist a restorable ACP row, then drop the live session so the
+        // prompt path takes the rehydration branch.
+        let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
+        acp_store
+            .create_session(&session_id, "test-agent", &workspace)
+            .expect("ACP session row must be created");
+        sessions.remove(&session_id).await;
+        assert!(
+            sessions.get_agent(&session_id).await.is_none(),
+            "harness invariant: the session must be absent so rehydration runs"
+        );
+
+        // The snapshot hook tells us the exact moment `list_ids()` has run and
+        // the commit still holds `config_write_lock`.
+        let snapshot_signal = Arc::clone(&after_snapshot);
+
+        // A config/set whose refresh must NOT see the rehydrated session,
+        // because the session does not exist when `list_ids()` runs.
+        let config_set_dispatcher = Arc::clone(&dispatcher);
+        let config_set = zeroclaw_spawn::spawn!(async move {
+            config_set_dispatcher
+                .handle_config_set(&json!({
+                    "prop": "providers.models.openai.test-provider.model",
+                    "value": "refreshed-model"
+                }))
+                .await
+        });
+
+        // Rehydrate inside the window: after the snapshot, before the commit
+        // releases the gate. `try_lock_owned` therefore fails and the Agent is
+        // built from the pre-commit config.
+        snapshot_signal.notified().await;
+        let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
+        assert!(
+            rehydrated.is_some(),
+            "rehydration must install the session even with the gate contended"
+        );
+
+        let res = config_set.await.expect("config/set task must complete");
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        // The reconcile task blocks on the config writer gate, so it can only
+        // run once the commit above released it. Poll for convergence.
+        let mut converged = String::new();
+        for _ in 0..200 {
+            converged = model_name_for_session(&dispatcher, &session_id).await;
+            if converged == "refreshed-model" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            converged, "refreshed-model",
+            "a session rehydrated inside the snapshot window must converge onto \
+             the committed generation; it was excluded from the refresh snapshot, \
+             so only the post-insert reconcile task can bring it forward"
+        );
+
+        // Identity and limits must come from that same committed generation,
+        // not a mix of the old provider box and the new config.
+        let agent = sessions
+            .get_agent(&session_id)
+            .await
+            .expect("rehydrated session exists");
+        let guard = agent.lock().await;
+        let (_, provider_name, model_name) = guard.attribution_fields();
+        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(model_name, "refreshed-model");
+        let limits = guard.context_limits_for_route("openai.test-provider", "refreshed-model");
+        assert!(
+            limits.context_token_budget > 0,
+            "the reconciled session must resolve limits from the committed \
+             generation rather than an unresolvable stale route"
         );
     }
 

@@ -1546,6 +1546,96 @@ mod tests {
         );
     }
 
+    /// A provider-alias rename refresh must not rewrite the transient
+    /// `model_provider` override of a session that replaced the one it
+    /// captured.
+    ///
+    /// `migrate_model_provider_override` runs BEFORE the generation-checked
+    /// `apply_model_provider` in the publication step. Without its own
+    /// generation check, a stale rename refresh would write the new alias onto
+    /// a same-ID successor (installed by `session/new` or ACP rehydration while
+    /// the refresh was in flight), and the follow-up `apply_model_provider`
+    /// would then correctly reject the stale provider tuple — leaving the
+    /// successor holding an override it never requested, naming an alias its
+    /// provider box was never built from.
+    #[tokio::test]
+    async fn migrate_model_provider_override_rejects_stale_generation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
+
+        // Pin an explicit override on the original session, the state a
+        // rename refresh would legitimately migrate.
+        store
+            .set_overrides(
+                "s",
+                SessionOverrides {
+                    model_provider: Some("openai.before".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("override applies to the original session");
+
+        // Replace the session under the same ID, as ACP rehydration does.
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let successor_gen = store.get_generation("s").await.unwrap();
+        assert_ne!(
+            captured_gen, successor_gen,
+            "harness invariant: the replacement must advance the generation, \
+             otherwise this test proves nothing"
+        );
+
+        let migrated = store
+            .migrate_model_provider_override("s", captured_gen, "openai.after".into())
+            .await;
+        assert!(
+            !migrated,
+            "a rename refresh holding the pre-replacement generation must be \
+             rejected rather than writing the successor's override"
+        );
+
+        assert_eq!(
+            store
+                .get_overrides("s")
+                .await
+                .and_then(|o| o.model_provider),
+            None,
+            "the successor must keep its own (unset) override; the stale rename \
+             must not leave it pointing at an alias it never requested"
+        );
+
+        // The same call with the successor's own generation is still accepted,
+        // so the fence rejects staleness rather than disabling migration.
+        let migrated_current = store
+            .migrate_model_provider_override("s", successor_gen, "openai.after".into())
+            .await;
+        assert!(
+            migrated_current,
+            "a refresh that captured the current generation must still migrate"
+        );
+        assert_eq!(
+            store
+                .get_overrides("s")
+                .await
+                .and_then(|o| o.model_provider)
+                .as_deref(),
+            Some("openai.after")
+        );
+    }
+
     #[tokio::test]
     async fn apply_model_provider_applies_temperature_to_captured_agent() {
         let store = make_store(4);

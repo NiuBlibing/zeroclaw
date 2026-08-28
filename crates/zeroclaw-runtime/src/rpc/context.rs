@@ -167,6 +167,14 @@ pub struct RpcContext {
 
     /// Lifecycle hook runner. `None` when hooks are disabled in config.
     pub hooks: Option<Arc<crate::hooks::HookRunner>>,
+
+    /// Test-only notifier fired by `prepare_live_sessions_refresh` immediately
+    /// after `list_ids()` completes (while `config_write_lock` is still held).
+    /// Lets a regression test insert an ACP session AFTER the snapshot and
+    /// BEFORE the commit, reproducing the window where `try_lock_owned` fails
+    /// and the session is excluded from the refresh snapshot.
+    #[cfg(test)]
+    pub after_list_ids_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl RpcContext {
@@ -193,6 +201,8 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            after_list_ids_notify: None,
         })
     }
 
@@ -214,6 +224,8 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            after_list_ids_notify: None,
         })
     }
 
@@ -239,6 +251,8 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            after_list_ids_notify: None,
         })
     }
 
@@ -264,6 +278,8 @@ impl RpcContext {
             sop_engine: Some(sop_engine),
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            after_list_ids_notify: None,
         })
     }
 
@@ -289,6 +305,8 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            after_list_ids_notify: None,
         })
     }
 
@@ -314,6 +332,8 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            after_list_ids_notify: None,
         })
     }
 
@@ -340,6 +360,8 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            after_list_ids_notify: None,
         })
     }
 
@@ -366,6 +388,8 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            after_list_ids_notify: None,
         })
     }
 }
