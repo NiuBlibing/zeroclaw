@@ -251,18 +251,33 @@ leave it describing an order that no longer holds. Archives written before
 sequence numbering existed carry no number; they are ordered by mtime and sort
 before every numbered archive.
 
-The primary pagination cursor is `next_segment_cursor`, an opaque string that
-encodes the segment basename, a byte offset, and an anchor event id. Pass it
-back verbatim as `until_segment_cursor` to resume; do not construct or parse it.
-The anchor lets the reader detect an active-file rotation between requests and
-rebase the cursor to the archive that now contains the anchored event.
+The primary pagination cursor is `next_segment_cursor`, an opaque string. Pass
+it back verbatim as `until_segment_cursor` to resume; do not construct or parse
+it. Its internal shape depends on which segment the page ended in, because the
+three segment kinds have different stability properties:
+
+- A **numbered archive** is addressed by the sequence number written into its
+  name at rotation. That number is never reused, so later rotations cannot
+  invalidate the cursor.
+- A **legacy archive**, written before sequence numbering existed, is addressed
+  by filename. An archive name is never reassigned to different content, so this
+  is stable in the same way.
+- The **active file** is addressed by offset plus an anchor event id. Its path
+  is stable but its content is replaced on each rotation, so the anchor is what
+  lets the reader detect that a rotation happened and resume from the archive
+  the anchored event now lives in.
 
 The legacy byte-offset cursor `next_cursor_line_offset` / `until_line_offset`
 remains valid and resolves against the active file only. It is `None` when the
 oldest event on the current page is in an archive file. For multi-segment
 deployments, use `next_segment_cursor` instead.
 
-The offset is not a durable event identity or cross-file checkpoint. A segment cursor becomes stale when the named archive is pruned by retention before the next request; the reader falls back to a full scan in that case. A byte-offset cursor becomes stale whenever the active file's bytes are replaced or its path changes:
+The offset is not a durable event identity or cross-file checkpoint. A segment
+cursor becomes unresolvable when the segment it names has been pruned by
+retention; the reader then reports the history as finished rather than resuming
+at an unrelated position, so a paging client stops where it was instead of
+silently jumping back to the newest events. A byte-offset cursor becomes stale
+whenever the active file's bytes are replaced or its path changes:
 
 - `rotating` renames the active file to an archive; the next append creates a new active file.
 - schema migration rewrites the active file through a temporary file and atomic rename.

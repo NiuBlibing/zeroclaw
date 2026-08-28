@@ -237,13 +237,20 @@ curl "$ZEROCLAW_GATEWAY/api/logs?trace_id=<value-from-a-prior-event>"
 </div>
 
 Log pagination walks backward with a segment-aware cursor. While `at_end` is false:
-1. Prefer `next_segment_cursor`, passed back unchanged as `until_segment_cursor`. Treat it as an **opaque token**: it encodes the segment, a byte offset, and an anchor event id, and its internal shape may change. Clients must round-trip the returned string verbatim rather than constructing or parsing one; a hand-built cursor loses the anchor and with it the rotation-boundary protection described below. This is the only cursor that can advance once the oldest event in a page is in a rotated archive.
+1. Prefer `next_segment_cursor`, passed back unchanged as `until_segment_cursor`. Treat it as an **opaque token**: its internal shape depends on which segment the page ended in and may change between releases. Clients must round-trip the returned string verbatim rather than constructing or parsing one. This is the only cursor that can advance once the oldest event in a page is in a rotated archive.
 2. Fall back to `next_cursor_line_offset` passed back as `until_line_offset` when the segment cursor is absent. This is a plain byte offset into the active file and resolves to `null` when the oldest event is in an archive.
 3. The legacy `next_cursor: [timestamp, id] | null` response remains for compatibility; passing it back as `until_ts` + `until_id` is deprecated because the lexicographic ID tie-break can silently skip events with the same timestamp.
 
 Restart from the newest page after changing filters. Treat `at_end: true` as the signal to stop requesting older pages for that walk.
 
-`until_line_offset` is a position in the current active file. Archive rotation, startup migration, and a configured path change replace the bytes or active file it refers to; restart from the newest page after those boundaries. `until_segment_cursor` embeds an anchor event id alongside the segment basename and byte offset. On each resume, the reader verifies the event immediately before the cursor boundary matches the stored id. If the active file was rotated between requests, creating a new file with the same basename, the mismatch is detected and the reader rebases the cursor to the rotated archive that actually contains the anchored event, so pagination continues safely across the rotation boundary without duplicating or skipping events.
+`until_line_offset` is a position in the current active file. Archive rotation, startup migration, and a configured path change replace the bytes or active file it refers to; restart from the newest page after those boundaries.
+
+`until_segment_cursor` is resilient across those boundaries, by different means depending on where the page ended:
+
+- **A page ending in an archive** is addressed by the archive's own identity, which is fixed when the archive is written and never reassigned to different content. Subsequent rotations therefore cannot invalidate it. If retention has since deleted that archive, the reader reports the history as finished rather than silently resuming at an unrelated position.
+- **A page ending in the active file** carries an anchor event id alongside the offset, because the active file's path is stable while its content is replaced on each rotation. On resume the reader checks that the event at the cursor boundary still matches the anchor; on a mismatch it searches the retained segments for that event and resumes from wherever it now lives, so pagination crosses a rotation without duplicating or skipping events. If the anchored event is gone entirely, the reader reports the history as finished.
+
+A cursor issued by an older daemon, which named a segment by filename without an anchor, is still accepted and read as a position in that named file.
 
 The `/api/status` response includes `daemon_started_at: string` (RFC
 3339), so a dashboard can default to "since daemon start" without an
