@@ -36,6 +36,14 @@ const AGGREGATE_DECODE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// this only affects which of the two errors an over-limit payload reports.
 const BASE64_LENGTH_SLACK_BYTES: usize = 64;
 
+/// Extra bytes added to the source-length ceiling in [`normalize_data_uri`] to
+/// cover the `data:` scheme prefix, the MIME type, the `;base64` parameter,
+/// the `,` separator, and any insignificant whitespace before the payload.
+/// Together with [`BASE64_LENGTH_SLACK_BYTES`] this keeps the entry-point check
+/// generous enough to never reject a valid marker while still bounding the
+/// source string before any allocation proportional to it occurs.
+const DATA_URI_HEADER_SLACK_BYTES: usize = 256;
+
 // Counts full decodes performed by `validate_image_content`.
 //
 // Budget exhaustion is observable two ways — an image can be skipped because it
@@ -1272,9 +1280,34 @@ async fn normalize_data_uri(
     max_bytes: usize,
     remaining_budget: &mut u64,
 ) -> anyhow::Result<String> {
+    // Bound the marker length before doing anything that allocates from it.
+    //
+    // Every subsequent branch — `source.find(',')`, header checks,
+    // `validate_mime`, and `STANDARD.decode` — can only run on a string that
+    // is already owned or about to be owned. Without this check, a malformed
+    // or unsupported header causes an error branch to call `source.to_string()`
+    // before the encoded-payload ceiling is ever reached, allocating a second
+    // full copy of attacker-controlled input. Checking the total source length
+    // here keeps all of them bounded: even a header that is entirely zeros
+    // contributes at most `max_encoded_len + DATA_URI_HEADER_SLACK_BYTES` to
+    // the rejection path.
+    let max_encoded_len = max_bytes
+        .div_ceil(3)
+        .saturating_mul(4)
+        .saturating_add(BASE64_LENGTH_SLACK_BYTES);
+    let max_source_len = max_encoded_len.saturating_add(DATA_URI_HEADER_SLACK_BYTES);
+    if source.len() > max_source_len {
+        return Err(MultimodalError::ImageTooLarge {
+            input: "[data URI]".to_string(),
+            size_bytes: source.len(),
+            max_bytes: max_source_len,
+        }
+        .into());
+    }
+
     let Some(comma_idx) = source.find(',') else {
         return Err(MultimodalError::InvalidMarker {
-            input: source.to_string(),
+            input: "[data URI]".to_string(),
             reason: "expected data URI payload".to_string(),
         }
         .into());
@@ -1285,7 +1318,7 @@ async fn normalize_data_uri(
 
     if !header.contains(";base64") {
         return Err(MultimodalError::InvalidMarker {
-            input: source.to_string(),
+            input: "[data URI]".to_string(),
             reason: "only base64 data URIs are supported".to_string(),
         }
         .into());
@@ -1299,7 +1332,10 @@ async fn normalize_data_uri(
         .trim()
         .to_ascii_lowercase();
 
-    validate_mime(source, &mime)?;
+    // Pass the category label rather than `source`: the MIME type is already
+    // embedded in a separate field, so the full URI text adds no diagnostic
+    // value and would copy controlled input into the error message.
+    validate_mime("[data URI]", &mime)?;
 
     // Reject on the *encoded* length before decoding.
     //
@@ -3165,6 +3201,76 @@ mod tests {
             "the within-ceiling payload must actually be base64-decoded"
         );
     }
+
+    #[tokio::test]
+    async fn oversized_data_uri_with_malformed_header_is_refused_before_any_source_copy() {
+        // The entry-point length guard must fire for malformed data URIs too,
+        // not only for valid-MIME oversized payloads. A malformed header (no
+        // comma, or `;base64` parameter absent) previously returned an error
+        // with `input: source.to_string()` *before* the encoded-length ceiling
+        // was reached, allowing an attacker to bypass the new check entirely by
+        // crafting a header that trips an earlier branch.
+        //
+        // `BASE64_DECODE_CALLS` stays at zero in both sub-cases because neither
+        // path reaches the base64 engine, but that is NOT the sensitive
+        // assertion here. The critical claim is that the total source length is
+        // bounded before *any* allocation from it: the entry-point guard fires
+        // before `source.find(',')` or `header.contains(";base64")` is
+        // evaluated, so no error branch can copy the full oversized source.
+        let cfg = MultimodalConfig::default();
+        let (_, max_mb) = cfg.effective_limits();
+        let max_bytes = max_mb * 1024 * 1024;
+        let filler = "A".repeat(max_bytes / 3 * 4 + 4096);
+
+        // Assert on the error *text*, not on whether the image was skipped.
+        // Both sub-cases are refused with or without the entry-point guard, so
+        // a skip assertion proves nothing. What the guard changes is whether the
+        // rejection carries a copy of the oversized source: the error must be
+        // bounded and must not embed the filler.
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+
+        // Sub-case 1: no comma — reaches the `comma_idx` branch first.
+        let no_comma = format!("data:image/png;base64{filler}");
+        let err = normalize_data_uri(&no_comma, max_bytes, &mut budget)
+            .await
+            .expect_err("an oversized malformed data URI must be refused");
+        let text = err.to_string();
+        assert!(
+            !text.contains(&filler),
+            "the rejection must not embed the oversized source; it copied {} bytes",
+            text.len()
+        );
+        assert!(
+            text.len() < 512,
+            "the rejection must stay bounded, got {} bytes",
+            text.len()
+        );
+
+        // Sub-case 2: unsupported MIME type — reaches `validate_mime` first.
+        let unsupported = format!("data:text/html;base64,{filler}");
+        let err2 = normalize_data_uri(&unsupported, max_bytes, &mut budget)
+            .await
+            .expect_err("an oversized unsupported-MIME data URI must be refused");
+        let text2 = err2.to_string();
+        assert!(
+            !text2.contains(&filler),
+            "the unsupported-MIME rejection must not embed the oversized source; it copied {} bytes",
+            text2.len()
+        );
+        assert!(
+            text2.len() < 512,
+            "the unsupported-MIME rejection must stay bounded, got {} bytes",
+            text2.len()
+        );
+
+        // A well-formed marker inside the ceiling must still normalize, so the
+        // entry-point guard is not simply rejecting everything.
+        let valid = format!("data:image/png;base64,{}", STANDARD.encode(valid_png()));
+        normalize_data_uri(&valid, max_bytes, &mut budget)
+            .await
+            .expect("a within-ceiling data URI still normalizes");
+    }
+
     #[tokio::test]
     async fn validate_image_content_rejects_empty_payload() {
         // Zero-byte files pass `validate_size`, which only has an upper bound.
