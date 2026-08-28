@@ -901,6 +901,10 @@ fn rotate_active(state: &Arc<WorkerState>, when: DateTime<Utc>) -> Result<()> {
     fs::rename(path, &archive)
         .with_context(|| format!("rotating log {} → {}", path.display(), archive.display()))?;
 
+    // Record the number before retention runs: retention may delete this very
+    // archive, and the series must not fall back to it on the next restart.
+    record_seq_watermark(path, seq);
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -911,21 +915,65 @@ fn rotate_active(state: &Arc<WorkerState>, when: DateTime<Utc>) -> Result<()> {
     Ok(())
 }
 
-/// Build the archive path for `path`, stamping the timestamp before the
-/// extension and disambiguating same-second rotations with a numeric suffix.
-/// Highest archive sequence number already on disk, plus one.
+/// Path of the sidecar that records the highest archive sequence ever issued.
 ///
-/// Nothing persists the counter directly, so it is recovered from the archive
-/// names at startup. That keeps the series increasing across restarts and
-/// policy reloads: a writer that restarted mid-day must not reuse a number an
-/// existing archive already carries, or a reader would order the two by an
-/// ambiguous key.
+/// Sits next to the active log as `<basename>.seq`, which does not match the
+/// archive-name shape, so `list_archives` never mistakes it for a segment.
+fn seq_watermark_path(active: &Path) -> PathBuf {
+    let dir = active.parent().unwrap_or_else(|| Path::new("."));
+    let name = active
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("runtime-trace");
+    dir.join(format!("{name}.seq"))
+}
+
+/// Record `seq` as the highest number ever issued, if it beats what is stored.
+///
+/// Best-effort: a failure here costs monotonicity across a wipe-and-restart,
+/// which the reader already handles as an unresolvable cursor, so it must never
+/// fail the append that triggered the rotation.
+fn record_seq_watermark(active: &Path, seq: u64) {
+    let path = seq_watermark_path(active);
+    let stored = read_seq_watermark(active);
+    if stored >= seq {
+        return;
+    }
+    if let Err(err) = fs::write(&path, seq.to_string()) {
+        tracing::warn!(
+            target: "zeroclaw_log_internal",
+            error = ?err,
+            path = %path.display(),
+            "log: could not record the rotation sequence high-water mark; a later \
+             restart may reuse a number if retention removes every archive",
+        );
+    }
+}
+
+/// Highest sequence recorded by a previous run, or `0` when there is none.
+fn read_seq_watermark(active: &Path) -> u64 {
+    fs::read_to_string(seq_watermark_path(active))
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The next archive sequence number to issue.
+///
+/// Taken from two sources, whichever is higher: the numbered archives still on
+/// disk, and a small sidecar recording the highest number ever issued. The
+/// archives alone are not enough. Age-based retention can delete every numbered
+/// archive, and a restart would then begin again at 1 while a client still
+/// holds a cursor naming sequence 1. That cursor is supposed to be
+/// unresolvable, but it would instead bind to an unrelated future archive and
+/// show the client history it never asked for. The sidecar keeps the series
+/// monotonic across that wipe.
 ///
 /// Legacy archives written before numbering existed contribute nothing here.
 /// They sort before every numbered archive, so starting a fresh series at 1
 /// alongside them is correct.
 fn seed_archive_seq(active: &Path) -> u64 {
-    let highest = match list_archives(active) {
+    let on_disk = match list_archives(active) {
         Ok(archives) => archives
             .iter()
             .filter_map(|(_, order)| match order {
@@ -936,22 +984,22 @@ fn seed_archive_seq(active: &Path) -> u64 {
             .unwrap_or(0),
         Err(err) => {
             // A directory that cannot be listed is reported by the query path
-            // as well; here it only means the series restarts. Rotation still
-            // works, and the reader falls back to mtime for anything it cannot
-            // order by name.
+            // as well. The watermark below still bounds the series, so this
+            // only loses the archives-on-disk half of the comparison.
             tracing::warn!(
                 target: "zeroclaw_log",
                 error = ?err,
                 path = %active.display(),
-                "log: could not read existing archives to seed the rotation sequence; \
-                 starting from 1",
+                "log: could not read existing archives to seed the rotation sequence",
             );
             0
         }
     };
-    highest.saturating_add(1)
+    on_disk.max(read_seq_watermark(active)).saturating_add(1)
 }
 
+/// Build the archive path for `path`, stamping the timestamp before the
+/// extension and disambiguating same-second rotations with a numeric suffix.
 fn archive_path(path: &Path, when: DateTime<Utc>, seq: u64) -> Result<PathBuf> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
@@ -1856,10 +1904,66 @@ mod tests {
     }
 
     #[test]
+    fn archive_sequence_never_reuses_a_number_after_retention_wipes_every_archive() {
+        // The cursor contract says an archive sequence is never reused, so a
+        // cursor naming a pruned segment stays unresolvable and the reader can
+        // honestly report the end of history. Deriving the next number only
+        // from the archives still on disk breaks that at one boundary: age
+        // retention can delete every numbered archive, and a restart would then
+        // begin again at 1. A client still holding `1:<off>` would have it bind
+        // to an unrelated future archive and be shown history it never asked
+        // for. A sidecar records the highest number ever issued so the series
+        // survives that wipe.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("runtime-trace.jsonl");
+        fs::write(&active, "").unwrap();
+
+        // Rotations reached sequence 5, then retention removed every archive.
+        record_seq_watermark(&active, 5);
+        assert!(
+            list_archives(&active)
+                .unwrap()
+                .iter()
+                .all(|(_, order)| !matches!(order, ArchiveOrder::Seq(_))),
+            "test setup: no numbered archive may remain on disk"
+        );
+
+        assert_eq!(
+            seed_archive_seq(&active),
+            6,
+            "the series must resume past every number it has already issued, \
+             even with no archive left to read it from"
+        );
+    }
+
+    #[test]
+    fn archive_sequence_prefers_whichever_source_is_higher() {
+        // Both sources bound the series: the archives still on disk and the
+        // recorded high-water mark. Whichever is higher wins, so neither a
+        // stale sidecar nor a wiped directory can pull the series backwards.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("runtime-trace.jsonl");
+        fs::write(&active, "").unwrap();
+        fs::write(
+            tmp.path()
+                .join("runtime-trace.0000000012-20260624-031500.jsonl"),
+            "x\n",
+        )
+        .unwrap();
+
+        // Sidecar behind the archives: the archive on disk decides.
+        record_seq_watermark(&active, 4);
+        assert_eq!(seed_archive_seq(&active), 13);
+
+        // Sidecar ahead of them: the watermark decides.
+        record_seq_watermark(&active, 30);
+        assert_eq!(seed_archive_seq(&active), 31);
+    }
+
+    #[test]
     fn archive_sequence_resumes_above_existing_archives() {
-        // Nothing persists the counter, so a restart recovers it from the
-        // names on disk. Reusing a number would leave two archives ordered by
-        // an ambiguous key.
+        // A restart recovers the counter from the names on disk. Reusing a
+        // number would leave two archives ordered by an ambiguous key.
         let tmp = tempfile::tempdir().unwrap();
         let active = tmp.path().join("runtime-trace.jsonl");
         fs::write(&active, "").unwrap();

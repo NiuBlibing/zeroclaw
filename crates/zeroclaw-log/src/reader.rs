@@ -758,12 +758,22 @@ fn resolve_cursor(segs: &[SegmentMeta], cursor: &SegmentCursor) -> Option<(usize
             .position(|s| s.seq == Some(*seq))
             .map(|idx| (idx, *off)),
 
-        // A legacy archive has no sequence number, but an archive's filename is
-        // stable: unlike the active path, it is never reassigned to different
-        // content. Not finding the name means retention removed that segment.
+        // A name-addressed cursor. This is the pre-sequence wire form, and it
+        // has always been ambiguous about which segment it names: a daemon that
+        // predates sequence numbering issued `<basename>:<off>` for the active
+        // file, while a legacy archive is addressed the same way. Both are
+        // still in circulation, so try the archives first (an archive name is
+        // never reassigned, so a hit there is unambiguous) and fall back to the
+        // active file when the name matches it instead.
+        //
+        // The active fallback carries no anchor, so it cannot detect a rotation
+        // that happened since the cursor was issued. That is the same exposure
+        // the form always had; cursors this reader issues for the active file
+        // use the anchored `active:` shape.
         CursorKind::LegacyArchive { name, off } => segs
             .iter()
             .position(|s| !s.is_active && s.name == *name)
+            .or_else(|| segs.iter().position(|s| s.is_active && s.name == *name))
             .map(|idx| (idx, *off)),
 
         // The active file's path is stable but its content is replaced on every
@@ -2258,6 +2268,53 @@ mod tests {
             vec!["active", "legacy-2", "legacy-1", "legacy-0"],
             "every row must be reachable by paging, including the oldest in a \
              legacy archive"
+        );
+    }
+
+    #[test]
+    fn legacy_name_cursor_resolves_against_the_active_file_too() {
+        // The pre-sequence wire form `<basename>:<off>` is ambiguous by
+        // construction: an older daemon issued it for the active file, and it
+        // is also how a legacy archive is addressed. Both are still in
+        // circulation, so resolution has to try archives and then the active
+        // file. Matching only archives made every older active cursor resolve
+        // to nothing, which surfaced as an empty at-end page and silently ended
+        // the client's walk.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+
+        let mut ev_a = make_event("a", None);
+        ev_a.id = "id-a".into();
+        ev_a.timestamp = "2026-01-01T00:00:00.000Z".into();
+        ev_a.message = Some("older".into());
+        let mut ev_b = make_event("b", None);
+        ev_b.id = "id-b".into();
+        ev_b.timestamp = "2026-01-01T00:00:01.000Z".into();
+        ev_b.message = Some("newer".into());
+        write_jsonl(&active, &[ev_a, ev_b]);
+
+        // Take the real byte boundary between the two events so the cursor
+        // addresses a position the reader will actually honour.
+        let first_page = query_log_page(&active, true, &LogFilter::default(), 1, None).unwrap();
+        let boundary = first_page
+            .next_cursor_line_offset
+            .expect("an active-file page carries a byte offset");
+
+        // An older daemon would have issued exactly this token.
+        let legacy = SegmentCursor::from_wire(&format!("trace.jsonl:{boundary}"))
+            .expect("the two-field form must still parse");
+        let page = query_log_page(&active, true, &LogFilter::default(), 10, Some(&legacy)).unwrap();
+
+        let seen: Vec<&str> = page
+            .events
+            .iter()
+            .map(|e| e.message.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            seen,
+            vec!["older"],
+            "a legacy cursor naming the active file must resolve against it, \
+             not fall through to an empty at-end page"
         );
     }
 
