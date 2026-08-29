@@ -11830,7 +11830,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -11902,7 +11904,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -11971,7 +11975,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -12192,9 +12198,11 @@ vision_model_provider = "custom.vision"
             .model_provider(Box::new(TextPrimary {
                 calls: Arc::clone(&calls),
             }))
-            .tools(vec![Box::new(AttachImage {
-                path: image_path.display().to_string(),
-            })])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(AttachImage {
+                    path: image_path.display().to_string(),
+                })],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -12527,7 +12535,9 @@ model_provider = "custom.primary"
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(Box::new(reliable))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                Vec::new(),
+            ))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .memory(mem)
             .observer(observer)
@@ -12742,7 +12752,9 @@ model_provider = "custom.only"
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(Box::new(reliable))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                Vec::new(),
+            ))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .memory(mem)
             .observer(observer)
@@ -13489,7 +13501,9 @@ model_provider = "custom.only"
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         Agent::builder()
             .model_provider(model_provider)
-            .tools(Vec::new())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                Vec::new(),
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
