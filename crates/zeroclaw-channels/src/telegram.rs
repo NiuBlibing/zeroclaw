@@ -40,6 +40,15 @@ enum IncomingAttachmentKind {
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
 /// Telegram Bot API allows at most 100 commands via setMyCommands.
 const TELEGRAM_MAX_BOT_COMMANDS: usize = 100;
+/// setMyCommands also refuses on total BODY SIZE, and reports that refusal with the
+/// same `BOT_COMMANDS_TOO_MUCH` string it uses for too many commands. The size limit
+/// is undocumented, so it is measured: against the live API, a body of 100 commands
+/// serializing to 9,714 bytes is accepted and the same shape at 9,814 bytes is
+/// refused. 100 commands each carrying a description at
+/// `TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN` serializes to roughly 14,800 bytes, so the
+/// two per-item caps can both be satisfied and the request still be rejected. Budget
+/// well under the measured edge.
+const TELEGRAM_MAX_BOT_COMMANDS_BODY_BYTES: usize = 8192;
 /// Telegram command names: 1-32 lowercase a-z, 0-9, and underscore.
 const TELEGRAM_COMMAND_NAME_MAX_LEN: usize = 32;
 /// Telegram command descriptions nominally allow up to 256 characters per the API docs,
@@ -90,6 +99,30 @@ fn truncate_telegram_command_description(raw: &str) -> String {
         .collect();
     truncated.push('…');
     truncated
+}
+
+/// Serialized length of the `setMyCommands` request body for `commands`.
+///
+/// A serialization failure cannot make the real body smaller, so it reports 0 and
+/// lets the request itself surface the problem rather than dropping every command.
+fn telegram_bot_commands_body_len(commands: &[serde_json::Value]) -> usize {
+    serde_json::to_string(&serde_json::json!({ "commands": commands })).map_or(0, |s| s.len())
+}
+
+/// Drop trailing commands until the `setMyCommands` body fits
+/// `TELEGRAM_MAX_BOT_COMMANDS_BODY_BYTES`, and report how many were dropped.
+///
+/// This is a second cap, applied after the count cap: the two are independent, and
+/// a command set inside the count limit can still exceed the size limit.
+fn fit_telegram_bot_commands_to_body_budget(commands: &mut Vec<serde_json::Value>) -> usize {
+    let mut dropped = 0;
+    while !commands.is_empty()
+        && telegram_bot_commands_body_len(commands) > TELEGRAM_MAX_BOT_COMMANDS_BODY_BYTES
+    {
+        commands.pop();
+        dropped += 1;
+    }
+    dropped
 }
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
@@ -1285,6 +1318,29 @@ impl TelegramChannel {
                 // measurements (limit, configured, registered) ride solely in
                 // `attributes` above, never in the message.
                 "Telegram command registration truncated to the platform limit"
+            );
+        }
+
+        // Second, independent cap: setMyCommands also refuses on total body size,
+        // reporting it as BOT_COMMANDS_TOO_MUCH. A set inside the count limit can
+        // still exceed it, which is why this runs after the truncation above.
+        let before_body_cap = commands.len();
+        let dropped_for_body = fit_telegram_bot_commands_to_body_budget(&mut commands);
+        if dropped_for_body > 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "TELEGRAM_MAX_BOT_COMMANDS_BODY_BYTES":
+                            TELEGRAM_MAX_BOT_COMMANDS_BODY_BYTES,
+                        "before_body_cap": before_body_cap,
+                        "registered": commands.len(),
+                        "dropped": dropped_for_body,
+                    })),
+                // Stable literal per the logging contract: per-event measurements
+                // ride solely in `attributes` above, never in the message.
+                "Telegram command registration trimmed to the platform body-size limit"
             );
         }
 
@@ -10466,6 +10522,75 @@ mod tests {
         assert_eq!(
             truncate_telegram_command_description("Short desc"),
             "Short desc"
+        );
+    }
+
+    /// Build `n` commands whose descriptions sit at the per-command cap. This is the
+    /// shape a real install reaches once enough tools and skills expose commands.
+    fn telegram_commands_fixture(n: usize, description_len: usize) -> Vec<serde_json::Value> {
+        (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "command": format!("toolcmd{i:03}"),
+                    "description": "d".repeat(description_len),
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn telegram_bot_commands_within_count_limit_can_still_exceed_the_body_budget() {
+        // The exact shape the live API refuses: the count cap and the per-command
+        // description cap are both satisfied, and the body is still too large.
+        let commands = telegram_commands_fixture(
+            TELEGRAM_MAX_BOT_COMMANDS,
+            TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN,
+        );
+        assert_eq!(commands.len(), TELEGRAM_MAX_BOT_COMMANDS);
+        assert!(
+            telegram_bot_commands_body_len(&commands) > TELEGRAM_MAX_BOT_COMMANDS_BODY_BYTES,
+            "a full command set at the description cap must exceed the body budget, \
+             otherwise this test is not exercising the case the API rejects"
+        );
+    }
+
+    #[test]
+    fn fit_telegram_bot_commands_trims_an_oversized_body_to_the_budget() {
+        let mut commands = telegram_commands_fixture(
+            TELEGRAM_MAX_BOT_COMMANDS,
+            TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN,
+        );
+        let before = commands.len();
+        let dropped = fit_telegram_bot_commands_to_body_budget(&mut commands);
+
+        assert!(dropped > 0, "an oversized body must lose commands");
+        assert_eq!(
+            commands.len() + dropped,
+            before,
+            "every dropped command must be accounted for"
+        );
+        assert!(
+            telegram_bot_commands_body_len(&commands) <= TELEGRAM_MAX_BOT_COMMANDS_BODY_BYTES,
+            "the trimmed body must fit the budget"
+        );
+        assert!(
+            !commands.is_empty(),
+            "trimming must not empty the menu outright"
+        );
+    }
+
+    #[test]
+    fn fit_telegram_bot_commands_leaves_a_small_set_untouched() {
+        // Over-correction control: a set that already fits must not be trimmed, so a
+        // green result above cannot come from a function that always drops commands.
+        let mut commands = telegram_commands_fixture(6, 40);
+        let before = commands.clone();
+        let dropped = fit_telegram_bot_commands_to_body_budget(&mut commands);
+
+        assert_eq!(dropped, 0, "a body inside the budget must lose nothing");
+        assert_eq!(
+            commands, before,
+            "a fitting set must be left byte-identical"
         );
     }
 

@@ -254,7 +254,19 @@ impl SessionStore {
     /// provider/resolver/limits generation instead of dispatching through the
     /// construction-time binding while canonical config has moved on.
     ///
-    /// A missing session is `Ok(())`, not an error: absence is the caller's
+    /// Returns the generation the wait resolved against. Callers holding a
+    /// cached `Agent` must compare it with the generation they captured and
+    /// re-look-up on a mismatch: waiting says nothing about WHICH instance now
+    /// answers to this ID.
+    ///
+    /// Keyed on `(id, generation)`, not `id` alone. A same-ID replacement
+    /// installs its own marker, so an ID-only re-check would observe the
+    /// successor's marker as "still pending" and then park on the predecessor's
+    /// notifier — which nobody fires again, stranding the waiter until timeout
+    /// even though the successor converged. On replacement this returns the new
+    /// generation immediately rather than waiting on an orphaned marker.
+    ///
+    /// A missing session is `Ok(None)`, not an error: absence is the caller's
     /// own lookup to report, and every call site here already handles it.
     /// `Err(Timeout)` should surface as a retryable busy error rather than
     /// proceeding on the provisional binding.
@@ -262,33 +274,50 @@ impl SessionStore {
         &self,
         id: &str,
         timeout: std::time::Duration,
-    ) -> Result<(), WaitForProviderUpdateError> {
-        let Some(pending) = self
+    ) -> Result<Option<u64>, WaitForProviderUpdateError> {
+        let Some((pending, generation)) = self
             .sessions
             .lock()
             .await
             .get(id)
-            .and_then(|session| session.pending_generation.clone())
+            .and_then(|session| {
+                session
+                    .pending_generation
+                    .as_ref()
+                    .map(|p| (Arc::clone(p), session.generation))
+            })
         else {
-            return Ok(());
+            return Ok(None);
         };
         // Register interest BEFORE re-checking, so a reconciliation that
         // completes between the lookup above and the wait below cannot leave
         // this caller parked on a notifier nobody will fire again.
         let notified = pending.notified();
         tokio::pin!(notified);
-        if self
+        // Re-check keyed on the SAME generation we cloned the marker from.
+        // An ID-only check would see a same-ID replacement's marker as "still
+        // pending" and then park on the predecessor's notifier, which nobody
+        // fires again. On replacement return the new generation immediately.
+        let current = self.sessions.lock().await;
+        match current.get(id) {
+            None => return Ok(None),
+            Some(session) if session.generation != generation => {
+                return Ok(Some(session.generation))
+            }
+            Some(session) if session.pending_generation.is_none() => return Ok(Some(generation)),
+            Some(_) => {}
+        }
+        drop(current);
+        tokio::time::timeout(timeout, notified)
+            .await
+            .map_err(|_| WaitForProviderUpdateError::Timeout)?;
+        // Return the generation we converged on, which may have changed again.
+        Ok(self
             .sessions
             .lock()
             .await
             .get(id)
-            .is_none_or(|session| session.pending_generation.is_none())
-        {
-            return Ok(());
-        }
-        tokio::time::timeout(timeout, notified)
-            .await
-            .map_err(|_| WaitForProviderUpdateError::Timeout)
+            .map(|session| session.generation))
     }
 
     /// Confirm a session's binding and wake everyone awaiting it.

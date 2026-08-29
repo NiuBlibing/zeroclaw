@@ -2091,7 +2091,7 @@ impl RpcDispatcher {
             ));
         }
 
-        let agent = match self.ctx.sessions.get_agent(sid).await {
+        let mut agent = match self.ctx.sessions.get_agent(sid).await {
             Some(a) => a,
             None => match self.rehydrate_reaped_session(sid).await {
                 Some(a) => a,
@@ -2166,13 +2166,18 @@ impl RpcDispatcher {
         // takes that same per-session guard, so acquiring it first would block
         // the very task this waits on. A no-op for every session without a
         // pending marker, which is all of them outside this narrow window.
-        match self
+        //
+        // Returns the generation it resolved against. The caller must compare
+        // it with the generation captured when the cached Agent was looked up,
+        // and re-lookup on a mismatch: the wait says nothing about which
+        // instance now answers to this ID.
+        let converged_generation = match self
             .ctx
             .sessions
             .await_pending_generation(sid, std::time::Duration::from_secs(30))
             .await
         {
-            Ok(()) => {}
+            Ok(observed_generation) => observed_generation,
             Err(crate::rpc::session::WaitForProviderUpdateError::SessionNotFound) => {
                 return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
             }
@@ -2181,6 +2186,31 @@ impl RpcDispatcher {
                     SESSION_BUSY,
                     "session generation reconciliation in progress; retry shortly",
                 ));
+            }
+        };
+
+        // Verify the cached Agent is still the instance that answered the wait.
+        // A same-ID replacement installs its own marker; the wait returns the
+        // new generation immediately, and the prompt must re-lookup rather than
+        // dispatch through a replaced predecessor.
+        if let Some(observed_generation) = converged_generation {
+            let current_generation = self
+                .ctx
+                .sessions
+                .get_generation(sid)
+                .await
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+            if current_generation != observed_generation {
+                // The session was replaced; the cached Agent is orphaned. This
+                // is rare but well-defined: two concurrent first prompts both
+                // looked up, found absent, and rehydrated. The second
+                // replacement won the insert race. Re-fetch the winner.
+                agent = self
+                    .ctx
+                    .sessions
+                    .get_agent(sid)
+                    .await
+                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
             }
         }
 
@@ -2551,13 +2581,18 @@ impl RpcDispatcher {
         // it would compose with a binding the reconciliation is about to
         // replace. Precedes the ordering lock because the reconciliation task
         // holds that same guard.
+        //
+        // The returned generation is discarded here, unlike in
+        // `session/prompt`: this handler caches no `Agent`, and it already
+        // captures the generation below and re-verifies it under the lock, so
+        // a same-ID replacement is rejected on that path instead.
         match self
             .ctx
             .sessions
             .await_pending_generation(&req.session_id, std::time::Duration::from_secs(30))
             .await
         {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(crate::rpc::session::WaitForProviderUpdateError::SessionNotFound) => {
                 return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
             }
@@ -5071,7 +5106,7 @@ impl RpcDispatcher {
             use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
             let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
             match guard
-                .resolve_via_broker(&req.run_id, decision, principal)
+                .resolve_via_broker_deferred(&req.run_id, decision, principal)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
             {
                 outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => {
