@@ -2258,10 +2258,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
 
-        let thread_id = message
-            .get("message_thread_id")
-            .and_then(serde_json::Value::as_i64)
-            .map(|id| id.to_string());
+        let thread_id = Self::topic_thread_id(message);
 
         let reply_target = if let Some(ref tid) = thread_id {
             format!("{}:{}", chat_id, tid)
@@ -2491,10 +2488,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
 
-        let thread_id = message
-            .get("message_thread_id")
-            .and_then(serde_json::Value::as_i64)
-            .map(|id| id.to_string());
+        let thread_id = Self::topic_thread_id(message);
 
         let reply_target = if let Some(ref tid) = thread_id {
             format!("{}:{}", chat_id, tid)
@@ -2782,6 +2776,26 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some(format!("> @{reply_sender}:\n{quoted_lines}"))
     }
 
+    /// Forum-topic thread id for history keying and reply routing, if this
+    /// message belongs to a genuine forum topic. Telegram also sets
+    /// `message_thread_id` for ordinary reply-threads in supergroups, which are
+    /// NOT topic boundaries and must continue the main chat's conversation
+    /// history — so gate on `is_topic_message` and treat a non-topic thread as
+    /// the main chat (no `thread_ts`, no `:tid` on `reply_target`).
+    fn topic_thread_id(message: &serde_json::Value) -> Option<String> {
+        if message
+            .get("is_topic_message")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return None;
+        }
+        message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())
+    }
+
     fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
         let message = update.get("message")?;
 
@@ -2824,10 +2838,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .unwrap_or(0);
 
         // Extract thread/topic ID for forum support
-        let thread_id = message
-            .get("message_thread_id")
-            .and_then(serde_json::Value::as_i64)
-            .map(|id| id.to_string());
+        let thread_id = Self::topic_thread_id(message);
 
         // reply_target: chat_id or chat_id:thread_id format
         let reply_target = if let Some(ref tid) = thread_id {
@@ -5860,7 +5871,8 @@ mod tests {
                 "chat": {
                     "id": -100_200_300
                 },
-                "message_thread_id": 789
+                "message_thread_id": 789,
+                "is_topic_message": true
             }
         });
 
@@ -5870,8 +5882,241 @@ mod tests {
 
         assert_eq!(msg.sender, "alice");
         assert_eq!(msg.reply_target, "-100200300:789");
+        assert_eq!(msg.thread_ts.as_deref(), Some("789"));
         assert_eq!(msg.content, "hello from topic");
         assert_eq!(msg.id, "telegram_-100200300_42");
+    }
+
+    #[test]
+    fn parse_update_reply_thread_shares_main_chat_history_key() {
+        // Telegram sets `message_thread_id` for ordinary reply-threads in
+        // supergroups too, but WITHOUT `is_topic_message`. Those are not topic
+        // boundaries: they must continue the main chat conversation, so
+        // `thread_ts` stays None and `reply_target` carries no `:tid` suffix —
+        // giving the same conversation-history key as a plain message in the chat.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let reply_thread = serde_json::json!({
+            "update_id": 4,
+            "message": {
+                "message_id": 43,
+                "text": "and another thing",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300 },
+                "message_thread_id": 789,
+                "reply_to_message": { "message_id": 40, "from": { "username": "bot" }, "text": "earlier" }
+            }
+        });
+        let msg = ch
+            .parse_update_message(&reply_thread)
+            .expect("reply-thread message should parse");
+        assert_eq!(
+            msg.reply_target, "-100200300",
+            "a reply-thread (no is_topic_message) must resolve to the main chat, not a :tid topic"
+        );
+        assert_eq!(
+            msg.thread_ts, None,
+            "a reply-thread must not set thread_ts, or it forks the conversation history key"
+        );
+
+        // Same chat + same sender, plain message: identical reply_target/thread_ts,
+        // so both land in one history bucket.
+        let plain = serde_json::json!({
+            "update_id": 5,
+            "message": {
+                "message_id": 44,
+                "text": "plain message",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300 }
+            }
+        });
+        let plain_msg = ch
+            .parse_update_message(&plain)
+            .expect("plain message should parse");
+        assert_eq!(plain_msg.reply_target, msg.reply_target);
+        assert_eq!(plain_msg.thread_ts, msg.thread_ts);
+    }
+
+    /// A real, decodable 1x1 baseline JPEG (grayscale, optimized Huffman
+    /// tables). Used instead of a header-only byte stub so the attachment
+    /// fixture stays valid if image validation ever tightens.
+    fn tiny_jpeg() -> Vec<u8> {
+        vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x20, 0x16, 0x18,
+            0x1C, 0x18, 0x14, 0x20, 0x1C, 0x1A, 0x1C, 0x24, 0x22, 0x20, 0x26, 0x30, 0x50, 0x34,
+            0x30, 0x2C, 0x2C, 0x30, 0x62, 0x46, 0x4A, 0x3A, 0x50, 0x74, 0x66, 0x7A, 0x78, 0x72,
+            0x66, 0x70, 0x6E, 0x80, 0x90, 0xB8, 0x9C, 0x80, 0x88, 0xAE, 0x8A, 0x6E, 0x70, 0xA0,
+            0xDA, 0xA2, 0xAE, 0xBE, 0xC4, 0xCE, 0xD0, 0xCE, 0x7C, 0x9A, 0xE2, 0xF2, 0xE0, 0xC8,
+            0xF0, 0xB8, 0xCA, 0xCE, 0xC6, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01,
+            0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xC4,
+            0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00,
+            0x3F, 0xFF, 0xD9,
+        ]
+    }
+
+    #[tokio::test]
+    async fn attachment_parser_applies_the_topic_thread_gate() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The attachment parser (`try_parse_attachment_message`) is one of the
+        // three parse paths wired to `topic_thread_id`. A genuine forum topic
+        // must keep `chat_id:thread_id` + `thread_ts`, while an ordinary
+        // reply-thread (no `is_topic_message`) must resolve to the main chat so
+        // it lands in the same conversation-history bucket as a plain message.
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let photo_bytes = tiny_jpeg();
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/file_1.jpg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/photos/file_1\.jpg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(photo_bytes.clone()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        // Genuine forum topic: isolated.
+        let topic = ch
+            .try_parse_attachment_message(&serde_json::json!({
+                "message": {
+                    "message_id": 42,
+                    "chat": { "id": -100_200_300, "type": "supergroup" },
+                    "from": { "username": "alice", "id": 99 },
+                    "photo": [ { "file_id": "best", "file_size": 20 } ],
+                    "caption": "look at this",
+                    "message_thread_id": 789,
+                    "is_topic_message": true
+                }
+            }))
+            .await
+            .expect_parsed("topic photo should parse");
+        assert_eq!(topic.reply_target, "-100200300:789");
+        assert_eq!(topic.thread_ts.as_deref(), Some("789"));
+
+        // Ordinary reply-thread (no is_topic_message): continues the main chat.
+        let reply = ch
+            .try_parse_attachment_message(&serde_json::json!({
+                "message": {
+                    "message_id": 43,
+                    "chat": { "id": -100_200_300, "type": "supergroup" },
+                    "from": { "username": "alice", "id": 99 },
+                    "photo": [ { "file_id": "best", "file_size": 20 } ],
+                    "caption": "and this",
+                    "message_thread_id": 789,
+                    "reply_to_message": { "message_id": 40, "from": { "username": "bob" }, "text": "x" }
+                }
+            }))
+            .await
+            .expect_parsed("reply-thread photo should parse");
+        assert_eq!(reply.reply_target, "-100200300");
+        assert_eq!(reply.thread_ts, None);
+    }
+
+    #[tokio::test]
+    async fn voice_parser_applies_the_topic_thread_gate() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The voice parser (`try_parse_voice_message`) is the third parse path
+        // wired to `topic_thread_id`. Same contract as the attachment path: a
+        // genuine topic isolates, an ordinary reply-thread continues the main
+        // chat. Reaching the parsed message requires the full transcription
+        // path, so mock getFile, the file download, and the Whisper endpoint.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file_1.ogg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file_1\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+        // Groq posts the audio to `config.api_url`.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/audio/transcriptions$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "text": "hello there" })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            api_url: format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_transcription(tc);
+
+        // Genuine forum topic: isolated.
+        let topic = ch
+            .try_parse_voice_message(&serde_json::json!({
+                "message": {
+                    "message_id": 51,
+                    "voice": { "file_id": "voice_file", "duration": 4 },
+                    "from": { "id": 555, "username": "alice" },
+                    "chat": { "id": -100_200_300, "type": "supergroup" },
+                    "message_thread_id": 789,
+                    "is_topic_message": true
+                }
+            }))
+            .await
+            .expect_parsed("topic voice should parse");
+        assert_eq!(topic.reply_target, "-100200300:789");
+        assert_eq!(topic.thread_ts.as_deref(), Some("789"));
+
+        // Ordinary reply-thread (no is_topic_message): continues the main chat.
+        let reply = ch
+            .try_parse_voice_message(&serde_json::json!({
+                "message": {
+                    "message_id": 52,
+                    "voice": { "file_id": "voice_file", "duration": 4 },
+                    "from": { "id": 555, "username": "alice" },
+                    "chat": { "id": -100_200_300, "type": "supergroup" },
+                    "message_thread_id": 789,
+                    "reply_to_message": { "message_id": 40, "from": { "username": "bob" }, "text": "x" }
+                }
+            }))
+            .await
+            .expect_parsed("reply-thread voice should parse");
+        assert_eq!(reply.reply_target, "-100200300");
+        assert_eq!(reply.thread_ts, None);
     }
 
     // ── File sending API URL tests ──────────────────────────────────
