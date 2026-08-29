@@ -275,18 +275,12 @@ impl SessionStore {
         id: &str,
         timeout: std::time::Duration,
     ) -> Result<Option<u64>, WaitForProviderUpdateError> {
-        let Some((pending, generation)) = self
-            .sessions
-            .lock()
-            .await
-            .get(id)
-            .and_then(|session| {
-                session
-                    .pending_generation
-                    .as_ref()
-                    .map(|p| (Arc::clone(p), session.generation))
-            })
-        else {
+        let Some((pending, generation)) = self.sessions.lock().await.get(id).and_then(|session| {
+            session
+                .pending_generation
+                .as_ref()
+                .map(|p| (Arc::clone(p), session.generation))
+        }) else {
             return Ok(None);
         };
         // Register interest BEFORE re-checking, so a reconciliation that
@@ -302,7 +296,7 @@ impl SessionStore {
         match current.get(id) {
             None => return Ok(None),
             Some(session) if session.generation != generation => {
-                return Ok(Some(session.generation))
+                return Ok(Some(session.generation));
             }
             Some(session) if session.pending_generation.is_none() => return Ok(Some(generation)),
             Some(_) => {}

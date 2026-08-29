@@ -2201,10 +2201,10 @@ impl RpcDispatcher {
                 .await
                 .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
             if current_generation != observed_generation {
-                // The session was replaced; the cached Agent is orphaned. This
-                // is rare but well-defined: two concurrent first prompts both
-                // looked up, found absent, and rehydrated. The second
-                // replacement won the insert race. Re-fetch the winner.
+                // The session was replaced; the cached Agent is orphaned. Two
+                // concurrent first prompts both looked up, found absent, and
+                // rehydrated; the later insert won. Re-fetch the winner rather
+                // than dispatching through the predecessor.
                 agent = self
                     .ctx
                     .sessions
