@@ -501,7 +501,7 @@ impl Chat {
                 if let Some(sid) = resumed_sid
                     && let Ok(msgs) = self.rpc.session_messages(&sid).await
                 {
-                    state.load_history(msgs.messages);
+                    state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
             }
@@ -1410,13 +1410,10 @@ impl Chat {
             return false;
         }
 
-        // The attachment manager is modal within the input surface. Higher
-        // overlays above have already had first refusal; handle it before queue,
-        // browse, and other pane-level shortcuts.
-        if state.pending_approval().is_none() && state.input_bar.has_attachment_manager() {
-            state.clear_mouse_highlight();
-            let _ = state.input_bar.handle_key(key);
-            state.mark_dirty_full();
+        // Input-bar overlays are modal within the input surface. Higher
+        // overlays above have already had first refusal; handle them before
+        // queue, browse, and other pane-level shortcuts.
+        if state.handle_input_bar_overlay_key(key) {
             return false;
         }
 
@@ -1529,7 +1526,7 @@ impl Chat {
 
         // Enter (slash commands + submit), text input, cursor, backspace.
         // It does NOT handle approval, selection, session management, etc.
-        if state.pending_approval().is_none() && !state.in_browse_mode() {
+        if state.composer_owns_text_input() {
             let action = state.input_bar.handle_key(key);
             match action {
                 InputBarAction::Submit { text, attachments } => {
@@ -1957,7 +1954,7 @@ impl Chat {
 
         Self::refresh_model_identity(rpc, state).await;
         if let Ok(msgs) = rpc.session_messages(&new_sid).await {
-            state.load_history(msgs.messages);
+            state.load_history(msgs.messages, pane_kind == PaneKind::Acp);
         }
     }
 
@@ -2685,10 +2682,11 @@ impl Chat {
         let ChatPhase::Active(state) = &mut self.phase else {
             return;
         };
-        // Approval overlays own input while an agent turn is paused for a
-        // decision. Keep paste aligned with the keyboard-input guard so it
-        // cannot mutate the hidden composer beneath the modal.
-        if state.pending_approval().is_some() {
+        // Bracketed paste bypasses the keyboard handlers that give modal and
+        // browse surfaces first refusal. Consult the same composer-ownership
+        // decision before routing it into the input bar so neither text nor a
+        // path-like attachment can mutate hidden state.
+        if !state.composer_owns_text_input() {
             return;
         }
         let action = state.input_bar.handle_paste(text);
@@ -5846,6 +5844,40 @@ impl ChatState {
         // Full is sticky — don't downgrade.
     }
 
+    /// Whether text input currently belongs to the composer rather than a
+    /// modal, picker, explorer, or transcript-browse surface.
+    fn composer_owns_text_input(&self) -> bool {
+        !self.model_picker.is_open()
+            && self.pending_elicitation().is_none()
+            && self.pending_approval().is_none()
+            && matches!(self.session_overlay, SessionOverlay::None)
+            && self.context_menu.is_none()
+            && !self.input_bar.has_file_explorer()
+            && !self.input_bar.has_attachment_manager()
+            && !self.in_browse_mode()
+    }
+
+    /// Route a key to an input-bar-owned overlay and retain its user feedback.
+    /// Returns true only when that overlay consumed the key before pane-level
+    /// shortcuts get a chance to process it.
+    fn handle_input_bar_overlay_key(&mut self, key: KeyEvent) -> bool {
+        if self.pending_approval().is_some()
+            || (!self.input_bar.has_file_explorer() && !self.input_bar.has_attachment_manager())
+        {
+            return false;
+        }
+
+        self.clear_mouse_highlight();
+        let action = self.input_bar.handle_key(key);
+        // Explorer confirmation can reject an attachment (for example a file
+        // over the size limit). Preserve that feedback instead of swallowing it.
+        if let InputBarAction::StatusMessage(message) = action {
+            self.set_info_notice(message);
+        }
+        self.mark_dirty_full();
+        true
+    }
+
     fn mark_dirty_full(&mut self) {
         self.dirty = LinesDirty::Full;
     }
@@ -6189,8 +6221,9 @@ impl ChatState {
         } else if !extend {
             self.browse_anchor = None;
         }
-        self.browse_cursor = Some(cur.saturating_sub(n));
-        self.scroll_entry_into_view(self.browse_cursor.unwrap());
+        let next = cur.saturating_sub(n);
+        self.browse_cursor = Some(next);
+        self.scroll_entry_into_view(next);
         self.pinned_to_bottom = false;
         self.mark_dirty_full();
     }
@@ -6209,8 +6242,9 @@ impl ChatState {
         } else if !extend {
             self.browse_anchor = None;
         }
-        self.browse_cursor = Some((cur + n).min(len - 1));
-        self.scroll_entry_into_view(self.browse_cursor.unwrap());
+        let next = cur.saturating_add(n).min(len - 1);
+        self.browse_cursor = Some(next);
+        self.scroll_entry_into_view(next);
         self.pinned_to_bottom =
             self.scroll_offset >= self.last_total_rows.saturating_sub(self.last_inner_height);
         self.mark_dirty_full();
@@ -7362,12 +7396,21 @@ impl ChatState {
         self.queue_sel = None;
     }
 
-    fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>) {
+    fn load_history(
+        &mut self,
+        messages: Vec<crate::client::MessageEntry>,
+        strip_runtime_enrichment: bool,
+    ) {
         for m in messages {
             match m.role() {
                 crate::client::MessageRole::User => {
-                    if self.first_message.is_none() {
-                        self.first_message = Some(m.content.clone());
+                    let display = if strip_runtime_enrichment {
+                        strip_enrichment_prefix(&m.content)
+                    } else {
+                        &m.content
+                    };
+                    if self.first_message.is_none() && !display.trim().is_empty() {
+                        self.first_message = Some(display.to_string());
                     }
                     self.entries.push(ChatEntry::UserMessage {
                         text: Some(Arc::<str>::from(m.content)),
@@ -7442,6 +7485,20 @@ impl ChatState {
         self.todo_tracker.reset_for_session(todo_settings);
         self.clear_queue();
     }
+}
+
+/// Strip the runtime's date/time enrichment prefix from an ACP-persisted user
+/// message. ACP stores the Agent's provider-visible history, while normal Chat
+/// sessions store raw prompts and must preserve an identical user-authored
+/// prefix. Content without the runtime envelope passes through unchanged.
+fn strip_enrichment_prefix(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("[CURRENT DATE & TIME:") else {
+        return content;
+    };
+    let Some(bracket_end) = rest.find(']') else {
+        return content;
+    };
+    rest[bracket_end + 1..].trim_start()
 }
 
 /// Body-only clipboard text.
@@ -12736,28 +12793,104 @@ mod tests {
             crate::todo_tracker::TodoTrackerSettings::default(),
         );
         let before = s.entries.len();
-        s.load_history(vec![
-            MessageEntry {
-                role: "user".to_string(),
-                content: "first ask".to_string(),
-            },
-            MessageEntry {
-                role: "assistant".to_string(),
-                content: "reply".to_string(),
-            },
-            MessageEntry {
-                role: "system".to_string(),
-                content: "ignored".to_string(),
-            },
-            MessageEntry {
-                role: "user".to_string(),
-                content: "second ask".to_string(),
-            },
-        ]);
+        s.load_history(
+            vec![
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "first ask".to_string(),
+                },
+                MessageEntry {
+                    role: "assistant".to_string(),
+                    content: "reply".to_string(),
+                },
+                MessageEntry {
+                    role: "system".to_string(),
+                    content: "ignored".to_string(),
+                },
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "second ask".to_string(),
+                },
+            ],
+            false,
+        );
         // User + assistant + user replayed; system dropped.
         assert_eq!(s.entries.len(), before + 3);
         // First user message seeds the pinned recovery row.
         assert_eq!(s.first_message.as_deref(), Some("first ask"));
+    }
+
+    #[test]
+    fn load_history_strips_enrichment_prefix_from_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session(
+            "sess-resume".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\nfirst ask".to_string(),
+            }],
+            true,
+        );
+        // The pinned row renders a single line; it must show the message
+        // text, not the runtime's timestamp prefix.
+        assert_eq!(s.first_message.as_deref(), Some("first ask"));
+        // The transcript entry keeps the persisted content untouched.
+        assert!(matches!(
+            &s.entries[s.entries.len() - 1],
+            ChatEntry::UserMessage { text: Some(t), .. }
+                if t.starts_with("[CURRENT DATE & TIME:") && t.ends_with("first ask")
+        ));
+    }
+
+    #[test]
+    fn load_history_skips_prefix_only_content_when_seeding_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session(
+            "sess-resume".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\n".to_string(),
+            }],
+            true,
+        );
+        // A message that strips to nothing must not claim the pinned row —
+        // Some("") would block a later real message from ever seeding it.
+        assert!(s.first_message.is_none());
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: "[CURRENT DATE & TIME: 2026-03-14 09:31:00 UTC]\n\nreal ask".to_string(),
+            }],
+            true,
+        );
+        assert_eq!(s.first_message.as_deref(), Some("real ask"));
+    }
+
+    #[test]
+    fn load_history_preserves_literal_timestamp_example_for_chat_sessions() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        let literal = "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\nthis is user-authored";
+
+        s.load_history(
+            vec![MessageEntry {
+                role: "user".to_string(),
+                content: literal.to_string(),
+            }],
+            false,
+        );
+
+        assert_eq!(s.first_message.as_deref(), Some(literal));
     }
 
     // ── Elicitation modal ────────────────────────────────────────
@@ -12979,6 +13112,122 @@ mod tests {
         chat.handle_paste(" must not reach the composer");
 
         assert_eq!(active_state(&mut chat).input_bar.input(), "alpha beta");
+    }
+
+    #[tokio::test]
+    async fn paste_does_not_mutate_hidden_composer_when_another_surface_owns_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut cases = Vec::new();
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).model_picker = ModelPickerOverlay::Loading;
+        cases.push(("model picker", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.turn_in_flight = true;
+        state.pending_elicitation = Some(single_elicitation());
+        cases.push(("elicitation", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).session_overlay = SessionOverlay::List {
+            sessions: Vec::new(),
+            list_state: ListState::default(),
+        };
+        cases.push(("session picker", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).context_menu = Some(ChatContextMenu {
+            rect: Rect::new(0, 0, 20, 5),
+            target: ChatContextMenuTarget::Queue(1),
+            selected: 0,
+        });
+        cases.push(("context menu", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.input_bar.add_attachment(PendingAttachment {
+            path: std::path::PathBuf::from("already-attached.png"),
+            mime_type: "image/png".into(),
+            filename: "already-attached.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        });
+        state.input_bar.clear_input();
+        state.input_bar.insert_text("/attachments");
+        assert!(matches!(
+            state
+                .input_bar
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputBarAction::Consumed
+        ));
+        cases.push(("attachment manager", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        assert!(matches!(
+            active_state(&mut chat)
+                .input_bar
+                .handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            InputBarAction::Consumed
+        ));
+        cases.push(("file explorer", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).browse_cursor = Some(0);
+        cases.push(("browse mode", chat));
+
+        let attachment_path = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        for (surface, mut chat) in cases {
+            let state = active_state(&mut chat);
+            let original_input = state.input_bar.input().to_string();
+            let original_attachment_count = state.input_bar.pending_attachments().len();
+
+            chat.handle_paste(" hidden text");
+            chat.handle_paste(&attachment_path);
+
+            let state = active_state(&mut chat);
+            assert_eq!(
+                state.input_bar.input(),
+                original_input,
+                "{surface} must keep pasted text out of the hidden composer"
+            );
+            assert_eq!(
+                state.input_bar.pending_attachments().len(),
+                original_attachment_count,
+                "{surface} must not create hidden attachments from pasted paths"
+            );
+        }
+    }
+
+    #[test]
+    fn file_explorer_attachment_error_reaches_info_notice() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        // Keep the explorer listing deterministic and let the guard clean up
+        // the oversized fixture even when an assertion fails.
+        let temp_dir = tempfile::tempdir().expect("create attachment fixture directory");
+        let oversized_path = temp_dir.path().join("oversized.bin");
+        let file = std::fs::File::create(&oversized_path).expect("create oversized attachment");
+        file.set_len(10 * 1024 * 1024 + 1)
+            .expect("make attachment exceed the 10 MiB limit");
+
+        let mut state = state();
+        state
+            .input_bar
+            .open_file_explorer_for_test(oversized_path.clone());
+
+        assert!(
+            state.handle_input_bar_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,))
+        );
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|notice| !notice.text.is_empty()),
+            "a rejected file-explorer attachment must produce visible feedback regardless of locale"
+        );
+        assert!(!state.input_bar.has_file_explorer());
     }
 
     #[tokio::test]
