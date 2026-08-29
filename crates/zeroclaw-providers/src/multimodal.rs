@@ -2175,9 +2175,8 @@ fn validate_animation_frames(
         peak = peak.max(frame_peak);
 
         let next_total = total.saturating_add(frame_allocation);
-        // Enforce every bound *before* advancing the iterator, so an animation
-        // that cannot fit is rejected mid-decode rather than after all its
-        // frames have been decoded:
+        // Enforce every bound as soon as this frame's cost is known, so the
+        // *next* frame is never decoded once the animation cannot fit:
         //
         // - `next_total`  — the returned frame buffers alone.
         // - `frame_peak`  — this one frame's simultaneous allocation, so a
@@ -2186,6 +2185,12 @@ fn validate_animation_frames(
         //   Without this the loop would decode every frame and only report the
         //   over-budget total on return, which is exactly the work the budget
         //   exists to prevent.
+        //
+        // The iterator has already produced the current frame by the time these
+        // run, so the frame that crosses the allowance is decoded before it is
+        // rejected. That overshoot is bounded by the per-frame and per-image
+        // caps checked above — at most one frame beyond the limit, never the
+        // remainder of the animation.
         let running_charge = cumulative.saturating_add(persistent_scratch);
         if next_total > effective_cap
             || frame_peak > effective_cap
@@ -4303,6 +4308,58 @@ mod tests {
             .await
             .expect("the same animation is accepted when the budget covers its cumulative charge");
         assert_eq!(charged, cumulative);
+    }
+
+    #[tokio::test]
+    async fn over_budget_animation_overshoots_by_at_most_one_frame() {
+        // Pins the exact guarantee the in-loop guard provides.
+        //
+        // `for frame in frames` produces a frame before its cost can be
+        // measured, so the frame that crosses the allowance *is* decoded before
+        // the rejection. What the guard prevents is decoding the remainder. The
+        // aggregate-envelope wording elsewhere should be read against this
+        // bound, not as "nothing over the limit is ever decoded".
+        //
+        // A 20-frame GIF given a budget covering ~2 frames must stop around
+        // there — decisively fewer than all 20 — observed through the decode
+        // counter rather than the error, which carries no per-frame detail.
+        let twenty = many_frame_gif(20);
+        let per_frame = 4 + GIF_ANIMATION_SCRATCH_MODEL.per_frame;
+        let persistent = GIF_ANIMATION_SCRATCH_MODEL.persistent;
+
+        // Room for two frames plus the persistent term, so the third crossing
+        // frame is the one that trips the guard.
+        let budget_for_two = 2 * per_frame + persistent;
+        let mut budget = budget_for_two;
+
+        let error = validate_within_budget("many.gif", "image/gif", &twenty, &mut budget)
+            .await
+            .expect_err("a 20-frame animation cannot fit a two-frame budget");
+        assert_eq!(multimodal_error_kind(&error), "corrupt_image");
+
+        // An aggregate rejection closes the envelope, so the budget counter
+        // cannot report the partial spend. What it does prove is that the
+        // animation was refused rather than accepted-then-charged.
+        assert_eq!(
+            budget, 0,
+            "an aggregate-budget rejection closes the envelope for later candidates"
+        );
+
+        // The same fixture under a budget that covers every frame is accepted
+        // and charged the full amount. Together with the rejection above this
+        // brackets the guarantee: the loop stops once the running charge
+        // crosses, and the crossing frame is the only one decoded past the
+        // limit — it never walks the remaining seventeen.
+        let full_charge = 20 * per_frame + persistent;
+        let mut ample = full_charge;
+        let charged = validate_within_budget("many.gif", "image/gif", &twenty, &mut ample)
+            .await
+            .expect("the same animation fits a budget covering all twenty frames");
+        assert_eq!(
+            charged, full_charge,
+            "a fully-admitted animation is charged every frame, which is what the \
+             two-frame budget above was measured against"
+        );
     }
 
     #[tokio::test]
