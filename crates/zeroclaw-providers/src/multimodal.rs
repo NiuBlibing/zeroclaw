@@ -3243,6 +3243,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn over_ceiling_marker_is_refused_on_the_production_path() {
+        // The parser-boundary counterpart to the test above.
+        //
+        // That one drives a ~28 MB marker, which is past the configured
+        // encoded ceiling but *below* `MAX_IMAGE_MARKER_BYTES`, so it proves
+        // the `normalize_data_uri` guard. This one drives a marker past the
+        // parser ceiling, which is refused earlier still — before
+        // `collapse_wrapped_marker` owns the span at all.
+        //
+        // Both allocation shapes are covered because they take different paths
+        // inside `collapse_wrapped_marker`: the single-line branch copies once,
+        // the wrapped branch allocates a build buffer *and* a trimmed copy.
+        // Driving them through `prepare_messages_for_provider` rather than the
+        // parser directly is what makes this a production-path proof: every
+        // counting, trimming, and normalization pass runs.
+        let cfg = MultimodalConfig::default();
+        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
+
+        for (label, marker_body) in [
+            ("single-line", payload.clone()),
+            // Newlines force the wrapped branch, the costlier of the two.
+            ("wrapped", format!("{payload}\n  continued")),
+        ] {
+            let message = format!("before [IMAGE:data:image/png;base64,{marker_body}] after");
+
+            let ((result, base64_decodes), pixel_decodes) = counting_decodes(async {
+                counting_base64_decodes(async {
+                    prepare_messages_for_provider(&[ChatMessage::user(message.clone())], &cfg)
+                        .await
+                        .expect("preparation does not hard-fail on a refused marker")
+                })
+                .await
+            })
+            .await;
+
+            assert!(
+                !result.contains_images,
+                "{label}: an over-ceiling marker must not reach the provider"
+            );
+            assert_eq!(
+                base64_decodes, 0,
+                "{label}: rejection must happen before `STANDARD.decode` runs"
+            );
+            assert_eq!(
+                pixel_decodes, 0,
+                "{label}: rejection must happen before any pixel decode"
+            );
+
+            // The marker is preserved verbatim as prose — the same treatment
+            // placeholder markers get — so the message text survives and the
+            // rejection never reports the marker through an error path.
+            let content = &result.messages[0].content;
+            assert!(
+                content.starts_with("before ") && content.ends_with(" after"),
+                "{label}: surrounding prose must survive the refusal"
+            );
+            assert!(
+                !content.contains("could not be loaded"),
+                "{label}: an over-ceiling marker is prose, not a skipped image"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn oversized_data_uri_with_malformed_header_is_refused_before_any_source_copy() {
         // The entry-point length guard must fire for malformed data URIs too,
         // not only for valid-MIME oversized payloads. A malformed header (no
