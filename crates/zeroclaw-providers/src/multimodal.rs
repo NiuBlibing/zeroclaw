@@ -12,6 +12,21 @@ use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 
+/// Maximum byte length for a single image marker candidate, enforced before any
+/// allocation or owned copy is made.
+///
+/// This is a hard sanity guard enforced in `parse_image_markers` before
+/// `collapse_wrapped_marker` or any other owned-copy operation runs. A marker
+/// candidate whose UTF-8 byte length exceeds this ceiling is treated as
+/// non-loadable and preserved verbatim in the cleaned output, bypassing all
+/// downstream validation and normalization.
+///
+/// The ceiling is deliberately set well above any legitimate configured
+/// `max_image_size_mb` (which clamps at 20 MiB decoded → ~27 MB base64 encoded)
+/// to avoid false rejections while still bounding parser-internal allocations
+/// against pathological input.
+const MAX_IMAGE_MARKER_BYTES: usize = 50 * 1024 * 1024; // 50 MiB
+
 /// Bounds for the content-validation decode in
 /// [`validate_image_content_with_projection`].
 /// Vision providers downscale well below this, so a legitimate attachment is
@@ -437,6 +452,26 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
         };
 
         let end = marker_start + rel_end;
+
+        // Bound the candidate span before it is copied.
+        //
+        // `collapse_wrapped_marker` owns the span (twice, for a line-wrapped
+        // marker: a build buffer plus the trimmed result), and every downstream
+        // ceiling — the data-URI source check, the base64 encoded check, the
+        // decoded-size check — runs on that owned copy. A pathological marker
+        // would therefore be materialized several times over before anything
+        // rejected it. Checking the borrowed span here keeps the parser's own
+        // allocations bounded regardless of what the caller does later.
+        //
+        // An over-ceiling marker is treated exactly like any other non-loadable
+        // reference: preserved verbatim as prose. It never becomes a candidate,
+        // so no normalization path ever sees it.
+        if end - marker_start > MAX_IMAGE_MARKER_BYTES {
+            cleaned.push_str(&content[start..=end]);
+            cursor = end + 1;
+            continue;
+        }
+
         let candidate = collapse_wrapped_marker(&content[marker_start..end]);
 
         if candidate.is_empty() || !is_loadable_image_reference(&candidate) {
@@ -5521,6 +5556,48 @@ mod tests {
 
         assert_eq!(cleaned, "hello [IMAGE:] world");
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn parse_image_markers_refuses_over_ceiling_marker_without_owning_it() {
+        // The parser copies a candidate span (twice, for a line-wrapped marker)
+        // before any downstream ceiling can see it, so the span itself has to be
+        // bounded here. An over-ceiling marker is treated like any other
+        // non-loadable reference: kept verbatim as prose, never a candidate.
+        //
+        // Both shapes are covered because they take different paths inside
+        // `collapse_wrapped_marker`: the single-line path allocates once, the
+        // wrapped path allocates a build buffer *and* a trimmed copy.
+        let oversized_payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
+
+        for (label, payload) in [
+            ("single-line", oversized_payload.clone()),
+            // Newlines force the wrapped branch, which is the costlier one.
+            ("wrapped", format!("{oversized_payload}\n  continued")),
+        ] {
+            let input = format!("before [IMAGE:data:image/png;base64,{payload}] after");
+            let (cleaned, refs) = parse_image_markers(&input);
+
+            assert!(
+                refs.is_empty(),
+                "{label}: an over-ceiling marker must never become a candidate"
+            );
+            assert_eq!(
+                cleaned, input,
+                "{label}: an over-ceiling marker is preserved verbatim as prose"
+            );
+        }
+
+        // A marker at the ceiling is still accepted, so the guard rejects only
+        // what is genuinely past it.
+        let at_ceiling = "A".repeat(MAX_IMAGE_MARKER_BYTES - "data:image/png;base64,".len());
+        let input = format!("[IMAGE:data:image/png;base64,{at_ceiling}]");
+        let (_, refs) = parse_image_markers(&input);
+        assert_eq!(
+            refs.len(),
+            1,
+            "a marker exactly at the ceiling must still be extracted"
+        );
     }
 
     #[tokio::test]
