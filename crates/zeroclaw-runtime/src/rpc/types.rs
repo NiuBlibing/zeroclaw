@@ -1331,6 +1331,12 @@ rpc_type! {
         /// deployments with multiple retained segments.
         pub next_segment_cursor: Option<String>,
         pub at_end: bool,
+        /// True when a retained segment could not be read and was left out of
+        /// this page. `at_end` then means "no older events among the segments
+        /// that could be read", which is weaker than "no older events exist",
+        /// so a client that stops paging on `at_end` should say the history is
+        /// partial rather than present it as complete.
+        pub incomplete: bool,
     }
 }
 

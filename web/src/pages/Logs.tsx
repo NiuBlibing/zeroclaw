@@ -167,6 +167,10 @@ export default function Logs() {
   const [cursorOlderOffset, setCursorOlderOffset] = useState<number | null>(null);
   const [cursorOlderLegacy, setCursorOlderLegacy] = useState<[string, string] | null>(null);
   const [atEnd, setAtEnd] = useState(false);
+  // Sticky for the life of a filter: a later page reading cleanly does not
+  // restore the segment an earlier one could not read, so `atEnd` alone would
+  // present a buffer with a hole in it as the whole stream.
+  const [historyIncomplete, setHistoryIncomplete] = useState(false);
   const [loading, setLoading] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [paused, setPaused] = useState(false);
@@ -227,6 +231,7 @@ export default function Logs() {
       setCursorOlderOffset(response.next_cursor_line_offset ?? null);
       setCursorOlderLegacy(response.next_cursor);
       setAtEnd(response.at_end);
+      setHistoryIncomplete(response.incomplete ?? false);
       setAttributionKeys(response.attribution_keys ?? []);
       setDaemonStartedAt(response.daemon_started_at);
     } catch (err) {
@@ -326,6 +331,7 @@ export default function Logs() {
       setCursorOlderOffset(response.next_cursor_line_offset ?? null);
       setCursorOlderLegacy(response.next_cursor);
       setAtEnd(response.at_end);
+      setHistoryIncomplete((prev) => prev || (response.incomplete ?? false));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -386,6 +392,7 @@ export default function Logs() {
                 {events.length} {t('logs.events')}
                 {atEnd ? ` · ${t('logs.at_end')}` : ''}
               </Badge>
+              {historyIncomplete && <Badge tone="warn">{t('logs.incomplete')}</Badge>}
               <Button
                 variant="ghost"
                 size="sm"

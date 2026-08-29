@@ -54,6 +54,11 @@ pub struct LogsResponse {
     pub next_segment_cursor: Option<String>,
     /// True when the file was fully scanned for this filter.
     pub at_end: bool,
+    /// True when a retained segment could not be read and was left out of this
+    /// page. `at_end` then means "no older events among the segments that could
+    /// be read", which is weaker than "no older events exist", so a client that
+    /// stops paging on `at_end` should present the history as partial.
+    pub incomplete: bool,
     /// Daemon start time so callers can implement "since daemon start"
     /// without an extra `/api/status` round-trip.
     pub daemon_started_at: String,
@@ -94,6 +99,7 @@ pub async fn handle_api_logs(
             next_cursor_line_offset: None,
             next_segment_cursor: None,
             at_end: true,
+            incomplete: false,
             daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
             attribution_keys: attribution_keys_for_response(),
         })
@@ -178,6 +184,7 @@ pub async fn handle_api_logs(
         next_cursor_line_offset,
         next_segment_cursor,
         at_end,
+        incomplete,
     } = match zeroclaw_log::query_log_page(
         &active,
         reads_archives,
@@ -208,6 +215,7 @@ pub async fn handle_api_logs(
         next_cursor_line_offset,
         next_segment_cursor,
         at_end,
+        incomplete,
         daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
         attribution_keys: attribution_keys_for_response(),
     })

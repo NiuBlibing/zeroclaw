@@ -2202,11 +2202,12 @@ export interface LogsResponse {
    *  `null` when the page is empty. */
   next_cursor_line_offset: number | null;
   /** Segment-aware cursor for the oldest event on the current page. Treat
-   *  it as an OPAQUE token: it encodes the segment, a byte offset, and an
-   *  anchor event id, and its internal shape may change. Pass the returned
+   *  it as an OPAQUE token: it identifies a segment and a byte offset within
+   *  it, and for the active file also carries an anchor event id so the
+   *  cursor survives a rotation. Its shape may change. Pass the returned
    *  string back verbatim as [`LogsQueryParams::until_segment_cursor`] —
-   *  never construct or parse one, since a hand-built cursor loses the
-   *  anchor that protects pagination across an active-file rotation.
+   *  never construct or parse one, since a hand-built cursor loses whatever
+   *  the daemon encoded to keep it stable.
    *  Supersedes `next_cursor_line_offset` for `rotating`-mode deployments:
    *  when the oldest event on a page lives in an archive rather than the
    *  active file, `next_cursor_line_offset` is `null` and only this cursor
@@ -2214,6 +2215,11 @@ export interface LogsResponse {
    *  daemons predating multi-segment reads. */
   next_segment_cursor?: string | null;
   at_end: boolean;
+  /** True when a retained segment could not be read and was left out of this
+   *  page. `at_end` then only means "no older events among the segments that
+   *  could be read", so the UI must not present the buffer as the complete
+   *  history. Omitted (treat as `false`) by daemons predating the field. */
+  incomplete?: boolean;
   daemon_started_at: string;
   /** Canonical attribution-field names the daemon currently emits. Sourced
    *  from `ATTRIBUTION_FIELDS` + `COMPOSITE_PREFIXES` in zeroclaw-log so

@@ -4089,6 +4089,7 @@ impl RpcDispatcher {
             next_cursor_line_offset: page.next_cursor_line_offset,
             next_segment_cursor: page.next_segment_cursor,
             at_end: page.at_end,
+            incomplete: page.incomplete,
         })
     }
 
@@ -4104,15 +4105,28 @@ impl RpcDispatcher {
             return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
         };
 
-        match zeroclaw_log::find_event_across_segments(&active, reads_archives, &p.id)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?
-        {
+        let found = zeroclaw_log::find_event_across_segments(&active, reads_archives, &p.id)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
+
+        match found.event {
             Some(evt) => {
                 let event = serde_json::to_value(evt).map_err(|e| {
                     rpc_err(INTERNAL_ERROR, format!("Failed to serialize event: {e}"))
                 })?;
                 to_result(LogsGetResult { event })
             }
+            // A miss is only authoritative when every segment was read. If one
+            // was skipped, the id may be sitting in it, and reporting "not
+            // found" would present a guess as a fact — the caller stops looking
+            // for an event that is still on disk.
+            None if found.incomplete => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!(
+                    "Log id `{}` was not found, but part of the retained history \
+                     could not be read; the event may still exist",
+                    p.id
+                ),
+            )),
             None => Err(rpc_err(
                 INTERNAL_ERROR,
                 format!("Log id `{}` not found", p.id),

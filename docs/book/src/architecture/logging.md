@@ -285,6 +285,12 @@ whenever the active file's bytes are replaced or its path changes:
 
 After one of those boundaries, restart pagination from the newest page. The legacy timestamp/ID cursor remains for compatibility but is deprecated under [#8012](https://github.com/zeroclaw-labs/zeroclaw/issues/8012) because lexicographic ID ordering can skip tied events.
 
+Enumeration and reading are not atomic, so a rotation can land between them: the listing names the pre-rotation active file, the rename turns that file into an archive, and the scan reads the fresh replacement instead. The rotated-away events would then sit unlisted between two segments the page did read, unreachable forever because pagination only walks toward older history. The reader re-checks the archive set after the read and redoes the page when it moved. Checking afterwards rather than before is what closes the window, because a check before opening leaves room for a rotation between the check and the open. Only a page that reaches the active file needs this; archives are immutable, so a scan that stops short of the active file cannot be racing anything.
+
+A segment that cannot be read is logged, left out of the merged view, and marked in the response with `incomplete: true` rather than failing the whole query, since one bad file should not cost the caller every other segment. `at_end` is then scoped to what could be read, and the flag is what tells the caller so; the daemon's own log reaches the operator, not the client that has to decide whether to keep paging. Single-event lookup carries the same distinction: a hit is authoritative however many segments were skipped, but a miss over a skipped segment is reported as unreadable-history rather than `not found`.
+
+Archive discovery rejects symlinks. Matching the writer's filename shape is not path confinement, and following a link would let anyone who can write into the log directory point an archive-shaped name at any file the daemon can read.
+
 ## Persistence policy owns rewrites and retention
 
 `StoragePolicy` in `config.rs` controls only the JSONL destination. Observer and broadcast delivery remain independent of it.

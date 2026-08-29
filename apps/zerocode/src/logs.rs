@@ -482,6 +482,10 @@ pub(crate) struct Logs {
     next_cursor_offset: Option<u64>,
     next_cursor_legacy: Option<(String, String)>,
     at_end: bool,
+    /// True when the daemon could not read part of the retained history. The
+    /// status line says so, because `at_end` alone would present a truncated
+    /// buffer as the whole stream.
+    history_incomplete: bool,
     loading: bool,
     // Viewport
     list_height: u16,
@@ -513,6 +517,7 @@ impl Logs {
             next_cursor_offset: None,
             next_cursor_legacy: None,
             at_end: false,
+            history_incomplete: false,
             loading: false,
             list_height: 0,
             last_list_area: Rect::default(),
@@ -538,8 +543,8 @@ impl Logs {
     ) {
         self.loading = true;
         // Set when a cursor-bearing response turns out to contain only events
-        // already in the buffer, which means the cursor's segment is gone and
-        // the daemon served the newest page instead of older history.
+        // already in the buffer, which means the cursor bought no older
+        // history and paging cannot advance past it.
         let mut stale_cursor_no_progress = false;
         // Cursor precedence: segment cursor first (only one that can cross
         // into a rotated archive), then plain byte offset, then the legacy
@@ -584,11 +589,11 @@ impl Logs {
                 let prepended = new_entries.len();
                 if has_cursor && prepended > 0 {
                     // Prepend older events before the existing buffer.
-                    // Deduplicate by id: when a cursor segment is pruned by
-                    // retention, query_log_page falls back to a full scan and
-                    // returns the newest page instead of an older continuation.
-                    // Prepending without deduplication would show the same
-                    // events twice and scramble the chronological order.
+                    // Deduplicate by id: a daemon predating segment cursors
+                    // answers an unresolvable one with the newest page rather
+                    // than the empty at-end sentinel current daemons return,
+                    // and prepending that without deduplication would show the
+                    // same events twice and scramble the chronological order.
                     let existing_ids: std::collections::HashSet<String> =
                         self.events.iter().map(|e| e.id.clone()).collect();
                     let deduped: Vec<LogEntry> = new_entries
@@ -605,10 +610,9 @@ impl Logs {
                             self.list_state.select(Some(sel + actually_prepended));
                         }
                     } else {
-                        // Every returned event was a duplicate: the cursor was
-                        // stale and the daemon served the newest page instead of
-                        // older history. Stop paging rather than treating this
-                        // as an ordinary older page.
+                        // Every returned event was a duplicate, so this page
+                        // carried no older history. Stop paging rather than
+                        // treating it as an ordinary older page.
                         //
                         // Recorded as a flag rather than returning early: the
                         // cleanup at the end of this function clears
@@ -628,10 +632,12 @@ impl Logs {
                 self.next_cursor_segment = result.next_segment_cursor;
                 self.next_cursor_offset = result.next_cursor_line_offset;
                 self.next_cursor_legacy = result.next_cursor;
-                // A no-progress page means the history this cursor pointed at
-                // is gone, so `result.at_end` (which describes the newest page
-                // the daemon fell back to) must not re-enable paging.
+                // A no-progress page means this cursor cannot advance, so
+                // whatever `at_end` describes must not re-enable paging.
                 self.at_end = result.at_end || stale_cursor_no_progress;
+                // Sticky: a later page reading cleanly does not restore the
+                // segment this one could not read.
+                self.history_incomplete |= result.incomplete;
             }
             Err(_) => {
                 // Query unavailable (old daemon without logs/query, or no log file).
@@ -661,6 +667,10 @@ impl Logs {
         self.next_cursor_offset = None;
         self.next_cursor_legacy = None;
         self.at_end = false;
+        // The buffer is refetched from scratch under the new filter, so a
+        // gap reported for the old one says nothing about the new pages. A
+        // segment that is still unreadable sets this again on the next query.
+        self.history_incomplete = false;
 
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
@@ -782,6 +792,11 @@ impl Logs {
                 Span::styled("[loading] ", theme::warn_style())
             } else if !self.at_end {
                 Span::styled("[more\u{2191}] ", theme::dim_style())
+            } else {
+                Span::raw("")
+            },
+            if self.history_incomplete {
+                Span::styled("[partial] ", theme::warn_style())
             } else {
                 Span::raw("")
             },

@@ -243,6 +243,8 @@ Log pagination walks backward with a segment-aware cursor. While `at_end` is fal
 
 Restart from the newest page after changing filters. Treat `at_end: true` as the signal to stop requesting older pages for that walk.
 
+`at_end` is scoped to the segments the daemon could actually read. When a retained segment cannot be opened, it is logged, left out of the merged view, and the response sets `incomplete: true`. The page is still returned, but `at_end` then means "no older events among the segments that could be read" rather than "no older events exist". Present such a walk as partial rather than complete. The same applies to a single-event lookup: rather than reporting a miss as `not found`, the daemon says the event was not found *and* that part of the retained history was unreadable, so it may still exist. Older daemons omit the field; treat its absence as `false`.
+
 `until_line_offset` is a position in the current active file. Archive rotation, startup migration, and a configured path change replace the bytes or active file it refers to; restart from the newest page after those boundaries.
 
 `until_segment_cursor` is resilient across those boundaries, by different means depending on where the page ended:
@@ -250,7 +252,7 @@ Restart from the newest page after changing filters. Treat `at_end: true` as the
 - **A page ending in an archive** is addressed by the archive's own identity, which is fixed when the archive is written and never reassigned to different content. Subsequent rotations therefore cannot invalidate it. If retention has since deleted that archive, the reader reports the history as finished rather than silently resuming at an unrelated position.
 - **A page ending in the active file** carries an anchor event id alongside the offset, because the active file's path is stable while its content is replaced on each rotation. On resume the reader checks that the event at the cursor boundary still matches the anchor; on a mismatch it searches the retained segments for that event and resumes from wherever it now lives, so pagination crosses a rotation without duplicating or skipping events. If the anchored event is gone entirely, the reader reports the history as finished.
 
-A cursor issued by an older daemon, which named a segment by filename without an anchor, is still accepted and read as a position in that named file.
+A cursor issued by an older daemon, which named a segment by filename without an anchor, is still accepted. That form cannot say whether it means a rotated archive or the active file, so the reader tries the archives first, where a name is never reassigned, and falls back to the active file.
 
 The `/api/status` response includes `daemon_started_at: string` (RFC
 3339), so a dashboard can default to "since daemon start" without an

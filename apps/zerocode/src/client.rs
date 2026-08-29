@@ -2955,6 +2955,13 @@ pub struct LogsQueryResult {
     #[serde(default)]
     pub next_segment_cursor: Option<String>,
     pub at_end: bool,
+    /// True when a retained segment could not be read and was left out of
+    /// this page. `at_end` is then only "no older events among the segments
+    /// that could be read", so the pane must not present the buffer as the
+    /// complete history. Absent (deserialized as `false`) on daemons that
+    /// predate the field.
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 /// Mirror of `zeroclaw_runtime::rpc::types::LogsGetResult`. Full log
