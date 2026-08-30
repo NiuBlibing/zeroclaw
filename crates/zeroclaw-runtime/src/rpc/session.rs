@@ -186,7 +186,15 @@ impl SessionStore {
         }
     }
 
-    pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<(), &'static str> {
+    pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<u64, &'static str> {
+        // Replacement is part of the session actor lifecycle. Serialize it
+        // with prompts so a same-ID successor cannot be published midway
+        // through a turn admitted for the predecessor.
+        let _session_guard = self
+            .session_queue
+            .acquire(&id)
+            .await
+            .map_err(|_| "session busy")?;
         let mut sessions = self.sessions.lock().await;
         if sessions.len() >= self.max_sessions {
             return Err("session limit reached");
@@ -197,7 +205,7 @@ impl SessionStore {
             .wrapping_add(1);
         session.generation = generation;
         sessions.insert(id, session);
-        Ok(())
+        Ok(generation)
     }
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
@@ -321,12 +329,15 @@ impl SessionStore {
     /// the session on its last known-good construction-time binding, which is
     /// strictly better than parking prompts forever on a convergence that will
     /// never arrive.
-    pub(crate) async fn clear_pending_generation(&self, id: &str) {
+    pub(crate) async fn clear_pending_generation(&self, id: &str, expected_generation: u64) {
         let notify = {
             let mut sessions = self.sessions.lock().await;
             match sessions.get_mut(id) {
-                Some(session) => session.pending_generation.take(),
+                Some(session) if session.generation == expected_generation => {
+                    session.pending_generation.take()
+                }
                 None => None,
+                Some(_) => None,
             }
         };
         if let Some(notify) = notify {
@@ -777,7 +788,16 @@ impl SessionStore {
             self.record_cancel_cause(id, CancelCause::SessionRemoved);
             token.cancel();
         }
-        self.sessions.lock().await.remove(id).is_some()
+        let (removed, pending) = self
+            .sessions
+            .lock()
+            .await
+            .remove(id)
+            .map_or((false, None), |session| (true, session.pending_generation));
+        if let Some(notify) = pending {
+            notify.notify_waiters();
+        }
+        removed
     }
 
     pub async fn evict_same_mode_sibling(
@@ -805,10 +825,18 @@ impl SessionStore {
             .map(|(key, _)| key.clone())
             .collect();
         let mut evicted = Vec::with_capacity(victims.len());
+        let mut pending = Vec::new();
         for key in victims {
             if let Some(s) = sessions.remove(&key) {
+                if let Some(notify) = s.pending_generation {
+                    pending.push(notify);
+                }
                 evicted.push((key, s.agent_alias));
             }
+        }
+        drop(sessions);
+        for notify in pending {
+            notify.notify_waiters();
         }
         evicted
     }
@@ -892,7 +920,16 @@ impl SessionStore {
             self.record_cancel_cause(id, CancelCause::AdminKill);
             token.cancel();
         }
-        self.sessions.lock().await.remove(id).is_some()
+        let (removed, pending) = self
+            .sessions
+            .lock()
+            .await
+            .remove(id)
+            .map_or((false, None), |session| (true, session.pending_generation));
+        if let Some(notify) = pending {
+            notify.notify_waiters();
+        }
+        removed
     }
 
     /// Record the cause for an imminent cancel-token fire. Call immediately

@@ -1891,7 +1891,8 @@ impl RpcDispatcher {
             Some(notify) => session.with_pending_generation(Arc::clone(notify)),
             None => session,
         };
-        self.ctx
+        let published_generation = self
+            .ctx
             .sessions
             .insert(sid.to_string(), session)
             .await
@@ -1932,21 +1933,19 @@ impl RpcDispatcher {
             let rehydrate_sid = sid.to_string();
             let rehydrate_alias = data.agent_alias.clone();
             zeroclaw_spawn::spawn!(async move {
-                Self::reconcile_rehydrated_session(
+                let reconciled = Self::reconcile_rehydrated_session(
                     Arc::clone(&rehydrate_ctx),
                     &rehydrate_sid,
                     &rehydrate_alias,
+                    published_generation,
                 )
                 .await;
-                // Unconditional: every exit path of the reconciliation —
-                // published, session gone, or unresolvable alias — must release
-                // the waiters. An abandoned repair leaves the session on its
-                // last known-good construction-time binding, which is strictly
-                // better than parking prompts on convergence that never comes.
-                rehydrate_ctx
-                    .sessions
-                    .clear_pending_generation(&rehydrate_sid)
-                    .await;
+                if reconciled {
+                    rehydrate_ctx
+                        .sessions
+                        .clear_pending_generation(&rehydrate_sid, published_generation)
+                        .await;
+                }
             });
         }
 
@@ -1983,15 +1982,15 @@ impl RpcDispatcher {
     /// what makes the read authoritative: it cannot return until the commit
     /// that owned the gate has finished.
     ///
-    /// The caller clears the session's pending-generation marker after this
-    /// returns, on every path — this function must therefore never park
-    /// indefinitely, and returns rather than retrying when the binding cannot
-    /// be resolved.
+    /// Returns `true` only after the committed provider binding is published.
+    /// A failed rebuild leaves the session pending, so callers cannot dispatch
+    /// through a mixed old-provider/new-config state.
     async fn reconcile_rehydrated_session(
         ctx: Arc<RpcContext>,
         session_id: &str,
         agent_alias: &str,
-    ) {
+        expected_generation: u64,
+    ) -> bool {
         // Acquire the gate (blocking) so we are guaranteed to read a config at
         // least as new as whatever committed while the Agent was being built.
         let _gate = Arc::clone(&ctx.config_write_lock).lock_owned().await;
@@ -2003,8 +2002,11 @@ impl RpcDispatcher {
         let _session_guard = ctx.sessions.lock_model_provider_update(session_id).await;
         // Capture generation inside the gate so it matches the config below.
         let Some(session_generation) = ctx.sessions.get_generation(session_id).await else {
-            return; // session was removed before we ran
+            return false; // session was removed before we ran
         };
+        if session_generation != expected_generation {
+            return false; // a successor owns this ID now
+        }
         let config_generation = Arc::new(ctx.config.read().clone());
         let agent_cfg = config_generation
             .resolved_agent_config(agent_alias)
@@ -2037,7 +2039,7 @@ impl RpcDispatcher {
                  provider against the committed config generation; the session stays on its \
                  construction-time provider"
             );
-            return;
+            return false;
         };
         let dispatcher =
             crate::agent::agent::tool_dispatcher_for_provider(&cfg, provider.as_ref(), &model);
@@ -2078,6 +2080,7 @@ impl RpcDispatcher {
                 Some(temperature),
             )
             .await;
+        true
     }
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
@@ -2091,7 +2094,7 @@ impl RpcDispatcher {
             ));
         }
 
-        let mut agent = match self.ctx.sessions.get_agent(sid).await {
+        let _initial_agent = match self.ctx.sessions.get_agent(sid).await {
             Some(a) => a,
             None => match self.rehydrate_reaped_session(sid).await {
                 Some(a) => a,
@@ -2114,6 +2117,16 @@ impl RpcDispatcher {
                 }
             },
         };
+
+        // Admit before reading mutable session metadata. Session replacement
+        // uses the same queue, so the rest of this turn has one incarnation.
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
         // Process inline attachments: upload each, append markers to prompt.
         let mut prompt = req.prompt.clone();
@@ -2148,14 +2161,6 @@ impl RpcDispatcher {
             }
         }
 
-        let _guard = self
-            .ctx
-            .sessions
-            .session_queue
-            .acquire(sid)
-            .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
-
         // Wait for a provisional binding to be confirmed before entering the
         // turn. A session rehydrated while a route-affecting commit held the
         // config writer gate is live but bound to an unconfirmed generation;
@@ -2189,30 +2194,7 @@ impl RpcDispatcher {
             }
         };
 
-        // Verify the cached Agent is still the instance that answered the wait.
-        // A same-ID replacement installs its own marker; the wait returns the
-        // new generation immediately, and the prompt must re-lookup rather than
-        // dispatch through a replaced predecessor.
-        if let Some(observed_generation) = converged_generation {
-            let current_generation = self
-                .ctx
-                .sessions
-                .get_generation(sid)
-                .await
-                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-            if current_generation != observed_generation {
-                // The session was replaced; the cached Agent is orphaned. Two
-                // concurrent first prompts both looked up, found absent, and
-                // rehydrated; the later insert won. Re-fetch the winner rather
-                // than dispatching through the predecessor.
-                agent = self
-                    .ctx
-                    .sessions
-                    .get_agent(sid)
-                    .await
-                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-            }
-        }
+        let _ = converged_generation;
 
         // Own the live-session provider generation through this turn. A
         // route-affecting config transaction holds the same lock while it
@@ -2242,6 +2224,15 @@ impl RpcDispatcher {
                 ));
             }
         };
+
+        // Resolve the canonical Agent only after admission and reconciliation;
+        // this prevents executing through an orphaned predecessor handle.
+        let agent = self
+            .ctx
+            .sessions
+            .get_agent(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());

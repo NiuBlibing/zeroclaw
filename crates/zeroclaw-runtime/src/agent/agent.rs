@@ -1985,9 +1985,12 @@ impl Agent {
         // are resolved from. Reading `live_config` here instead would let a
         // mid-session `config/set` report new capacity for a provider that was
         // rebuilt from the construction-time snapshot.
+        // `config` is the immutable snapshot captured by the live constructor
+        // before async setup. Seed the generation cell from that same snapshot
+        // so provider/resolver/limits cannot be split across two commits.
         let config_generation: Option<ConfigGeneration> = live_config
             .as_ref()
-            .map(|live| Arc::new(parking_lot::RwLock::new(Arc::new(live.read().clone()))));
+            .map(|_| Arc::new(parking_lot::RwLock::new(Arc::new(config.clone()))));
         let live_config_for_generation = live_config.as_ref().map(Arc::clone);
 
         let context_limits_resolver: ContextLimitsResolver =
