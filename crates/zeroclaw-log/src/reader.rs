@@ -43,12 +43,12 @@ pub struct LogFilter {
 ///
 /// Two forms exist, with different stability properties:
 ///
-/// - **Archive cursor** (`<seq>:<off>`): identifies a position in a numbered
-///   archive. The sequence number is written into the archive name at rotation
-///   time and is never reused, so this form survives any number of subsequent
-///   rotations. If the segment has been deleted by retention, the reader
-///   returns an empty page with `at_end = true` rather than silently jumping
-///   to a different position.
+/// - **Archive cursor** (`archive:<seq>:<off>`): identifies a position in a
+///   numbered archive. The sequence number is written into the archive name at
+///   rotation time and is never reused, so this form survives any number of
+///   subsequent rotations. If the segment has been deleted by retention, the
+///   reader returns an empty page with `at_end = true` rather than silently
+///   jumping to a different position.
 ///
 /// - **Active cursor** (`active:<off>:<anchor_id>`): identifies a position in
 ///   the current active file. Because the active file's path is stable but its
@@ -87,7 +87,7 @@ impl SegmentCursor {
     ///
     /// - `active:<off>:<anchor_id>` — active cursor with anchor
     /// - `active:<off>` — active cursor without anchor (legacy active)
-    /// - `<seq>:<off>` — archive cursor (both fields are decimal integers)
+    /// - `archive:<seq>:<off>` — numbered archive cursor
     /// - `<basename>:<off>` — pre-sequence form, ambiguous by construction:
     ///   an older daemon issued it for the active file, and it is also how a
     ///   legacy archive is addressed. Parsing cannot tell them apart, so the
@@ -125,14 +125,20 @@ impl SegmentCursor {
             };
         }
 
-        // Archive cursor: both sides of the single ':' are decimal integers.
-        if let Some((left, right)) = s.split_once(':')
-            && !left.contains(':')
-            && !right.contains(':')
-            && let (Ok(seq), Ok(off)) = (left.parse::<u64>(), right.parse::<u64>())
+        // Numbered archives have their own prefix so an archive sequence can
+        // never be confused with a legacy cursor for an all-numeric basename.
+        if let Some(rest) = s.strip_prefix("archive:")
+            && rest.contains(':')
         {
+            let (seq_str, off_str) = rest.split_once(':')?;
+            if seq_str.is_empty() || off_str.is_empty() || off_str.contains(':') {
+                return None;
+            }
             return Some(Self {
-                kind: CursorKind::Archive { seq, off },
+                kind: CursorKind::Archive {
+                    seq: seq_str.parse().ok()?,
+                    off: off_str.parse().ok()?,
+                },
             });
         }
 
@@ -154,7 +160,7 @@ impl SegmentCursor {
     /// Serialize to wire format.
     pub fn to_wire(&self) -> String {
         match &self.kind {
-            CursorKind::Archive { seq, off } => format!("{seq}:{off}"),
+            CursorKind::Archive { seq, off } => format!("archive:{seq}:{off}"),
             // The legacy wire form predates the `active:` prefix and the
             // sequence grammar, so it is the one shape that still addresses a
             // segment by name.
@@ -843,24 +849,13 @@ enum SegmentRef {
 fn resolve_cursor(segs: &[SegmentMeta], cursor: &SegmentCursor) -> Option<(usize, u64)> {
     match &cursor.kind {
         // An archive sequence is permanent: the number is written into the name
-        // at rotation and never reused. Not finding it usually means retention
-        // removed that segment, so there is genuinely nothing older to return.
-        //
-        // The one exception is the grammar overlap with the pre-sequence form.
-        // `<seq>:<off>` and `<basename>:<off>` are indistinguishable when the
-        // basename is all digits, and the numeric grammar is tried first, so an
-        // older daemon's active-file cursor for a log named `123` arrives here
-        // as sequence 123. Comparing the active file's own name as a number
-        // catches exactly that case and no other: an ordinary basename does not
-        // parse, so a genuinely pruned archive still resolves to nothing. It
-        // also survives zero padding, since both sides are compared as numbers.
+        // at rotation and never reused. Not finding it means retention removed
+        // that segment, so there is genuinely nothing older to return. The
+        // explicit `archive:` wire prefix keeps this identity distinct from a
+        // legacy cursor naming an all-numeric active file.
         CursorKind::Archive { seq, off } => segs
             .iter()
             .position(|s| s.seq == Some(*seq))
-            .or_else(|| {
-                segs.iter()
-                    .position(|s| s.is_active && s.name.parse::<u64>() == Ok(*seq))
-            })
             .map(|idx| (idx, *off)),
 
         // A name-addressed cursor. This is the pre-sequence wire form, and it
@@ -1109,6 +1104,9 @@ fn resolve_or_at_end(
     }
 }
 
+/// How many times a read is redone because its segment snapshot moved under it.
+const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
+
 /// Read one page across the active file and every retained archive.
 ///
 /// This is the entry point for `/api/logs` and the `logs/query` RPC. It owns
@@ -1154,9 +1152,6 @@ pub fn query_log_page(
     limit: usize,
     segment_cursor: Option<&SegmentCursor>,
 ) -> Result<LogPage> {
-    /// How many times a page is redone because the archive set moved under it.
-    const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
-
     let limit = limit.clamp(1, 10_000);
     let needle = filter.q.as_deref().map(|s| s.to_ascii_lowercase());
 
@@ -1203,10 +1198,10 @@ pub fn query_log_page(
     Ok(last.unwrap_or_else(at_end_page))
 }
 
-// Test seam: runs immediately after each enumeration inside `query_log_page`,
-// letting a test rotate the log inside the exact window the surrounding code
-// exists to survive. Without it a test can only check the pieces, and would
-// still pass with the re-check removed.
+// Test seam: runs immediately after each reader-owned enumeration, letting a
+// test rotate the log inside the exact window the surrounding code exists to
+// survive. Without it a test can only check the pieces, and would still pass
+// with the re-check removed.
 #[cfg(test)]
 thread_local! {
     static AFTER_ENUMERATE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
@@ -1291,59 +1286,83 @@ pub fn find_event_across_segments(
     reads_archives: bool,
     id: &str,
 ) -> Result<SegmentLookup> {
-    // Same policy boundary as `query_log_page`: an id that only exists in an
-    // unmanaged archive is not part of this policy's logical stream.
-    let mut incomplete = false;
-    let segs = enumerate_segment_metas(active, reads_archives, &mut incomplete)?;
-    // Newest first (active file, then archives newest to oldest), since a
-    // recently rotated event is the likelier target.
-    for seg in segs.iter().rev() {
-        let file = match File::open(&seg.path) {
-            Ok(f) => f,
-            // Retention or a rotation moved it between enumeration and now.
-            // An ordinary race: the id, if it was there, is in the archive
-            // that replaced it, which this loop still visits.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                tracing::warn!(
-                    target: "zeroclaw_log",
-                    error = ?err,
-                    path = %seg.path.display(),
-                    "log: skipping unreadable segment during id lookup"
-                );
-                incomplete = true;
-                continue;
-            }
-        };
-        for line in BufReader::new(file).lines() {
-            let Ok(line) = line else {
-                // The rest of this segment is unreadable. Keep searching the
-                // others, but the part not read could have held the id.
-                tracing::warn!(
-                    target: "zeroclaw_log",
-                    path = %seg.path.display(),
-                    "log: stopped reading a segment early during id lookup"
-                );
-                incomplete = true;
-                break;
+    // A rotation can replace the active path after enumeration. Reading that
+    // replacement succeeds but misses every event moved into the newly created,
+    // unlisted archive, so verify the archive set after every complete miss and
+    // retry from a fresh snapshot when it moved.
+    for _ in 0..MAX_SNAPSHOT_ATTEMPTS {
+        // Same policy boundary as `query_log_page`: an id that only exists in
+        // an unmanaged archive is not part of this policy's logical stream.
+        let mut incomplete = false;
+        let segs = enumerate_segment_metas(active, reads_archives, &mut incomplete)?;
+        after_enumerate_hook();
+        let mut active_missing = false;
+
+        // Newest first (active file, then archives newest to oldest), since a
+        // recently rotated event is the likelier target.
+        for seg in segs.iter().rev() {
+            let file = match File::open(&seg.path) {
+                Ok(f) => f,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    // A missing archive may have been pruned. A missing active
+                    // path can also be the rename half of an in-flight rotation;
+                    // redo the lookup instead of treating that window as a
+                    // conclusive miss.
+                    active_missing |= seg.is_active;
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "zeroclaw_log",
+                        error = ?err,
+                        path = %seg.path.display(),
+                        "log: skipping unreadable segment during id lookup"
+                    );
+                    incomplete = true;
+                    continue;
+                }
             };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(event) = serde_json::from_str::<LogEvent>(trimmed)
-                && event.id == id
-            {
-                return Ok(SegmentLookup {
-                    event: Some(event),
-                    incomplete: false,
-                });
+            for line in BufReader::new(file).lines() {
+                let Ok(line) = line else {
+                    // The rest of this segment is unreadable. Keep searching
+                    // the others, but the part not read could have held the id.
+                    tracing::warn!(
+                        target: "zeroclaw_log",
+                        path = %seg.path.display(),
+                        "log: stopped reading a segment early during id lookup"
+                    );
+                    incomplete = true;
+                    break;
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(event) = serde_json::from_str::<LogEvent>(trimmed)
+                    && event.id == id
+                {
+                    return Ok(SegmentLookup {
+                        event: Some(event),
+                        incomplete: false,
+                    });
+                }
             }
         }
+
+        if active_missing || (reads_archives && archive_set_moved(active, &segs)?) {
+            continue;
+        }
+        return Ok(SegmentLookup {
+            event: None,
+            incomplete,
+        });
     }
+
+    // Continuous churn prevented a stable miss. Make that uncertainty visible
+    // so the RPC layer does not turn it into an authoritative "not found".
     Ok(SegmentLookup {
         event: None,
-        incomplete,
+        incomplete: true,
     })
 }
 
@@ -2537,14 +2556,14 @@ mod tests {
 
     #[test]
     fn cursor_wire_format_round_trips_and_rejects_malformed_tokens() {
-        // Archive cursors are two integers; active cursors carry the fixed
-        // "active:" prefix. Both forms must survive a round trip unchanged so a
-        // client that echoes the token back lands on the same position.
+        // Archive and active cursors carry distinct fixed prefixes. Both forms
+        // must survive a round trip unchanged so a client that echoes the token
+        // back lands on the same position.
         let archive = SegmentCursor {
             kind: CursorKind::Archive { seq: 7, off: 4096 },
         };
-        assert_eq!(archive.to_wire(), "7:4096");
-        assert_eq!(SegmentCursor::from_wire("7:4096"), Some(archive));
+        assert_eq!(archive.to_wire(), "archive:7:4096");
+        assert_eq!(SegmentCursor::from_wire("archive:7:4096"), Some(archive));
 
         let active = SegmentCursor {
             kind: CursorKind::Active {
@@ -2571,9 +2590,29 @@ mod tests {
         // invalid-parameter response.
         assert_eq!(SegmentCursor::from_wire("active:512:"), None);
 
-        // Non-numeric offsets are rejected in both forms.
+        // A two-field token still belongs to the legacy basename grammar, even
+        // when that basename is literally `archive`.
+        assert_eq!(
+            SegmentCursor::from_wire("archive:7").map(|cursor| cursor.kind),
+            Some(CursorKind::LegacyArchive {
+                name: "archive".into(),
+                off: 7,
+            }),
+            "the new prefix must not invalidate a legacy cursor whose basename \
+             is literally `archive`"
+        );
+        // Once the second colon selects the explicit archive grammar, malformed
+        // fields are rejected rather than falling through to the legacy form.
+        assert_eq!(SegmentCursor::from_wire("archive:7:"), None);
+        assert_eq!(SegmentCursor::from_wire("archive::4096"), None);
+        assert_eq!(SegmentCursor::from_wire("archive:abc:4096"), None);
+        assert_eq!(SegmentCursor::from_wire("archive:7:abc"), None);
+        assert_eq!(SegmentCursor::from_wire("archive:7:4096:extra"), None);
+
+        // Non-numeric offsets are rejected in active and legacy forms too.
         assert_eq!(SegmentCursor::from_wire("active:abc"), None);
         assert_eq!(SegmentCursor::from_wire("active:abc:evt-1"), None);
+        assert_eq!(SegmentCursor::from_wire("trace.jsonl:abc"), None);
         assert_eq!(SegmentCursor::from_wire(""), None);
     }
 
@@ -2835,14 +2874,55 @@ mod tests {
     }
 
     #[test]
+    fn lookup_retries_when_rotation_replaces_active_after_enumeration() {
+        // Opening the listed active path is not enough to prove the lookup saw
+        // the listed content: rotation can rename that file and create a new
+        // one at the same path before the open. The open then succeeds against
+        // the replacement while the target sits in a new, unlisted archive.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+
+        let mut target = make_event("x", None);
+        target.id = "rotated-target".into();
+        target.message = Some("moved-during-lookup".into());
+        write_jsonl(&active, &[target]);
+
+        let rotate_dir = tmp.path().to_path_buf();
+        let mut fired = false;
+        let _hook = EnumerateHook::install(move || {
+            if fired {
+                return;
+            }
+            fired = true;
+            let active = rotate_dir.join("trace.jsonl");
+            std::fs::rename(
+                &active,
+                rotate_dir.join("trace.0000000001-20260101-000000.jsonl"),
+            )
+            .unwrap();
+            let mut replacement = make_event("x", None);
+            replacement.id = "replacement".into();
+            replacement.message = Some("new-active".into());
+            write_jsonl(&active, &[replacement]);
+        });
+
+        let hit = find_event_across_segments(&active, true, "rotated-target").unwrap();
+        assert_eq!(
+            hit.event
+                .expect("lookup must retry against the new archive")
+                .message
+                .as_deref(),
+            Some("moved-during-lookup")
+        );
+        assert!(!hit.incomplete, "a successful retry is authoritative");
+    }
+
+    #[test]
     fn a_numeric_log_basename_does_not_strand_an_older_daemons_active_cursor() {
-        // `<seq>:<off>` and `<basename>:<off>` are the same grammar when the
-        // basename is all digits, and parsing tries the numeric form first. An
-        // older daemon paginating a log file literally named `123` therefore
-        // issued `123:<off>` meaning the active file, and it arrives as archive
-        // sequence 123. Resolution has to notice that the active file's own
-        // name is that number, or the cursor resolves to nothing and the walk
-        // ends on an empty at-end page.
+        // An older daemon paginating a log file literally named `123` issued
+        // `123:<off>` meaning the active file. Numbered archives now use an
+        // explicit `archive:` prefix, so the old token remains a name-addressed
+        // cursor even though its basename happens to be all digits.
         let tmp = tempfile::tempdir().unwrap();
         let active = tmp.path().join("123");
 
@@ -2866,12 +2946,11 @@ mod tests {
             .expect("the two-field form must parse");
         assert_eq!(
             cursor.kind,
-            CursorKind::Archive {
-                seq: 123,
+            CursorKind::LegacyArchive {
+                name: "123".into(),
                 off: boundary
             },
-            "test premise: the numeric grammar wins at parse time, so the \
-             ambiguity can only be settled during resolution"
+            "an unprefixed numeric token is a legacy basename, not an archive"
         );
 
         let page = query_log_page(&active, true, &LogFilter::default(), 10, Some(&cursor)).unwrap();
@@ -2889,16 +2968,16 @@ mod tests {
     }
 
     #[test]
-    fn a_pruned_archive_cursor_still_resolves_to_nothing() {
-        // The numeric fallback above must stay narrow. An ordinary log name
-        // does not parse as a number, so a cursor into an archive retention
-        // deleted keeps reporting the history as finished rather than binding
-        // to the active file.
+    fn a_pruned_archive_cursor_cannot_rebind_to_a_numeric_active_basename() {
+        // The explicit archive identity must stay authoritative after
+        // retention deletes the segment. In particular, sequence 123 must not
+        // fall back to a current active file that happens to be named `123`, or
+        // pagination would silently jump into unrelated content.
         let tmp = tempfile::tempdir().unwrap();
-        let active = tmp.path().join("trace.jsonl");
+        let active = tmp.path().join("123");
         write_jsonl(&active, &[make_event("x", None)]);
 
-        let cursor = SegmentCursor::from_wire("7:100").expect("archive cursor parses");
+        let cursor = SegmentCursor::from_wire("archive:123:0").expect("archive cursor parses");
         let page = query_log_page(&active, true, &LogFilter::default(), 10, Some(&cursor)).unwrap();
         assert!(page.events.is_empty());
         assert!(
