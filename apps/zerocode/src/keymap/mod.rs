@@ -95,7 +95,26 @@ pub fn match_chord<A: Copy>(table: &[(Chord, A)], event: &KeyEvent) -> Option<A>
 /// chords (e.g. `["Tab"]`, `["⌘x"]`). Help surfaces use this so the keys
 /// they advertise track the live keybinding registry instead of literals.
 pub fn action_key_labels<A: RebindableActions>(action: A) -> Vec<String> {
-    action.resolved().iter().map(Chord::display).collect()
+    let action_key = action.key();
+    action
+        .resolved()
+        .iter()
+        .filter(|chord| show_chord_in_help(&action_key, chord))
+        .map(Chord::display)
+        .collect()
+}
+
+fn show_chord_in_help(_action_key: &str, _chord: &Chord) -> bool {
+    #[cfg(target_os = "macos")]
+    if _action_key == "logs.copy_selection"
+        && _chord.code == KeyCode::Char('C')
+        && _chord.modifiers == KeyModifiers::CONTROL.union(KeyModifiers::SHIFT)
+    {
+        // Some macOS terminals collapse Ctrl+Shift+C to Ctrl+C, which
+        // reaches ZeroCode as Quit instead of the advertised Logs action.
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -220,6 +239,25 @@ mod tests {
         assert_eq!(
             LogsTabAction::from_chord(&ev),
             Some(LogsTabAction::OpenDetail)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn help_hides_unreliable_fallback_only_for_logs_copy() {
+        assert_eq!(action_key_labels(LogsTabAction::CopySelection), vec!["⌘c"]);
+        assert_eq!(
+            action_key_labels(ChatTabAction::CopyAllVisible),
+            vec!["Ctrl+Shift+C"]
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn logs_copy_help_keeps_both_resolved_bindings() {
+        assert_eq!(
+            action_key_labels(LogsTabAction::CopySelection),
+            vec!["Super+c", "Ctrl+Shift+C"]
         );
     }
 
