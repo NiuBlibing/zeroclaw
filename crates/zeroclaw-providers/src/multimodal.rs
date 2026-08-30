@@ -371,6 +371,38 @@ fn is_loadable_image_reference(candidate: &str) -> bool {
         || is_windows_unc_path(candidate)
 }
 
+const REJECTED_IMAGE_MARKER_NOTE: &str = "[image omitted: image marker exceeds safety limit]";
+
+/// Classify an over-ceiling marker without owning its attacker-sized body.
+///
+/// The regular parser collapses line wrapping before classifying a reference,
+/// so inspect a small collapsed prefix here as well. Every supported absolute
+/// reference shape is identifiable from this bounded prefix.
+fn over_ceiling_marker_is_loadable(raw: &str) -> bool {
+    const PREFIX_LIMIT: usize = 256;
+
+    let mut prefix = String::with_capacity(PREFIX_LIMIT);
+    let mut skip_ws = false;
+    for ch in raw.chars() {
+        if ch == '\n' || ch == '\r' {
+            skip_ws = true;
+            continue;
+        }
+        if skip_ws {
+            if ch.is_whitespace() {
+                continue;
+            }
+            skip_ws = false;
+        }
+        if prefix.len().saturating_add(ch.len_utf8()) > PREFIX_LIMIT {
+            break;
+        }
+        prefix.push(ch);
+    }
+
+    is_loadable_image_reference(prefix.trim())
+}
+
 /// Returns true for Windows-style absolute paths like `C:\…` or `D:/…`.
 fn is_windows_path(candidate: &str) -> bool {
     let mut chars = candidate.chars();
@@ -421,32 +453,72 @@ fn collapse_wrapped_marker(raw: &str) -> String {
         }
         out.push(ch);
     }
-    out.trim().to_string()
+    trim_string_in_place(out)
+}
+
+fn trim_string_in_place(mut value: String) -> String {
+    let start = value.len() - value.trim_start().len();
+    let end = value.trim_end().len();
+    let start = start.min(end);
+    value.truncate(end);
+    if start > 0 {
+        value.drain(..start);
+    }
+    value
 }
 
 /// True when `content` holds an image marker, terminated or not.
 ///
 /// This is how a provider adapter tells *residue of this crate's own marker
 /// normalization* from a data URI the author wrote deliberately. An
-/// unterminated marker is copied through by [`parse_image_markers`] verbatim,
-/// prefix included, so the prefix is present in both the input and the cleaned
-/// output whenever residue is possible.
+/// Bounded unterminated markers are copied through by
+/// [`parse_image_markers`] verbatim, prefix included, so the prefix is present
+/// in both the input and cleaned output whenever residue is possible. An
+/// over-ceiling unterminated marker is replaced by a fixed note instead.
 pub(crate) fn carries_image_marker(content: &str) -> bool {
     content.contains(IMAGE_MARKER_PREFIX)
 }
 
-pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
+#[derive(Default)]
+struct ParsedImageMarkers {
+    cleaned: String,
+    refs: Vec<String>,
+    rejected_count: usize,
+}
+
+fn push_rejected_image_marker(cleaned: &mut String) {
+    if cleaned.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
+        cleaned.push(' ');
+    }
+    cleaned.push_str(REJECTED_IMAGE_MARKER_NOTE);
+}
+
+fn parse_image_markers_inner(content: &str, materialize: bool) -> ParsedImageMarkers {
     let mut refs = Vec::new();
-    let mut cleaned = String::with_capacity(content.len());
+    // Do not reserve from the complete untrusted message. A rejected marker
+    // can dominate `content.len()`, while the retained output is only the
+    // surrounding prose plus a fixed sentinel.
+    let mut cleaned = String::new();
+    let mut rejected_count = 0usize;
     let mut cursor = 0usize;
 
     while let Some(rel_start) = content[cursor..].find(IMAGE_MARKER_PREFIX) {
         let start = cursor + rel_start;
-        cleaned.push_str(&content[cursor..start]);
+        if materialize {
+            cleaned.push_str(&content[cursor..start]);
+        }
 
         let marker_start = start + IMAGE_MARKER_PREFIX.len();
         let Some(rel_end) = content[marker_start..].find(']') else {
-            cleaned.push_str(&content[start..]);
+            let marker_len = content.len() - marker_start;
+            if marker_len > MAX_IMAGE_MARKER_BYTES {
+                rejected_count += 1;
+                if materialize {
+                    push_rejected_image_marker(&mut cleaned);
+                }
+            } else if materialize {
+                cleaned.push_str(&content[start..]);
+            }
             cursor = content.len();
             break;
         };
@@ -463,11 +535,18 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
         // rejected it. Checking the borrowed span here keeps the parser's own
         // allocations bounded regardless of what the caller does later.
         //
-        // An over-ceiling marker is treated exactly like any other non-loadable
-        // reference: preserved verbatim as prose. It never becomes a candidate,
-        // so no normalization path ever sees it.
+        // A syntactically loadable over-ceiling reference is rejected here and
+        // replaced with fixed text. Placeholder/prose markers retain their
+        // historical literal treatment.
         if end - marker_start > MAX_IMAGE_MARKER_BYTES {
-            cleaned.push_str(&content[start..=end]);
+            if over_ceiling_marker_is_loadable(&content[marker_start..end]) {
+                rejected_count += 1;
+                if materialize {
+                    push_rejected_image_marker(&mut cleaned);
+                }
+            } else if materialize {
+                cleaned.push_str(&content[start..=end]);
+            }
             cursor = end + 1;
             continue;
         }
@@ -478,7 +557,9 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
             // Preserve the original marker text (placeholders like
             // `[IMAGE:...]` or `[IMAGE:<path>]` should survive as prose
             // rather than triggering a loader error).
-            cleaned.push_str(&content[start..=end]);
+            if materialize {
+                cleaned.push_str(&content[start..=end]);
+            }
         } else {
             refs.push(candidate);
         }
@@ -486,11 +567,24 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
         cursor = end + 1;
     }
 
-    if cursor < content.len() {
+    if materialize && cursor < content.len() {
         cleaned.push_str(&content[cursor..]);
     }
 
-    (cleaned.trim().to_string(), refs)
+    ParsedImageMarkers {
+        cleaned: if materialize {
+            trim_string_in_place(cleaned)
+        } else {
+            String::new()
+        },
+        refs,
+        rejected_count,
+    }
+}
+
+pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
+    let parsed = parse_image_markers_inner(content, true);
+    (parsed.cleaned, parsed.refs)
 }
 
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
@@ -508,7 +602,25 @@ fn count_image_markers_with_latest_tool_results(
         .filter(|(index, message)| {
             should_normalize_message_images(*index, message, latest_tool_result_indices)
         })
-        .map(|(_, message)| parse_image_markers(&message.content).1.len())
+        .map(|(_, message)| {
+            parse_image_markers_inner(&message.content, false)
+                .refs
+                .len()
+        })
+        .sum()
+}
+
+fn count_rejected_image_markers_with_latest_tool_results(
+    messages: &[ChatMessage],
+    latest_tool_result_indices: &HashSet<usize>,
+) -> usize {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(index, message)| {
+            should_normalize_message_images(*index, message, latest_tool_result_indices)
+        })
+        .map(|(_, message)| parse_image_markers_inner(&message.content, false).rejected_count)
         .sum()
 }
 
@@ -520,7 +632,11 @@ pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
         .filter(|message| message.role == "user" && !is_prompt_tool_result_message(message))
-        .map(|message| parse_image_markers(&message.content).1.len())
+        .map(|message| {
+            parse_image_markers_inner(&message.content, false)
+                .refs
+                .len()
+        })
         .sum()
 }
 
@@ -529,7 +645,11 @@ pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
         .iter()
         .rev()
         .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
-        .map(|message| parse_image_markers(&message.content).1.len())
+        .map(|message| {
+            parse_image_markers_inner(&message.content, false)
+                .refs
+                .len()
+        })
         .unwrap_or(0)
 }
 
@@ -853,8 +973,10 @@ async fn prepare_messages_inner(
 
     let latest_tool_indices = latest_tool_result_indices(messages);
     let total_images = count_image_markers_with_latest_tool_results(messages, &latest_tool_indices);
+    let total_rejected =
+        count_rejected_image_markers_with_latest_tool_results(messages, &latest_tool_indices);
 
-    if total_images == 0 {
+    if total_images == 0 && total_rejected == 0 {
         return Ok(PreparedMessages {
             messages: messages
                 .iter()
@@ -940,9 +1062,14 @@ async fn prepare_messages_inner(
             continue;
         }
 
-        let (cleaned_text, refs) = parse_image_markers(&message.content);
+        let parsed = parse_image_markers_inner(&message.content, true);
+        let cleaned_text = parsed.cleaned;
+        let refs = parsed.refs;
         if refs.is_empty() {
-            normalized_messages.push(message.clone());
+            normalized_messages.push(ChatMessage {
+                role: message.role.clone(),
+                content: cleaned_text,
+            });
             continue;
         }
 
@@ -3261,12 +3388,19 @@ mod tests {
         let cfg = MultimodalConfig::default();
         let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
 
-        for (label, marker_body) in [
-            ("single-line", payload.clone()),
+        for (label, marker_body, terminated) in [
+            ("single-line", payload.clone(), true),
             // Newlines force the wrapped branch, the costlier of the two.
-            ("wrapped", format!("{payload}\n  continued")),
+            ("wrapped", format!("{payload}\n  continued"), true),
+            // The no-closing-bracket path must apply the same bound without
+            // copying the complete remainder into the cleaned output.
+            ("unterminated", payload.clone(), false),
         ] {
-            let message = format!("before [IMAGE:data:image/png;base64,{marker_body}] after");
+            let message = if terminated {
+                format!("before [IMAGE:data:image/png;base64,{marker_body}] after")
+            } else {
+                format!("before [IMAGE:data:image/png;base64,{marker_body}")
+            };
 
             let ((result, base64_decodes), pixel_decodes) = counting_decodes(async {
                 counting_base64_decodes(async {
@@ -3296,12 +3430,16 @@ mod tests {
             // rejection never reports the marker through an error path.
             let content = &result.messages[0].content;
             assert!(
-                content.starts_with("before ") && content.ends_with(" after"),
+                content.starts_with("before "),
                 "{label}: surrounding prose must survive the refusal"
             );
             assert!(
-                !content.contains("could not be loaded"),
-                "{label}: an over-ceiling marker is prose, not a skipped image"
+                content.contains(REJECTED_IMAGE_MARKER_NOTE),
+                "{label}: the refusal must leave a fixed provider-visible note"
+            );
+            assert!(
+                !content.contains("data:image") && !content.contains(&payload[..128]),
+                "{label}: the raw marker must not reach provider-visible content"
             );
         }
     }
@@ -5683,8 +5821,8 @@ mod tests {
     fn parse_image_markers_refuses_over_ceiling_marker_without_owning_it() {
         // The parser copies a candidate span (twice, for a line-wrapped marker)
         // before any downstream ceiling can see it, so the span itself has to be
-        // bounded here. An over-ceiling marker is treated like any other
-        // non-loadable reference: kept verbatim as prose, never a candidate.
+        // bounded here. A loadable over-ceiling marker is replaced by fixed
+        // text and never becomes a candidate.
         //
         // Both shapes are covered because they take different paths inside
         // `collapse_wrapped_marker`: the single-line path allocates once, the
@@ -5703,11 +5841,21 @@ mod tests {
                 refs.is_empty(),
                 "{label}: an over-ceiling marker must never become a candidate"
             );
-            assert_eq!(
-                cleaned, input,
-                "{label}: an over-ceiling marker is preserved verbatim as prose"
+            assert!(
+                cleaned.contains(REJECTED_IMAGE_MARKER_NOTE),
+                "{label}: an over-ceiling marker must become a bounded note"
+            );
+            assert!(
+                !cleaned.contains("data:image") && !cleaned.contains(&oversized_payload[..128]),
+                "{label}: the cleaned output must not retain the raw marker"
             );
         }
+
+        let unterminated = format!("before [IMAGE:data:image/png;base64,{oversized_payload}");
+        let (cleaned, refs) = parse_image_markers(&unterminated);
+        assert!(refs.is_empty());
+        assert!(cleaned.contains(REJECTED_IMAGE_MARKER_NOTE));
+        assert!(!cleaned.contains("data:image"));
 
         // A marker at the ceiling is still accepted, so the guard rejects only
         // what is genuinely past it.
