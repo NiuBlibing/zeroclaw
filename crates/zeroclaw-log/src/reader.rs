@@ -1142,9 +1142,9 @@ const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
 /// discarded and redone against the newer listing.
 ///
 /// Rotations during the redo just go round again, bounded by
-/// `MAX_SNAPSHOT_ATTEMPTS`. Exhausting that bound returns the last page rather
-/// than failing: reaching it takes several rotations inside one query, at which
-/// point the writer is churning history faster than a reader can page it.
+/// `MAX_SNAPSHOT_ATTEMPTS`. Exhausting that bound returns an error: every page
+/// produced by those attempts is known to omit a segment, so returning one as
+/// successful would let backward pagination skip retained events permanently.
 pub fn query_log_page(
     active: &Path,
     reads_archives: bool,
@@ -1155,7 +1155,6 @@ pub fn query_log_page(
     let limit = limit.clamp(1, 10_000);
     let needle = filter.q.as_deref().map(|s| s.to_ascii_lowercase());
 
-    let mut last: Option<LogPage> = None;
     for _ in 0..MAX_SNAPSHOT_ATTEMPTS {
         let mut unreadable = false;
         let segs = enumerate_segment_metas(active, reads_archives, &mut unreadable)?;
@@ -1192,10 +1191,9 @@ pub fn query_log_page(
         if !archive_set_moved(active, &segs)? {
             return Ok(page);
         }
-        last = Some(page);
     }
 
-    Ok(last.unwrap_or_else(at_end_page))
+    anyhow::bail!("log segment snapshot did not stabilize after {MAX_SNAPSHOT_ATTEMPTS} attempts")
 }
 
 // Test seam: runs immediately after each reader-owned enumeration, letting a
@@ -2870,6 +2868,52 @@ mod tests {
             vec!["new-active", "ROTATED-AWAY"],
             "the segment created by the rotation must be in the page, not \
              stranded between two segments it did read"
+        );
+    }
+
+    #[test]
+    fn query_refuses_a_page_when_its_snapshot_never_stabilizes() {
+        // Every attempt reads a replacement active file while the content it
+        // enumerated moves into a newly created, unlisted archive. Returning
+        // any one of those pages as successful would permanently strand the
+        // omitted segment behind an older page cursor.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+
+        let mut initial = make_event("x", None);
+        initial.id = "initial".into();
+        initial.message = Some("initial-active".into());
+        write_jsonl(&active, &[initial]);
+
+        let rotate_dir = tmp.path().to_path_buf();
+        let rotations = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let hook_rotations = std::rc::Rc::clone(&rotations);
+        let _hook = EnumerateHook::install(move || {
+            let seq = hook_rotations.get() + 1;
+            hook_rotations.set(seq);
+
+            let active = rotate_dir.join("trace.jsonl");
+            std::fs::rename(
+                &active,
+                rotate_dir.join(format!("trace.{seq:010}-20260101-000000.jsonl")),
+            )
+            .unwrap();
+            let mut replacement = make_event("x", None);
+            replacement.id = format!("replacement-{seq}");
+            replacement.message = Some(format!("replacement-{seq}"));
+            write_jsonl(&active, &[replacement]);
+        });
+
+        let err = query_log_page(&active, true, &LogFilter::default(), 1, None)
+            .expect_err("a page from a known-stale snapshot must not be returned");
+        assert_eq!(
+            rotations.get(),
+            MAX_SNAPSHOT_ATTEMPTS as u64,
+            "the reader must exhaust its bounded retry budget"
+        );
+        assert_eq!(
+            err.to_string(),
+            "log segment snapshot did not stabilize after 3 attempts"
         );
     }
 
