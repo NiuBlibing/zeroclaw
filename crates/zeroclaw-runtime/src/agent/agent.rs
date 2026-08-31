@@ -423,10 +423,10 @@ pub struct Agent {
     /// the full conversation history on every turn and tool iteration.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
     provider_switch_config: Option<ProviderSwitchConfig>,
-    /// The generation cell the context-limits resolver reads. Republished
-    /// together with `provider_switch_config.config` by
-    /// `sync_config_generation`, so provider rebuilding and limit resolution
-    /// cannot observe different config generations.
+    /// The generation cell the context-limits resolver reads. Direct ACP/WS
+    /// agents retain their construction generation until reconnect; callers
+    /// with an acknowledged live-refresh transaction may republish it together
+    /// with `provider_switch_config.config` through `sync_config_generation`.
     config_generation: Option<ConfigGeneration>,
     /// Channel name stamped onto observer events to identify the calling surface
     /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
@@ -492,18 +492,17 @@ pub struct StreamedTurnError {
 /// (`try_apply_model_switch`) and context-limit resolution
 /// (`context_limits_for_route`) both read this cell, so a route, the provider
 /// box serving it, and the capacity/budget reported for it can never describe
-/// different generations. `Agent::sync_config_generation` republishes it from
-/// the live config at each turn boundary; between boundaries a turn observes
-/// one stable generation.
+/// different generations. Callers with an acknowledged refresh transaction
+/// may republish it; direct ACP/WS agents pin it until reconnect.
 pub type ConfigGeneration =
     std::sync::Arc<parking_lot::RwLock<std::sync::Arc<zeroclaw_config::schema::Config>>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
-    /// Live shared config this snapshot is refreshed from, when the agent is
-    /// daemon-backed. `None` for one-shot/test agents, whose `config` snapshot
-    /// is already the only generation that exists.
+    /// Live shared config this snapshot is refreshed from when the caller owns
+    /// an acknowledged model-generation refresh transaction. `None` for
+    /// one-shot/test agents and direct ACP/WS agents pinned until reconnect.
     pub live: Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 }
 
@@ -1205,15 +1204,17 @@ impl Agent {
         }
     }
 
-    /// Republish the agent's config generation from the live shared config.
+    /// Republish the agent's config generation from its acknowledged live model
+    /// config source, when one exists.
     ///
     /// Called at a turn boundary, before any route is resolved. Provider
     /// rebuilding (`try_apply_model_switch`, via `provider_switch_config`) and
     /// limit resolution (`context_limits_for_route`, via `config_generation`)
     /// then read one identical `Arc<Config>`, so dispatch, route identity, and
     /// reported limits cannot straddle a mid-session `config/set`. Within a turn
-    /// the generation is stable: a reload that lands mid-turn is observed by the
-    /// next turn, not by half of this one.
+    /// the generation is stable. Direct ACP/WS agents intentionally have no
+    /// live model source here: they remain wholly on their construction
+    /// generation until reconnect instead of partially adopting a reload.
     pub fn sync_config_generation(&mut self) {
         let Some(live) = self
             .provider_switch_config
@@ -1582,6 +1583,7 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1610,13 +1612,15 @@ impl Agent {
             sop_audit,
             canvas_store,
             None,
+            None,
         )
         .await
     }
 
-    /// Build a daemon-backed ACP/WS Agent whose structured-history cap follows
-    /// the shared config after reloads.
-    pub async fn from_live_config_with_session_cwd_and_mcp_backchannel(
+    /// Build a daemon-backed ACP/WS Agent whose model route generation is pinned
+    /// until reconnect while independently live tool/history policy continues
+    /// to follow the shared config.
+    pub async fn from_pinned_live_config_with_session_cwd_and_mcp_backchannel(
         live_config: Arc<parking_lot::RwLock<Config>>,
         agent_alias: &str,
         session_cwd: Option<&Path>,
@@ -1641,6 +1645,7 @@ impl Agent {
             sop_audit,
             canvas_store,
             Some(live_config),
+            None,
         )
         .await
     }
@@ -1673,6 +1678,7 @@ impl Agent {
             sop_audit,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1703,6 +1709,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             None,
+            Some(Arc::clone(&live_config)),
             Some(live_config),
         )
         .await
@@ -1722,6 +1729,7 @@ impl Agent {
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
         live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+        live_model_config: Option<Arc<parking_lot::RwLock<Config>>>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -1978,20 +1986,18 @@ impl Agent {
         };
 
         // Daemon-backed agents resolve limits from a generation CELL rather than
-        // directly from `live_config`. `sync_config_generation` republishes that
-        // cell and `provider_switch_config.config` from the live config as one
-        // step at each turn boundary, so `try_apply_model_switch` rebuilds the
-        // provider and route resolver from exactly the generation these limits
-        // are resolved from. Reading `live_config` here instead would let a
-        // mid-session `config/set` report new capacity for a provider that was
-        // rebuilt from the construction-time snapshot.
+        // directly from `live_config`. Callers with an acknowledged model
+        // refresh transaction may supply `live_model_config`; direct ACP/WS
+        // callers omit it so provider, route resolver, and limits all remain on
+        // the construction generation until reconnect. The separate
+        // `live_config` handle remains available to tools and history policy.
         // `config` is the immutable snapshot captured by the live constructor
         // before async setup. Seed the generation cell from that same snapshot
         // so provider/resolver/limits cannot be split across two commits.
         let config_generation: Option<ConfigGeneration> = live_config
             .as_ref()
             .map(|_| Arc::new(parking_lot::RwLock::new(Arc::new(config.clone()))));
-        let live_config_for_generation = live_config.as_ref().map(Arc::clone);
+        let live_config_for_generation = live_model_config;
 
         let context_limits_resolver: ContextLimitsResolver =
             if let Some(generation) = config_generation.as_ref().map(Arc::clone) {
@@ -12900,6 +12906,166 @@ model_provider = "custom.only"
             },
         );
         cfg
+    }
+
+    fn direct_live_generation_config(
+        data_dir: &Path,
+        provider_alias: &str,
+        model: &str,
+        window: usize,
+        history_cap: usize,
+    ) -> zeroclaw_config::schema::Config {
+        let provider_ref = format!("custom.{provider_alias}");
+        let mut cfg = zeroclaw_config::schema::Config {
+            data_dir: data_dir.to_path_buf(),
+            memory: zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.providers.models.custom.insert(
+            provider_alias.to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:1/v1".to_string()),
+                    model: Some(model.to_string()),
+                    context_window: Some(window),
+                    ..Default::default()
+                },
+            },
+        );
+        cfg.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        cfg.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                context_compact_ratio: Some(0.5),
+                max_history_messages: Some(history_cap),
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "direct".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: provider_ref.clone().into(),
+                risk_profile: "default".into(),
+                runtime_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        cfg.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: provider_ref,
+            model: model.to_string(),
+            api_key: None,
+        }];
+        cfg
+    }
+
+    #[tokio::test]
+    async fn direct_live_agents_pin_one_route_generation_until_reconnect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let live = Arc::new(parking_lot::RwLock::new(direct_live_generation_config(
+            temp.path(),
+            "old",
+            "old-model",
+            200_000,
+            12,
+        )));
+        let mut retained = Agent::from_pinned_live_config_with_session_cwd_and_mcp_backchannel(
+            Arc::clone(&live),
+            "direct",
+            Some(temp.path()),
+            false,
+            true,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("direct Agent construction");
+
+        *live.write() = direct_live_generation_config(temp.path(), "new", "new-model", 8_000, 3);
+        retained.sync_config_generation();
+
+        let (_, retained_provider, retained_model) = retained.attribution_fields();
+        let retained_route = retained.resolved_route_for_test("hint:fast");
+        let retained_limits = retained.context_limits();
+        assert_eq!(
+            (retained_provider.as_str(), retained_model.as_str()),
+            ("custom.old", "old-model")
+        );
+        assert_eq!(
+            (
+                retained_route.provider_name.as_str(),
+                retained_route.model.as_str()
+            ),
+            ("custom.old", "old-model")
+        );
+        assert_eq!(
+            (
+                retained_limits.model_context_window,
+                retained_limits.context_token_budget
+            ),
+            (200_000, 100_000)
+        );
+        assert_eq!(
+            retained
+                .structured_history_cap_resolver
+                .as_ref()
+                .expect("direct Agent history resolver")(),
+            3,
+            "independently live history policy must adopt the reload while route state stays pinned"
+        );
+        assert_eq!(
+            retained
+                .provider_switch_config
+                .as_ref()
+                .and_then(|switch| switch.config.as_ref())
+                .and_then(|cfg| cfg.providers.models.custom.get("old"))
+                .and_then(|provider| provider.base.model.as_deref()),
+            Some("old-model"),
+            "the provider-rebuild snapshot must stay on the retained Agent's generation"
+        );
+
+        let rebuilt = Agent::from_pinned_live_config_with_session_cwd_and_mcp_backchannel(
+            Arc::clone(&live),
+            "direct",
+            Some(temp.path()),
+            false,
+            true,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("replacement direct Agent construction");
+        let (_, rebuilt_provider, rebuilt_model) = rebuilt.attribution_fields();
+        let rebuilt_route = rebuilt.resolved_route_for_test("hint:fast");
+        let rebuilt_limits = rebuilt.context_limits();
+        assert_eq!(
+            (rebuilt_provider.as_str(), rebuilt_model.as_str()),
+            ("custom.new", "new-model")
+        );
+        assert_eq!(
+            (
+                rebuilt_route.provider_name.as_str(),
+                rebuilt_route.model.as_str()
+            ),
+            ("custom.new", "new-model")
+        );
+        assert_eq!(
+            (
+                rebuilt_limits.model_context_window,
+                rebuilt_limits.context_token_budget
+            ),
+            (8_000, 4_000)
+        );
     }
 
     /// A mid-session `config/set` must be observed by provider rebuilding and by

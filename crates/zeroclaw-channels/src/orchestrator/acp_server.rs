@@ -252,7 +252,7 @@ impl AcpServer {
         enable_mcp: bool,
     ) -> Result<Agent> {
         if let ConfigSource::Live(live_config) = &self.config_source {
-            Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+            Agent::from_pinned_live_config_with_session_cwd_and_mcp_backchannel(
                 Arc::clone(live_config),
                 agent_alias,
                 Some(workspace_dir),
