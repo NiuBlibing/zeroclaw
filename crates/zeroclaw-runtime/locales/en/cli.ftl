@@ -1176,6 +1176,7 @@ channel-telegram-approval-ack-approved = Approved
 channel-telegram-approval-ack-always-approved = Always approved
 channel-telegram-approval-ack-denied = Denied
 channel-telegram-approval-ack-unknown = Unknown action
+channel-telegram-approval-ack-already-resolved = Approval already resolved
 channel-discord-approval-btn-allow-once = Allow once
 channel-discord-approval-btn-allow-session = Allow this session
 channel-discord-approval-btn-allow-always = Always allow
