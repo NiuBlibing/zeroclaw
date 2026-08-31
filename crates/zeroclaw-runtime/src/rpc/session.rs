@@ -91,9 +91,9 @@ pub struct RpcSession {
     /// binding is provisional: dispatch would use the construction-time
     /// provider while canonical config has already moved on. Consumers that
     /// must observe one coherent generation (`session/prompt`,
-    /// `session/configure`) await this before proceeding; the reconciliation
-    /// task clears it and wakes them once it has published, or abandoned, the
-    /// committed binding.
+    /// `session/configure`) await this before proceeding; reconciliation or a
+    /// later ordinary refresh clears it and wakes them only after publishing
+    /// the committed binding.
     ///
     /// `None` is the steady state — a session inserted with a confirmed
     /// binding never carries one, so the common path costs one `Option`
@@ -126,9 +126,9 @@ impl RpcSession {
     }
 
     /// Mark this session as published with a provisional binding. The
-    /// returned notifier is handed to the reconciliation task, which calls
-    /// `SessionStore::clear_pending_generation` once it has published (or
-    /// abandoned) the committed binding.
+    /// returned notifier is handed to the reconciliation and refresh paths,
+    /// which call `SessionStore::clear_pending_generation` only after a
+    /// committed binding has been published for this session generation.
     pub fn with_pending_generation(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
         self.pending_generation = Some(notify);
         self
@@ -324,11 +324,10 @@ impl SessionStore {
 
     /// Confirm a session's binding and wake everyone awaiting it.
     ///
-    /// Called by the reconciliation task on BOTH outcomes — a published
-    /// committed binding and an abandoned repair. An abandoned repair leaves
-    /// the session on its last known-good construction-time binding, which is
-    /// strictly better than parking prompts forever on a convergence that will
-    /// never arrive.
+    /// Called only after a committed binding is published. Failed repair keeps
+    /// the marker in place so prompt/configure callers cannot observe a mixed
+    /// provider/config generation; a later successful ordinary refresh clears
+    /// it for this exact session generation.
     pub(crate) async fn clear_pending_generation(&self, id: &str, expected_generation: u64) {
         let notify = {
             let mut sessions = self.sessions.lock().await;

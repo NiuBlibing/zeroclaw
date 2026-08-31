@@ -1876,8 +1876,8 @@ impl RpcDispatcher {
         // refresh transaction's `list_ids()` snapshot, so it is published with
         // a PROVISIONAL binding: live, but bound to a config generation that is
         // not yet confirmed. `session/prompt` and `session/configure` await
-        // this before proceeding, and the reconciliation task below clears it
-        // on both outcomes.
+        // this before proceeding. Reconciliation or a later ordinary refresh
+        // clears it only after publishing one coherent committed binding.
         let try_lock_failed = config_generation_guard.is_none();
         let pending_generation = try_lock_failed.then(|| Arc::new(tokio::sync::Notify::new()));
         let session = super::session::RpcSession::new(
@@ -2023,9 +2023,9 @@ impl RpcDispatcher {
         let Some((model_provider_ref, cfg, (provider, provider_name, model, resolver))) = resolved
         else {
             // The alias is unresolvable against the committed config. Leave the
-            // construction-time box in place — it is the last known-good
-            // binding — and record it, because this session will not converge
-            // until a later refresh includes it.
+            // construction-time box in place but keep the session unavailable:
+            // a later refresh can publish one coherent binding and clear its
+            // pending marker after configuration is repaired.
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2036,8 +2036,8 @@ impl RpcDispatcher {
                         "agent_alias": agent_alias,
                     })),
                 "rehydrated session: post-insert reconciliation could not resolve the agent's \
-                 provider against the committed config generation; the session stays on its \
-                 construction-time provider"
+                 provider against the committed config generation; the session remains pending \
+                 until a later coherent refresh"
             );
             return false;
         };
@@ -2079,8 +2079,7 @@ impl RpcDispatcher {
                 config_generation,
                 Some(temperature),
             )
-            .await;
-        true
+            .await
     }
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
@@ -3627,7 +3626,8 @@ impl RpcDispatcher {
                     .migrate_model_provider_override(&session_id, session_generation, new_ref)
                     .await;
             }
-            ctx.sessions
+            let applied = ctx
+                .sessions
                 .apply_model_provider(
                     &session_id,
                     session_generation,
@@ -3644,6 +3644,11 @@ impl RpcDispatcher {
                     Some(temperature),
                 )
                 .await;
+            if applied {
+                ctx.sessions
+                    .clear_pending_generation(&session_id, session_generation)
+                    .await;
+            }
         }
     }
 
@@ -13109,6 +13114,89 @@ mod tests {
             "the reconciled session must resolve limits from the committed \
              generation rather than an unresolvable stale route"
         );
+    }
+
+    /// A failed post-insert reconciliation must keep the provisional session
+    /// unavailable, but a later coherent live refresh must recover it instead
+    /// of leaving `session/configure` permanently busy.
+    #[tokio::test]
+    async fn failed_rehydration_reconcile_recovers_on_later_live_refresh() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_model_refresh_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let dispatcher = Arc::new(dispatcher);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
+        acp_store
+            .create_session(&session_id, "test-agent", &workspace)
+            .expect("ACP session row must be created");
+        sessions.remove(&session_id).await;
+
+        // Force rehydration down the provisional path, then make the committed
+        // agent route unresolvable before its queued reconciliation can read
+        // config. The construction-time provider remains last-known-good, but
+        // pending must prevent callers from observing it with the newer config.
+        let config_gate = Arc::clone(&dispatcher.ctx.config_write_lock)
+            .lock_owned()
+            .await;
+        let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
+        assert!(rehydrated.is_some(), "rehydration must publish the session");
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.missing-provider".into();
+
+        // Let the spawned reconciliation queue on the writer gate before it
+        // is released. Tokio's mutex is FIFO, so reacquiring the gate below
+        // proves that queued attempt observed the invalid committed route and
+        // settled before the assertion.
+        tokio::task::yield_now().await;
+        drop(config_gate);
+        let settled_gate = Arc::clone(&dispatcher.ctx.config_write_lock)
+            .lock_owned()
+            .await;
+        drop(settled_gate);
+
+        assert!(matches!(
+            sessions
+                .await_pending_generation(&session_id, std::time::Duration::from_millis(10))
+                .await,
+            Err(crate::rpc::session::WaitForProviderUpdateError::Timeout)
+        ));
+
+        // Repair canonical config and use the ordinary live-refresh path. A
+        // successful same-generation publication is the recovery event that
+        // clears pending; no separate retry state or helper is necessary.
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.test-provider".into();
+        RpcDispatcher::refresh_live_sessions_for_agent(Arc::clone(&dispatcher.ctx), "test-agent")
+            .await
+            .expect("repaired live refresh must succeed");
+
+        sessions
+            .await_pending_generation(&session_id, std::time::Duration::from_millis(10))
+            .await
+            .expect("successful live refresh must clear the pending marker");
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "temperature": 0.4 }
+            }))
+            .await
+            .expect("session/configure must proceed after coherent recovery");
     }
 
     /// Reverse-order regression: `session/configure` queues before a provider
