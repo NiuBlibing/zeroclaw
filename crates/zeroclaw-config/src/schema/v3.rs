@@ -17,9 +17,10 @@ pub struct V3Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<toml::Value>,
 
-    /// V4 drops the inert agent-inline tunable keys (superseded by runtime
-    /// profiles, #6877). They deserialized silently into nothing; V4 strips
-    /// them so a migrated config no longer advertises keys that do nothing.
+    /// V4 drops the inert agent-inline tunable keys (each superseded by the
+    /// runtime-profile surface). They deserialized silently into nothing; V4
+    /// strips them so a migrated config no longer advertises keys that do
+    /// nothing.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub agents: std::collections::HashMap<String, toml::Value>,
 
@@ -38,8 +39,8 @@ fn default_v3_schema_version() -> u32 {
 }
 
 /// Inert agent-inline tunable keys removed in V4. Each was superseded by the
-/// runtime-profile surface (#6877); the agent-inline form deserialized into
-/// nothing. Dropped from every `[agents.<alias>]` block during migration.
+/// runtime-profile surface; the agent-inline form deserialized into nothing.
+/// Dropped from every `[agents.<alias>]` block during migration.
 const V4_INERT_AGENT_KEYS: &[&str] = &[
     "compact_context",
     "max_tool_iterations",
