@@ -1253,6 +1253,11 @@ impl Agent {
         self.temperature
     }
 
+    #[cfg(test)]
+    pub fn multimodal_config_for_test(&self) -> &zeroclaw_config::schema::MultimodalConfig {
+        &self.multimodal_config
+    }
+
     pub fn set_model_name(&mut self, model_name: String) {
         self.model_name = model_name;
     }
@@ -1263,6 +1268,14 @@ impl Agent {
 
     pub fn set_model_provider_name(&mut self, model_provider_name: String) {
         self.model_provider_name = model_provider_name;
+    }
+
+    /// Refreshes the `[multimodal]` policy snapshot alongside a live provider
+    /// swap. The provider boundary carries its own clone of the same policy,
+    /// so both must move together or the runtime preparation pass and the
+    /// provider boundary disagree after a refresh.
+    pub fn set_multimodal_config(&mut self, config: zeroclaw_config::schema::MultimodalConfig) {
+        self.multimodal_config = config;
     }
 
     pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
