@@ -3268,9 +3268,14 @@ impl RpcDispatcher {
                     .map(|agent| agent.model_provider.as_str())
             });
             // Compare on the provider-profile portion so a three-segment
-            // `<type>.<alias>.<model>` ref still matches the edited profile.
-            (effective_ref.map(profile_ref_of) == Some(target_ref.clone()))
-                .then(|| target_ref.clone())
+            // `<type>.<alias>.<model>` ref still matches the edited profile,
+            // but rebuild from the session's own complete reference —
+            // collapsing it to the profile would fall back to models.default
+            // and lose the session's selected model entry.
+            if effective_ref.map(profile_ref_of) != Some(target_ref.clone()) {
+                return None;
+            }
+            effective_ref.map(str::to_string)
         })
         .await;
     }
@@ -10650,6 +10655,69 @@ mod tests {
         );
 
         wait_for_model_name(&dispatcher, &session_id, "other-model").await;
+    }
+
+    #[tokio::test]
+    async fn config_set_provider_refresh_preserves_session_nested_model_ref() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+
+        // Convert the profile to nested-only: a `default` entry plus a `fast`
+        // entry, with the agent selecting `fast` through a three-segment ref.
+        // Nothing points at the profile-level `model` anymore.
+        let provider = cfg
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("openai provider slot exists");
+        provider.model = None;
+        provider.models.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("old-model".to_string()),
+                ..Default::default()
+            },
+        );
+        provider.models.insert(
+            "fast".to_string(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("fast-model".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg.agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.test-provider.fast".into();
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "fast-model",
+            "session must start on the selected nested model entry"
+        );
+
+        // Editing the selected entry's tuning triggers the provider-scoped
+        // live refresh; the rebuild must keep the session's three-segment
+        // selection instead of collapsing to the profile default entry.
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.models.fast.temperature",
+                "value": 0.5
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "config/set providers.models.<t>.<a>.models.<alias>.temperature must succeed: {res:?}"
+        );
+
+        wait_for_temperature(&dispatcher, &session_id, Some(0.5)).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "fast-model",
+            "provider-scoped refresh must not collapse the selected nested model to models.default"
+        );
     }
 
     #[tokio::test]

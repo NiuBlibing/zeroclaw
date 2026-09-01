@@ -28,9 +28,9 @@ fn configured_model_provider_profiles(config: &Config) -> Vec<String> {
     profiles
 }
 
-/// Resolve a `model_provider` argument into the normalized two-segment
-/// profile ref plus, when the argument was a three-segment
-/// `<type>.<alias>.<model_alias>` ref, the model id that entry selects.
+/// Resolve a `model_provider` argument while preserving the full reference
+/// plus, when it is a three-segment `<type>.<alias>.<model_alias>` ref, the
+/// model id selected by that entry.
 fn resolve_model_provider_profile_ref(
     config: &Config,
     raw: &str,
@@ -86,7 +86,7 @@ fn resolve_model_provider_profile_ref(
         None
     };
 
-    Ok((format!("{family}.{alias}"), derived_model))
+    Ok((raw.to_string(), derived_model))
 }
 
 pub struct ModelSwitchTool {
@@ -570,6 +570,106 @@ mod tests {
             assert_eq!(
                 pending_switch(&state),
                 Some(("custom.local".to_string(), "local-model".to_string()))
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_preserves_three_segment_ref_and_derives_model_id() {
+        let mut config = test_config();
+        config
+            .providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .models
+            .insert(
+                "reasoning".to_string(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("gpt-5.3-mini".to_string()),
+                    ..Default::default()
+                },
+            );
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+
+        with_switch_state(|state| {
+            let result = tool
+                .handle_set(&json!({
+                    "model_provider": "openai.default.reasoning"
+                }))
+                .expect("set should return a tool result");
+
+            assert!(result.success, "unexpected error: {:?}", result.error);
+            // The pending switch must keep the full three-segment ref —
+            // collapsing it to `openai.default` would lose the selected model
+            // entry on the rebuild path.
+            assert_eq!(
+                pending_switch(&state),
+                Some((
+                    "openai.default.reasoning".to_string(),
+                    "gpt-5.3-mini".to_string()
+                ))
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_rejects_unknown_nested_model_alias() {
+        with_switch_state(|state| {
+            let result = tool()
+                .handle_set(&json!({
+                    "model_provider": "openai.default.missing",
+                    "model": "gpt-4o"
+                }))
+                .expect("set should return a tool result");
+
+            assert!(!result.success);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("openai.default.missing"),
+                "unexpected error: {:?}",
+                result.error
+            );
+            assert_eq!(pending_switch(&state), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_explicit_model_wins_over_nested_entry_id() {
+        let mut config = test_config();
+        config
+            .providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .models
+            .insert(
+                "fast".to_string(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("gpt-4o-mini".to_string()),
+                    ..Default::default()
+                },
+            );
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+
+        with_switch_state(|state| {
+            let result = tool
+                .handle_set(&json!({
+                    "model_provider": "openai.default.fast",
+                    "model": "gpt-4o"
+                }))
+                .expect("set should return a tool result");
+
+            assert!(result.success, "unexpected error: {:?}", result.error);
+            assert_eq!(
+                pending_switch(&state),
+                Some(("openai.default.fast".to_string(), "gpt-4o".to_string()))
             );
         })
         .await;

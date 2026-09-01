@@ -3,6 +3,7 @@
 // are referenced at runtime by `crate::migration`.
 pub mod v1;
 pub mod v2;
+pub mod v3;
 
 use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
@@ -4107,9 +4108,21 @@ impl Config {
         self.providers
             .models
             .iter_entries()
-            .filter_map(|(_, _, base)| base.model.as_deref().map(str::trim))
-            .find(|m| !m.is_empty())
-            .map(ToString::to_string)
+            .find_map(|(family, alias, entry)| {
+                let provider_ref = format!("{family}.{alias}");
+                self.resolve_model_selection(&provider_ref)
+                    .and_then(|selection| selection.model_id)
+                    .map(|model| model.trim().to_string())
+                    .filter(|model| !model.is_empty())
+                    .or_else(|| {
+                        entry
+                            .model
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|model| !model.is_empty())
+                            .map(ToString::to_string)
+                    })
+            })
     }
 
     /// Resolve the risk profile for an explicit agent alias.
@@ -13722,6 +13735,24 @@ pub struct ModelRouteConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
+}
+
+impl ModelRouteConfig {
+    /// The provider-local model this route requests: the explicit `model`
+    /// when set, otherwise the model id selected by the `model_provider`
+    /// reference — a three-segment `<type>.<alias>.<model_alias>` ref names a
+    /// nested model entry, and a two-segment ref resolves the profile's
+    /// default. Empty when neither resolves.
+    pub fn effective_model(&self, config: &Config) -> String {
+        let explicit = self.model.trim();
+        if !explicit.is_empty() {
+            return explicit.to_string();
+        }
+        config
+            .resolve_model_selection(&self.model_provider)
+            .and_then(|selection| selection.model_id)
+            .unwrap_or_default()
+    }
 }
 
 // ── Model cache (shared between CLI refresh and channel reader) ──
@@ -31622,6 +31653,102 @@ model = "primary-model"
         );
         // resolve_default_model returns the first non-empty model across all model_providers.
         assert!(config.resolve_default_model().is_some());
+    }
+
+    /// A profile whose only model ids live under the nested `models` subtable
+    /// must still count for `resolve_default_model` — the gateway and WS
+    /// onboarding use it to decide whether any model is configured at all.
+    #[test]
+    async fn resolve_default_model_accepts_nested_only_profile() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
+                    // Profile-level `model` stays empty; the ids are nested.
+                    model: None,
+                    models: HashMap::from([(
+                        "default".to_string(),
+                        ModelEntryConfig {
+                            id: Some("or-nested-model".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(
+            config.resolve_default_model().as_deref(),
+            Some("or-nested-model"),
+        );
+    }
+
+    #[test]
+    async fn model_route_effective_model_resolves_nested_refs() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("profile-model".to_string()),
+                    models: HashMap::from([
+                        (
+                            "default".to_string(),
+                            ModelEntryConfig {
+                                id: Some("nested-default".to_string()),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "reasoning".to_string(),
+                            ModelEntryConfig {
+                                id: Some("nested-reasoning".to_string()),
+                                ..Default::default()
+                            },
+                        ),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+
+        // A three-segment route ref with no explicit `model` names its nested
+        // model entry instead of dispatching with an empty model string.
+        let route = ModelRouteConfig {
+            hint: "reasoning".to_string(),
+            model_provider: "openrouter.default.reasoning".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(route.effective_model(&config), "nested-reasoning");
+
+        // A two-segment ref resolves the profile default (models.default
+        // before the legacy profile-level `model`).
+        let route = ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: "openrouter.default".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(route.effective_model(&config), "nested-default");
+
+        // An explicit `model` always wins over the ref resolution.
+        let route = ModelRouteConfig {
+            hint: "pinned".to_string(),
+            model_provider: "openrouter.default.reasoning".to_string(),
+            model: "explicit-model".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(route.effective_model(&config), "explicit-model");
+
+        // Nothing set — not even whitespace-only model text — resolves.
+        let route = ModelRouteConfig {
+            hint: "empty".to_string(),
+            model: "  ".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(route.effective_model(&config), "");
     }
 
     #[test]

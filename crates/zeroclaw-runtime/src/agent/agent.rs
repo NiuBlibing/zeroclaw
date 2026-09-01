@@ -6077,6 +6077,121 @@ mod tests {
         assert!((summary.daily_cost_usd - 0.75).abs() < 1e-12);
     }
 
+    /// Same-family pricing regression at the turn level: two `custom.*`
+    /// aliases with distinct rates, the agent bound to one of them, and a
+    /// real `Agent::turn` driven against a mock endpoint. The recorded cost
+    /// must come from the selected alias's pricing slot — a bare-family
+    /// lookup would be ambiguous here and record zero.
+    #[tokio::test]
+    async fn turn_bills_selected_same_family_alias_rate() {
+        use crate::agent::cost::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext,
+            build_model_provider_pricing,
+        };
+        use crate::cost::CostTracker;
+        use axum::{Json, Router, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        // OpenAI-compatible mock returning a fixed completion with exact
+        // usage: 1M input + 1M output tokens.
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                Json(serde_json::json!({
+                    "choices": [{"message": {"content": "hello from mock"}}],
+                    "usage": {"prompt_tokens": 1_000_000_u64, "completion_tokens": 1_000_000_u64}
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut config = Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.cost.enabled = true;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        {
+            let cheap = config
+                .providers
+                .models
+                .ensure("custom", "cheap")
+                .expect("custom cheap slot");
+            cheap.api_key = Some("test-key".to_string());
+            cheap.model = Some("cheap-model".to_string());
+            cheap.uri = Some(format!("http://{mock_addr}"));
+            cheap.pricing = HashMap::from([
+                ("cheap-model.input".to_string(), 0.15),
+                ("cheap-model.output".to_string(), 0.60),
+            ]);
+        }
+        {
+            let premium = config
+                .providers
+                .models
+                .ensure("custom", "premium")
+                .expect("custom premium slot");
+            premium.api_key = Some("test-key".to_string());
+            premium.model = Some("premium-model".to_string());
+            premium.uri = Some(format!("http://{mock_addr}"));
+            premium.pricing = HashMap::from([
+                ("premium-model.input".to_string(), 2.50),
+                ("premium-model.output".to_string(), 10.00),
+            ]);
+        }
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.premium".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let mut agent = Agent::from_config(&config, "test-agent")
+            .await
+            .expect("agent from config");
+        assert_eq!(agent.model_provider_name, "custom.premium");
+
+        let tracker = Arc::new(CostTracker::new(config.cost.clone(), &config.data_dir).unwrap());
+        let context = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(build_model_provider_pricing(&config)),
+        );
+        let response = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), agent.turn("hello"))
+            .await
+            .expect("agent turn");
+
+        assert_eq!(response, "hello from mock");
+        // 1M input @ $2.50/Mtok + 1M output @ $10.00/Mtok = $12.50 from the
+        // selected `custom.premium` slot. The sibling alias would bill $0.75
+        // and a bare-family lookup (ambiguous between two aliases) zero.
+        let summary = tracker.get_summary().unwrap();
+        assert!(
+            (summary.daily_cost_usd - 12.50).abs() < 1e-12,
+            "turn must bill the selected alias's rates, got {}",
+            summary.daily_cost_usd
+        );
+
+        server_handle.abort();
+    }
+
     #[test]
     fn builder_allowed_tools_none_keeps_all_tools() {
         let model_provider = Box::new(MockModelProvider {

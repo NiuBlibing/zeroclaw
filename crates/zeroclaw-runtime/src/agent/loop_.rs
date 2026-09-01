@@ -2053,6 +2053,25 @@ pub async fn run(
                                 &new_model_provider,
                                 agent_model_provider,
                             );
+                            // Profile-level options plus the selected model
+                            // entry's per-model tuning — a three-segment switch
+                            // ref must carry the nested entry's knobs.
+                            let mut switch_options =
+                                zeroclaw_providers::options_for_provider_ref(
+                                    &config,
+                                    &new_model_provider,
+                                    &zeroclaw_providers::provider_runtime_options_for_agent(
+                                        &config,
+                                        agent_alias,
+                                    ),
+                                );
+                            zeroclaw_providers::apply_model_entry_options(
+                                &mut switch_options,
+                                config
+                                    .resolve_model_selection(&new_model_provider)
+                                    .as_ref()
+                                    .and_then(|s| s.model_entry),
+                            );
                             model_provider =
                                 zeroclaw_providers::create_routed_model_provider_with_options(
                                     &config,
@@ -2062,14 +2081,7 @@ pub async fn run(
                                     &config.reliability,
                                     &config.model_routes,
                                     &new_model,
-                                    &zeroclaw_providers::options_for_provider_ref(
-                                        &config,
-                                        &new_model_provider,
-                                        &zeroclaw_providers::provider_runtime_options_for_agent(
-                                            &config,
-                                            agent_alias,
-                                        ),
-                                    ),
+                                    &switch_options,
                                 )?;
 
                             provider_name = new_model_provider;
@@ -2615,6 +2627,26 @@ pub async fn run(
                                     &new_model_provider,
                                     agent_model_provider,
                                 );
+                                // Profile-level options plus the selected model
+                                // entry's per-model tuning — a three-segment
+                                // switch ref must carry the nested entry's
+                                // knobs.
+                                let mut switch_options2 =
+                                    zeroclaw_providers::options_for_provider_ref(
+                                        &config,
+                                        &new_model_provider,
+                                        &zeroclaw_providers::provider_runtime_options_for_agent(
+                                            &config,
+                                            agent_alias,
+                                        ),
+                                    );
+                                zeroclaw_providers::apply_model_entry_options(
+                                    &mut switch_options2,
+                                    config
+                                        .resolve_model_selection(&new_model_provider)
+                                        .as_ref()
+                                        .and_then(|s| s.model_entry),
+                                );
                                 model_provider =
                                     zeroclaw_providers::create_routed_model_provider_with_options(
                                         &config,
@@ -2624,14 +2656,7 @@ pub async fn run(
                                         &config.reliability,
                                         &config.model_routes,
                                         &new_model,
-                                        &zeroclaw_providers::options_for_provider_ref(
-                                            &config,
-                                            &new_model_provider,
-                                            &zeroclaw_providers::provider_runtime_options_for_agent(
-                                                &config,
-                                                agent_alias,
-                                            ),
-                                        ),
+                                        &switch_options2,
                                     )?;
 
                                 provider_name = new_model_provider;

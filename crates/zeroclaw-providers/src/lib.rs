@@ -1656,7 +1656,12 @@ fn append_fallback_chain(
             continue;
         }
 
-        let opts = provider_runtime_options_for_alias(config, family, &alias);
+        let mut opts = provider_runtime_options_for_alias(config, family, &alias);
+        // A three-segment fallback ref names a nested model entry; its
+        // per-model tuning applies on top of the profile options. The
+        // selection also yields the named entry's model id below.
+        let selection = config.resolve_model_selection(raw);
+        apply_model_entry_options(&mut opts, selection.as_ref().and_then(|s| s.model_entry));
         if !factory::fallback_auth_ready_for_alias(
             config,
             family,
@@ -1672,6 +1677,13 @@ fn append_fallback_chain(
             );
         }
 
+        // A three-segment ref pins the fallback to the named entry's model id;
+        // a two-segment ref keeps the profile-level pin (push_pinned_entries
+        // falls back to the entry's `model`).
+        let model_override = selection
+            .as_ref()
+            .filter(|s| s.model_alias.is_some())
+            .and_then(|s| s.model_id.clone());
         match create_model_provider_inner(
             Some(config),
             family,
@@ -1680,7 +1692,14 @@ fn append_fallback_chain(
             entry.uri.as_deref(),
             &opts,
         ) {
-            Ok(built) => push_pinned_entries(out, config, family, &alias, built, None),
+            Ok(built) => push_pinned_entries(
+                out,
+                config,
+                family,
+                &alias,
+                built,
+                model_override.as_deref(),
+            ),
             Err(e) => {
                 let profile = format!("[providers.models.{family}.{alias}]");
                 anyhow::bail!(
@@ -1896,11 +1915,22 @@ pub fn create_routed_model_provider_with_options(
             })
             .or_else(|| is_primary.then_some(api_key).flatten());
         let url = if is_primary { api_url } else { None };
-        let entry_options = if is_primary {
+        let mut entry_options = if is_primary {
             options.clone()
         } else {
             options_for_provider_ref(config, name, options)
         };
+        // A three-segment route ref (`<family>.<alias>.<model>`) carries its
+        // own per-model tuning on top of the profile options. Overlaying for
+        // the primary too is idempotent — callers that already applied the
+        // nested entry pass the same values.
+        apply_model_entry_options(
+            &mut entry_options,
+            config
+                .resolve_model_selection(name)
+                .as_ref()
+                .and_then(|s| s.model_entry),
+        );
 
         match create_resilient_model_provider_from_ref_with_model_override(
             config,
@@ -1926,7 +1956,10 @@ pub fn create_routed_model_provider_with_options(
                 r.hint.clone(),
                 router::Route {
                     provider_name: r.model_provider.clone(),
-                    model: r.model.clone(),
+                    // An unset route model resolves through the selection
+                    // contract so a three-segment route ref names its nested
+                    // model entry instead of dispatching with an empty model.
+                    model: r.effective_model(config),
                 },
             )
         })
