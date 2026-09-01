@@ -185,14 +185,6 @@ pub struct RpcContext {
     /// credentials with no trail.
     pub cert_audit: Option<Arc<crate::security::audit::AuditLogger>>,
 
-    /// Test-only notifier fired by `prepare_live_sessions_refresh` immediately
-    /// after `list_ids()` completes (while `config_write_lock` is still held).
-    /// Lets a regression test insert an ACP session AFTER the snapshot and
-    /// BEFORE the commit, reproducing the window where `try_lock_owned` fails
-    /// and the session is excluded from the refresh snapshot.
-    #[cfg(test)]
-    pub after_list_ids_notify: Option<Arc<tokio::sync::Notify>>,
-
     /// Test-only pause between the prepare and commit halves of
     /// `commit_config_with_live_session_refresh`. See `ConfigCommitPause`.
     #[cfg(test)]
@@ -201,9 +193,10 @@ pub struct RpcContext {
 
 /// Test-only pause point inside `commit_config_with_live_session_refresh`:
 /// fires `arrived` once the prepare phase has completed (so every per-session
-/// skip decision has already dropped the skipped sessions' ordering guards),
-/// then parks on `release` until the test fires it. Lets a regression drive
-/// `session/configure` deterministically inside the prepared-and-skipped
+/// skip decision has already dropped the skipped sessions' ordering guards
+/// and the `list_ids()` snapshot has passed), then parks on `release` until
+/// the test fires it. Lets a regression drive other RPCs (`session/configure`,
+/// session rehydration) deterministically inside the prepared-and-skipped
 /// window — after the refresh snapshot has passed over a session but before
 /// the candidate config is saved and swapped.
 #[cfg(test)]
@@ -247,8 +240,6 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             #[cfg(test)]
-            after_list_ids_notify: None,
-            #[cfg(test)]
             config_commit_pause: None,
             cert_audit,
         })
@@ -272,8 +263,6 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
-            #[cfg(test)]
-            after_list_ids_notify: None,
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -308,8 +297,6 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             #[cfg(test)]
-            after_list_ids_notify: None,
-            #[cfg(test)]
             config_commit_pause: None,
             cert_audit,
         })
@@ -337,8 +324,6 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
-            #[cfg(test)]
-            after_list_ids_notify: None,
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -368,8 +353,6 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             #[cfg(test)]
-            after_list_ids_notify: None,
-            #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
         })
@@ -398,8 +381,6 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             #[cfg(test)]
-            after_list_ids_notify: None,
-            #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
         })
@@ -427,8 +408,6 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
-            #[cfg(test)]
-            after_list_ids_notify: None,
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
@@ -459,8 +438,6 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             #[cfg(test)]
-            after_list_ids_notify: None,
-            #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,
         })
@@ -489,8 +466,6 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
-            #[cfg(test)]
-            after_list_ids_notify: None,
             #[cfg(test)]
             config_commit_pause: None,
             cert_audit: None,

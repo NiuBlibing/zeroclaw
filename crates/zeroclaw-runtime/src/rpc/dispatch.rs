@@ -3729,10 +3729,14 @@ impl RpcDispatcher {
     ) -> Result<(), JsonRpcError> {
         let prepared =
             Self::prepare_live_sessions_refresh(Arc::clone(&self.ctx), &working, scope).await?;
-        // Test-only: park after preparation so a regression can drive
-        // `session/configure` deterministically inside the prepared-and-
-        // skipped window — every skip decision (and its guard release) has
-        // happened, but the candidate config is not yet saved or swapped.
+        // Test-only: park after preparation so a regression can drive other
+        // RPCs (`session/configure`, session rehydration) deterministically
+        // inside the prepared-and-skipped window — every skip decision (and
+        // its guard release) has happened, the `list_ids()` snapshot has
+        // passed, but the candidate config is not yet saved or swapped. A
+        // merely-notified hook cannot hold this window open: on a loaded
+        // runner the commit can finish while the test is still observing
+        // the mid-transaction state.
         #[cfg(test)]
         if let Some(pause) = self.ctx.config_commit_pause.as_ref() {
             pause.arrived.notify_one();
@@ -3756,12 +3760,6 @@ impl RpcDispatcher {
         scope: &LiveSessionRefreshScope,
     ) -> Result<Vec<PreparedLiveSessionRefresh>, JsonRpcError> {
         let session_ids = ctx.sessions.list_ids().await;
-        // Test-only hook: notify after the snapshot so a regression test can
-        // insert a session between list_ids() and the commit boundary.
-        #[cfg(test)]
-        if let Some(n) = ctx.after_list_ids_notify.as_ref() {
-            n.notify_one();
-        }
         let mut prepared = Vec::new();
         for session_id in session_ids {
             // Capture the generation before acquiring the lock so we can
@@ -9707,13 +9705,18 @@ mod tests {
     }
 
     /// Like `make_persistence_test_dispatcher`, but arms the test-only
-    /// `after_list_ids_notify` hook so a regression can act inside the refresh
-    /// snapshot window (after `list_ids()`, before the commit releases the
-    /// config writer gate).
-    fn make_persistence_test_dispatcher_with_snapshot_hook(
+    /// `config_commit_pause` hook so a regression can act deterministically
+    /// inside the refresh transaction: `commit_config_with_live_session_refresh`
+    /// parks after preparation — the `list_ids()` snapshot has run and every
+    /// skip decision (and its guard release) has happened — but before the
+    /// candidate config is saved or swapped, all while `config_write_lock`
+    /// stays held. The commit then only proceeds once the test releases it,
+    /// so mid-transaction observations cannot race the commit's completion
+    /// on a loaded CI runner.
+    fn make_persistence_test_dispatcher_with_commit_pause(
         config: zeroclaw_config::schema::Config,
         data_dir: &std::path::Path,
-        after_list_ids: Arc<tokio::sync::Notify>,
+        pause: Arc<crate::rpc::context::ConfigCommitPause>,
     ) -> (
         RpcDispatcher,
         Arc<crate::rpc::session::SessionStore>,
@@ -9733,7 +9736,7 @@ mod tests {
             Some(Arc::clone(&acp_store)),
         ))
         .unwrap_or_else(|_| panic!("freshly constructed ctx must be uniquely owned"));
-        ctx_inner.after_list_ids_notify = Some(after_list_ids);
+        ctx_inner.config_commit_pause = Some(pause);
         let ctx = Arc::new(ctx_inner);
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
@@ -13060,7 +13063,6 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let ctx = Arc::new(crate::rpc::context::RpcContext {
-            after_list_ids_notify: None,
             config_commit_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
@@ -13106,7 +13108,6 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let ctx = Arc::new(crate::rpc::context::RpcContext {
-            after_list_ids_notify: None,
             config_commit_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
@@ -13211,7 +13212,6 @@ mod tests {
         runner.register(Box::new(_hook));
 
         let ctx = Arc::new(crate::rpc::context::RpcContext {
-            after_list_ids_notify: None,
             config_commit_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
@@ -14123,11 +14123,11 @@ mod tests {
             .expect("test provider exists")
             .uri = Some(server.uri());
         let data_dir = config.data_dir.clone();
-        let after_snapshot = Arc::new(tokio::sync::Notify::new());
-        let (dispatcher, sessions, acp_store) = make_persistence_test_dispatcher_with_snapshot_hook(
+        let commit_pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
+        let (dispatcher, sessions, acp_store) = make_persistence_test_dispatcher_with_commit_pause(
             config,
             &data_dir,
-            Arc::clone(&after_snapshot),
+            Arc::clone(&commit_pause),
         );
         let dispatcher = Arc::new(dispatcher);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
@@ -14138,10 +14138,13 @@ mod tests {
             .expect("ACP session row must be created");
         sessions.remove(&session_id).await;
 
-        // Drive a route-affecting commit and rehydrate inside its snapshot
-        // window, so the session is published with a provisional binding on
-        // the pre-commit model.
-        let snapshot_signal = Arc::clone(&after_snapshot);
+        // Drive a route-affecting commit and rehydrate while it is parked
+        // between its prepare and commit halves, so the session is published
+        // with a provisional binding on the pre-commit model. Parking (rather
+        // than merely being notified) is what makes the harness invariant
+        // below deterministic: the commit cannot finish and let the queued
+        // reconciliation publish while we are still observing the
+        // provisional state, no matter how loaded the runner is.
         let config_set_dispatcher = Arc::clone(&dispatcher);
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
@@ -14151,7 +14154,7 @@ mod tests {
                 }))
                 .await
         });
-        snapshot_signal.notified().await;
+        commit_pause.arrived.notified().await;
 
         let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
         assert!(rehydrated.is_some(), "rehydration must install the session");
@@ -14162,6 +14165,10 @@ mod tests {
              pre-commit model, otherwise this test cannot distinguish the two"
         );
 
+        // Release the parked commit. The reconciliation task queued by the
+        // rehydration above then publishes the committed generation before
+        // the prompt below can enter its turn.
+        commit_pause.release.notify_one();
         let res = config_set.await.expect("config/set task must complete");
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
@@ -14220,11 +14227,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_model_refresh_test_config(&tmp);
         let data_dir = config.data_dir.clone();
-        let after_snapshot = Arc::new(tokio::sync::Notify::new());
-        let (dispatcher, sessions, acp_store) = make_persistence_test_dispatcher_with_snapshot_hook(
+        let commit_pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
+        let (dispatcher, sessions, acp_store) = make_persistence_test_dispatcher_with_commit_pause(
             config,
             &data_dir,
-            Arc::clone(&after_snapshot),
+            Arc::clone(&commit_pause),
         );
         let dispatcher = Arc::new(dispatcher);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
@@ -14242,7 +14249,6 @@ mod tests {
 
         // Change ONLY the temperature, so the assertion cannot pass by way of
         // the provider repair.
-        let snapshot_signal = Arc::clone(&after_snapshot);
         let config_set_dispatcher = Arc::clone(&dispatcher);
         let config_set = zeroclaw_spawn::spawn!(async move {
             config_set_dispatcher
@@ -14253,13 +14259,18 @@ mod tests {
                 .await
         });
 
-        // Rehydrate inside the snapshot window: the session is absent when
-        // `list_ids()` runs, so the refresh never prepares it, and
-        // `try_lock_owned` fails so the Agent is built at the old 0.2.
-        snapshot_signal.notified().await;
+        // Rehydrate while the commit is parked between its prepare and commit
+        // halves: the session is absent from the `list_ids()` snapshot, so the
+        // refresh never prepares it, and `try_lock_owned` fails because the
+        // commit still holds the writer gate, so the Agent is built at the old
+        // 0.2. Parking the commit also makes that premise deterministic — a
+        // merely-notified commit could finish first on a loaded runner and the
+        // test would silently stop exercising the reconciliation path.
+        commit_pause.arrived.notified().await;
         let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
         assert!(rehydrated.is_some(), "rehydration must install the session");
 
+        commit_pause.release.notify_one();
         let res = config_set.await.expect("config/set task must complete");
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
@@ -14303,11 +14314,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_model_refresh_test_config(&tmp);
         let data_dir = config.data_dir.clone();
-        let after_snapshot = Arc::new(tokio::sync::Notify::new());
-        let (dispatcher, sessions, acp_store) = make_persistence_test_dispatcher_with_snapshot_hook(
+        let commit_pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
+        let (dispatcher, sessions, acp_store) = make_persistence_test_dispatcher_with_commit_pause(
             config,
             &data_dir,
-            Arc::clone(&after_snapshot),
+            Arc::clone(&commit_pause),
         );
         let dispatcher = Arc::new(dispatcher);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
@@ -14324,9 +14335,9 @@ mod tests {
             "harness invariant: the session must be absent so rehydration runs"
         );
 
-        // The snapshot hook tells us the exact moment `list_ids()` has run and
-        // the commit still holds `config_write_lock`.
-        let snapshot_signal = Arc::clone(&after_snapshot);
+        // The commit pause tells us the `list_ids()` snapshot has run and the
+        // commit still holds `config_write_lock` — and keeps holding it until
+        // the test releases the commit.
 
         // A config/set whose refresh must NOT see the rehydrated session,
         // because the session does not exist when `list_ids()` runs.
@@ -14340,16 +14351,18 @@ mod tests {
                 .await
         });
 
-        // Rehydrate inside the window: after the snapshot, before the commit
-        // releases the gate. `try_lock_owned` therefore fails and the Agent is
-        // built from the pre-commit config.
-        snapshot_signal.notified().await;
+        // Rehydrate while the commit is parked: after the snapshot, before the
+        // commit releases the gate. `try_lock_owned` therefore fails and the
+        // Agent is built from the pre-commit config — deterministically,
+        // because the parked commit cannot complete first on a loaded runner.
+        commit_pause.arrived.notified().await;
         let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
         assert!(
             rehydrated.is_some(),
             "rehydration must install the session even with the gate contended"
         );
 
+        commit_pause.release.notify_one();
         let res = config_set.await.expect("config/set task must complete");
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
