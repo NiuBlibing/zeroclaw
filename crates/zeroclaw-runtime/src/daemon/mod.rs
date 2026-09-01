@@ -744,6 +744,8 @@ pub async fn run(
         Some(std::sync::Arc::new(RpcContext {
             #[cfg(test)]
             after_list_ids_notify: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             sessions,

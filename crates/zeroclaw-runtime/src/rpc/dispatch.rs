@@ -2594,6 +2594,29 @@ impl RpcDispatcher {
             }
         }
 
+        // Serialize with candidate-config preparation. A route-affecting
+        // `config/set` holds `config_write_lock` across prepare → commit →
+        // publish, and its prepare phase SKIPS a session whose current
+        // override points away from the edited provider, dropping that
+        // session's ordering guard before the candidate config commits.
+        // Without this gate, a configure selecting the edited provider
+        // inside that window would build it from the still-installed old
+        // config; the transaction then commits without rebuilding the
+        // skipped session, and the next prompt's `sync_config_generation`
+        // publishes the new config into the limits cell while the provider
+        // box and route resolver stay on the old generation. Acquiring the
+        // gate BEFORE the per-session guard preserves the global lock order
+        // (`config/set` and `reconcile_rehydrated_session` both take
+        // config-write → session-update); taking it after the session lock
+        // would deadlock against them.
+        //
+        // The pending-generation wait above must stay before this
+        // acquisition: reconciliation publishes while holding the writer
+        // gate, so parking here with the gate held would block the very
+        // task that wait is waiting on (and stall every other config write
+        // until the timeout).
+        let _config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+
         // Capture the session generation /before/ acquiring the per-session
         // update lock. If the session is replaced while we wait for the lock,
         // the re-verification below will detect the mismatch and reject the
@@ -3459,6 +3482,15 @@ impl RpcDispatcher {
     ) -> Result<(), JsonRpcError> {
         let prepared =
             Self::prepare_live_sessions_refresh(Arc::clone(&self.ctx), &working, scope).await?;
+        // Test-only: park after preparation so a regression can drive
+        // `session/configure` deterministically inside the prepared-and-
+        // skipped window — every skip decision (and its guard release) has
+        // happened, but the candidate config is not yet saved or swapped.
+        #[cfg(test)]
+        if let Some(pause) = self.ctx.config_commit_pause.as_ref() {
+            pause.arrived.notify_one();
+            pause.release.notified().await;
+        }
         self.save_and_swap_config(working, config_write_guard)
             .await?;
         let config_generation = Arc::new(self.ctx.config.read().clone());
@@ -9418,6 +9450,27 @@ mod tests {
         dispatcher
     }
 
+    /// Like `make_config_set_test_dispatcher`, but arms the test-only
+    /// config-commit pause so a regression can drive `session/configure`
+    /// deterministically inside the prepared-and-skipped window (after the
+    /// refresh prepare phase, before the candidate config is committed).
+    fn make_config_set_test_dispatcher_with_commit_pause(
+        config: zeroclaw_config::schema::Config,
+        pause: Arc<crate::rpc::context::ConfigCommitPause>,
+    ) -> RpcDispatcher {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let mut ctx_inner = Arc::try_unwrap(RpcContext::minimal(config, Arc::clone(&sessions)))
+            .unwrap_or_else(|_| panic!("freshly constructed ctx must be uniquely owned"));
+        ctx_inner.config_commit_pause = Some(pause);
+        let ctx = Arc::new(ctx_inner);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+        dispatcher
+    }
+
     fn make_shared_sessions_dispatcher(
         config: zeroclaw_config::schema::Config,
         sessions: Arc<crate::rpc::session::SessionStore>,
@@ -10765,6 +10818,182 @@ mod tests {
         }
     }
 
+    /// Deterministic regression for the prepared-and-skipped config-transaction
+    /// race between `config/set` and `session/configure`.
+    ///
+    /// A route-affecting `config/set` prepares its live-session refresh under
+    /// the config writer gate and SKIPS a session whose effective provider
+    /// override points away from the edited provider, dropping that session's
+    /// ordering guard before the candidate config commits. A
+    /// `session/configure` that selects the edited provider inside that window
+    /// must not build it from the still-installed old config: the transaction
+    /// then commits without rebuilding the skipped session, and the next
+    /// prompt dispatches through an old-generation provider box while
+    /// `sync_config_generation` publishes the committed config into the limits
+    /// cell. Holding the writer gate across the configure build closes both
+    /// orderings.
+    ///
+    /// The test-only commit pause parks `config/set` between prepare and
+    /// commit, so the configure runs deterministically inside the window
+    /// rather than by timing luck.
+    #[tokio::test]
+    async fn session_configure_waits_for_prepared_and_skipped_config_transaction() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let mut config = make_model_refresh_test_config(&tmp);
+        // The session pins to `pinned`; `config/set` edits `edited`, so the
+        // refresh prepare phase skips the session and releases its ordering
+        // guard before the candidate config commits.
+        let pinned = config
+            .providers
+            .models
+            .ensure("openai", "pinned")
+            .expect("pinned provider slot exists");
+        pinned.api_key = Some("pinned-key".into());
+        pinned.uri = Some("http://127.0.0.1:1".into());
+        pinned.model = Some("pinned-model".into());
+        let edited = config
+            .providers
+            .models
+            .ensure("openai", "edited")
+            .expect("edited provider slot exists");
+        edited.api_key = Some("edited-key".into());
+        edited.uri = Some(server.uri());
+        edited.model = Some("old-model".into());
+        edited.context_window = Some(200_000);
+
+        let pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
+        let dispatcher = Arc::new(make_config_set_test_dispatcher_with_commit_pause(
+            config,
+            Arc::clone(&pause),
+        ));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        // Pin the session away from the provider the config edit targets, so
+        // the refresh prepare phase skips it.
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "model_provider": "openai.pinned" }
+            }))
+            .await
+            .expect("session/configure must pin the provider override");
+
+        // config/set edits the OTHER provider. Its prepare phase inspects the
+        // pinned session, skips it (override != edited provider), and drops
+        // its ordering guard — then the commit pauses before saving.
+        let arrived = pause.arrived.notified();
+        tokio::pin!(arrived);
+        let config_dispatcher = Arc::clone(&dispatcher);
+        let config_set = zeroclaw_spawn::spawn!(async move {
+            config_dispatcher
+                .handle_config_set(&json!({
+                    "prop": "providers.models.openai.edited.model",
+                    "value": "new-model"
+                }))
+                .await
+        });
+        let mut config_set = Box::pin(config_set);
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived.as_mut())
+            .await
+            .expect("config/set must pause after preparing the refresh");
+
+        // Select the edited provider inside the prepared-and-skipped window.
+        // The paused transaction still owns the config writer gate and has
+        // not committed the candidate config, so this configure must queue
+        // behind the whole transaction instead of building the provider from
+        // the still-installed old config.
+        let configure_dispatcher = Arc::clone(&dispatcher);
+        let configure_sid = session_id.clone();
+        let configure = zeroclaw_spawn::spawn!(async move {
+            configure_dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": configure_sid,
+                    "overrides": { "model_provider": "openai.edited" }
+                }))
+                .await
+        });
+        let mut configure = Box::pin(configure);
+
+        // Release the commit. The configure may only observe the committed
+        // generation; on the unfixed code it completes here on the old
+        // config and the session is left with an old-generation provider box
+        // the skipped transaction never rebuilds.
+        pause.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut config_set)
+            .await
+            .expect("config/set must complete after the pause is released")
+            .expect("config/set task must complete")
+            .expect("config/set must commit the edited provider");
+        let configure_result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut configure)
+                .await
+                .expect("session/configure must complete after the transaction")
+                .expect("session/configure task must complete");
+        assert!(
+            configure_result.is_ok(),
+            "session/configure must select the edited provider: {configure_result:?}"
+        );
+
+        // The immediate next prompt proves the provider box, route identity,
+        // and limits all describe one generation.
+        let prompt_result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": session_id,
+                "prompt": "hello",
+            }))
+            .await;
+        assert!(
+            prompt_result.is_err(),
+            "the mock intentionally returns a provider error"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock server must retain received requests");
+        assert!(!requests.is_empty(), "session/prompt must reach the mock");
+        for request in requests {
+            let body: Value = serde_json::from_slice(&request.body)
+                .expect("OpenAI request body must be valid JSON");
+            assert_eq!(
+                body.get("model").and_then(Value::as_str),
+                Some("new-model"),
+                "the provider box serving the next prompt must come from the committed \
+                 generation, not the config the skipped prepare phase observed"
+            );
+        }
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let agent = agent.lock().await;
+        let (_, provider_name, model_name) = agent.attribution_fields();
+        assert_eq!(
+            provider_name, "openai.edited",
+            "the session must serve through the selected provider"
+        );
+        assert_eq!(
+            model_name, "new-model",
+            "the provider box and route resolver must come from the committed generation"
+        );
+        let limits = agent.context_limits_for_route("openai.edited", "new-model");
+        assert_eq!(
+            limits.model_context_window, 200_000,
+            "limits must resolve against the committed generation for the served route"
+        );
+    }
+
     #[tokio::test]
     async fn model_provider_update_does_not_block_unrelated_session_configure() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11795,6 +12024,7 @@ mod tests {
         runner.register(Box::new(_hook));
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             after_list_ids_notify: None,
+            config_commit_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -11839,6 +12069,7 @@ mod tests {
         runner.register(Box::new(_hook));
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             after_list_ids_notify: None,
+            config_commit_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -11942,6 +12173,7 @@ mod tests {
 
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             after_list_ids_notify: None,
+            config_commit_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
