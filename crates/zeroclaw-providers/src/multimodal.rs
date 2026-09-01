@@ -80,6 +80,12 @@ tokio::task_local! {
     /// ceiling must fire before this is incremented; if it does not, any
     /// oversized input would arrive here and be charged to this counter.
     static BASE64_DECODE_CALLS: std::sync::atomic::AtomicUsize;
+    /// Counts candidate bytes the parser took ownership of (one add per
+    /// collected `refs` entry). Counting and selection passes must run without
+    /// owning candidate bodies — only the chosen set may materialize — so a
+    /// production-path test can observe this counter to prove no pass before
+    /// the cap decision collected attacker-sized spans.
+    static CANDIDATE_OWNERSHIP_BYTES: std::sync::atomic::AtomicUsize;
 }
 
 /// Records one decode against the ambient counter, if a test installed one.
@@ -95,6 +101,15 @@ fn record_decode_call() {
 fn record_base64_decode_call() {
     let _ = BASE64_DECODE_CALLS.try_with(|calls| {
         calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+/// Records `bytes` of candidate ownership against the ambient counter, if a
+/// test installed one.
+#[cfg(test)]
+fn record_candidate_ownership(bytes: usize) {
+    let _ = CANDIDATE_OWNERSHIP_BYTES.try_with(|owned| {
+        owned.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     });
 }
 
@@ -373,13 +388,16 @@ fn is_loadable_image_reference(candidate: &str) -> bool {
 
 const REJECTED_IMAGE_MARKER_NOTE: &str = "[image omitted: image marker exceeds safety limit]";
 
-/// Classify an over-ceiling marker without owning its attacker-sized body.
+/// Classify a marker span without owning its attacker-sized body.
 ///
 /// The regular parser collapses line wrapping before classifying a reference,
 /// so inspect a small collapsed prefix here as well. Every supported absolute
-/// reference shape is identifiable from this bounded prefix.
-fn over_ceiling_marker_is_loadable(raw: &str) -> bool {
-    const PREFIX_LIMIT: usize = 256;
+/// reference shape is identifiable from this bounded prefix. The limit covers
+/// the longest classification decision any legal reference needs — a UNC path
+/// `\\<253-byte DNS hostname>\<share>` requires 257 bytes to decide, so the
+/// prefix is sized with margin rather than exactly.
+fn marker_span_is_loadable(raw: &str) -> bool {
+    const PREFIX_LIMIT: usize = 512;
 
     let mut prefix = String::with_capacity(PREFIX_LIMIT);
     let mut skip_ws = false;
@@ -483,7 +501,30 @@ pub(crate) fn carries_image_marker(content: &str) -> bool {
 struct ParsedImageMarkers {
     cleaned: String,
     refs: Vec<String>,
+    loadable_count: usize,
     rejected_count: usize,
+}
+
+/// What a [`parse_image_markers_inner`] call may own.
+///
+/// Classification always runs on borrowed spans, so the counting passes in
+/// [`ParseMode::Scan`] never materialize candidate bodies — a message full of
+/// large-but-under-ceiling markers cannot allocate through a count, no matter
+/// how many counting rounds run before the cap is applied. Callers that only
+/// rewrite text (stale-history stripping, age trimming) use
+/// [`ParseMode::RewriteOnly`] for the same reason: the rewritten text carries
+/// no attacker-sized copies either. Only normalization, which must hand the
+/// reference downstream, collects candidates — and by then the cap has
+/// already chosen the surviving set.
+enum ParseMode {
+    /// Count loadable and rejected markers. Builds nothing.
+    Scan,
+    /// Rewrite the text — loadable markers removed, over-ceiling markers
+    /// replaced — but collect no candidate bodies.
+    RewriteOnly,
+    /// Rewrite the text and collect the loadable candidate bodies for
+    /// normalization.
+    RewriteAndCollect,
 }
 
 fn push_rejected_image_marker(cleaned: &mut String) {
@@ -493,12 +534,15 @@ fn push_rejected_image_marker(cleaned: &mut String) {
     cleaned.push_str(REJECTED_IMAGE_MARKER_NOTE);
 }
 
-fn parse_image_markers_inner(content: &str, materialize: bool) -> ParsedImageMarkers {
+fn parse_image_markers_inner(content: &str, mode: ParseMode) -> ParsedImageMarkers {
+    let materialize = !matches!(mode, ParseMode::Scan);
+    let collect_refs = matches!(mode, ParseMode::RewriteAndCollect);
     let mut refs = Vec::new();
     // Do not reserve from the complete untrusted message. A rejected marker
     // can dominate `content.len()`, while the retained output is only the
     // surrounding prose plus a fixed sentinel.
     let mut cleaned = String::new();
+    let mut loadable_count = 0usize;
     let mut rejected_count = 0usize;
     let mut cursor = 0usize;
 
@@ -539,7 +583,7 @@ fn parse_image_markers_inner(content: &str, materialize: bool) -> ParsedImageMar
         // replaced with fixed text. Placeholder/prose markers retain their
         // historical literal treatment.
         if end - marker_start > MAX_IMAGE_MARKER_BYTES {
-            if over_ceiling_marker_is_loadable(&content[marker_start..end]) {
+            if marker_span_is_loadable(&content[marker_start..end]) {
                 rejected_count += 1;
                 if materialize {
                     push_rejected_image_marker(&mut cleaned);
@@ -551,9 +595,13 @@ fn parse_image_markers_inner(content: &str, materialize: bool) -> ParsedImageMar
             continue;
         }
 
-        let candidate = collapse_wrapped_marker(&content[marker_start..end]);
-
-        if candidate.is_empty() || !is_loadable_image_reference(&candidate) {
+        // Classify on the borrowed span here as well — the same boundary the
+        // over-ceiling check above relies on — so counting and rewriting
+        // never pay for a candidate the cap might not keep. `refs` receives
+        // the collapsed body only when the caller will actually normalize it;
+        // because both decisions share one classifier, a count can never
+        // disagree with the later selection over the same span.
+        if !marker_span_is_loadable(&content[marker_start..end]) {
             // Preserve the original marker text (placeholders like
             // `[IMAGE:...]` or `[IMAGE:<path>]` should survive as prose
             // rather than triggering a loader error).
@@ -561,7 +609,13 @@ fn parse_image_markers_inner(content: &str, materialize: bool) -> ParsedImageMar
                 cleaned.push_str(&content[start..=end]);
             }
         } else {
-            refs.push(candidate);
+            loadable_count += 1;
+            if collect_refs {
+                let candidate = collapse_wrapped_marker(&content[marker_start..end]);
+                #[cfg(test)]
+                record_candidate_ownership(candidate.len());
+                refs.push(candidate);
+            }
         }
 
         cursor = end + 1;
@@ -578,12 +632,13 @@ fn parse_image_markers_inner(content: &str, materialize: bool) -> ParsedImageMar
             String::new()
         },
         refs,
+        loadable_count,
         rejected_count,
     }
 }
 
 pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
-    let parsed = parse_image_markers_inner(content, true);
+    let parsed = parse_image_markers_inner(content, ParseMode::RewriteAndCollect);
     (parsed.cleaned, parsed.refs)
 }
 
@@ -592,10 +647,17 @@ pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
     count_image_markers_with_latest_tool_results(messages, &latest_tool_indices)
 }
 
-fn count_image_markers_with_latest_tool_results(
+/// One non-owning pass over the messages the provider would normalize,
+/// returning `(loadable, rejected)` marker counts.
+///
+/// Both counts feed the fast-path decision at the top of
+/// [`prepare_messages_inner`], so they are collected together: two separate
+/// counting rounds would double the parse work on every request for no
+/// benefit.
+fn scan_image_marker_counts_with_latest_tool_results(
     messages: &[ChatMessage],
     latest_tool_result_indices: &HashSet<usize>,
-) -> usize {
+) -> (usize, usize) {
     messages
         .iter()
         .enumerate()
@@ -603,25 +665,22 @@ fn count_image_markers_with_latest_tool_results(
             should_normalize_message_images(*index, message, latest_tool_result_indices)
         })
         .map(|(_, message)| {
-            parse_image_markers_inner(&message.content, false)
-                .refs
-                .len()
+            let parsed = parse_image_markers_inner(&message.content, ParseMode::Scan);
+            (parsed.loadable_count, parsed.rejected_count)
         })
-        .sum()
+        .fold(
+            (0, 0),
+            |(loadable, rejected), (more_loadable, more_rejected)| {
+                (loadable + more_loadable, rejected + more_rejected)
+            },
+        )
 }
 
-fn count_rejected_image_markers_with_latest_tool_results(
+fn count_image_markers_with_latest_tool_results(
     messages: &[ChatMessage],
     latest_tool_result_indices: &HashSet<usize>,
 ) -> usize {
-    messages
-        .iter()
-        .enumerate()
-        .filter(|(index, message)| {
-            should_normalize_message_images(*index, message, latest_tool_result_indices)
-        })
-        .map(|(_, message)| parse_image_markers_inner(&message.content, false).rejected_count)
-        .sum()
+    scan_image_marker_counts_with_latest_tool_results(messages, latest_tool_result_indices).0
 }
 
 pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
@@ -632,11 +691,7 @@ pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
         .filter(|message| message.role == "user" && !is_prompt_tool_result_message(message))
-        .map(|message| {
-            parse_image_markers_inner(&message.content, false)
-                .refs
-                .len()
-        })
+        .map(|message| parse_image_markers_inner(&message.content, ParseMode::Scan).loadable_count)
         .sum()
 }
 
@@ -645,11 +700,7 @@ pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
         .iter()
         .rev()
         .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
-        .map(|message| {
-            parse_image_markers_inner(&message.content, false)
-                .refs
-                .len()
-        })
+        .map(|message| parse_image_markers_inner(&message.content, ParseMode::Scan).loadable_count)
         .unwrap_or(0)
 }
 
@@ -972,9 +1023,8 @@ async fn prepare_messages_inner(
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
     let latest_tool_indices = latest_tool_result_indices(messages);
-    let total_images = count_image_markers_with_latest_tool_results(messages, &latest_tool_indices);
-    let total_rejected =
-        count_rejected_image_markers_with_latest_tool_results(messages, &latest_tool_indices);
+    let (total_images, total_rejected) =
+        scan_image_marker_counts_with_latest_tool_results(messages, &latest_tool_indices);
 
     if total_images == 0 && total_rejected == 0 {
         return Ok(PreparedMessages {
@@ -1062,7 +1112,7 @@ async fn prepare_messages_inner(
             continue;
         }
 
-        let parsed = parse_image_markers_inner(&message.content, true);
+        let parsed = parse_image_markers_inner(&message.content, ParseMode::RewriteAndCollect);
         let cleaned_text = parsed.cleaned;
         let refs = parsed.refs;
         if refs.is_empty() {
@@ -1167,7 +1217,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
             should_normalize_message_images(*index, message, &latest_tool_indices)
         })
         .filter_map(|(i, m)| {
-            let count = parse_image_markers(&m.content).1.len();
+            let count = parse_image_markers_inner(&m.content, ParseMode::Scan).loadable_count;
             if count > 0 { Some((i, count)) } else { None }
         })
         .collect();
@@ -1191,11 +1241,13 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
         .enumerate()
         .map(|(i, m)| {
             if strip_indices.contains(&i) {
-                let (cleaned, _) = parse_image_markers(&m.content);
-                let text = if cleaned.trim().is_empty() {
+                // The message is already sentenced — its images are being
+                // dropped — so rewriting must not also pay to own them.
+                let parsed = parse_image_markers_inner(&m.content, ParseMode::RewriteOnly);
+                let text = if parsed.cleaned.trim().is_empty() {
                     "[image removed from history]".to_string()
                 } else {
-                    cleaned
+                    parsed.cleaned
                 };
                 ChatMessage {
                     role: m.role.clone(),
@@ -3445,6 +3497,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn counting_and_cap_selection_do_not_materialize_uncalled_candidates() {
+        // Production-path counterpart of the scan tests: every counting,
+        // trimming, and selection pass runs, and the ownership counter
+        // observes exactly what those passes own. Three under-ceiling markers
+        // with a one-image cap means only the newest message's candidate may
+        // ever be materialized — the counts, the cap trim, and the
+        // stale-replay strip must all classify on borrowed spans.
+        //
+        // The payloads are over the (clamped, ≤ 20 MiB) encoded ceiling, so
+        // the surviving candidate is refused at the normalize entry guard:
+        // the test observes ownership, not decode work.
+        let payload_bytes = 30 * 1024 * 1024;
+        let payload = "A".repeat(payload_bytes);
+        let config = MultimodalConfig {
+            max_images: 1,
+            ..MultimodalConfig::default()
+        };
+        let messages: Vec<ChatMessage> = (0..3)
+            .map(|i| {
+                ChatMessage::user(format!(
+                    "message {i} [IMAGE:data:image/png;base64,{payload}]"
+                ))
+            })
+            .collect();
+
+        let (((result, base64_decodes), pixel_decodes), owned_bytes) =
+            counting_candidate_ownership(async {
+                counting_base64_decodes(async {
+                    counting_decodes(async {
+                        prepare_messages_for_provider(&messages, &config)
+                            .await
+                            .expect("preparation does not hard-fail on refused candidates")
+                    })
+                    .await
+                })
+                .await
+            })
+            .await;
+
+        assert_eq!(
+            base64_decodes, 0,
+            "the encoded ceiling must refuse before base64 decoding"
+        );
+        assert_eq!(pixel_decodes, 0, "nothing reaches a pixel decode");
+        // No pass before or during selection owned more than the one chosen
+        // candidate body. Before the counting paths went non-owning, the
+        // first count alone owned all three.
+        assert!(
+            owned_bytes < 2 * payload_bytes,
+            "counting and cap selection must not materialize every candidate \
+             (owned {owned_bytes} bytes for {payload_bytes}-byte payloads)"
+        );
+
+        // The chosen-set semantics are visible in the output: the two oldest
+        // messages were stripped as units and keep only their prose, the
+        // newest kept its prose plus the refusal note, and no raw marker
+        // survives anywhere.
+        assert!(!result.contains_images);
+        for (index, message) in result.messages.iter().enumerate() {
+            assert!(
+                !message.content.contains("data:image")
+                    && !message.content.contains(&payload[..128]),
+                "message {index}: the raw marker must not reach provider-visible content"
+            );
+        }
+        assert!(
+            result.messages[0].content.contains("message 0"),
+            "the trimmed messages keep their text, losing only the image"
+        );
+        assert!(
+            result.messages[2].content.contains("message 2")
+                && result.messages[2].content.contains("could not be loaded"),
+            "the surviving candidate is refused by the encoded ceiling, not dropped silently"
+        );
+    }
+
+    #[tokio::test]
     async fn oversized_data_uri_with_malformed_header_is_refused_before_any_source_copy() {
         // The entry-point length guard must fire for malformed data URIs too,
         // not only for valid-MIME oversized payloads. A malformed header (no
@@ -3758,6 +3887,29 @@ mod tests {
                 let value = body.await;
                 let count = BASE64_DECODE_CALLS
                     .with(|calls| calls.load(std::sync::atomic::Ordering::Relaxed));
+                (value, count)
+            })
+            .await
+    }
+
+    /// Runs `body` with a fresh [`CANDIDATE_OWNERSHIP_BYTES`] counter scoped
+    /// to it, and returns `(body's value, candidate bytes owned)`.
+    ///
+    /// Distinct from the decode counters: those observe work the ceilings
+    /// exist to prevent; this one observes *ownership* — the parser taking a
+    /// marker span into an owned `String`. A production-path run whose
+    /// counting passes stay non-owning can only accumulate bytes for the
+    /// candidates the cap actually chose.
+    async fn counting_candidate_ownership<F, T>(body: F) -> (T, usize)
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        CANDIDATE_OWNERSHIP_BYTES
+            .scope(counter, async move {
+                let value = body.await;
+                let count = CANDIDATE_OWNERSHIP_BYTES
+                    .with(|owned| owned.load(std::sync::atomic::Ordering::Relaxed));
                 (value, count)
             })
             .await
@@ -5866,6 +6018,108 @@ mod tests {
             refs.len(),
             1,
             "a marker exactly at the ceiling must still be extracted"
+        );
+    }
+
+    #[test]
+    fn scan_mode_counts_under_ceiling_markers_without_owning_them() {
+        // The over-ceiling test above proves a single oversized span is
+        // refused before `collapse_wrapped_marker` runs. This one pins the
+        // other half of the ownership boundary: markers *under* the ceiling
+        // stay unowned while counting, so several large-but-legal markers
+        // cannot allocate through a count — only the later, cap-chosen
+        // normalization pass may own them.
+        let payload = "A".repeat(30 * 1024 * 1024);
+        let input = format!(
+            "one [IMAGE:data:image/png;base64,{payload}] two [IMAGE:data:image/png;base64,{payload}]"
+        );
+
+        let scanned = parse_image_markers_inner(&input, ParseMode::Scan);
+        assert_eq!(scanned.loadable_count, 2, "both markers count as loadable");
+        assert_eq!(
+            scanned.rejected_count, 0,
+            "neither marker is over the ceiling"
+        );
+        assert!(
+            scanned.refs.is_empty(),
+            "the scan must not own any candidate body"
+        );
+        assert!(
+            scanned.cleaned.is_empty(),
+            "the scan must not build cleaned text"
+        );
+
+        // The collecting mode owns exactly the loadable set, and its count
+        // agrees with what was collected — counting can never disagree with
+        // selection because both read the same classifier.
+        let collected = parse_image_markers_inner(&input, ParseMode::RewriteAndCollect);
+        assert_eq!(collected.loadable_count, collected.refs.len());
+        assert_eq!(collected.refs.len(), 2);
+
+        // Rewriting without collecting (stale-history strips) owns nothing
+        // either, while still removing the markers from the text.
+        let rewritten = parse_image_markers_inner(&input, ParseMode::RewriteOnly);
+        assert_eq!(rewritten.loadable_count, 2);
+        assert!(rewritten.refs.is_empty());
+        assert!(
+            !rewritten.cleaned.contains("data:image"),
+            "the rewrite must remove the loadable markers"
+        );
+    }
+
+    #[test]
+    fn marker_span_classification_matches_the_collapsed_reference() {
+        // `marker_span_is_loadable` decides from a bounded collapsed prefix so
+        // no mode ever owns a span just to classify it. That is sound only
+        // while every *legal* reference shape is decided within the prefix
+        // limit — the longest is a UNC path with a maximal-length (253-byte)
+        // DNS hostname, which needs 257 bytes to find the share delimiter.
+        // Pin the equivalence for that boundary and the common shapes.
+        let mut shapes: Vec<String> = [
+            "/absolute/path.png",
+            "http://example.com/a.png",
+            "https://example.com/b.webp",
+            "data:image/png;base64,iVBORw0KGgo=",
+            "C:\\Users\\share\\c.png",
+            "D:/data/d.png",
+            "not a reference",
+            "relative/path.png",
+            "   ",
+            "",
+        ]
+        .iter()
+        .map(|shape| shape.to_string())
+        .collect();
+        shapes.push(format!(r"\\{}\share\e.png", "s".repeat(253)));
+        shapes.push(format!(r"\\{}\share", "s".repeat(253)));
+        shapes.push(format!(r"\\{}\share\f.png", "s".repeat(15)));
+        for shape in &shapes {
+            assert_eq!(
+                marker_span_is_loadable(shape),
+                is_loadable_image_reference(&collapse_wrapped_marker(shape)),
+                "span classification must match the collapsed reference for {shape:?}"
+            );
+        }
+
+        // Beyond the prefix limit the classifier is deliberately stricter: a
+        // UNC server longer than any legal hostname classifies as prose
+        // rather than paying to own the span. Divergence in this direction
+        // can never collect a candidate the full check would reject — it
+        // only refuses an absurd one — and the equivalence above covers
+        // every legal shape.
+        let absurd_unc = format!(r"\\{}\share\g.png", "s".repeat(600));
+        assert!(!marker_span_is_loadable(&absurd_unc));
+        assert!(is_loadable_image_reference(&collapse_wrapped_marker(
+            &absurd_unc
+        )));
+
+        // A line-wrapped marker classifies through the collapse-equivalent
+        // prefix path, not the raw text with the newline still in it.
+        let wrapped = "data:image/png;base64,iVBO\n  Rw0KGgo=";
+        assert!(marker_span_is_loadable(wrapped));
+        assert_eq!(
+            marker_span_is_loadable(wrapped),
+            is_loadable_image_reference(&collapse_wrapped_marker(wrapped))
         );
     }
 
