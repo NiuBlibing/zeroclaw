@@ -887,15 +887,20 @@ fn should_normalize_message_images(
 }
 
 fn stripped_image_marker_text(content: &str) -> String {
-    let (cleaned, refs) = parse_image_markers(content);
-    if refs.is_empty() {
+    let parsed = parse_image_markers_inner(content, ParseMode::RewriteOnly);
+    // "No loadable candidates" is not "nothing changed": an over-ceiling
+    // marker is rejected rather than collected, and its raw body must not
+    // survive this strip. Only a parse that found neither a loadable nor a
+    // rejected marker may return the input untouched — placeholder markers
+    // are preserved verbatim by the rewrite, so that return equals the input.
+    if parsed.loadable_count == 0 && parsed.rejected_count == 0 {
         return content.to_string();
     }
 
-    if cleaned.trim().is_empty() {
+    if parsed.cleaned.trim().is_empty() {
         "[image removed from history]".to_string()
     } else {
-        cleaned
+        parsed.cleaned
     }
 }
 
@@ -1185,14 +1190,17 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
         .enumerate()
         .map(|(i, m)| {
             if i < cutoff && m.role == "user" {
-                let (cleaned, refs) = parse_image_markers(&m.content);
-                if refs.is_empty() {
+                let parsed = parse_image_markers_inner(&m.content, ParseMode::RewriteOnly);
+                // Same detector contract as `stripped_image_marker_text`: an
+                // empty candidate list is not "no change" — a rejected marker
+                // rewrites the text without ever producing a candidate.
+                if parsed.loadable_count == 0 && parsed.rejected_count == 0 {
                     return m.clone();
                 }
-                let text = if cleaned.trim().is_empty() {
+                let text = if parsed.cleaned.trim().is_empty() {
                     "[image removed from history]".to_string()
                 } else {
-                    cleaned
+                    parsed.cleaned
                 };
                 ChatMessage {
                     role: m.role.clone(),
@@ -6381,6 +6389,112 @@ mod tests {
             !prepared.messages[0]
                 .content
                 .contains("stale-prompt-tool-result.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_native_tool_result_replays_over_ceiling_marker_as_note() {
+        // Regression for the stale-replay bypass: an over-ceiling loadable
+        // marker produces no candidates, and `stripped_image_marker_text`
+        // used to read "no candidates" as "nothing changed", so a stale tool
+        // result — which the counting passes deliberately exclude — replayed
+        // the raw oversized marker into provider-visible text. The strip must
+        // consult the parse state, not infer it from an empty candidate list.
+        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": format!("screenshot [IMAGE:data:image/png;base64,{payload}]"),
+        })
+        .to_string();
+
+        // The later plain user turn makes the tool result stale and leaves
+        // the history with no counted image, so preparation takes the
+        // no-image fast path — exactly the route that used to forward the
+        // raw marker.
+        let messages = vec![
+            ChatMessage::tool(native_tool_content),
+            ChatMessage::user("What did you see?".to_string()),
+        ];
+
+        let ((result, base64_decodes), pixel_decodes) = counting_base64_decodes(async {
+            counting_decodes(async {
+                prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+                    .await
+                    .expect("preparation must not hard-fail on a refused marker")
+            })
+            .await
+        })
+        .await;
+
+        let value: serde_json::Value = serde_json::from_str(&result.messages[0].content)
+            .expect("stale native tool result should remain valid JSON");
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(
+            inner.contains("screenshot"),
+            "surrounding prose must survive"
+        );
+        assert!(
+            inner.contains(REJECTED_IMAGE_MARKER_NOTE),
+            "the refusal must replace the raw marker"
+        );
+        assert!(
+            !inner.contains("data:image") && !inner.contains(&payload[..128]),
+            "the raw marker must not survive the stale replay"
+        );
+        assert_eq!(
+            base64_decodes, 0,
+            "rejection must happen before base64 decoding"
+        );
+        assert_eq!(
+            pixel_decodes, 0,
+            "rejection must happen before any pixel decode"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_prompt_tool_result_replays_over_ceiling_marker_in_full_preparation() {
+        // The in-loop replay branch strips stale carriers on the *full*
+        // preparation path too — the second route to the same helper. A
+        // later user image keeps that path live while the stale prompt
+        // carrier holds the over-ceiling marker.
+        let temp = tempfile::tempdir().unwrap();
+        let fresh_path = temp.path().join("fresh-user-image.png");
+        std::fs::write(&fresh_path, valid_png()).unwrap();
+
+        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
+        let messages = vec![
+            ChatMessage::user(format!(
+                "[Tool results]\nGenerated [IMAGE:data:image/png;base64,{payload}]"
+            )),
+            ChatMessage::user(format!(
+                "and here is a fresh one [IMAGE:{}]",
+                fresh_path.display()
+            )),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation must not hard-fail on a refused marker");
+
+        assert!(
+            prepared.contains_images,
+            "the fresh valid image must survive"
+        );
+        let stale = &prepared.messages[0].content;
+        assert!(
+            stale.contains("[Tool results]") && stale.contains("Generated"),
+            "the stale carrier keeps its prose"
+        );
+        assert!(
+            stale.contains(REJECTED_IMAGE_MARKER_NOTE),
+            "the refusal must replace the raw marker"
+        );
+        assert!(
+            !stale.contains("data:image") && !stale.contains(&payload[..128]),
+            "the raw marker must not survive the stale replay"
         );
     }
 
