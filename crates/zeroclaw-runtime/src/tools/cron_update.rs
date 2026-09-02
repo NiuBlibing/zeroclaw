@@ -204,11 +204,6 @@ impl Tool for CronUpdateTool {
                             }
                         }
                     }
-                },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
-                    "default": false
                 }
             },
             "required": ["job_id", "patch"]
@@ -349,6 +344,20 @@ mod tests {
         Arc::new(
             SecurityPolicy::for_agent(cfg, TEST_AGENT).expect("test-agent has resolvable profiles"),
         )
+    }
+
+    #[tokio::test]
+    async fn schema_does_not_advertise_self_approval() {
+        // `approved` is runtime plumbing injected by the approval gate,
+        // never a model-facing parameter (RFC #7155).
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        assert!(
+            tool.parameters_schema()["properties"]
+                .get("approved")
+                .is_none()
+        );
     }
 
     #[tokio::test]

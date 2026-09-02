@@ -236,11 +236,6 @@ impl Tool for ShellTool {
                 "command": {
                     "type": "string",
                     "description": "The shell command to execute"
-                },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
-                    "default": false
                 }
             },
             "required": ["command"]
@@ -738,7 +733,10 @@ mod tests {
                 .expect("schema required field should be an array")
                 .contains(&json!("command"))
         );
-        assert!(schema["properties"]["approved"].is_object());
+        // The runtime-owned `approved` arg is intentionally absent from the
+        // schema: the model must never be told it can self-approve (RFC #7155).
+        // `agent::set_runtime_approved_arg` is the only writer on the loop path.
+        assert!(schema["properties"].get("approved").is_none());
     }
 
     #[cfg(all(any(unix, windows), not(target_os = "android")))]
