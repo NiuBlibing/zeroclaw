@@ -11875,7 +11875,12 @@ mod tests {
     ///
     /// The test-only commit pause parks `config/set` between prepare and
     /// commit, so the configure runs deterministically inside the window
-    /// rather than by timing luck.
+    /// rather than by timing luck. While the commit is parked the configure
+    /// task is polled through a bounded yield loop and asserted unfinished —
+    /// the pre-fix code completes there (it does not take the writer gate),
+    /// so the regression fails deterministically at that point instead of
+    /// depending on the scheduler polling the configure before the released
+    /// commit resumes.
     #[tokio::test]
     async fn session_configure_waits_for_prepared_and_skipped_config_transaction() {
         use wiremock::matchers::method;
@@ -11963,10 +11968,27 @@ mod tests {
         });
         let mut configure = Box::pin(configure);
 
+        // The paused transaction still owns the config writer gate, so the
+        // configure must be parked on it — poll the task through a bounded
+        // sleep-free yield loop and assert it never finishes. This is the
+        // negative-control point: without the production lock the configure
+        // runs to completion right here (nothing else blocks it — the skipped
+        // session's ordering guard was already dropped), publishing a
+        // provider built from the still-installed old config.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            assert!(
+                !configure.is_finished(),
+                "session/configure must queue on config_write_lock while the \
+                 paused config transaction owns it; finishing here means it \
+                 built the provider from the pre-commit config"
+            );
+        }
+
         // Release the commit. The configure may only observe the committed
-        // generation; on the unfixed code it completes here on the old
-        // config and the session is left with an old-generation provider box
-        // the skipped transaction never rebuilds.
+        // generation; on the unfixed code it has already completed above on
+        // the old config and the session is left with an old-generation
+        // provider box the skipped transaction never rebuilds.
         pause.release.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(5), &mut config_set)
             .await
