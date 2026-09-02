@@ -892,7 +892,10 @@ impl Logs {
                 Span::raw("")
             },
             if self.history_incomplete {
-                Span::styled("[partial] ", theme::warn_style())
+                Span::styled(
+                    format!("{} ", crate::i18n::t("zc-logs-status-partial")),
+                    theme::warn_style(),
+                )
             } else {
                 Span::raw("")
             },
@@ -2031,6 +2034,46 @@ mod tests {
         assert!(text.contains(&crate::i18n::t("zc-logs-preview-only")));
         // And it must not sit on the "Loading…" placeholder.
         assert!(!text.contains(&crate::i18n::t("zc-logs-loading")));
+    }
+
+    #[tokio::test]
+    async fn status_line_renders_partial_badge_from_catalogue() {
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        logs.history_incomplete = true;
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+
+        // The badge must resolve from the ZeroCode Fluent catalogue rather
+        // than a bare literal, so non-English users see a localized marker.
+        let badge = crate::i18n::t("zc-logs-status-partial");
+        assert!(!badge.contains('{'), "key must resolve: {badge:?}");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains(&badge), "rendered: {rendered:?}");
+
+        // A fully readable history must not show the badge.
+        logs.history_incomplete = false;
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!rendered.contains(&badge), "rendered: {rendered:?}");
     }
 
     #[test]
