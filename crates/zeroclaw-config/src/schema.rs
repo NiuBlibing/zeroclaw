@@ -3280,16 +3280,20 @@ impl FamilyEndpoint for KiloModelProviderConfig {
     }
 }
 
-// ── ZeroRouter (self-hosted LLM gateway — OpenAI-compatible) ──
+// ── ZeroRouter (LLM gateway — OpenAI-compatible; hosted or self-hosted) ──
 
-/// ZeroRouter endpoint. ZeroRouter is a family of independently operated
-/// routers, so there is no canonical hosted default: the single variant
-/// points at the router container's own bind
-/// (`ZEROROUTER_BIND=0.0.0.0:8080`). A hosted deployment does run at
-/// `https://zerorouter.ai`, but it is one deployment among many rather than
-/// the family default, so operators reaching it — or any other remote
-/// router — set `base.uri`. [`ZEROROUTER_DEFAULT_URL`] is the canonical
-/// family default consumed by both schema and provider construction.
+/// ZeroRouter endpoint. The single variant points at the public hosted
+/// deployment, `https://zerorouter.ai` (currently in beta) — the endpoint a
+/// user who names this provider without further configuration expects, and
+/// the one that works out of the box: its `/v1/models` listing is public, so
+/// discovery succeeds before any key is configured. ZeroRouter is also
+/// self-hostable (AGPL); operators running their own router — locally
+/// (`ZEROROUTER_BIND=0.0.0.0:8080`, so `http://localhost:8080/v1`) or
+/// anywhere else — set `base.uri` to reach it. A localhost default was
+/// considered and rejected: it made the zero-config path a connection
+/// refusal, or worse, a silent partial catalog from a stray dev instance.
+/// [`ZEROROUTER_DEFAULT_URL`] is the canonical default consumed by both
+/// schema and provider construction.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
@@ -3300,8 +3304,8 @@ pub enum ZerorouterEndpoint {
     Default,
 }
 
-/// Default API base for a locally running ZeroRouter.
-pub const ZEROROUTER_DEFAULT_URL: &str = "http://localhost:8080/v1";
+/// Default API base: the hosted ZeroRouter deployment.
+pub const ZEROROUTER_DEFAULT_URL: &str = "https://zerorouter.ai/v1";
 
 impl ModelEndpoint for ZerorouterEndpoint {
     fn uri(&self) -> &'static str {
@@ -17187,13 +17191,17 @@ pub struct LarkConfig {
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub app_secret: String,
-    /// Encrypt key for webhook message decryption (optional)
+    /// Encrypt key for webhook message decryption and signed event-subscription
+    /// validation (optional when verification_token is configured for plaintext
+    /// callbacks).
     #[serde(default)]
     #[secret]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub encrypt_key: Option<String>,
-    /// Verification token for webhook validation (optional)
+    /// Verification token for plaintext webhook validation and URL verification.
+    /// Required in webhook mode unless encrypt_key is configured for signed
+    /// event-subscription callbacks; optional in websocket mode.
     #[serde(default)]
     #[secret]
     #[tab(Connection)]
@@ -23263,6 +23271,18 @@ impl Config {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| std::ffi::OsStr::new("config.toml"));
         let resolved = zeroclaw_dir.join(file_name);
+        if tokio::fs::try_exists(&resolved).await.with_context(|| {
+            format!(
+                "Failed to check resolved config path {}",
+                resolved.display()
+            )
+        })? {
+            anyhow::bail!(
+                "Config path {} has no parent directory and resolves to {}; refusing to overwrite existing config",
+                self.config_path.display(),
+                resolved.display()
+            );
+        }
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": self.config_path.display().to_string(), "resolved": resolved.display().to_string(), "source": source.as_str()})), "Config path missing parent directory; resolving from runtime environment");
         Ok(resolved)
     }
@@ -31376,6 +31396,65 @@ model = "primary-model"
             unsafe { std::env::remove_var("HOME") };
         }
         let _ = tokio::fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    async fn save_refuses_to_overwrite_existing_runtime_config_from_bare_path() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("workspace");
+        let resolved_config_path = temp_home.join(".zeroclaw").join("config.toml");
+        let original = "schema_version = 5\n\n[operator_only]\nkeep = true\n";
+        tokio::fs::create_dir_all(resolved_config_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&resolved_config_path, original)
+            .await
+            .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+
+        let mut config = Config {
+            data_dir: workspace_dir,
+            config_path: PathBuf::from("config.toml"),
+            ..Default::default()
+        };
+        let save_result = config.save().await;
+        config.mark_dirty("observability.backend");
+        let save_dirty_result = config.save_dirty().await;
+        let written = tokio::fs::read_to_string(&resolved_config_path)
+            .await
+            .unwrap();
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        if let Some(home) = original_home {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = tokio::fs::remove_dir_all(temp_home).await;
+
+        assert!(
+            save_result
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to overwrite existing config"),
+        );
+        assert!(
+            save_dirty_result
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to overwrite existing config"),
+        );
+        assert_eq!(written, original);
     }
 
     #[test]
