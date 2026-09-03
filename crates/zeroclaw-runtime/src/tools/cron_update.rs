@@ -440,7 +440,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("not allowed"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("high-risk command is disallowed")
+        );
     }
 
     #[tokio::test]
@@ -551,7 +556,7 @@ mod tests {
             denied
                 .error
                 .unwrap_or_default()
-                .contains("explicit approval")
+                .contains("operator approval")
         );
 
         let approved = tool

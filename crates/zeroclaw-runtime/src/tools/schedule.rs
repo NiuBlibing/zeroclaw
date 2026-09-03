@@ -938,7 +938,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("not allowed")
+                .contains("high-risk command is disallowed")
         );
     }
 
@@ -1019,7 +1019,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("explicit approval")
+                .contains("operator approval")
         );
 
         let approved = tool

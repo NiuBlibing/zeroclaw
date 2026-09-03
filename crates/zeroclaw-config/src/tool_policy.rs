@@ -294,6 +294,79 @@ pub fn extract_shell_action(
     })
 }
 
+/// The fact schema tag carried inside every shell action fingerprint — see
+/// [`ShellAction::fingerprint_facts`].
+pub const SHELL_ACTION_FACTS_SCHEMA: &str = "zc-shell-action-v1";
+
+impl ShellAction {
+    /// The canonical fingerprint facts for this action (RFC #7155 §5.2:
+    /// the complete action, not the display string).
+    ///
+    /// Shape (v1): `{"schema": "zc-shell-action-v1", "dialect": …, "cwd": …,
+    /// "segments": [{"env": {…}, "executable": <as typed>,
+    /// "arguments": […]}]}`. Env assignments and arguments bind the argv;
+    /// redirections bind through their argument tokens; `cwd` binds the
+    /// working directory; `dialect` binds the interpreter. The
+    /// `schema` tag is the [`ACTION_FINGERPRINT_DOMAIN_V1`] companion inside
+    /// the facts: bumping either invalidates outstanding approvals.
+    ///
+    /// serde_json's sorted-key maps make the serialization canonical, so
+    /// two extractions of the same command hash identically.
+    #[must_use]
+    pub fn fingerprint_facts(&self) -> serde_json::Value {
+        let segments: Vec<serde_json::Value> = self
+            .segments
+            .iter()
+            .map(|segment| {
+                let env: serde_json::Map<String, serde_json::Value> = segment
+                    .env_assignments
+                    .iter()
+                    .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
+                    .collect();
+                serde_json::json!({
+                    "env": env,
+                    "executable": segment.executable,
+                    "arguments": segment.arguments,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "schema": SHELL_ACTION_FACTS_SCHEMA,
+            "dialect": dialect_name(self.dialect),
+            "cwd": self
+                .cwd
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            "segments": segments,
+        })
+    }
+}
+
+/// Stable wire names for [`ShellDialect`] inside fingerprint facts.
+fn dialect_name(dialect: ShellDialect) -> &'static str {
+    match dialect {
+        ShellDialect::Posix => "posix",
+        ShellDialect::WindowsCmd => "windows_cmd",
+        ShellDialect::PowerShell => "powershell",
+        ShellDialect::None => "none",
+    }
+}
+
+/// The action fingerprint for a shell command: what a confirmation mints
+/// against and what execution consumes against. Both sides must go through
+/// this one function — the fingerprint is only meaningful as a shared
+/// computation.
+#[must_use]
+pub fn shell_action_fingerprint(
+    command: &str,
+    dialect: ShellDialect,
+    cwd: Option<&Path>,
+) -> zeroclaw_api::permission::ActionFingerprint {
+    let action = extract_shell_action(command, dialect, cwd);
+    let ToolAction::Shell(shell) = &action;
+    zeroclaw_api::permission::ActionFingerprint::compute(&shell.fingerprint_facts())
+}
+
 fn extract_posix_like_segments(
     command: &str,
     dialect: ShellDialect,
@@ -676,11 +749,34 @@ impl CompiledRuleSet {
     /// it to a blanket `Allow` would widen permissions — a regression, not
     /// a compilation.
     pub fn compile(risk_profile: &RiskProfileConfig) -> Self {
+        Self::compile_from_fields(
+            risk_profile.level,
+            &risk_profile.allowed_commands,
+            &risk_profile.always_ask,
+            &risk_profile.auto_approve,
+            risk_profile.block_high_risk_commands,
+            risk_profile.require_approval_for_medium_risk,
+            &risk_profile.tool_policy,
+        )
+    }
+
+    /// Compile from the individual fields a [`crate::policy::SecurityPolicy`]
+    /// mirrors, so the table is built from exactly the values a struct-literal
+    /// policy carries (never from a stored snapshot that can desync).
+    pub fn compile_from_fields(
+        autonomy: crate::autonomy::AutonomyLevel,
+        allowed_commands: &[String],
+        always_ask: &[String],
+        auto_approve: &[String],
+        block_high_risk_commands: bool,
+        require_approval_for_medium_risk: bool,
+        tool_policy: &ToolPolicyConfig,
+    ) -> Self {
         use crate::autonomy::AutonomyLevel;
 
         let mut rules: Vec<PolicyRule> = Vec::new();
 
-        if risk_profile.level == AutonomyLevel::ReadOnly {
+        if autonomy == AutonomyLevel::ReadOnly {
             rules.push(PolicyRule {
                 matcher: RuleMatcher::AnyShell,
                 decision: Decision::Deny,
@@ -689,7 +785,7 @@ impl CompiledRuleSet {
             });
         }
 
-        for tool in &risk_profile.always_ask {
+        for tool in always_ask {
             rules.push(PolicyRule {
                 matcher: RuleMatcher::ToolName {
                     tool: tool.trim().to_string(),
@@ -700,7 +796,7 @@ impl CompiledRuleSet {
             });
         }
 
-        for tool in &risk_profile.auto_approve {
+        for tool in auto_approve {
             rules.push(PolicyRule {
                 matcher: RuleMatcher::ToolName {
                     tool: tool.trim().to_string(),
@@ -711,10 +807,7 @@ impl CompiledRuleSet {
             });
         }
 
-        let has_wildcard = risk_profile
-            .allowed_commands
-            .iter()
-            .any(|entry| entry.trim() == "*");
+        let has_wildcard = allowed_commands.iter().any(|entry| entry.trim() == "*");
         if has_wildcard {
             rules.push(PolicyRule {
                 matcher: RuleMatcher::AnyShell,
@@ -723,7 +816,7 @@ impl CompiledRuleSet {
                 source: RuleSource::Legacy(LegacyField::WildcardAllowlist),
             });
         }
-        for entry in &risk_profile.allowed_commands {
+        for entry in allowed_commands {
             if entry.trim() == "*" {
                 continue;
             }
@@ -738,7 +831,7 @@ impl CompiledRuleSet {
             });
         }
 
-        if risk_profile.block_high_risk_commands {
+        if block_high_risk_commands {
             rules.push(PolicyRule {
                 matcher: RuleMatcher::AnyShell,
                 decision: Decision::Deny,
@@ -746,14 +839,14 @@ impl CompiledRuleSet {
                 source: RuleSource::Builtin(BuiltinPredicate::HighRiskBlocked),
             });
         }
-        if risk_profile.level == AutonomyLevel::Supervised {
+        if autonomy == AutonomyLevel::Supervised {
             rules.push(PolicyRule {
                 matcher: RuleMatcher::AnyShell,
                 decision: Decision::Ask,
                 overridable: true,
                 source: RuleSource::Builtin(BuiltinPredicate::SupervisedHighRisk),
             });
-            if risk_profile.require_approval_for_medium_risk {
+            if require_approval_for_medium_risk {
                 rules.push(PolicyRule {
                     matcher: RuleMatcher::AnyShell,
                     decision: Decision::Ask,
@@ -763,7 +856,7 @@ impl CompiledRuleSet {
             }
         }
 
-        for rule in &risk_profile.tool_policy.rules {
+        for rule in &tool_policy.rules {
             // Config validation rejects unparseable patterns at load time
             // (see `validate_tool_policy`), so a parse failure here cannot
             // happen for a validated profile; skipping keeps compile
@@ -781,9 +874,9 @@ impl CompiledRuleSet {
 
         Self {
             rules,
-            escape_hatch: has_wildcard && !risk_profile.block_high_risk_commands,
-            block_high_risk_commands: risk_profile.block_high_risk_commands,
-            confirmation_validity_secs: risk_profile.tool_policy.confirmation_validity_secs,
+            escape_hatch: has_wildcard && !block_high_risk_commands,
+            block_high_risk_commands,
+            confirmation_validity_secs: tool_policy.confirmation_validity_secs,
         }
     }
 
@@ -898,7 +991,11 @@ pub fn resolve_decision(action: &ToolAction, scopes: &ResolvedScopes) -> Resolut
     if shell.dialect == ShellDialect::None {
         return Resolution::new(Decision::Deny, ResolutionReason::NoShellAccess);
     }
-    if shell.segments.is_empty() {
+    if shell.segments.is_empty() && shell.parse_status == ParseStatus::Clean {
+        // A clean parse producing no command word is not a runnable action.
+        // A DEGRADED parse producing no segments (unparseable PowerShell)
+        // must fall through instead: the escape hatch may still allow it,
+        // exactly like the legacy gates it bypassed before parsing.
         return Resolution::new(Decision::Deny, ResolutionReason::EmptyCommand);
     }
 
@@ -913,7 +1010,24 @@ pub fn resolve_decision(action: &ToolAction, scopes: &ResolvedScopes) -> Resolut
             Some(_) => segment_resolution,
         });
     }
-    let mut resolution = combined.expect("segments is non-empty");
+    // Zero segments (degraded parse): no rule ever matched, so the default
+    // is the fail-closed Ask — unless the trusted-environment escape hatch
+    // is active, whose historical meaning is skipping command-level syntax
+    // restrictions entirely.
+    let mut resolution = combined.unwrap_or_else(|| {
+        if scopes.profile.escape_hatch() {
+            Resolution::new(
+                Decision::Allow,
+                ResolutionReason::MatchedRule {
+                    decision: Decision::Allow,
+                    source: RuleSource::Legacy(LegacyField::WildcardAllowlist),
+                    pattern: "Shell(*)".to_string(),
+                },
+            )
+        } else {
+            Resolution::new(Decision::Ask, ResolutionReason::Unmatched)
+        }
+    });
 
     // RFC #7155 §2.3: an apparent Allow on a degraded parse never executes
     // unconditionally. The escape hatch keeps its historical meaning
@@ -1517,6 +1631,60 @@ mod tests {
         assert_eq!(shell.cwd.as_deref(), Some(Path::new("/w")));
     }
 
+    #[test]
+    fn fingerprint_facts_bind_the_complete_action() {
+        use zeroclaw_api::permission::ActionFingerprint;
+
+        let base =
+            shell_action_fingerprint("rm -rf /tmp/x", ShellDialect::Posix, Some(Path::new("/ws")));
+        // Same command, same cwd → same fingerprint.
+        assert_eq!(
+            base,
+            shell_action_fingerprint("rm -rf /tmp/x", ShellDialect::Posix, Some(Path::new("/ws")))
+        );
+        // Any fact change → different fingerprint: args, cwd, dialect,
+        // executable spelling, env assignments.
+        assert_ne!(
+            base,
+            shell_action_fingerprint("rm -rf /tmp/y", ShellDialect::Posix, Some(Path::new("/ws")))
+        );
+        assert_ne!(
+            base,
+            shell_action_fingerprint(
+                "rm -rf /tmp/x",
+                ShellDialect::Posix,
+                Some(Path::new("/other"))
+            )
+        );
+        assert_ne!(
+            base,
+            shell_action_fingerprint(
+                "rm -rf /tmp/x",
+                ShellDialect::PowerShell,
+                Some(Path::new("/ws"))
+            )
+        );
+        assert_ne!(
+            base,
+            shell_action_fingerprint(
+                "/usr/bin/rm -rf /tmp/x",
+                ShellDialect::Posix,
+                Some(Path::new("/ws"))
+            )
+        );
+        assert_ne!(
+            base,
+            shell_action_fingerprint(
+                "FOO=1 rm -rf /tmp/x",
+                ShellDialect::Posix,
+                Some(Path::new("/ws"))
+            )
+        );
+        // Fingerprint determinism is the shared-computation property the
+        // gate (mint) and dispatch (consume) both rely on.
+        let _ = ActionFingerprint::compute;
+    }
+
     // ── Resolution precedence ───────────────────────────────────────
 
     #[test]
@@ -1957,7 +2125,7 @@ mod tests {
 
     /// The expected new decision, derived from the legacy outcome:
     /// - legacy Ok with approved=false (no ask fired) → Allow;
-    /// - legacy Err "requires explicit approval" → Ask;
+    /// - legacy Err "requires operator approval" → Ask;
     /// - legacy Err "high-risk command is disallowed" → Deny;
     /// - legacy Err "not allowed by security policy" → the resolver's own
     ///   answer, which may exercise one of the two sanctioned deltas.
@@ -1967,7 +2135,7 @@ mod tests {
     ) -> Decision {
         match legacy_unapproved {
             Ok(_) => Decision::Allow,
-            Err(error) if error.contains("requires explicit approval") => Decision::Ask,
+            Err(error) if error.contains("requires operator approval") => Decision::Ask,
             Err(error) if error.contains("high-risk command is disallowed") => Decision::Deny,
             Err(_) => resolver.decision,
         }

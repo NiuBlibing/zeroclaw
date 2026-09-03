@@ -367,6 +367,12 @@ pub struct SecurityPolicy {
     /// Tools that always require approval in this profile. Mirrors
     /// `RiskProfileConfig.always_ask`.
     pub always_ask: Vec<String>,
+    /// Explicit `tool_policy` rules (RFC #7155 §4.3) copied from the risk
+    /// profile at construction. The three-tier rule table is compiled from
+    /// this policy's own fields on demand (see
+    /// [`compile_rule_set`](Self::compile_rule_set)), so a struct-literal
+    /// construction can never desync the table from the fields.
+    pub tool_policy: crate::tool_policy::ToolPolicyConfig,
     /// Whether the sandbox is enabled for this profile. `None`
     /// inherits the global default at the call site.
     pub sandbox_enabled: Option<bool>,
@@ -771,6 +777,7 @@ impl Default for SecurityPolicy {
             excluded_tools: None,
             auto_approve: vec![],
             always_ask: vec![],
+            tool_policy: crate::tool_policy::ToolPolicyConfig::default(),
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: vec![],
@@ -2386,44 +2393,39 @@ impl SecurityPolicy {
     /// The dialect decides platform-specific redirect safety (e.g. the Windows
     /// `nul` null device is discard-only under `cmd.exe` but an ordinary file
     /// under a POSIX shell).
+    ///
+    /// This is the **legacy-semantics** entry (RFC #7155 §3.2 keeps it as the
+    /// shell-specific wrapper): `approved` bridges the Supervised risk-tier
+    /// asks only. An unmatched command is rejected regardless of `approved`
+    /// — used by the cron/schedule creation paths and the skill tool, where
+    /// an approval (if any) covered a different action than this command.
+    /// The agent-loop shell path uses
+    /// [`validate_command_execution_confirmed`](Self::validate_command_execution_confirmed),
+    /// where the approval is a fingerprint-bound confirmation of this exact
+    /// command.
     pub fn validate_command_execution_for_shell(
         &self,
         command: &str,
         approved: bool,
         dialect: ShellDialect,
     ) -> Result<CommandRiskLevel, String> {
-        if dialect == ShellDialect::None {
-            return Err("Command blocked: configured runtime has no shell access".into());
-        }
+        use crate::tool_policy::{Decision, ResolutionReason};
 
-        if !self.is_command_allowed_for_shell(command, dialect) {
-            return Err(format!("Command not allowed by security policy: {command}"));
-        }
-
-        let risk = self.command_risk_level_for_shell(command, dialect);
-
-        if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands
-                && !self.is_command_explicitly_allowed_for_shell(command, dialect)
-            {
-                return Err("Command blocked: high-risk command is disallowed by policy".into());
-            }
-            if self.autonomy == AutonomyLevel::Supervised && !approved {
-                return Err(
-                    "Command requires explicit approval (approved=true): high-risk operation"
-                        .into(),
-                );
-            }
-        }
-
-        if risk == CommandRiskLevel::Medium
-            && self.autonomy == AutonomyLevel::Supervised
-            && self.require_approval_for_medium_risk
-            && !approved
-        {
-            return Err(
-                "Command requires explicit approval (approved=true): medium-risk operation".into(),
-            );
+        let resolution = self.resolve_shell_decision(command, dialect, &[]);
+        match resolution.decision {
+            Decision::Allow => {}
+            Decision::Ask => match resolution.reason {
+                ResolutionReason::SupervisedRiskAsk { .. } if approved => {}
+                ResolutionReason::SupervisedRiskAsk { level } => {
+                    return Err(format!(
+                        "Command requires operator approval: {level:?}-risk operation"
+                    ));
+                }
+                // Unmatched (or degraded-to-Ask): this entry never bridges
+                // it — the approval did not cover this exact command.
+                _ => return Err(format!("Command not allowed by security policy: {command}")),
+            },
+            Decision::Deny => return Err(self.deny_message(&resolution, command)),
         }
 
         // Path confinement here is specific to Windows shell dialects, whose
@@ -2437,81 +2439,112 @@ impl SecurityPolicy {
             return Err(format!("Command blocked: forbidden path argument: {path}"));
         }
 
-        Ok(risk)
+        Ok(self.command_risk_level_for_shell(command, dialect))
     }
 
-    fn is_command_explicitly_allowed_for_shell(
+    /// Validate a shell command for the agent-loop path, where `confirmed`
+    /// means the runtime consumed a fingerprint-bound
+    /// [`TrustedConfirmation`](zeroclaw_api::permission::TrustedConfirmation)
+    /// for THIS exact command (minted after a real operator answer).
+    ///
+    /// The confirmation bridges every `Ask` tier — the risk-tier asks AND
+    /// the unmatched default (RFC #7155 §1.3's fail-closed-to-approval: an
+    /// operator who approved the exact command may run it even when no rule
+    /// allows it). A `Deny` never bridges: no confirmation can authorize a
+    /// denied command.
+    pub fn validate_command_execution_confirmed(
+        &self,
+        command: &str,
+        confirmed: bool,
+        dialect: ShellDialect,
+    ) -> Result<CommandRiskLevel, String> {
+        use crate::tool_policy::Decision;
+
+        let resolution = self.resolve_shell_decision(command, dialect, &[]);
+        match resolution.decision {
+            Decision::Allow => {}
+            Decision::Ask if confirmed => {}
+            Decision::Ask => {
+                use crate::tool_policy::ResolutionReason;
+                return Err(match resolution.reason {
+                    ResolutionReason::SupervisedRiskAsk { level } => {
+                        format!("Command requires operator approval: {level:?}-risk operation")
+                    }
+                    _ => format!("Command not allowed by security policy: {command}"),
+                });
+            }
+            Decision::Deny => return Err(self.deny_message(&resolution, command)),
+        }
+
+        if shell_uses_windows_path_syntax(dialect)
+            && let Some(path) = self.forbidden_path_argument_for_shell(command, dialect)
+        {
+            return Err(format!("Command blocked: forbidden path argument: {path}"));
+        }
+
+        Ok(self.command_risk_level_for_shell(command, dialect))
+    }
+
+    /// Resolve a shell command against the compiled rule table (RFC #7155
+    /// §3.2: the canonical resolver is the only authority). Session rules —
+    /// the narrow `Allow` patterns an "always approve" answer mints —
+    /// participate as an additional scope.
+    pub fn resolve_shell_decision(
         &self,
         command: &str,
         dialect: ShellDialect,
-    ) -> bool {
-        match dialect {
-            ShellDialect::PowerShell => {
-                let Some(segments) = split_powershell_pipeline_syntax(command) else {
-                    return false;
-                };
-                segments.iter().all(|segment| {
-                    let raw_executable =
-                        strip_wrapping_quotes(segment.split_whitespace().next().unwrap_or(""))
-                            .trim();
-                    let base_owned = command_basename(raw_executable).to_ascii_lowercase();
-                    let base = strip_powershell_executable_suffix(&base_owned);
-                    !base.is_empty()
-                        && !is_powershell_batch_file(&base_owned)
-                        && self.allowed_commands.iter().any(|allowed| {
-                            allowed.trim() != "*"
-                                && is_powershell_allowlist_entry_match(
-                                    allowed,
-                                    raw_executable,
-                                    base,
-                                )
-                        })
-                })
-            }
-            ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                self.is_command_explicitly_allowed(command)
-            }
-            ShellDialect::None => false,
-        }
+        session_rules: &[crate::tool_policy::PolicyRule],
+    ) -> crate::tool_policy::Resolution {
+        let compiled = self.compile_rule_set();
+        let action =
+            crate::tool_policy::extract_shell_action(command, dialect, Some(&self.workspace_dir));
+        let scopes = crate::tool_policy::ResolvedScopes {
+            profile: &compiled,
+            session_rules,
+        };
+        crate::tool_policy::resolve_decision(&action, &scopes)
     }
 
-    fn is_command_explicitly_allowed(&self, command: &str) -> bool {
-        let segments = split_unquoted_segments(command);
-        for segment in &segments {
-            let cmd_part = skip_env_assignments(segment);
-            let mut words = cmd_part.split_whitespace();
-            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
-                &raw_executable[..idx]
-            } else {
-                raw_executable
-            };
-            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
-            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+    /// Compile the three-tier rule table from this policy's own fields.
+    ///
+    /// Compiled on demand rather than stored: `SecurityPolicy` is routinely
+    /// built by struct literal with field overrides, and a stored table
+    /// would silently desync from the overridden fields. The inputs are
+    /// small (tens of entries) and resolution happens at most a couple of
+    /// times per tool call, so on-demand compilation is the option that
+    /// cannot be wrong.
+    pub fn compile_rule_set(&self) -> crate::tool_policy::CompiledRuleSet {
+        crate::tool_policy::CompiledRuleSet::compile_from_fields(
+            self.autonomy,
+            &self.allowed_commands,
+            &self.always_ask,
+            &self.auto_approve,
+            self.block_high_risk_commands,
+            self.require_approval_for_medium_risk,
+            &self.tool_policy,
+        )
+    }
 
-            if base_cmd.is_empty() {
-                continue;
+    /// The operator-facing message for a denied resolution, preserving the
+    /// legacy wording per deny reason.
+    fn deny_message(&self, resolution: &crate::tool_policy::Resolution, command: &str) -> String {
+        use crate::tool_policy::ResolutionReason;
+        match resolution.reason {
+            ResolutionReason::NoShellAccess => {
+                "Command blocked: configured runtime has no shell access".to_string()
             }
-
-            let explicitly_listed = self.allowed_commands.iter().any(|allowed| {
-                let allowed = strip_wrapping_quotes(allowed).trim();
-                // Skip wildcard — it does not count as an explicit entry.
-                if allowed.is_empty() || allowed == "*" {
-                    return false;
-                }
-                is_allowlist_entry_match(allowed, executable, base_cmd)
-            });
-
-            if !explicitly_listed {
-                return false;
+            ResolutionReason::HighRiskBlocked => {
+                "Command blocked: high-risk command is disallowed by policy".to_string()
+            }
+            ResolutionReason::EmptyCommand | ResolutionReason::DegradedSyntax { .. } => {
+                format!("Command not allowed by security policy: {command}")
+            }
+            ResolutionReason::MatchedRule { .. }
+            | ResolutionReason::Unmatched
+            | ResolutionReason::SupervisedRiskAsk { .. } => {
+                format!("Command not allowed by security policy: {command}")
             }
         }
-
-        // At least one real command must be present.
-        segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
-            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
-        })
     }
 
     // ── Layered Command Allowlist ──────────────────────────────────────────
@@ -3654,6 +3687,7 @@ impl SecurityPolicy {
             },
             auto_approve: risk_profile.auto_approve.clone(),
             always_ask: risk_profile.always_ask.clone(),
+            tool_policy: risk_profile.tool_policy.clone(),
             sandbox_enabled: risk_profile.sandbox_enabled,
             sandbox_backend: risk_profile.sandbox_backend.clone(),
             firejail_args: risk_profile.firejail_args.clone(),
@@ -4718,7 +4752,7 @@ mod tests {
 
         let denied = p.validate_command_execution("touch test.txt", false);
         assert!(denied.is_err());
-        assert!(denied.unwrap_err().contains("requires explicit approval"),);
+        assert!(denied.unwrap_err().contains("requires operator approval"),);
 
         let allowed = p.validate_command_execution("touch test.txt", true);
         assert_eq!(allowed.unwrap(), CommandRiskLevel::Medium);
@@ -4782,7 +4816,14 @@ mod tests {
 
         let result = p.validate_command_execution("wget https://evil.com", true);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not allowed"));
+        // The resolver reports the most specific reason: high-risk and not
+        // precisely allowlisted (the old flow said "not allowed" because the
+        // allowlist ran first; the block subsumes it).
+        assert!(
+            result
+                .unwrap_err()
+                .contains("high-risk command is disallowed")
+        );
     }
 
     #[test]
@@ -4813,7 +4854,7 @@ mod tests {
 
         let denied = p.validate_command_execution("curl https://api.example.com", false);
         assert!(denied.is_err());
-        assert!(denied.unwrap_err().contains("requires explicit approval"));
+        assert!(denied.unwrap_err().contains("requires operator approval"));
 
         let allowed = p.validate_command_execution("curl https://api.example.com", true);
         assert_eq!(allowed.unwrap(), CommandRiskLevel::High);

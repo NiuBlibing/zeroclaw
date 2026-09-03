@@ -1,6 +1,11 @@
 //! Interactive approval workflow for supervised mode.
 //! Provides a pre-execution hook that prompts the user before tool calls,
-//! with session-scoped "Always" allowlists and audit logging.
+//! with session-scoped "Always" rules and audit logging, plus the
+//! single-use confirmation ledger of RFC #7155 §5.2.
+
+pub mod ledger;
+
+pub use ledger::ConfirmationLedger;
 
 use crate::security::AutonomyLevel;
 use chrono::Utc;
@@ -10,7 +15,15 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::io::BufReader;
 use std::io::{self, BufRead, Write};
+use std::sync::{Arc, OnceLock};
+use uuid::Uuid;
+use zeroclaw_api::permission::{
+    ActionFingerprint, ApproveOrDeny, ApproverKind, ConsumeOutcome, RouteId, TimeWindow,
+    TrustedConfirmation,
+};
+use zeroclaw_api::runtime_traits::ShellDialect;
 use zeroclaw_config::schema::RiskProfileConfig;
+use zeroclaw_config::tool_policy::{ArgPattern, PolicyRule, RuleMatcher, RuleSource};
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -94,13 +107,63 @@ pub struct ApprovalManager {
     /// When `true`, shell calls in non-interactive mode still enter the outer
     /// approval flow because a real client approval channel exists.
     non_interactive_shell_requires_approval: bool,
-    /// Session-scoped allowlist built from "Always" responses.
-    session_allowlist: Mutex<HashSet<String>>,
+    /// Session-scoped rules built from "Always" responses. RFC #7155
+    /// §3.3.4: an "always approve" answer mints a NARROW rule — for shell
+    /// commands the exact executable plus the approved argument prefix,
+    /// for other tools the tool name (the legacy semantics).
+    session_rules: Mutex<Vec<PolicyRule>>,
+    /// Single-use confirmations minted after real operator answers
+    /// (RFC #7155 §5.2).
+    confirmation_ledger: ConfirmationLedger,
+    /// Security policy + shell dialect for the RFC #7155 shell approval
+    /// path, set once by the site that constructed this manager (it owns
+    /// both). Unset (tests, configless paths) => the gate falls back to the
+    /// legacy tool-name-only gating.
+    policy_context: OnceLock<PolicyContextHolder>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
 }
 
+/// The set-once policy context (see [`ApprovalManager::policy_context`]).
+pub struct PolicyContextHolder {
+    pub security: Arc<crate::security::SecurityPolicy>,
+    pub shell_dialect: ShellDialect,
+}
+
 impl ApprovalManager {
+    /// Attach the security policy and shell dialect this manager's agent
+    /// runs under (RFC #7155: the approval gate resolves the actual shell
+    /// command, which needs both). Call once, right after construction, at
+    /// the site that owns the policy. Sites without a policy (tests,
+    /// configless paths) leave it unset and get the legacy tool-name-only
+    /// gating.
+    pub fn set_policy_context(
+        &self,
+        security: Arc<crate::security::SecurityPolicy>,
+        shell_dialect: ShellDialect,
+    ) {
+        let _ = self.policy_context.set(PolicyContextHolder {
+            security,
+            shell_dialect,
+        });
+    }
+
+    /// The attached security policy, when the construction site provided
+    /// one.
+    pub fn policy(&self) -> Option<&crate::security::SecurityPolicy> {
+        self.policy_context
+            .get()
+            .map(|holder| holder.security.as_ref())
+    }
+
+    /// The attached shell dialect (`Posix` when no policy context was set -
+    /// the same conservative default the legacy path used).
+    pub fn shell_dialect(&self) -> ShellDialect {
+        self.policy_context
+            .get()
+            .map_or(ShellDialect::Posix, |holder| holder.shell_dialect)
+    }
+
     /// Create an interactive (CLI) approval manager from a risk profile.
     pub fn from_risk_profile(risk_profile: &RiskProfileConfig) -> Self {
         Self {
@@ -109,7 +172,9 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: false,
             non_interactive_shell_requires_approval: false,
-            session_allowlist: Mutex::new(HashSet::new()),
+            session_rules: Mutex::new(Vec::new()),
+            confirmation_ledger: ConfirmationLedger::new(),
+            policy_context: OnceLock::new(),
             audit_log: Mutex::new(Vec::new()),
         }
     }
@@ -121,7 +186,9 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: false,
-            session_allowlist: Mutex::new(HashSet::new()),
+            session_rules: Mutex::new(Vec::new()),
+            confirmation_ledger: ConfirmationLedger::new(),
+            policy_context: OnceLock::new(),
             audit_log: Mutex::new(Vec::new()),
         }
     }
@@ -133,7 +200,9 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: true,
-            session_allowlist: Mutex::new(HashSet::new()),
+            session_rules: Mutex::new(Vec::new()),
+            confirmation_ledger: ConfirmationLedger::new(),
+            policy_context: OnceLock::new(),
             audit_log: Mutex::new(Vec::new()),
         }
     }
@@ -155,7 +224,9 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: self.non_interactive,
             non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
-            session_allowlist: Mutex::new(HashSet::new()),
+            session_rules: Mutex::new(Vec::new()),
+            confirmation_ledger: ConfirmationLedger::new(),
+            policy_context: OnceLock::new(),
             audit_log: Mutex::new(Vec::new()),
         }
     }
@@ -200,9 +271,15 @@ impl ApprovalManager {
             return ApprovalRequirement::Approved;
         }
 
-        // Session allowlist (from prior "Always" responses).
-        let allowlist = self.session_allowlist.lock();
-        if allowlist.contains(tool_name) {
+        // Session rules (from prior "Always" responses): a tool-name
+        // Allow rule skips the prompt. The NARROW shell rules minted for
+        // shell "Always" answers are consulted by the shell resolver
+        // through `session_rules()`, not here.
+        let session = self.session_rules.lock();
+        if session.iter().any(|rule| {
+            rule.decision == zeroclaw_config::tool_policy::Decision::Allow
+                && matches!(&rule.matcher, RuleMatcher::ToolName { tool } if tool == tool_name || tool.trim() == "*")
+        }) {
             return ApprovalRequirement::Approved;
         }
 
@@ -218,10 +295,13 @@ impl ApprovalManager {
         decision: &ApprovalResponse,
         channel: &str,
     ) {
-        // If "Always", add to session allowlist.
+        // If "Always", mint the session rule.
         if *decision == ApprovalResponse::Always {
-            let mut allowlist = self.session_allowlist.lock();
-            allowlist.insert(tool_name.to_string());
+            let rule = self.always_session_rule(tool_name, args);
+            let mut session = self.session_rules.lock();
+            if !session.contains(&rule) {
+                session.push(rule);
+            }
         }
 
         // Append to audit log.
@@ -242,9 +322,94 @@ impl ApprovalManager {
         self.audit_log.lock().clone()
     }
 
-    /// Get the current session allowlist.
-    pub fn session_allowlist(&self) -> HashSet<String> {
-        self.session_allowlist.lock().clone()
+    /// The session rules minted so far ("Always" answers). The shell
+    /// resolver consumes these as an additional scope.
+    pub fn session_rules(&self) -> Vec<PolicyRule> {
+        self.session_rules.lock().clone()
+    }
+
+    /// Whether a hard `always_ask` entry covers this tool (`*` or the exact
+    /// name). A hard ask forces the prompt even for resolver-`Allow` shell
+    /// commands — a configured `always_ask` must not be skippable.
+    pub fn hard_asks(&self, tool_name: &str) -> bool {
+        self.always_ask.contains("*") || self.always_ask.contains(tool_name)
+    }
+
+    /// Mint a fresh trusted confirmation for an approved action and record
+    /// it in the ledger. Only the approval gate calls this, after a real
+    /// operator answer (RFC #7155 §5.1: nothing model-supplied can produce
+    /// one).
+    pub fn mint_confirmation(
+        &self,
+        action_facts: &serde_json::Value,
+        route: RouteId,
+        validity_secs: u64,
+    ) -> TrustedConfirmation {
+        let now = Utc::now().timestamp().max(0) as u64;
+        let confirmation = TrustedConfirmation::new(
+            Uuid::new_v4(),
+            ActionFingerprint::compute(action_facts),
+            ApproveOrDeny::Approve,
+            TimeWindow::new(now, validity_secs),
+            ApproverKind::Human,
+            route,
+            None,
+        );
+        self.confirmation_ledger.mint(confirmation.clone());
+        confirmation
+    }
+
+    /// Consume a confirmation for the action with these facts. `Consumed`
+    /// is the only outcome that authorizes execution.
+    pub fn consume_confirmation(
+        &self,
+        confirmation_id: &Uuid,
+        action_facts: &serde_json::Value,
+    ) -> ConsumeOutcome {
+        let now = Utc::now().timestamp().max(0) as u64;
+        self.confirmation_ledger.consume(
+            confirmation_id,
+            &ActionFingerprint::compute(action_facts),
+            now,
+        )
+    }
+
+    /// The narrow session rule an "Always" answer mints (RFC #7155 §3.3.4):
+    /// for a shell-family tool, the exact executable plus the approved
+    /// argument prefix (so `always allow git push` never widens into `git
+    /// push --force` being pre-approved unless it literally was); for any
+    /// other tool, the tool name (the legacy semantics).
+    fn always_session_rule(&self, tool_name: &str, args: &serde_json::Value) -> PolicyRule {
+        // Narrow only under an attached policy context (the RFC #7155
+        // shell path). A contextless manager keeps the legacy tool-name
+        // rule so its behavior is unchanged.
+        if self.policy().is_some()
+            && crate::agent::is_runtime_approved_arg_tool(tool_name)
+            && let Some(command) = args.get("command").and_then(serde_json::Value::as_str)
+        {
+            let dialect = self.shell_dialect();
+            let action = zeroclaw_config::tool_policy::extract_shell_action(command, dialect, None);
+            let zeroclaw_config::tool_policy::ToolAction::Shell(shell) = &action;
+            if let Some(segment) = shell.segments.first() {
+                return PolicyRule {
+                    matcher: RuleMatcher::ShellCommand {
+                        executable: segment.base.clone(),
+                        arg_pattern: Some(ArgPattern::Prefix(segment.arguments.clone())),
+                    },
+                    decision: zeroclaw_config::tool_policy::Decision::Allow,
+                    overridable: true,
+                    source: RuleSource::Session,
+                };
+            }
+        }
+        PolicyRule {
+            matcher: RuleMatcher::ToolName {
+                tool: tool_name.to_string(),
+            },
+            decision: zeroclaw_config::tool_policy::Decision::Allow,
+            overridable: true,
+            source: RuleSource::Session,
+        }
     }
 
     /// Prompt the user on the CLI and return their decision.

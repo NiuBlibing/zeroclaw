@@ -409,7 +409,7 @@ mod tests {
         std::fs::create_dir_all(&config.data_dir).unwrap();
         seed_test_agent(&mut config);
         let cfg = Arc::new(config);
-        // Create with explicit approval so the job persists for the run test.
+        // Create with operator approval so the job persists for the run test.
         let job = cron::add_shell_job_with_approval(
             &cfg,
             TEST_AGENT,
@@ -432,7 +432,7 @@ mod tests {
             denied
                 .error
                 .unwrap_or_default()
-                .contains("explicit approval")
+                .contains("operator approval")
         );
     }
 
