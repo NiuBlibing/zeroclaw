@@ -690,6 +690,10 @@ pub enum EscalationViolation {
     /// (parent) to `false`, bypassing the human-in-the-loop step the
     /// parent required.
     RequireApprovalDisabledByChild,
+    /// The child's explicit `tool_policy` rules widen the parent's on
+    /// resolved semantics (RFC #7155 §4.4): an uncovered child `Allow`,
+    /// a dropped parent `Deny`, or an extended confirmation window.
+    ToolPolicyEscalation { reason: String },
 }
 
 impl std::fmt::Display for EscalationViolation {
@@ -746,6 +750,9 @@ impl std::fmt::Display for EscalationViolation {
                 f,
                 "subagent attempts to set require_approval_for_medium_risk=false but the parent enforces it"
             ),
+            Self::ToolPolicyEscalation { reason } => {
+                write!(f, "subagent tool_policy widens the parent's: {reason}")
+            }
         }
     }
 }
@@ -3608,6 +3615,16 @@ impl SecurityPolicy {
         }
         if parent.require_approval_for_medium_risk && !self.require_approval_for_medium_risk {
             return Err(EscalationViolation::RequireApprovalDisabledByChild);
+        }
+
+        // RFC #7155 §4.4: the explicit tool_policy rules compare on RESOLVED
+        // semantics — a child Allow must be a subset of a parent Allow, a
+        // parent Deny must stay in effect, and the confirmation window may
+        // only shrink.
+        if let Err(reason) =
+            crate::tool_policy::ensure_no_rule_escalation(&self.tool_policy, &parent.tool_policy)
+        {
+            return Err(EscalationViolation::ToolPolicyEscalation { reason });
         }
 
         Ok(())

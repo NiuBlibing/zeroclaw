@@ -236,6 +236,11 @@ impl Tool for ShellTool {
                 "command": {
                     "type": "string",
                     "description": "The shell command to execute"
+                },
+                "intent": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "description": "What this command is meant to accomplish, in one sentence. Shown to the operator next to the real command during approval; never used for authorization."
                 }
             },
             "required": ["command"]

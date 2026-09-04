@@ -32,6 +32,12 @@ use zeroclaw_config::tool_policy::{ArgPattern, PolicyRule, RuleMatcher, RuleSour
 pub struct ApprovalRequest {
     pub tool_name: String,
     pub arguments: serde_json::Value,
+    /// The model-stated intent, for HUMAN display only (RFC #7155 §5.5):
+    /// shown side-by-side with the real action, explicitly labeled
+    /// untrusted. NEVER an authorization input — the confirmation binds the
+    /// action fingerprint, and changing `intent` satisfies no approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
 }
 
 /// The user's response to an approval request.
@@ -83,6 +89,28 @@ pub struct ApprovalLogEntry {
     pub arguments_summary: String,
     pub decision: ApprovalResponse,
     pub channel: String,
+    /// The hex action fingerprint of the confirmation minted for an
+    /// approved shell command (RFC #7155 §5.2), when one was minted.
+    /// `None` for tool-name-level decisions without a shell resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_fingerprint: Option<String>,
+    /// The trusted route the decision arrived on (`cli`, channel alias,
+    /// approval-route name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_route: Option<String>,
+    /// How the minted confirmation was consumed (`consumed`, `replay`,
+    /// `expired`, ...) — present only when a confirmation existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_state: Option<String>,
+}
+
+/// The confirmation provenance recorded alongside an approval decision
+/// (RFC #7155 §3.5 audit fields).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmationAudit {
+    pub action_fingerprint: String,
+    pub trusted_route: String,
+    pub terminal_state: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,12 +316,17 @@ impl ApprovalManager {
     }
 
     /// Record an approval decision and update session state.
+    ///
+    /// `confirmation` carries the audit provenance of the confirmation
+    /// minted for this decision (fingerprint, route, terminal state), when
+    /// one was minted (RFC #7155 §3.5 audit fields).
     pub fn record_decision(
         &self,
         tool_name: &str,
         args: &serde_json::Value,
         decision: &ApprovalResponse,
         channel: &str,
+        confirmation: Option<ConfirmationAudit>,
     ) {
         // If "Always", mint the session rule.
         if *decision == ApprovalResponse::Always {
@@ -312,6 +345,15 @@ impl ApprovalManager {
             arguments_summary: summary,
             decision: decision.clone(),
             channel: channel.to_string(),
+            action_fingerprint: confirmation
+                .as_ref()
+                .map(|audit| audit.action_fingerprint.clone()),
+            trusted_route: confirmation
+                .as_ref()
+                .map(|audit| audit.trusted_route.clone()),
+            terminal_state: confirmation
+                .as_ref()
+                .map(|audit| audit.terminal_state.clone()),
         };
         let mut log = self.audit_log.lock();
         log.push(entry);
@@ -433,6 +475,21 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
         crate::i18n::get_required_cli_string_with_args("cli-approval-request", &tool_args)
     );
     eprintln!("   {summary}");
+    // RFC #7155 §5.5: the agent-stated intent is shown next to the real
+    // command, explicitly labeled untrusted. It is never an authorization
+    // input; a harmless-looking intent must never mask the real command
+    // above it.
+    if let Some(intent) = request
+        .intent
+        .as_deref()
+        .filter(|intent| !intent.is_empty())
+    {
+        let intent_args = [("intent", intent)];
+        eprintln!(
+            "{}",
+            crate::i18n::get_required_cli_string_with_args("cli-approval-intent", &intent_args)
+        );
+    }
     eprint!(
         "{}",
         crate::i18n::get_required_cli_string_with_args("cli-approval-prompt", &tool_args)
@@ -749,6 +806,7 @@ mod tests {
             &serde_json::json!({"path": "test.txt"}),
             &ApprovalResponse::Always,
             "cli",
+            None,
         );
 
         // Now file_write should be in session allowlist.
@@ -765,6 +823,7 @@ mod tests {
             &serde_json::json!({"command": "ls"}),
             &ApprovalResponse::Always,
             "cli",
+            None,
         );
 
         // shell is in always_ask, so it still needs approval.
@@ -779,6 +838,7 @@ mod tests {
             &serde_json::json!({}),
             &ApprovalResponse::Yes,
             "cli",
+            None,
         );
         assert!(mgr.needs_approval("file_write"));
     }
@@ -794,12 +854,14 @@ mod tests {
             &serde_json::json!({"command": "rm -rf ./build/"}),
             &ApprovalResponse::No,
             "cli",
+            None,
         );
         mgr.record_decision(
             "file_write",
             &serde_json::json!({"path": "out.txt", "content": "hello"}),
             &ApprovalResponse::Yes,
             "cli",
+            None,
         );
 
         let log = mgr.audit_log();
@@ -818,6 +880,7 @@ mod tests {
             &serde_json::json!({"command": "ls"}),
             &ApprovalResponse::Yes,
             "telegram",
+            None,
         );
 
         let log = mgr.audit_log();
@@ -958,6 +1021,7 @@ mod tests {
             &serde_json::json!({"path": "test.txt"}),
             &ApprovalResponse::Always,
             "telegram",
+            None,
         );
 
         assert!(!mgr.needs_approval("file_write"));
@@ -972,6 +1036,7 @@ mod tests {
             &serde_json::json!({"command": "ls"}),
             &ApprovalResponse::Always,
             "telegram",
+            None,
         );
 
         // shell is in always_ask, so it still needs approval even after "Always".
@@ -999,6 +1064,7 @@ mod tests {
         let req = ApprovalRequest {
             tool_name: "shell".into(),
             arguments: serde_json::json!({"command": "echo hi"}),
+            intent: Some("clean the build directory".into()),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();

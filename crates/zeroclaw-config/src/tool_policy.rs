@@ -1428,6 +1428,152 @@ pub fn collect_shadowing_warnings(
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
+// ─── Delegation no-escalation (RFC #7155 §4.4/§2.6) ────────────────────────────
+
+/// Whether `child` argument pattern is fully covered by (a subset of)
+/// `parent`. Conservative: a `Glob` child is only provably covered by an
+/// identical glob or an `AnyShell` parent — glob-subset math is not
+/// attempted, so an unprovable case is an escalation.
+fn arg_pattern_covered(child: &Option<ArgPattern>, parent: &Option<ArgPattern>) -> bool {
+    match (child, parent) {
+        // Child allows any args: only a parent that also allows any args
+        // (or a wider rule handled by the caller) covers it.
+        (None, None) => true,
+        (None, Some(_)) => false,
+        // Child constrains args; an any-args parent covers everything.
+        (Some(_), None) => true,
+        (Some(ArgPattern::Literal(child_tokens)), Some(ArgPattern::Literal(parent_tokens))) => {
+            child_tokens == parent_tokens
+        }
+        (Some(ArgPattern::Literal(child_tokens)), Some(ArgPattern::Prefix(parent_tokens))) => {
+            child_tokens.len() >= parent_tokens.len()
+                && child_tokens[..parent_tokens.len()] == parent_tokens[..]
+        }
+        (Some(ArgPattern::Prefix(child_tokens)), Some(ArgPattern::Prefix(parent_tokens))) => {
+            child_tokens.len() >= parent_tokens.len()
+                && child_tokens[..parent_tokens.len()] == parent_tokens[..]
+        }
+        (Some(ArgPattern::Glob(child_glob)), Some(ArgPattern::Glob(parent_glob))) => {
+            child_glob == parent_glob
+        }
+        // Literal/Prefix vs Glob, Glob vs Literal/Prefix: not provable.
+        _ => false,
+    }
+}
+
+/// Whether a child `Allow` rule is covered by some parent `Allow` rule
+/// (RFC #7155 §4.4: "a new Allow must be a subset of some parent Allow").
+fn allow_rule_covered(child: &PolicyRule, parent_allows: &[&PolicyRule]) -> bool {
+    parent_allows
+        .iter()
+        .any(|parent| match (&child.matcher, &parent.matcher) {
+            (_, RuleMatcher::AnyShell) => true,
+            (
+                RuleMatcher::ShellCommand {
+                    executable: child_exec,
+                    arg_pattern: child_args,
+                },
+                RuleMatcher::ShellCommand {
+                    executable: parent_exec,
+                    arg_pattern: parent_args,
+                },
+            ) => {
+                command_names_equivalent(child_exec.trim(), parent_exec.trim())
+                    && arg_pattern_covered(child_args, parent_args)
+            }
+            _ => false,
+        })
+}
+
+/// Compare two profiles' explicit `tool_policy` sections on RESOLVED rule
+/// semantics (RFC #7155 §4.4): a delegated/child policy may only narrow.
+///
+/// Fails when the child
+/// - adds an `Allow` rule not covered by any parent `Allow`;
+/// - drops a parent `Deny` rule without a covering child `Deny`; or
+/// - extends the confirmation validity window beyond the parent's.
+///
+/// Returns the offending description on violation (the caller maps it to
+/// its escalation-violation type).
+pub fn ensure_no_rule_escalation(
+    child: &ToolPolicyConfig,
+    parent: &ToolPolicyConfig,
+) -> Result<(), String> {
+    let parse = |config: &ToolPolicyConfig| -> Vec<PolicyRule> {
+        config
+            .rules
+            .iter()
+            .filter_map(|rule| {
+                parse_pattern(&rule.pattern).ok().map(|matcher| PolicyRule {
+                    matcher,
+                    decision: rule.decision,
+                    overridable: false,
+                    source: RuleSource::Explicit,
+                })
+            })
+            .collect()
+    };
+    let child_rules = parse(child);
+    let parent_rules = parse(parent);
+
+    let parent_allows: Vec<&PolicyRule> = parent_rules
+        .iter()
+        .filter(|rule| rule.decision == Decision::Allow)
+        .collect();
+    for rule in child_rules
+        .iter()
+        .filter(|rule| rule.decision == Decision::Allow)
+    {
+        if !allow_rule_covered(rule, &parent_allows) {
+            return Err(format!(
+                "tool_policy allow rule `{}` is not covered by any parent allow rule",
+                describe_matcher(&rule.matcher)
+            ));
+        }
+    }
+
+    let child_denies: Vec<&PolicyRule> = child_rules
+        .iter()
+        .filter(|rule| rule.decision == Decision::Deny)
+        .collect();
+    for rule in parent_rules
+        .iter()
+        .filter(|rule| rule.decision == Decision::Deny)
+    {
+        let still_denied = child_denies.iter().any(|child_deny| {
+            matches!(
+                (&child_deny.matcher, &rule.matcher),
+                (
+                    RuleMatcher::ShellCommand {
+                        executable: child_exec,
+                        ..
+                    },
+                    RuleMatcher::ShellCommand {
+                        executable: parent_exec,
+                        ..
+                    }
+                ) if command_names_equivalent(child_exec.trim(), parent_exec.trim())
+            ) || matches!(child_deny.matcher, RuleMatcher::AnyShell)
+                && matches!(rule.matcher, RuleMatcher::AnyShell)
+        });
+        if !still_denied {
+            return Err(format!(
+                "parent tool_policy deny rule `{}` is dropped by the child policy",
+                describe_matcher(&rule.matcher)
+            ));
+        }
+    }
+
+    if child.confirmation_validity_secs > parent.confirmation_validity_secs {
+        return Err(format!(
+            "tool_policy confirmation_validity_secs extends the parent's window              ({}s > {}s); delegation may only shrink it",
+            child.confirmation_validity_secs, parent.confirmation_validity_secs
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2018,6 +2164,105 @@ mod tests {
     }
 
     // ── Config defaults, validation & shadowing ────────────────────
+
+    // ── No-escalation on resolved rule semantics ───────────────────
+
+    fn policy_config(rules: &[(&str, Decision)], validity: u64) -> ToolPolicyConfig {
+        ToolPolicyConfig {
+            rules: rules
+                .iter()
+                .map(|(pattern, decision)| PolicyRuleConfig {
+                    pattern: (*pattern).to_string(),
+                    decision: *decision,
+                })
+                .collect(),
+            confirmation_validity_secs: validity,
+        }
+    }
+
+    #[test]
+    fn narrower_child_allow_is_not_escalation() {
+        let parent = policy_config(&[("Shell(git:*)", Decision::Allow)], 300);
+        let child = policy_config(&[("Shell(git push:*)", Decision::Allow)], 120);
+        assert!(ensure_no_rule_escalation(&child, &parent).is_ok());
+    }
+
+    #[test]
+    fn wider_child_allow_is_escalation() {
+        let parent = policy_config(&[("Shell(git push:*)", Decision::Allow)], 300);
+        let child = policy_config(&[("Shell(git:*)", Decision::Allow)], 300);
+        let error = ensure_no_rule_escalation(&child, &parent).unwrap_err();
+        assert!(error.contains("not covered"), "{error}");
+    }
+
+    #[test]
+    fn uncovered_child_allow_is_escalation() {
+        let parent = policy_config(&[("Shell(git:*)", Decision::Allow)], 300);
+        let child = policy_config(&[("Shell(rm:*)", Decision::Allow)], 300);
+        assert!(ensure_no_rule_escalation(&child, &parent).is_err());
+    }
+
+    #[test]
+    fn dropped_parent_deny_is_escalation() {
+        let parent = policy_config(
+            &[
+                ("Shell(rm:*)", Decision::Deny),
+                ("Shell(git:*)", Decision::Allow),
+            ],
+            300,
+        );
+        // Child keeps the allow but drops the deny.
+        let child = policy_config(&[("Shell(git:*)", Decision::Allow)], 300);
+        let error = ensure_no_rule_escalation(&child, &parent).unwrap_err();
+        assert!(error.contains("dropped"), "{error}");
+    }
+
+    #[test]
+    fn kept_parent_deny_is_not_escalation() {
+        let parent = policy_config(
+            &[
+                ("Shell(rm:*)", Decision::Deny),
+                ("Shell(git:*)", Decision::Allow),
+            ],
+            300,
+        );
+        let child = policy_config(
+            &[
+                ("Shell(rm:*)", Decision::Deny),
+                ("Shell(git push:*)", Decision::Allow),
+            ],
+            120,
+        );
+        assert!(ensure_no_rule_escalation(&child, &parent).is_ok());
+    }
+
+    #[test]
+    fn extended_confirmation_window_is_escalation() {
+        let parent = policy_config(&[], 300);
+        let child = policy_config(&[], 600);
+        let error = ensure_no_rule_escalation(&child, &parent).unwrap_err();
+        assert!(error.contains("validity"), "{error}");
+    }
+
+    #[test]
+    fn glob_child_allow_is_conservatively_escalation() {
+        // Glob subset is not provable without glob math; an unprovable
+        // child Allow fails closed.
+        let parent = policy_config(&[("Shell(git push:*)", Decision::Allow)], 300);
+        let child = policy_config(&[("Shell(git push *)", Decision::Allow)], 300);
+        assert!(ensure_no_rule_escalation(&child, &parent).is_err());
+    }
+
+    #[test]
+    fn empty_child_never_escalates() {
+        let parent = policy_config(&[("Shell(rm:*)", Decision::Deny)], 60);
+        // An empty child drops the parent deny in its OWN table — but an
+        // empty child adds nothing; deny-dropping is judged on the child's
+        // table NOT re-including the parent rule... per the design, a child
+        // may only inherit-or-narrow: dropping is an escalation.
+        let child = policy_config(&[], 300);
+        assert!(ensure_no_rule_escalation(&child, &parent).is_err());
+    }
 
     #[test]
     fn default_tool_policy_is_empty_and_backward_compatible() {

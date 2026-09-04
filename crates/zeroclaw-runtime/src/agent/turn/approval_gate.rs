@@ -86,6 +86,11 @@ pub(crate) async fn gate_tool_approval(
         let request = ApprovalRequest {
             tool_name: tool_name.to_string(),
             arguments: tool_args.clone(),
+            // RFC #7155 §5.5: display-only, untrusted, clamped.
+            intent: tool_args
+                .get("intent")
+                .and_then(serde_json::Value::as_str)
+                .map(|intent| intent.chars().take(200).collect::<String>()),
         };
 
         // Interactive CLI: prompt the operator.
@@ -160,7 +165,62 @@ pub(crate) async fn gate_tool_approval(
         let decision_channel = decided_by
             .clone()
             .unwrap_or_else(|| ctx.channel_name.to_string());
-        mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
+
+        // RFC #7155 §5.1/§5.2: for the resolved shell command, the
+        // operator's approval mints a single-use confirmation bound to the
+        // command's action fingerprint, and `approved` means the
+        // confirmation was consumed. Nothing model-supplied can produce
+        // one: the loop strips the injected bits before this gate.
+        // `shell_confirmation` is the OUTER one from the resolution
+        // pre-check; the consumed result must reach the final Proceed.
+        let mut confirmation_audit: Option<crate::approval::ConfirmationAudit> = None;
+        if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always)
+            && let Some(command) = tool_args.get("command").and_then(serde_json::Value::as_str)
+            && let Some(security) = mgr.policy()
+            && crate::agent::is_runtime_approved_arg_tool(tool_name)
+        {
+            let dialect = mgr.shell_dialect();
+            let action = zeroclaw_config::tool_policy::extract_shell_action(
+                command,
+                dialect,
+                Some(&security.workspace_dir),
+            );
+            let zeroclaw_config::tool_policy::ToolAction::Shell(shell_action) = &action;
+            let facts = shell_action.fingerprint_facts();
+            let confirmation = mgr.mint_confirmation(
+                &facts,
+                zeroclaw_api::permission::RouteId::from(decision_channel.clone()),
+                security.tool_policy.confirmation_validity_secs,
+            );
+            let outcome = mgr.consume_confirmation(&confirmation.confirmation_id, &facts);
+            if outcome != ConsumeOutcome::Consumed {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "tool": tool_name,
+                            "consume_outcome": format!("{outcome:?}"),
+                            "trace_id": ctx.turn_id,
+                        })),
+                    "confirmation consume failed right after mint"
+                );
+            }
+            shell_confirmation = Some(outcome == ConsumeOutcome::Consumed);
+            confirmation_audit = Some(crate::approval::ConfirmationAudit {
+                action_fingerprint: confirmation.action_fingerprint.as_hex(),
+                trusted_route: confirmation.trusted_route.to_string(),
+                terminal_state: format!("{outcome:?}").to_lowercase(),
+            });
+        }
+        mgr.record_decision(
+            tool_name,
+            tool_args,
+            &decision,
+            &decision_channel,
+            confirmation_audit,
+        );
 
         if decision == ApprovalResponse::No {
             // This string is fed back to the MODEL, so it states the outcome and
@@ -282,46 +342,6 @@ pub(crate) async fn gate_tool_approval(
 
         if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
             approval_requirement = ApprovalRequirement::Approved;
-            // RFC #7155 §5.1/§5.2: for the resolved shell command, the
-            // operator's approval mints a single-use confirmation bound to
-            // the command's action fingerprint, and `approved` means the
-            // confirmation was consumed. Nothing model-supplied can produce
-            // one: the loop strips the injected bits before this gate.
-            if shell_confirmation.is_none()
-                && let Some(command) = tool_args.get("command").and_then(serde_json::Value::as_str)
-                && let Some(security) = mgr.policy()
-                && crate::agent::is_runtime_approved_arg_tool(tool_name)
-            {
-                let dialect = mgr.shell_dialect();
-                let action = zeroclaw_config::tool_policy::extract_shell_action(
-                    command,
-                    dialect,
-                    Some(&security.workspace_dir),
-                );
-                let zeroclaw_config::tool_policy::ToolAction::Shell(shell_action) = &action;
-                let facts = shell_action.fingerprint_facts();
-                let confirmation = mgr.mint_confirmation(
-                    &facts,
-                    zeroclaw_api::permission::RouteId::from(decision_channel),
-                    security.tool_policy.confirmation_validity_secs,
-                );
-                let outcome = mgr.consume_confirmation(&confirmation.confirmation_id, &facts);
-                if outcome != ConsumeOutcome::Consumed {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_category(::zeroclaw_log::EventCategory::Tool)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "tool": tool_name,
-                                "consume_outcome": format!("{outcome:?}"),
-                                "trace_id": ctx.turn_id,
-                            })),
-                        "confirmation consume failed right after mint"
-                    );
-                }
-                shell_confirmation = Some(outcome == ConsumeOutcome::Consumed);
-            }
         }
     }
 
