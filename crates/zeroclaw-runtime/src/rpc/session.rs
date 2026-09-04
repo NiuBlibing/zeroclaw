@@ -400,6 +400,7 @@ impl SessionStore {
         guard.set_model_provider(rt.provider);
         guard.set_model_provider_name(rt.provider_name);
         guard.set_model_name(rt.model_name);
+        guard.set_model_identity(rt.identity);
         guard.set_tool_dispatcher(rt.tool_dispatcher);
         guard.set_temperature(temperature_override.or(rt.temperature));
         self.signal_test_gate_done(done);
