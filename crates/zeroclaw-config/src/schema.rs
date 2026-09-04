@@ -880,6 +880,49 @@ pub struct ModelSelection<'a> {
     pub model_id: Option<String>,
 }
 
+/// Owned identity of a resolved model selection — the comparison key for
+/// "is this a different model than the current one".
+///
+/// Two refs that resolve to the same profile, the same model entry, and the
+/// same effective model id compare equal — so a two-segment ref and the
+/// three-segment ref naming that profile's selected entry are the same model
+/// (no spurious rebuild), while two entries under one profile that happen to
+/// share a model id stay distinct (a real switch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelIdentity {
+    /// Provider family key, e.g. `"openai"`.
+    pub family: String,
+    /// Provider profile alias, e.g. `"default"`.
+    pub alias: String,
+    /// Name of the selected model entry under the profile's `models` map.
+    /// `None` when no entry was selected (legacy single-model path).
+    pub entry_alias: Option<String>,
+    /// Effective model id, after any caller-supplied override.
+    pub model_id: String,
+}
+
+impl ModelSelection<'_> {
+    /// Owned identity of this selection, for "did the model change"
+    /// comparisons. `model_override` (when set) replaces the resolved model
+    /// id, mirroring how callers layer an explicit model over
+    /// [`Self::model_id`].
+    #[must_use]
+    pub fn identity(&self, model_override: Option<&str>) -> ModelIdentity {
+        let model_id = model_override
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.model_id.clone())
+            .unwrap_or_default();
+        ModelIdentity {
+            family: self.family.to_string(),
+            alias: self.alias.to_string(),
+            entry_alias: self.model_alias.clone(),
+            model_id,
+        }
+    }
+}
+
 /// Extract the `(family, alias)` provider-profile pair from a model_provider
 /// reference. Accepts both the two-segment `<family>.<alias>` form and the
 /// three-segment `<family>.<alias>.<model_alias>` form (the model alias is
@@ -43813,6 +43856,44 @@ model = "llama-3.3-70b"
         // Unparseable / missing profile → None.
         assert!(config.resolve_model_selection("openai").is_none());
         assert!(config.resolve_model_selection("openai.absent").is_none());
+    }
+
+    #[::core::prelude::v1::test]
+    fn model_identity_distinguishes_real_and_equivalent_switches() {
+        let raw = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+uri = "https://gw.internal/v1"
+
+[providers.models.openai.gw.models.default]
+id = "gpt-4o-mini"
+
+[providers.models.openai.gw.models.cheap]
+id = "gpt-4o-mini"
+
+[providers.models.openai.gw.models.big]
+id = "gpt-4o"
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+
+        // A two-segment ref naming the profile's default entry and the
+        // three-segment ref naming it explicitly are the same model: a
+        // switch between them must be a no-op, not a rebuild.
+        let two = config.resolve_model_selection("openai.gw").unwrap();
+        let three = config.resolve_model_selection("openai.gw.default").unwrap();
+        assert_eq!(two.identity(None), three.identity(None));
+
+        // Two entries that happen to share a model id are different models:
+        // the entry name is part of the identity, so switching between them
+        // rebuilds (their tuning overlays may differ).
+        let cheap = config.resolve_model_selection("openai.gw.cheap").unwrap();
+        assert_ne!(three.identity(None), cheap.identity(None));
+
+        // An explicit model override replaces the resolved id.
+        let overridden = three.identity(Some("custom-id"));
+        assert_eq!(overridden.model_id, "custom-id");
+        assert_ne!(overridden, three.identity(None));
     }
 
     #[::core::prelude::v1::test]

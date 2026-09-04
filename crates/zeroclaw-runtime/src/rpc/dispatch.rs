@@ -2455,6 +2455,7 @@ impl RpcDispatcher {
                 let (model_provider, model_provider_name, model_name) =
                     crate::agent::agent::build_session_model_provider(
                         &config,
+                        &agent_alias,
                         model_provider_ref,
                         merged.model.as_deref(),
                     )
@@ -3357,6 +3358,7 @@ impl RpcDispatcher {
                 };
                 match crate::agent::agent::build_session_model_provider(
                     &config,
+                    &agent_alias,
                     &model_provider_ref,
                     overrides.model.as_deref(),
                 ) {

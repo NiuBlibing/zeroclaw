@@ -25,9 +25,74 @@ pub use zeroclaw_api::agent::TurnEvent;
 
 pub fn build_session_model_provider(
     config: &Config,
+    agent_alias: &str,
     model_provider_ref: &str,
     model_override: Option<&str>,
 ) -> Result<(Box<dyn ModelProvider>, String, String)> {
+    let rt = build_model(
+        config,
+        agent_alias,
+        model_provider_ref,
+        model_override,
+        BuildCredentials::TargetOnly,
+    )?;
+    Ok((rt.provider, rt.provider_name, rt.model_name))
+}
+
+/// Credential policy for [`build_model`] — the one dimension on which the
+/// construction call sites legitimately differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildCredentials {
+    /// Runtime switch (`model_switch` tool): when neither a matching
+    /// `model_routes` key nor the target profile's own key exists, fall back
+    /// to the agent's original profile key — an in-session switch may borrow
+    /// the session's credential.
+    Switch,
+    /// Config-driven construction (initial construction, hot refresh, session
+    /// overrides): route and target-profile keys only. Borrowing the agent's
+    /// key here would leak a credential across provider families — the same
+    /// isolation the headless driver's override construction documents.
+    TargetOnly,
+}
+
+/// The complete model runtime produced by one [`build_model`] call — ready to
+/// commit wholesale, nothing here needs per-call-site post-processing.
+pub struct ModelRuntime {
+    pub provider: Box<dyn ModelProvider>,
+    /// Normalised two-segment `<family>.<alias>` name — the key
+    /// `provider_pricing` bills by.
+    pub provider_name: String,
+    pub model_name: String,
+    /// `entry ∨ profile`, purely config-derived. Explicit per-invocation
+    /// temperatures (CLI flag, session override) are caller-side modifiers,
+    /// overlaid with a single `.or()` at their existing sites — they are not
+    /// properties of the model.
+    pub temperature: Option<f64>,
+    /// `entry ∨ profile ∨ UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`, resolved —
+    /// history-trim budgets must follow the model that is actually running.
+    pub context_window: usize,
+    pub tool_dispatcher: Box<dyn ToolDispatcher>,
+    /// Identity of the resolved selection — the "did the model change" key.
+    pub identity: zeroclaw_config::schema::ModelIdentity,
+}
+
+/// The single model constructor: initial construction, runtime switches, live
+/// refresh, and session overrides all rebuild through here.
+///
+/// Callers supply only the ref (two- or three-segment), an optional explicit
+/// model, and the credential policy; everything else (agent config, entry
+/// overlay, temperature, context window, dispatcher, identity) is derived
+/// from the full config. The raw ref is passed through to the providers
+/// construction chain: that chain re-resolves the model entry from the ref it
+/// is given, and feeding it a normalised two-segment ref would select
+/// `models.default` and clobber the selected entry's tuning overlay.
+pub fn build_model(
+    config: &Config,
+    agent_alias: &str,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+    credentials: BuildCredentials,
+) -> anyhow::Result<ModelRuntime> {
     // A ref must be at least `<type>.<alias>`; a third segment selects a model
     // entry under the profile's `models` map. The entry itself may be absent
     // (e.g. auth via env) — resolution stays lenient so an override can still
@@ -74,26 +139,109 @@ pub fn build_session_model_provider(
             ))
         })?;
 
-    let provider_ref = format!("{model_provider_name}.{model_provider_alias}");
-    let mut model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+    let identity = selection
+        .as_ref()
+        .map(|s| s.identity(model_override))
+        .unwrap_or_else(|| zeroclaw_config::schema::ModelIdentity {
+            family: model_provider_name.clone(),
+            alias: model_provider_alias.clone(),
+            entry_alias: None,
+            model_id: model_name.clone(),
+        });
+
+    let mut runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
         config,
         &model_provider_name,
         &model_provider_alias,
     );
-    zeroclaw_providers::apply_model_entry_options(&mut model_provider_runtime_options, model_entry);
+    zeroclaw_providers::apply_model_entry_options(&mut runtime_options, model_entry);
 
-    let model_provider = zeroclaw_providers::create_routed_model_provider_with_options(
+    // Credential fallback per policy; the construction chain's own order is
+    // route key → target-profile key → this fallback.
+    let (fallback_key, fallback_uri) = match credentials {
+        BuildCredentials::TargetOnly => (
+            entry.and_then(|e| e.api_key.as_deref()),
+            entry.and_then(|e| e.uri.as_deref()),
+        ),
+        BuildCredentials::Switch => switch_credential_fallback(
+            config,
+            agent_alias,
+            model_provider_ref,
+            &model_name,
+        ),
+    };
+
+    let provider = zeroclaw_providers::create_routed_model_provider_with_options(
         config,
-        &provider_ref,
-        entry.and_then(|e| e.api_key.as_deref()),
-        entry.and_then(|e| e.uri.as_deref()),
+        // The raw ref, deliberately: see the function-level comment.
+        model_provider_ref,
+        fallback_key,
+        fallback_uri,
         &config.reliability,
         &config.model_routes,
         &model_name,
-        &model_provider_runtime_options,
+        &runtime_options,
     )?;
 
-    Ok((model_provider, model_provider_ref.to_string(), model_name))
+    let agent_cfg = config
+        .resolved_agent_config(agent_alias)
+        .or_else(|| config.agent(agent_alias).cloned())
+        .unwrap_or_default();
+    let tool_dispatcher = tool_dispatcher_for_provider(&agent_cfg, provider.as_ref(), &model_name);
+
+    // `entry ∨ profile` for the temperature; the same shape as
+    // `Config::effective_model_context_window` for the window, but resolved
+    // from THIS ref so a switch moves the trim budget with the model.
+    let temperature = selection
+        .as_ref()
+        .and_then(|s| s.model_entry.and_then(|e| e.temperature).or(s.entry.temperature));
+    let context_window = selection
+        .as_ref()
+        .and_then(|s| {
+            s.model_entry
+                .and_then(|e| e.context_window)
+                .or(s.entry.context_window)
+        })
+        .unwrap_or(zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK);
+
+    Ok(ModelRuntime {
+        provider,
+        provider_name: format!("{model_provider_name}.{model_provider_alias}"),
+        model_name,
+        temperature,
+        context_window,
+        tool_dispatcher,
+        identity,
+    })
+}
+
+/// Credential fallback for an in-session model switch: a `model_routes` key
+/// matching the switched ref and model wins, else the agent's original
+/// profile key (and base URL) so a keyless target borrows the session's
+/// credential.
+fn switch_credential_fallback<'a>(
+    config: &'a Config,
+    agent_alias: &str,
+    model_provider_ref: &str,
+    model: &str,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let agent_entry = config
+        .resolved_model_provider_for_agent(agent_alias)
+        .map(|(_ty, _alias, entry)| entry);
+    let default_api_key = agent_entry.and_then(|e| e.api_key.as_deref());
+    let default_base_url = agent_entry.and_then(|e| e.uri.as_deref());
+
+    // Prefer a route-specific api_key when the switched provider/model
+    // matches a configured model_route entry.
+    let route_api_key = config
+        .model_routes
+        .iter()
+        .find(|r| {
+            r.model_provider.eq_ignore_ascii_case(model_provider_ref)
+                && (r.model.eq_ignore_ascii_case(model) || r.hint.eq_ignore_ascii_case(model))
+        })
+        .and_then(|r| r.api_key.as_deref());
+    (route_api_key.or(default_api_key), default_base_url)
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -3440,7 +3588,7 @@ mod tests {
     #[test]
     fn build_session_model_provider_rejects_undotted_ref() {
         let config = Config::default();
-        let err = match build_session_model_provider(&config, "anthropic", Some("m")) {
+        let err = match build_session_model_provider(&config, "tester", "anthropic", Some("m")) {
             Ok(_) => panic!("undotted ref must error"),
             Err(e) => e,
         };
@@ -3451,7 +3599,12 @@ mod tests {
     fn build_session_model_provider_requires_a_model() {
         // No configured entry and no override → cannot resolve a model name.
         let config = Config::default();
-        let err = match build_session_model_provider(&config, "anthropic.default", None) {
+        let err = match build_session_model_provider(
+            &config,
+            "tester",
+            "anthropic.default",
+            None,
+        ) {
             Ok(_) => panic!("missing model must error"),
             Err(e) => e,
         };
@@ -3478,10 +3631,67 @@ mod tests {
         );
 
         let (_provider, provider_ref, model) =
-            build_session_model_provider(&config, "openai.fast", None).unwrap();
+            build_session_model_provider(&config, "tester", "openai.fast", None).unwrap();
 
         assert_eq!(provider_ref, "openai.fast");
         assert_eq!(model, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn build_model_keeps_selected_entry_tuning_over_default_entry() {
+        use zeroclaw_config::schema::{ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        // `default` carries a tuning field; a three-segment ref selecting
+        // `cheap` must not have that field clobbered by the default entry.
+        // Before build_model passed the raw ref through, the providers chain
+        // re-resolved the normalised two-segment name, picked `models.default`,
+        // and overlaid ITS tuning on top of the selected entry's.
+        let mut config = Config::default();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "default".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o".to_string()),
+                vision: Some(false),
+                ..Default::default()
+            },
+        );
+        entries.insert(
+            "cheap".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o-mini".to_string()),
+                vision: Some(true),
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "gw".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("https://gw.internal/v1".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    models: entries,
+                    ..Default::default()
+                },
+            },
+        );
+
+        let rt = build_model(
+            &config,
+            "tester",
+            "openai.gw.cheap",
+            None,
+            BuildCredentials::TargetOnly,
+        )
+        .unwrap();
+
+        assert_eq!(rt.provider_name, "openai.gw");
+        assert_eq!(rt.model_name, "gpt-4o-mini");
+        assert!(
+            rt.provider.capabilities_for_model(&rt.model_name).vision,
+            "the selected entry's vision tuning must survive construction; a clobber by \
+             `models.default` (vision=false) means the raw ref did not reach the providers chain"
+        );
     }
 
     zeroclaw_api::mock_tool_attribution!(
