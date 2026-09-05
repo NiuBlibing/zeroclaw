@@ -168,7 +168,7 @@ impl Tool for SkillShellTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
 
-        // Security validation (RFC #7155 §5.1): the skill tool presents NO
+        // Security validation (RFC 7155 §5.1): the skill tool presents NO
         // confirmation — an operator's approval of the *skill invocation*
         // did not approve this exact command (the model supplies the
         // substituted arguments), so risk-tier commands fail closed with

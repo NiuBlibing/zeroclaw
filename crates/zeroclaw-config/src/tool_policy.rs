@@ -1,5 +1,5 @@
 //! Three-tier tool permission policy engine — the Phase 0/1 rule authority
-//! of RFC #7155.
+//! of RFC 7155.
 //!
 //! One rule table, one resolver. Legacy risk-profile fields
 //! (`allowed_commands`, `always_ask`, `auto_approve`, `block_high_risk_commands`,
@@ -24,7 +24,7 @@
 //! unparseable PowerShell) extract as `ParseStatus::Degraded`, and an
 //! apparent `Allow` on a degraded command downgrades to `Ask` — or `Deny`
 //! when `block_high_risk_commands` is on — never unconditional execution
-//! (RFC #7155 §2.3). The one exemption is the legacy trusted-environment
+//! (RFC 7155 §2.3). The one exemption is the legacy trusted-environment
 //! escape hatch (`allowed_commands = ["*"]` with
 //! `block_high_risk_commands = false`), which keeps its historical meaning
 //! of opting out of command-level syntax restrictions.
@@ -112,7 +112,7 @@ pub enum BuiltinPredicate {
 /// Where a rule came from. `Explicit` rules (user-written
 /// `tool_policy.rules`) are the only `Allow` source that can carve out of
 /// the overridable risk-default `Ask` tiers; legacy and session `Allow`
-/// rules cannot (the design decision behind RFC #7155 §2.2's
+/// rules cannot (the design decision behind RFC 7155 §2.2's
 /// `Shell(cargo test:*) = allow` example).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuleSource {
@@ -170,7 +170,7 @@ pub struct PolicyRule {
     /// `false` = hard rule: no `Allow` of any source may override it.
     /// Hard rules: `always_ask`, the High-risk block, read-only autonomy,
     /// and every explicit user `Deny`/`Ask` (a matched `Ask` is mandatory
-    /// approval — RFC #7155 §1.3: "Allow rules and auto_approve cannot
+    /// approval — RFC 7155 §1.3: "Allow rules and auto_approve cannot
     /// downgrade it" — so it must survive any `Allow`). Only the legacy
     /// Supervised risk-tier predicates stay overridable.
     pub overridable: bool,
@@ -299,7 +299,7 @@ pub fn extract_shell_action(
 pub const SHELL_ACTION_FACTS_SCHEMA: &str = "zc-shell-action-v1";
 
 impl ShellAction {
-    /// The canonical fingerprint facts for this action (RFC #7155 §5.2:
+    /// The canonical fingerprint facts for this action (RFC 7155 §5.2:
     /// the complete action, not the display string).
     ///
     /// Shape (v1): `{"schema": "zc-shell-action-v1", "dialect": …, "cwd": …,
@@ -690,11 +690,11 @@ pub fn parse_pattern(pattern: &str) -> Result<RuleMatcher, String> {
 // ─── Config schema types ─────────────────────────────────────────────────────
 
 /// Default freshness window for confirmations minted under a profile
-/// (RFC #7155 §5.2): five minutes.
+/// (RFC 7155 §5.2): five minutes.
 pub const DEFAULT_CONFIRMATION_VALIDITY_SECS: u64 = 300;
 
 /// Command/tool-level fine-grained permission rules on a risk profile
-/// (RFC #7155 §4.3). Empty = only legacy-compiled rules adjudicate — the
+/// (RFC 7155 §4.3). Empty = only legacy-compiled rules adjudicate — the
 /// default, with behavior identical to a profile without the section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -704,7 +704,7 @@ pub struct ToolPolicyConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<PolicyRuleConfig>,
     /// How long a minted approval stays valid, in seconds (1..=86400).
-    /// Delegation may only shrink this, never extend it (RFC #7155 §4.4).
+    /// Delegation may only shrink this, never extend it (RFC 7155 §4.4).
     #[serde(default = "default_confirmation_validity_secs")]
     pub confirmation_validity_secs: u64,
 }
@@ -759,7 +759,7 @@ impl CompiledRuleSet {
     /// Compile a risk profile's legacy fields and explicit rules into one
     /// rule table.
     ///
-    /// The legacy mapping (RFC #7155 §1.2), verified command-for-command
+    /// The legacy mapping (RFC 7155 §1.2), verified command-for-command
     /// against the pre-RFC `SecurityPolicy` behavior by the golden tests
     /// at the bottom of this file:
     ///
@@ -970,7 +970,7 @@ pub enum ResolutionReason {
     HighRiskBlocked,
     /// The built-in Supervised risk-tier ask.
     SupervisedRiskAsk { level: CommandRiskLevel },
-    /// Syntax degradation downgraded an apparent Allow (RFC #7155 §2.3).
+    /// Syntax degradation downgraded an apparent Allow (RFC 7155 §2.3).
     DegradedSyntax {
         reason: DegradationReason,
         decision: Decision,
@@ -997,7 +997,7 @@ impl Resolution {
 }
 
 /// Adjudicate a tool action against the scopes: the single authority
-/// (RFC #7155 §3.2).
+/// (RFC 7155 §3.2).
 ///
 /// Per matched-rule precedence — the algorithm of record, step by step:
 ///
@@ -1060,7 +1060,7 @@ pub fn resolve_decision(action: &ToolAction, scopes: &ResolvedScopes) -> Resolut
         }
     });
 
-    // RFC #7155 §2.3: an apparent Allow on a degraded parse never executes
+    // RFC 7155 §2.3: an apparent Allow on a degraded parse never executes
     // unconditionally. The escape hatch keeps its historical meaning
     // (opting out of command-level syntax restrictions).
     if !scopes.profile.escape_hatch()
@@ -1094,7 +1094,7 @@ pub fn resolve_decision(action: &ToolAction, scopes: &ResolvedScopes) -> Resolut
 /// Resolve the tool-name layer question ("does this tool need approval")
 /// against the same table — the `ApprovalManager` consults this so
 /// `always_ask` / `auto_approve` / session grants stop being a second,
-/// independent authority (RFC #7155 §1.2's "they can no longer disagree").
+/// independent authority (RFC 7155 §1.2's "they can no longer disagree").
 ///
 /// Only [`RuleMatcher::ToolName`] rules participate; a `ToolName` entry of
 /// `"*"` matches any tool, mirroring the legacy wildcard semantics.
@@ -1170,7 +1170,7 @@ where
     }
     // Step 3: an Explicit or Session Allow lifts the overridable
     // risk-default Ask. Both are precise operator allowances — one written
-    // in config, one granted live by an "always approve" answer (RFC #7155
+    // in config, one granted live by an "always approve" answer (RFC 7155
     // §3.3.4: an Always grant crosses the risk-default Ask exactly like
     // today's session allowlist did, but never Deny and never a hard Ask).
     // Neither crosses steps 1–2.
@@ -1388,7 +1388,7 @@ pub fn validate_tool_policy(profile_alias: &str, policy: &ToolPolicyConfig) -> R
 // ─── Shadowing warnings ──────────────────────────────────────────────────────
 
 /// Warn when an explicit rule makes another rule on the same profile dead
-/// (RFC #7155 §4.2's shadowed-rule detection).
+/// (RFC 7155 §4.2's shadowed-rule detection).
 ///
 /// Two cases worth an operator's attention:
 /// - an explicit `Ask` on an executable shadows the legacy `Allow` for the
@@ -1463,7 +1463,7 @@ pub fn collect_shadowing_warnings(
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-// ─── Delegation no-escalation (RFC #7155 §4.4/§2.6) ────────────────────────────
+// ─── Delegation no-escalation (RFC 7155 §4.4/§2.6) ────────────────────────────
 
 /// Whether `child` argument pattern is fully covered by (a subset of)
 /// `parent`. Conservative: a `Glob` child is only provably covered by an
@@ -1497,7 +1497,7 @@ fn arg_pattern_covered(child: &Option<ArgPattern>, parent: &Option<ArgPattern>) 
 }
 
 /// Whether a child `Allow` rule is covered by some parent `Allow` rule
-/// (RFC #7155 §4.4: "a new Allow must be a subset of some parent Allow").
+/// (RFC 7155 §4.4: "a new Allow must be a subset of some parent Allow").
 fn allow_rule_covered(child: &PolicyRule, parent_allows: &[&PolicyRule]) -> bool {
     parent_allows
         .iter()
@@ -1521,7 +1521,7 @@ fn allow_rule_covered(child: &PolicyRule, parent_allows: &[&PolicyRule]) -> bool
 }
 
 /// Compare two profiles' explicit `tool_policy` sections on RESOLVED rule
-/// semantics (RFC #7155 §4.4): a delegated/child policy may only narrow.
+/// semantics (RFC 7155 §4.4): a delegated/child policy may only narrow.
 ///
 /// Fails when the child
 /// - adds an `Allow` rule not covered by any parent `Allow`;
@@ -1956,7 +1956,7 @@ mod tests {
             decision: Decision::Allow,
         }];
         // cargo test is Medium risk under Supervised → legacy-compiled Ask,
-        // but the explicit rule is the precise carve-out (the RFC #7155
+        // but the explicit rule is the precise carve-out (the RFC 7155
         // §2.2 example).
         let resolution = resolve_with(&cfg, "cargo test --lib", ShellDialect::Posix);
         assert_eq!(resolution.decision, Decision::Allow);
@@ -2389,7 +2389,7 @@ mod tests {
     //   1. unmatched command: legacy hard reject → Ask (fail-closed into
     //      approval instead of a blanket reject);
     //   2. allowlisted + degraded syntax + block_high_risk=false: legacy
-    //      hard reject → Ask (RFC #7155 §2.3: an apparent Allow on a
+    //      hard reject → Ask (RFC 7155 §2.3: an apparent Allow on a
     //      degraded parse downgrades, never executes unconditionally).
     // Everything else must match the legacy outcome exactly.
 
@@ -2466,7 +2466,7 @@ mod tests {
     #[test]
     fn golden_delta_2_degraded_allowlist_syntax_without_block_moves_to_ask() {
         // Legacy: allowlisted + backtick + block_high_risk=false → hard
-        // reject even when approved. New: Ask (RFC #7155 §2.3 — an
+        // reject even when approved. New: Ask (RFC 7155 §2.3 — an
         // apparent Allow on a degraded parse downgrades to Ask).
         let mut cfg = profile(AutonomyLevel::Supervised, &["echo"]);
         cfg.block_high_risk_commands = false;

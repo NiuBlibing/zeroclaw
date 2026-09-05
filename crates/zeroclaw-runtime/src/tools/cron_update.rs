@@ -349,7 +349,7 @@ mod tests {
     #[tokio::test]
     async fn schema_does_not_advertise_self_approval() {
         // `approved` is runtime plumbing injected by the approval gate,
-        // never a model-facing parameter (RFC #7155).
+        // never a model-facing parameter (RFC 7155).
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);

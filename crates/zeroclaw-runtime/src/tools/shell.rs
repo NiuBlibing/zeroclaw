@@ -263,7 +263,7 @@ impl Tool for ShellTool {
                 anyhow::Error::msg("Missing 'command' parameter")
             })?;
         // The runtime-injected `approved` bit means "a fingerprint-bound
-        // confirmation was consumed for THIS exact command" (RFC #7155
+        // confirmation was consumed for THIS exact command" (RFC 7155
         // §5.2): the loop strips any model-supplied value and only the
         // approval gate's mint+consume writes `true`. See
         // `agent::set_runtime_approved_arg` and the gate in
@@ -745,7 +745,7 @@ mod tests {
                 .contains(&json!("command"))
         );
         // The runtime-owned `approved` arg is intentionally absent from the
-        // schema: the model must never be told it can self-approve (RFC #7155).
+        // schema: the model must never be told it can self-approve (RFC 7155).
         // `agent::set_runtime_approved_arg` is the only writer on the loop path.
         assert!(schema["properties"].get("approved").is_none());
     }

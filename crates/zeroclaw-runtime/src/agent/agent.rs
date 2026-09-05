@@ -1810,7 +1810,7 @@ impl Agent {
         } else {
             ApprovalManager::for_non_interactive(risk_profile)
         };
-        // RFC #7155: the gate resolves the actual shell command, which
+        // RFC 7155: the gate resolves the actual shell command, which
         // needs the policy and the runtime's dialect.
         approval_manager.set_policy_context(Arc::clone(&security), runtime.shell_dialect());
 

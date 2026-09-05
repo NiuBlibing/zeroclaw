@@ -1,4 +1,4 @@
-//! Single-use confirmation ledger (RFC #7155 §5.2) — the consumption half
+//! Single-use confirmation ledger (RFC 7155 §5.2) — the consumption half
 //! of the trusted-confirmation boundary.
 //!
 //! The approval gate MINTS a
@@ -25,7 +25,7 @@
 //!
 //! Pure in-memory and per-`ApprovalManager` (never persisted, never shared
 //! across managers): durable pending-action recovery is the separately
-//! ratified unbounded-wait follow-up (RFC #7155 §R).
+//! ratified unbounded-wait follow-up (RFC 7155 §R).
 
 use std::collections::HashMap;
 

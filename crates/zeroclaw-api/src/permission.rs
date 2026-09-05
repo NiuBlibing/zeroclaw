@@ -1,5 +1,5 @@
 //! Trusted approval confirmation contract — the frozen Phase 0 boundary of
-//! RFC #7155.
+//! RFC 7155.
 //!
 //! These types are the durable cross-surface contract for what an approval
 //! IS: a [`TrustedConfirmation`] binds the approver's decision to the exact
@@ -8,7 +8,7 @@
 //! consumed at most once with deterministic terminal states
 //! ([`ConsumeOutcome`]). The runtime approval gate, channel approval
 //! backchannels, the gateway, and future consumers (stronger approval
-//! authentication #3767, the desktop approval consumer #6909, the separately
+//! authentication issue 3767, the desktop approval consumer issue 6909, the separately
 //! ratified automated-approver phase) all reference this module so the
 //! contract cannot drift per-surface.
 //!
@@ -17,7 +17,7 @@
 //! 1. **Provenance.** A confirmation can only be minted by the trusted
 //!    approval path — the runtime gate, after a real operator or backchannel
 //!    answer. Nothing in the model's tool-call JSON can produce one
-//!    (RFC #7155 §5.1 removed the model-self-attestable `approved` field).
+//!    (RFC 7155 §5.1 removed the model-self-attestable `approved` field).
 //! 2. **Exactness.** The fingerprint binds the complete action facts, not
 //!    the display string. Any change to the action — arguments, working
 //!    directory, env changes, redirections, principal — makes an existing
@@ -50,7 +50,7 @@ pub const ACTION_FINGERPRINT_DOMAIN_V1: &[u8] = b"zc-actfp-v1";
 /// object built by the tool-action extractor — for shell v1:
 /// executable identity, normalized arguments, working directory, env
 /// changes, redirections/stdin, and the originating principal. Matching the
-/// display string is insufficient (RFC #7155 §5.2): a confirmation whose
+/// display string is insufficient (RFC 7155 §5.2): a confirmation whose
 /// fingerprint no longer matches the action at execution time is `Stale`,
 /// never `Consumed`.
 ///
@@ -153,7 +153,7 @@ pub enum ApproverKind {
     /// A human answered through a trusted route.
     Human,
     /// Reserved for the separately ratified automated-approver phase
-    /// (#7155 §6). The v1 gate never mints one; a ledger that sees one
+    /// (RFC 7155 §6). The v1 gate never mints one; a ledger that sees one
     /// before that phase ships is looking at a bug.
     Automated,
 }
@@ -224,10 +224,10 @@ pub enum ApproveOrDeny {
 /// it stays valid.
 ///
 /// This bounds the **decision's** lifetime, not the operator's reply time —
-/// the approval wait is a separate, cancellable concern (RFC #7155 §5.4).
+/// the approval wait is a separate, cancellable concern (RFC 7155 §5.4).
 /// A confirmation may be consumed up to `issued_at_unix + ttl_secs`; after
 /// that it is [`ConsumeOutcome::Expired`] — re-ask, not a deny. Delegation
-/// may only shrink, never extend, a parent's window (RFC #7155 §4.4).
+/// may only shrink, never extend, a parent's window (RFC 7155 §4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeWindow {
     /// When the confirmation was minted, UNIX seconds.
@@ -266,8 +266,8 @@ impl TimeWindow {
 /// consumable once.
 ///
 /// Only the trusted approval path mints these — never model-supplied tool
-/// arguments (RFC #7155 §5.1). The struct is `#[non_exhaustive]` so the
-/// reserved extension points (authentication strength #3767,
+/// arguments (RFC 7155 §5.1). The struct is `#[non_exhaustive]` so the
+/// reserved extension points (authentication strength issue 3767,
 /// automated-approver evidence) can be added without breaking consumers;
 /// construction from outside this crate goes through
 /// [`TrustedConfirmation::new`].
@@ -331,7 +331,7 @@ impl TrustedConfirmation {
 }
 
 /// The single-use consumption result of a confirmation — the frozen
-/// terminal-state table of RFC #7155 §5.2.
+/// terminal-state table of RFC 7155 §5.2.
 ///
 /// Every non-happy-path outcome is terminal, deterministic, and fails
 /// closed: none of them silently allows execution. The table, verbatim

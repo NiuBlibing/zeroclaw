@@ -367,7 +367,7 @@ pub struct SecurityPolicy {
     /// Tools that always require approval in this profile. Mirrors
     /// `RiskProfileConfig.always_ask`.
     pub always_ask: Vec<String>,
-    /// Explicit `tool_policy` rules (RFC #7155 §4.3) copied from the risk
+    /// Explicit `tool_policy` rules (RFC 7155 §4.3) copied from the risk
     /// profile at construction. The three-tier rule table is compiled from
     /// this policy's own fields on demand (see
     /// [`compile_rule_set`](Self::compile_rule_set)), so a struct-literal
@@ -691,7 +691,7 @@ pub enum EscalationViolation {
     /// parent required.
     RequireApprovalDisabledByChild,
     /// The child's explicit `tool_policy` rules widen the parent's on
-    /// resolved semantics (RFC #7155 §4.4): an uncovered child `Allow`,
+    /// resolved semantics (RFC 7155 §4.4): an uncovered child `Allow`,
     /// a dropped parent `Deny`, or an extended confirmation window.
     ToolPolicyEscalation { reason: String },
 }
@@ -2401,7 +2401,7 @@ impl SecurityPolicy {
     /// `nul` null device is discard-only under `cmd.exe` but an ordinary file
     /// under a POSIX shell).
     ///
-    /// This is the **legacy-semantics** entry (RFC #7155 §3.2 keeps it as the
+    /// This is the **legacy-semantics** entry (RFC 7155 §3.2 keeps it as the
     /// shell-specific wrapper): `approved` bridges the Supervised risk-tier
     /// asks only. An unmatched command is rejected regardless of `approved`
     /// — used by the cron/schedule creation paths and the skill tool, where
@@ -2455,7 +2455,7 @@ impl SecurityPolicy {
     /// for THIS exact command (minted after a real operator answer).
     ///
     /// The confirmation bridges every `Ask` tier — the risk-tier asks AND
-    /// the unmatched default (RFC #7155 §1.3's fail-closed-to-approval: an
+    /// the unmatched default (RFC 7155 §1.3's fail-closed-to-approval: an
     /// operator who approved the exact command may run it even when no rule
     /// allows it). A `Deny` never bridges: no confirmation can authorize a
     /// denied command.
@@ -2502,7 +2502,7 @@ impl SecurityPolicy {
         Ok(self.command_risk_level_for_shell(command, dialect))
     }
 
-    /// Resolve a shell command against the compiled rule table (RFC #7155
+    /// Resolve a shell command against the compiled rule table (RFC 7155
     /// §3.2: the canonical resolver is the only authority). Session rules —
     /// the narrow `Allow` patterns an "always approve" answer mints —
     /// participate as an additional scope.
@@ -3627,7 +3627,7 @@ impl SecurityPolicy {
             return Err(EscalationViolation::RequireApprovalDisabledByChild);
         }
 
-        // RFC #7155 §4.4: the explicit tool_policy rules compare on RESOLVED
+        // RFC 7155 §4.4: the explicit tool_policy rules compare on RESOLVED
         // semantics — a child Allow must be a subset of a parent Allow, a
         // parent Deny must stay in effect, and the confirmation window may
         // only shrink.

@@ -1344,7 +1344,7 @@ mod tests {
     #[test]
     fn schema_does_not_advertise_self_approval() {
         // `approved` is runtime plumbing injected by the approval gate,
-        // never a model-facing parameter (RFC #7155).
+        // never a model-facing parameter (RFC 7155).
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg = Arc::new(Config {
             data_dir: tmp.path().join("data"),

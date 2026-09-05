@@ -601,7 +601,7 @@ mod tests {
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["action"].is_object());
         // `approved` is runtime plumbing injected by the approval gate,
-        // never a model-facing parameter (RFC #7155).
+        // never a model-facing parameter (RFC 7155).
         assert!(schema["properties"].get("approved").is_none());
     }
 

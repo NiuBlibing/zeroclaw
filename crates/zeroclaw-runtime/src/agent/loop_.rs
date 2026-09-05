@@ -1716,7 +1716,7 @@ pub async fn run(
         // ── Approval manager (supervised mode) ───────────────────────
         let approval_manager = if interactive {
             let manager = ApprovalManager::from_risk_profile(&risk_profile);
-            // RFC #7155: the gate resolves the actual shell command, which
+            // RFC 7155: the gate resolves the actual shell command, which
             // needs the policy and the runtime's dialect.
             manager.set_policy_context(Arc::clone(&security), runtime.shell_dialect());
             Some(manager)
@@ -2920,7 +2920,7 @@ pub async fn process_message(
             }
         };
         let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
-        // RFC #7155: the gate resolves the actual shell command, which
+        // RFC 7155: the gate resolves the actual shell command, which
         // needs the policy and the runtime's dialect. (Non-interactive
         // without a back-channel still fails closed on Ask tiers.)
         approval_manager.set_policy_context(Arc::clone(&security), runtime.shell_dialect());

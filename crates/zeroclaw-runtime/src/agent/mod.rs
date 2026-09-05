@@ -34,7 +34,7 @@ pub use turn::{
 /// Tools whose execution policy consumes a runtime-owned `approved` bit.
 ///
 /// The `approved` arg is runtime plumbing, NOT a model-facing parameter: no
-/// tool schema advertises it (RFC #7155 — a model must never be told it can
+/// tool schema advertises it (RFC 7155 — a model must never be told it can
 /// self-approve). [`set_runtime_approved_arg`] is the only writer on the tool
 /// loop path: `call_prep` overwrites the key unconditionally before the
 /// approval gate (stripping any model-supplied value) and rewrites it with the

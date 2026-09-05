@@ -1,7 +1,7 @@
 //! Interactive approval workflow for supervised mode.
 //! Provides a pre-execution hook that prompts the user before tool calls,
 //! with session-scoped "Always" rules and audit logging, plus the
-//! single-use confirmation ledger of RFC #7155 §5.2.
+//! single-use confirmation ledger of RFC 7155 §5.2.
 
 pub mod ledger;
 
@@ -32,7 +32,7 @@ use zeroclaw_config::tool_policy::{ArgPattern, PolicyRule, RuleMatcher, RuleSour
 pub struct ApprovalRequest {
     pub tool_name: String,
     pub arguments: serde_json::Value,
-    /// The model-stated intent, for HUMAN display only (RFC #7155 §5.5):
+    /// The model-stated intent, for HUMAN display only (RFC 7155 §5.5):
     /// shown side-by-side with the real action, explicitly labeled
     /// untrusted. NEVER an authorization input — the confirmation binds the
     /// action fingerprint, and changing `intent` satisfies no approval.
@@ -90,7 +90,7 @@ pub struct ApprovalLogEntry {
     pub decision: ApprovalResponse,
     pub channel: String,
     /// The hex action fingerprint of the confirmation minted for an
-    /// approved shell command (RFC #7155 §5.2), when one was minted.
+    /// approved shell command (RFC 7155 §5.2), when one was minted.
     /// `None` for tool-name-level decisions without a shell resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_fingerprint: Option<String>,
@@ -105,7 +105,7 @@ pub struct ApprovalLogEntry {
 }
 
 /// The confirmation provenance recorded alongside an approval decision
-/// (RFC #7155 §3.5 audit fields).
+/// (RFC 7155 §3.5 audit fields).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfirmationAudit {
     pub action_fingerprint: String,
@@ -135,15 +135,15 @@ pub struct ApprovalManager {
     /// When `true`, shell calls in non-interactive mode still enter the outer
     /// approval flow because a real client approval channel exists.
     non_interactive_shell_requires_approval: bool,
-    /// Session-scoped rules built from "Always" responses. RFC #7155
+    /// Session-scoped rules built from "Always" responses. RFC 7155
     /// §3.3.4: an "always approve" answer mints a NARROW rule — for shell
     /// commands the exact executable plus the approved argument prefix,
     /// for other tools the tool name (the legacy semantics).
     session_rules: Mutex<Vec<PolicyRule>>,
     /// Single-use confirmations minted after real operator answers
-    /// (RFC #7155 §5.2).
+    /// (RFC 7155 §5.2).
     confirmation_ledger: ConfirmationLedger,
-    /// Security policy + shell dialect for the RFC #7155 shell approval
+    /// Security policy + shell dialect for the RFC 7155 shell approval
     /// path, set once by the site that constructed this manager (it owns
     /// both). Unset (tests, configless paths) => the gate falls back to the
     /// legacy tool-name-only gating.
@@ -161,7 +161,7 @@ pub struct PolicyContextHolder {
 
 impl ApprovalManager {
     /// Attach the security policy and shell dialect this manager's agent
-    /// runs under (RFC #7155: the approval gate resolves the actual shell
+    /// runs under (RFC 7155: the approval gate resolves the actual shell
     /// command, which needs both). Call once, right after construction, at
     /// the site that owns the policy. Sites without a policy (tests,
     /// configless paths) leave it unset and get the legacy tool-name-only
@@ -320,7 +320,7 @@ impl ApprovalManager {
     ///
     /// `confirmation` carries the audit provenance of the confirmation
     /// minted for this decision (fingerprint, route, terminal state), when
-    /// one was minted (RFC #7155 §3.5 audit fields).
+    /// one was minted (RFC 7155 §3.5 audit fields).
     pub fn record_decision(
         &self,
         tool_name: &str,
@@ -380,7 +380,7 @@ impl ApprovalManager {
 
     /// Mint a fresh trusted confirmation for an approved action and record
     /// it in the ledger. Only the approval gate calls this, after a real
-    /// operator answer (RFC #7155 §5.1: nothing model-supplied can produce
+    /// operator answer (RFC 7155 §5.1: nothing model-supplied can produce
     /// one).
     pub fn mint_confirmation(
         &self,
@@ -417,13 +417,13 @@ impl ApprovalManager {
         )
     }
 
-    /// The narrow session rule an "Always" answer mints (RFC #7155 §3.3.4):
+    /// The narrow session rule an "Always" answer mints (RFC 7155 §3.3.4):
     /// for a shell-family tool, the exact executable plus the approved
     /// argument prefix (so `always allow git push` never widens into `git
     /// push --force` being pre-approved unless it literally was); for any
     /// other tool, the tool name (the legacy semantics).
     fn always_session_rule(&self, tool_name: &str, args: &serde_json::Value) -> PolicyRule {
-        // Narrow only under an attached policy context (the RFC #7155
+        // Narrow only under an attached policy context (the RFC 7155
         // shell path). A contextless manager keeps the legacy tool-name
         // rule so its behavior is unchanged.
         if self.policy().is_some()
@@ -476,7 +476,7 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
         crate::i18n::get_required_cli_string_with_args("cli-approval-request", &tool_args)
     );
     eprintln!("   {summary}");
-    // RFC #7155 §5.5: the agent-stated intent is shown next to the real
+    // RFC 7155 §5.5: the agent-stated intent is shown next to the real
     // command, explicitly labeled untrusted. It is never an authorization
     // input; a harmless-looking intent must never mask the real command
     // above it.

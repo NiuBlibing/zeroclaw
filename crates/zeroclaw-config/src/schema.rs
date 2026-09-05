@@ -12915,7 +12915,7 @@ pub struct RiskProfileConfig {
     /// `<server>__<tool>` MCP names that would otherwise be auto-admitted
     /// by the `allowed_tools` MCP exception described above.
     pub excluded_tools: Vec<String>,
-    /// Command/tool-level fine-grained permission rules (RFC #7155
+    /// Command/tool-level fine-grained permission rules (RFC 7155
     /// `tool_policy`). Empty = only the legacy-compiled rules adjudicate —
     /// the default, with behavior identical to a profile without the
     /// section. See [`crate::tool_policy::ToolPolicyConfig`].

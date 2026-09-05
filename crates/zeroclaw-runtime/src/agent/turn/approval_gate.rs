@@ -1,7 +1,7 @@
 //! The per-tool-call approval gate: CLI prompt, channel inline approval, or
 //! auto-deny, plus decision recording. For shell-family tools under an
 //! attached policy context, the gate first RESOLVES the actual command
-//! (RFC #7155): a hard `Deny` never reaches a prompt, an `Allow`-tier
+//! (RFC 7155): a hard `Deny` never reaches a prompt, an `Allow`-tier
 //! resolution skips the prompt, and only an `Ask` tier prompts — with the
 //! approval minting a fingerprint-bound confirmation.
 
@@ -26,7 +26,7 @@ pub(crate) enum ApprovalGateOutcome {
 /// (falling back to auto-deny), and record the decision.
 ///
 /// For shell-family tools whose manager carries a policy context, the
-/// command is resolved through the rule table first (RFC #7155 §3.2/§8):
+/// command is resolved through the rule table first (RFC 7155 §3.2/§8):
 /// `Deny` → a synthesized denial without a prompt; `Allow` (without a hard
 /// `always_ask` on the tool) → proceed without a prompt — no confirmation is
 /// needed for an explicitly-allowed command; `Ask` → the prompt flow, where
@@ -44,7 +44,7 @@ pub(crate) async fn gate_tool_approval(
         .map(|mgr| mgr.approval_requirement(tool_name))
         .unwrap_or(ApprovalRequirement::NotRequired);
 
-    // ── RFC #7155 shell resolution ──────────────────────────────────
+    // ── RFC 7155 shell resolution ──────────────────────────────────
     // Only when the manager carries a policy context; everything else
     // (non-shell tools, configless paths) keeps the legacy tool-name flow.
     let mut shell_confirmation: Option<bool> = None;
@@ -71,7 +71,7 @@ pub(crate) async fn gate_tool_approval(
                     // manager without a back-channel): proceed unapproved —
                     // the shell tool's confirmed validation then fails
                     // closed. Tool-level approval can never bypass a
-                    // command-level Ask (RFC #7155 §1.3).
+                    // command-level Ask (RFC 7155 §1.3).
                     shell_confirmation = Some(false);
                 }
                 // Prompt flow below; the Yes/Always branch mints the
@@ -86,7 +86,7 @@ pub(crate) async fn gate_tool_approval(
         let request = ApprovalRequest {
             tool_name: tool_name.to_string(),
             arguments: tool_args.clone(),
-            // RFC #7155 §5.5: display-only, untrusted, clamped.
+            // RFC 7155 §5.5: display-only, untrusted, clamped.
             intent: tool_args
                 .get("intent")
                 .and_then(serde_json::Value::as_str)
@@ -166,7 +166,7 @@ pub(crate) async fn gate_tool_approval(
             .clone()
             .unwrap_or_else(|| ctx.channel_name.to_string());
 
-        // RFC #7155 §5.1/§5.2: for the resolved shell command, the
+        // RFC 7155 §5.1/§5.2: for the resolved shell command, the
         // operator's approval mints a single-use confirmation bound to the
         // command's action fingerprint, and `approved` means the
         // confirmation was consumed. Nothing model-supplied can produce
@@ -352,7 +352,7 @@ pub(crate) async fn gate_tool_approval(
 }
 
 /// The synthesized denial for a resolver-`Deny` shell command: no prompt
-/// happens, because no approval could change the outcome (RFC #7155 §1.3:
+/// happens, because no approval could change the outcome (RFC 7155 §1.3:
 /// no `Allow` from any source can overturn a matched `Deny`).
 async fn shell_denied_outcome(
     ctx: &TurnCtx<'_>,

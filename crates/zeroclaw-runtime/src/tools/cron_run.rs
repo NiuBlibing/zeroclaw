@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn schema_does_not_advertise_self_approval() {
         // `approved` is runtime plumbing injected by the approval gate,
-        // never a model-facing parameter (RFC #7155).
+        // never a model-facing parameter (RFC 7155).
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
             data_dir: tmp.path().join("data"),
