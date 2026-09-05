@@ -152,7 +152,8 @@ pub struct ApprovalManager {
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
 }
 
-/// The set-once policy context (see [`ApprovalManager::policy_context`]).
+/// The set-once policy context (see
+/// [`ApprovalManager::set_policy_context`]).
 pub struct PolicyContextHolder {
     pub security: Arc<crate::security::SecurityPolicy>,
     pub shell_dialect: ShellDialect,

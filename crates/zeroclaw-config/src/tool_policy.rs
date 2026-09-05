@@ -222,8 +222,8 @@ pub enum ParseStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellSegment {
     /// Leading `NAME=value` words (preserved for fingerprinting; the
-    /// executable extraction skips them exactly like
-    /// [`crate::policy::skip_env_assignments`]).
+    /// executable extraction skips them exactly like the legacy
+    /// allowlist's env-assignment skip).
     pub env_assignments: Vec<(String, String)>,
     /// The executable as typed (quote-stripped, inline redirects removed):
     /// the identity an approval fingerprint must bind, so `./foo/bar.sh`

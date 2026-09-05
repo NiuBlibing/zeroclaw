@@ -2,8 +2,8 @@
 //! of the trusted-confirmation boundary.
 //!
 //! The approval gate MINTS a
-//! [`TrustedConfirmation`](zeroclaw_api::permission::TrustedConfirmation)
-//! after a real operator answer; this ledger is where that confirmation
+//! [`TrustedConfirmation`] after a real operator answer; this ledger is
+//! where that confirmation
 //! lives and is consumed at most once. Every consumption returns a
 //! deterministic [`ConsumeOutcome`] terminal state, and none of the
 //! non-happy states silently allows execution:
