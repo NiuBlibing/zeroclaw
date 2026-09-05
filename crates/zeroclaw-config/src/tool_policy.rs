@@ -307,7 +307,8 @@ impl ShellAction {
     /// "arguments": […]}]}`. Env assignments and arguments bind the argv;
     /// redirections bind through their argument tokens; `cwd` binds the
     /// working directory; `dialect` binds the interpreter. The
-    /// `schema` tag is the [`ACTION_FINGERPRINT_DOMAIN_V1`] companion inside
+    /// `schema` tag is the [`zeroclaw_api::permission::ACTION_FINGERPRINT_DOMAIN_V1`]
+    /// companion inside
     /// the facts: bumping either invalidates outstanding approvals.
     ///
     /// serde_json's sorted-key maps make the serialization canonical, so
@@ -492,27 +493,50 @@ fn capture_env_assignments(segment: &str) -> Vec<(String, String)> {
     assignments
 }
 
+/// A segment placeholder for syntax the extractor could not trust: an
+/// empty base matches no name rule, and the High risk keeps the risk-tier
+/// predicates applying exactly like the legacy whole-command classification.
+fn phantom_high_risk_segment() -> ShellSegment {
+    ShellSegment {
+        env_assignments: Vec::new(),
+        executable: String::new(),
+        base: String::new(),
+        arguments: Vec::new(),
+        risk: CommandRiskLevel::High,
+    }
+}
+
 fn extract_powershell_segments(command: &str) -> (Vec<ShellSegment>, ParseStatus) {
+    let mut degradation: Option<DegradationReason> = None;
+    let mut segments = Vec::new();
+
     let Some(pipeline_segments) = split_simple_powershell_pipeline(command) else {
+        // Unparseable PowerShell: the legacy risk classifier treated the
+        // whole command as High risk, and the legacy allowlist rejected it.
+        // Preserve both facts: a phantom High-risk segment (empty base
+        // matches no rule, so only the risk predicates and the wildcard
+        // apply) plus the degraded status.
+        segments.push(phantom_high_risk_segment());
         return (
-            Vec::new(),
+            segments,
             ParseStatus::Degraded(DegradationReason::UnparseablePowerShell),
         );
     };
     let has_pipeline = pipeline_segments.len() > 1;
-    let mut degradation: Option<DegradationReason> = None;
-    let mut segments = Vec::new();
 
     for segment in &pipeline_segments {
         let mut words = segment.split_whitespace();
         let Some(base_raw) = words.next() else {
             degradation = Some(DegradationReason::UnsafePowerShellSegment);
+            segments.push(phantom_high_risk_segment());
             continue;
         };
         let base_owned = command_basename(base_raw).to_ascii_lowercase();
         // The simple-pipeline gate rejects these executables outright; they
         // extract as degraded (a batch file or `$`-prefixed name runs
-        // content the segment list cannot enumerate).
+        // content the segment list cannot enumerate). A phantom High-risk
+        // segment still records them — matching the legacy risk
+        // classification — so the risk predicates keep applying.
         if base_owned.is_empty()
             || base_owned.starts_with('$')
             || base_owned.starts_with('"')
@@ -521,6 +545,13 @@ fn extract_powershell_segments(command: &str) -> (Vec<ShellSegment>, ParseStatus
             || base_owned.ends_with(".bat")
         {
             degradation = Some(DegradationReason::UnsafePowerShellSegment);
+            segments.push(ShellSegment {
+                env_assignments: Vec::new(),
+                executable: base_raw.to_string(),
+                base: String::new(),
+                arguments: words.map(str::to_string).collect(),
+                risk: CommandRiskLevel::High,
+            });
             continue;
         }
         let base = base_owned
@@ -1042,15 +1073,19 @@ pub fn resolve_decision(action: &ToolAction, scopes: &ResolvedScopes) -> Resolut
         } else {
             resolution.decision
         };
-        if degraded_decision != resolution.decision {
-            resolution = Resolution::new(
-                degraded_decision,
-                ResolutionReason::DegradedSyntax {
-                    reason,
-                    decision: degraded_decision,
-                },
-            );
-        }
+        // Rebind the reason even when the DECISION is unchanged (an Ask
+        // staying Ask): a degraded command's Ask is structural — the
+        // syntax could not be trusted — so the validation entries must not
+        // let an approval bit bridge it the way they bridge risk-tier
+        // asks. The legacy allowlist rejected these commands regardless of
+        // approval; the reason is what carries that fact.
+        resolution = Resolution::new(
+            degraded_decision,
+            ResolutionReason::DegradedSyntax {
+                reason,
+                decision: degraded_decision,
+            },
+        );
     }
 
     resolution

@@ -977,7 +977,6 @@ cli-daemon-started-gateway = Gateway:  {$url}
 cli-daemon-started-socket = Socket:   {$path}
 cli-daemon-started-pairing = Emparejamiento: activado (consulta arriba el estado actual del gateway)
 cli-daemon-started-stop = Ctrl+C o SIGTERM para detener
-<<<<<<< HEAD
 cli-relay-rotation-requested = Se solicitó una rotación del node-id del nodo relay. Un daemon en ejecución hará la rotación en ~{$secs}s; el nuevo id llegará a los clientes de forma integrada durante su próxima renovación de certificado.
 cli-mtls-issued-client-cert = Certificado de cliente emitido para '{$name}':
 cli-mtls-issued-cert-path = {"  "}certificado: {$path}
@@ -1005,7 +1004,6 @@ cli-delegate-error-invalid-semantic-completion = El agente '{$agent_name}' fall�
 cli-agent-error-invalid-semantic-completion = El proveedor de modelo devolvió una finalización semántica no válida.
 cli-delegate-error-incomplete-after-provider-tools = El agente '{$agent_name}' falló: el proveedor de modelo terminó después de ejecutar herramientas sin una respuesta final.
 cli-agent-error-incomplete-after-provider-tools = El proveedor de modelo terminó después de ejecutar herramientas sin una respuesta final.
-=======
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: desconocido / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: ya tiene context_window = {$ctx}
@@ -1077,7 +1075,6 @@ channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
 # ── Agent vision capability errors ──
->>>>>>> 2a50dff14c (feat(runtime): intent display aid, confirmation audit, and semantic no-escalation (RFC #7155))
 cli-agent-vision-unsupported-by-fallback = Se recibieron {$marker_count} marcadores de imagen, pero el model_provider alternativo={$fallback_name} no admite entrada de visión
 cli-agent-vision-unsupported-by-provider = Se recibieron {$marker_count} marcadores de imagen, pero este model_provider no admite entrada de visión
 cli-agent-error-provider-context-window = La solicitud es demasiado grande para el modelo seleccionado. Reduce la conversación o elige un modelo con una ventana de contexto mayor.

@@ -980,7 +980,6 @@ cli-daemon-started-gateway = Passerelle : {$url}
 cli-daemon-started-socket = Socket :     {$path}
 cli-daemon-started-pairing = Appairage : activé (voir ci-dessus l'état actuel de la passerelle)
 cli-daemon-started-stop = Ctrl+C ou SIGTERM pour arrêter
-<<<<<<< HEAD
 cli-relay-rotation-requested = Une rotation de l’identifiant du nœud relais a été demandée. Un daemon en cours d’exécution effectuera la rotation dans ~{$secs}s ; le nouvel identifiant sera transmis aux clients en bande lors de leur prochain renouvellement de certificat.
 cli-mtls-issued-client-cert = Certificat client émis pour '{$name}' :
 cli-mtls-issued-cert-path = {"  "}certificat : {$path}
@@ -1008,7 +1007,6 @@ cli-delegate-error-invalid-semantic-completion = L'agent '{$agent_name}' a écho
 cli-agent-error-invalid-semantic-completion = Le fournisseur de modèle a renvoyé une réponse sémantique non valide.
 cli-delegate-error-incomplete-after-provider-tools = L'agent '{$agent_name}' a échoué : le fournisseur de modèle s'est arrêté après l'exécution des outils sans fournir de réponse finale.
 cli-agent-error-incomplete-after-provider-tools = Le fournisseur de modèle s'est arrêté après l'exécution des outils sans fournir de réponse finale.
-=======
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: inconnu / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: a déjà context_window = {$ctx}
@@ -1080,7 +1078,6 @@ channel-approval-opt-allow-always = Toujours autoriser
 channel-approval-opt-reject = Rejeter
 channel-approval-opt-reject-with-edit = Rejeter avec modification
 # ── Agent vision capability errors ──
->>>>>>> 2a50dff14c (feat(runtime): intent display aid, confirmation audit, and semantic no-escalation (RFC #7155))
 cli-agent-vision-unsupported-by-fallback = {$marker_count} marqueur(s) d’image reçu(s), mais le model_provider de secours={$fallback_name} ne prend pas en charge les entrées visuelles
 cli-agent-vision-unsupported-by-provider = {$marker_count} marqueur(s) d’image reçu(s), mais ce model_provider ne prend pas en charge les entrées visuelles
 cli-agent-error-provider-context-window = La requête est trop volumineuse pour le modèle sélectionné. Réduisez la conversation ou choisissez un modèle avec une fenêtre de contexte plus grande.

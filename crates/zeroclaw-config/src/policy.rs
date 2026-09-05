@@ -2470,7 +2470,17 @@ impl SecurityPolicy {
         let resolution = self.resolve_shell_decision(command, dialect, &[]);
         match resolution.decision {
             Decision::Allow => {}
-            Decision::Ask if confirmed => {}
+            // A confirmation bridges risk-tier asks and the unmatched
+            // default — but NOT a degraded-syntax Ask: the operator
+            // approved the fingerprint of a command whose syntax could not
+            // be trusted, and the legacy gates rejected those regardless
+            // of approval.
+            Decision::Ask
+                if confirmed
+                    && !matches!(
+                        resolution.reason,
+                        crate::tool_policy::ResolutionReason::DegradedSyntax { .. }
+                    ) => {}
             Decision::Ask => {
                 use crate::tool_policy::ResolutionReason;
                 return Err(match resolution.reason {

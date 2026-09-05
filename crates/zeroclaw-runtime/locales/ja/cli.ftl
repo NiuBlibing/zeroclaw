@@ -975,7 +975,6 @@ cli-daemon-started-gateway = ゲートウェイ: {$url}
 cli-daemon-started-socket = ソケット:     {$path}
 cli-daemon-started-pairing = ペアリング: 有効（現在の状態は上のゲートウェイ出力を確認してください）
 cli-daemon-started-stop = Ctrl+C または SIGTERM で停止
-<<<<<<< HEAD
 cli-relay-rotation-requested = リレー node-id のローテーションを要求しました。実行中のデーモンは~{$secs}s以内にローテーションします。新しい ID は、次回の証明書更新時にインバンドでクライアントへ届きます。
 cli-mtls-issued-client-cert = クライアント証明書を '{$name}' 用に発行しました:
 cli-mtls-issued-cert-path = {"  "}cert: {$path}
@@ -1003,7 +1002,6 @@ cli-delegate-error-invalid-semantic-completion = エージェント '{$agent_nam
 cli-agent-error-invalid-semantic-completion = モデルプロバイダーが無効なセマンティック完了を返しました。
 cli-delegate-error-incomplete-after-provider-tools = エージェント '{$agent_name}' が失敗しました：モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。
 cli-agent-error-incomplete-after-provider-tools = モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。
-=======
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: 不明 / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: 既に context_window = {$ctx} が設定されています
@@ -1075,7 +1073,6 @@ channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
 # ── Agent vision capability errors ──
->>>>>>> 2a50dff14c (feat(runtime): intent display aid, confirmation audit, and semantic no-escalation (RFC #7155))
 cli-agent-vision-unsupported-by-fallback = {$marker_count} 個の画像マーカーを受信しましたが、フォールバック model_provider={$fallback_name} は画像入力をサポートしていません
 cli-agent-vision-unsupported-by-provider = {$marker_count} 個の画像マーカーを受信しましたが、この model_provider は画像入力をサポートしていません
 cli-agent-error-provider-context-window = リクエストが選択したモデルのコンテキストウィンドウを超えています。会話を短くするか、より大きなコンテキストウィンドウを持つモデルを選択してください。

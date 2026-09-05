@@ -976,7 +976,6 @@ cli-daemon-started-gateway = Gateway:  {$url}
 cli-daemon-started-socket = Socket:   {$path}
 cli-daemon-started-pairing = 配对：已启用（当前状态请查看上方 gateway 输出）
 cli-daemon-started-stop = 按 Ctrl+C 或发送 SIGTERM 停止
-<<<<<<< HEAD
 cli-relay-rotation-requested = 已请求轮换中继 node-id。正在运行的守护进程将在 ~{$secs}s 内完成轮换；新 ID 将在客户端下次续订证书时通过带内方式传达。
 cli-mtls-issued-client-cert = 已为 '{$name}' 签发客户端证书：
 cli-mtls-issued-cert-path = {"  "}证书: {$path}
@@ -1004,7 +1003,6 @@ cli-delegate-error-invalid-semantic-completion = 代理 '{$agent_name}' 失败�
 cli-agent-error-invalid-semantic-completion = 模型提供商返回了无效的语义完成结果。
 cli-delegate-error-incomplete-after-provider-tools = 代理 '{$agent_name}' 失败：模型提供商执行工具后未返回最终响应便结束了。
 cli-agent-error-incomplete-after-provider-tools = 模型提供商执行工具后未返回最终响应便结束了。
-=======
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: 未知 / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: 已有 context_window = {$ctx}
@@ -1076,7 +1074,6 @@ channel-approval-opt-allow-always = 始终允许
 channel-approval-opt-reject = 拒绝
 channel-approval-opt-reject-with-edit = 编辑后拒绝
 # ── Agent vision capability errors ──
->>>>>>> 2a50dff14c (feat(runtime): intent display aid, confirmation audit, and semantic no-escalation (RFC #7155))
 cli-agent-vision-unsupported-by-fallback = 收到 {$marker_count} 个图像标记，但回退 model_provider={$fallback_name} 不支持视觉输入
 cli-agent-vision-unsupported-by-provider = 收到 {$marker_count} 个图像标记，但此 model_provider 不支持视觉输入
 cli-agent-error-provider-context-window = 请求超过了所选模型的上下文窗口。请缩短对话或选择上下文窗口更大的模型。
