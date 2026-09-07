@@ -427,6 +427,21 @@ fn is_loadable_image_reference(candidate: &str) -> bool {
 
 const REJECTED_IMAGE_MARKER_NOTE: &str = "[image omitted: image marker exceeds safety limit]";
 
+/// Outcome of classifying a marker span from its bounded collapsed prefix.
+enum MarkerSpanClass {
+    /// A loadable reference shape, decided within the prefix.
+    Loadable,
+    /// Ordinary prose — placeholder markers, relative paths, free text.
+    Prose,
+    /// Image-shaped but not decidable within the prefix: a UNC span whose
+    /// server component pushes the share separator past the prefix limit.
+    /// Only UNC can land here — every other shape is decided by its first
+    /// few bytes. Treated as a rejected reference, never as prose: the
+    /// alternative would forward an attacker-sized image-shaped span
+    /// verbatim into provider-visible text.
+    Undecidable,
+}
+
 /// Classify a marker span without owning its attacker-sized body.
 ///
 /// The regular parser collapses line wrapping before classifying a reference,
@@ -435,11 +450,21 @@ const REJECTED_IMAGE_MARKER_NOTE: &str = "[image omitted: image marker exceeds s
 /// the longest classification decision any legal reference needs — a UNC path
 /// `\\<253-byte DNS hostname>\<share>` requires 257 bytes to decide, so the
 /// prefix is sized with margin rather than exactly.
-fn marker_span_is_loadable(raw: &str) -> bool {
+///
+/// A span that starts as a UNC reference but is still undecided when the
+/// prefix runs out returns [`MarkerSpanClass::Undecidable`] — the full span
+/// might be a legal reference (the share separator sits past the limit) or
+/// might have no share at all (prose). Deciding it either way would need the
+/// whole span, so the caller refuses it: classifying an image-shaped span as
+/// prose forwards its raw body into provider-visible text, while refusing it
+/// only drops an image no legal configuration could have produced (a server
+/// name beyond any hostname limit).
+fn marker_span_class(raw: &str) -> MarkerSpanClass {
     const PREFIX_LIMIT: usize = 512;
 
     let mut prefix = String::with_capacity(PREFIX_LIMIT);
     let mut skip_ws = false;
+    let mut truncated = false;
     for ch in raw.chars() {
         if ch == '\n' || ch == '\r' {
             skip_ws = true;
@@ -452,12 +477,20 @@ fn marker_span_is_loadable(raw: &str) -> bool {
             skip_ws = false;
         }
         if prefix.len().saturating_add(ch.len_utf8()) > PREFIX_LIMIT {
+            truncated = true;
             break;
         }
         prefix.push(ch);
     }
 
-    is_loadable_image_reference(prefix.trim())
+    let trimmed = prefix.trim();
+    if is_loadable_image_reference(trimmed) {
+        return MarkerSpanClass::Loadable;
+    }
+    if truncated && trimmed.starts_with(r"\\") {
+        return MarkerSpanClass::Undecidable;
+    }
+    MarkerSpanClass::Prose
 }
 
 /// Returns true for Windows-style absolute paths like `C:\…` or `D:/…`.
@@ -627,16 +660,23 @@ fn parse_image_markers_inner(content: &str, mode: ParseMode) -> ParsedImageMarke
         // allocations bounded regardless of what the caller does later.
         //
         // A syntactically loadable over-ceiling reference is rejected here and
-        // replaced with fixed text. Placeholder/prose markers retain their
+        // replaced with fixed text, and so is an undecidable image-shaped one
+        // — preserving either verbatim would forward an attacker-sized body
+        // as provider-visible prose. Placeholder/prose markers retain their
         // historical literal treatment.
         if end - marker_start > MAX_IMAGE_MARKER_BYTES {
-            if marker_span_is_loadable(&content[marker_start..end]) {
-                rejected_count += 1;
-                if materialize {
-                    push_rejected_image_marker(&mut cleaned);
+            match marker_span_class(&content[marker_start..end]) {
+                MarkerSpanClass::Prose => {
+                    if materialize {
+                        cleaned.push_str(&content[start..=end]);
+                    }
                 }
-            } else if materialize {
-                cleaned.push_str(&content[start..=end]);
+                MarkerSpanClass::Loadable | MarkerSpanClass::Undecidable => {
+                    rejected_count += 1;
+                    if materialize {
+                        push_rejected_image_marker(&mut cleaned);
+                    }
+                }
             }
             cursor = end + 1;
             continue;
@@ -647,22 +687,34 @@ fn parse_image_markers_inner(content: &str, mode: ParseMode) -> ParsedImageMarke
         // never pay for a candidate the cap might not keep. `refs` receives
         // the collapsed body only when the caller will actually normalize it;
         // because both decisions share one classifier, a count can never
-        // disagree with the later selection over the same span.
-        if !marker_span_is_loadable(&content[marker_start..end]) {
-            // Preserve the original marker text (placeholders like
-            // `[IMAGE:...]` or `[IMAGE:<path>]` should survive as prose
-            // rather than triggering a loader error).
-            if materialize {
-                cleaned.push_str(&content[start..=end]);
+        // disagree with the later selection over the same span. An
+        // undecidable image-shaped span is refused with the same fixed note
+        // rather than preserved verbatim: its body is attacker-controlled
+        // text wearing an image marker's shape.
+        match marker_span_class(&content[marker_start..end]) {
+            MarkerSpanClass::Prose => {
+                // Preserve the original marker text (placeholders like
+                // `[IMAGE:...]` or `[IMAGE:<path>]` should survive as prose
+                // rather than triggering a loader error).
+                if materialize {
+                    cleaned.push_str(&content[start..=end]);
+                }
             }
-        } else {
-            loadable_count += 1;
-            loadable_spans.push((marker_start, end));
-            if collect_refs {
-                let candidate = collapse_wrapped_marker(&content[marker_start..end]);
-                #[cfg(test)]
-                record_candidate_ownership(candidate.len());
-                refs.push(candidate);
+            MarkerSpanClass::Undecidable => {
+                rejected_count += 1;
+                if materialize {
+                    push_rejected_image_marker(&mut cleaned);
+                }
+            }
+            MarkerSpanClass::Loadable => {
+                loadable_count += 1;
+                loadable_spans.push((marker_start, end));
+                if collect_refs {
+                    let candidate = collapse_wrapped_marker(&content[marker_start..end]);
+                    #[cfg(test)]
+                    record_candidate_ownership(candidate.len());
+                    refs.push(candidate);
+                }
             }
         }
 
@@ -6295,12 +6347,12 @@ mod tests {
 
     #[test]
     fn marker_span_classification_matches_the_collapsed_reference() {
-        // `marker_span_is_loadable` decides from a bounded collapsed prefix so
-        // no mode ever owns a span just to classify it. That is sound only
-        // while every *legal* reference shape is decided within the prefix
-        // limit — the longest is a UNC path with a maximal-length (253-byte)
-        // DNS hostname, which needs 257 bytes to find the share delimiter.
-        // Pin the equivalence for that boundary and the common shapes.
+        // `marker_span_class` decides from a bounded collapsed prefix so no
+        // mode ever owns a span just to classify it. That is sound only while
+        // every *legal* reference shape is decided within the prefix limit —
+        // the longest is a UNC path with a maximal-length (253-byte) DNS
+        // hostname, which needs 257 bytes to find the share delimiter. Pin
+        // the equivalence for that boundary and the common shapes.
         let mut shapes: Vec<String> = [
             "/absolute/path.png",
             "http://example.com/a.png",
@@ -6321,32 +6373,103 @@ mod tests {
         shapes.push(format!(r"\\{}\share\f.png", "s".repeat(15)));
         for shape in &shapes {
             assert_eq!(
-                marker_span_is_loadable(shape),
+                matches!(marker_span_class(shape), MarkerSpanClass::Loadable),
                 is_loadable_image_reference(&collapse_wrapped_marker(shape)),
                 "span classification must match the collapsed reference for {shape:?}"
             );
         }
 
-        // Beyond the prefix limit the classifier is deliberately stricter: a
-        // UNC server longer than any legal hostname classifies as prose
-        // rather than paying to own the span. Divergence in this direction
-        // can never collect a candidate the full check would reject — it
-        // only refuses an absurd one — and the equivalence above covers
-        // every legal shape.
+        // Beyond the prefix limit a UNC-shaped span is *undecidable*: the
+        // full collapsed check would accept it as a reference (the server
+        // name has no length limit there), but deciding that from the span
+        // itself would mean owning it. The classifier refuses instead of
+        // guessing prose — the divergence can never forward an
+        // image-shaped body as provider-visible text, and the equivalence
+        // above covers every legal shape, so only an absurd one (a server
+        // name beyond any hostname limit) can land here.
         let absurd_unc = format!(r"\\{}\share\g.png", "s".repeat(600));
-        assert!(!marker_span_is_loadable(&absurd_unc));
+        assert!(matches!(
+            marker_span_class(&absurd_unc),
+            MarkerSpanClass::Undecidable
+        ));
         assert!(is_loadable_image_reference(&collapse_wrapped_marker(
             &absurd_unc
+        )));
+
+        // A short UNC span with no share is decided, not undecidable: the
+        // whole span fits in the prefix, so the full-check answer is
+        // available — it is prose.
+        let short_serverless = format!(r"\\{}", "s".repeat(20));
+        assert!(matches!(
+            marker_span_class(&short_serverless),
+            MarkerSpanClass::Prose
+        ));
+        assert!(!is_loadable_image_reference(&collapse_wrapped_marker(
+            &short_serverless
         )));
 
         // A line-wrapped marker classifies through the collapse-equivalent
         // prefix path, not the raw text with the newline still in it.
         let wrapped = "data:image/png;base64,iVBO\n  Rw0KGgo=";
-        assert!(marker_span_is_loadable(wrapped));
+        assert!(matches!(
+            marker_span_class(wrapped),
+            MarkerSpanClass::Loadable
+        ));
         assert_eq!(
-            marker_span_is_loadable(wrapped),
+            matches!(marker_span_class(wrapped), MarkerSpanClass::Loadable),
             is_loadable_image_reference(&collapse_wrapped_marker(wrapped))
         );
+    }
+
+    #[tokio::test]
+    async fn undecidable_unc_markers_never_reach_provider_text() {
+        // Regression for the ambiguous-UNC bypass: a marker whose server
+        // component pushes the share separator past the classifier's bounded
+        // prefix used to classify as prose, and prose markers are preserved
+        // verbatim — so an image-shaped span of nearly `MAX_IMAGE_MARKER_BYTES`
+        // was forwarded into provider-visible text while the scan counted
+        // neither a loadable nor a rejected image, letting the no-image fast
+        // path return the raw body untouched. Both the over-ceiling and the
+        // under-ceiling shape must land on the fixed refusal note instead,
+        // with nothing spent on decoding.
+        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
+        let oversized_marker = format!(r"[IMAGE:\\{}\share\a.png{}]", "s".repeat(600), payload);
+        let under_ceiling_marker = format!(r"[IMAGE:\\{}\share\b.png]", "s".repeat(600));
+
+        let messages = vec![ChatMessage::user(format!(
+            "screenshot {oversized_marker} and {under_ceiling_marker}"
+        ))];
+
+        let ((result, base64_decodes), pixel_decodes) = counting_base64_decodes(async {
+            counting_decodes(async {
+                prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+                    .await
+                    .expect("preparation must not hard-fail on refused markers")
+            })
+            .await
+        })
+        .await;
+
+        let content = &result.messages[0].content;
+        assert!(
+            content.contains("screenshot"),
+            "surrounding prose must survive"
+        );
+        assert_eq!(
+            content.matches(REJECTED_IMAGE_MARKER_NOTE).count(),
+            2,
+            "both undecidable UNC markers must be replaced by the refusal note"
+        );
+        assert!(
+            !content.contains(r"\share\"),
+            "no part of the undecidable UNC bodies may survive: {content}"
+        );
+        assert!(
+            !content.contains("data:image") && !content.contains(&payload[..128]),
+            "the raw oversized body must not reach provider-visible content"
+        );
+        assert_eq!(base64_decodes, 0, "nothing is base64-decoded");
+        assert_eq!(pixel_decodes, 0, "no decode budget is consumed");
     }
 
     #[tokio::test]
