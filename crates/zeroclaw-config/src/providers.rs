@@ -276,7 +276,7 @@ impl ModelProviders {
     }
 
     /// First entry across every typed slot that declares a non-empty `model`,
-    /// in the deterministic `iter_entries` order. An entry without a `model`
+    /// in the existing `iter_entries` order. An entry without a `model`
     /// cannot serve as an install-wide default — there is no model string to
     /// pair with the provider — so entries without one are skipped instead of
     /// seeding a provider/model mismatch at the consumer.
@@ -701,9 +701,8 @@ mod tests {
             },
         );
 
-        // Slot order first (openai precedes ollama), then alias order within
-        // the slot — and entries without a model are skipped, so "alpha" is
-        // passed over in favor of "beta".
+        // Openai precedes ollama in slot order. Within openai, only "beta"
+        // has a model, so it is selected regardless of alias iteration order.
         let first = providers
             .first_entry_with_model()
             .expect("an entry with a model must be found");

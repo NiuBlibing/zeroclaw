@@ -3994,7 +3994,7 @@ impl Config {
 
     /// Return the first concrete `model` string available for use as a
     /// default: the model declared by the first entry that has one, in the
-    /// deterministic order of
+    /// iteration order of
     /// [`ModelProviders::first_entry_with_model`](crate::providers::ModelProviders::first_entry_with_model).
     /// Returns `None` only when no model-provider entry has any model
     /// configured at all.
