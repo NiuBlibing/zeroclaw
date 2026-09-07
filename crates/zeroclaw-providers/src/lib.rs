@@ -665,6 +665,9 @@ pub struct ModelProviderRuntimeOptions {
     /// instead of silently reverting to defaults and re-trimming history a
     /// configured request had legitimately accepted.
     pub multimodal: zeroclaw_config::schema::MultimodalConfig,
+    /// How compatible chat-completions providers handle image markers in
+    /// native role=`tool` results.
+    pub tool_result_image_policy: zeroclaw_config::schema::ToolResultImagePolicy,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -691,6 +694,7 @@ impl Default for ModelProviderRuntimeOptions {
             chat_template_kwargs: None,
             tls_ca_cert_path: None,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            tool_result_image_policy: Default::default(),
         }
     }
 }
@@ -755,6 +759,9 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
         tls_ca_cert_path,
         multimodal: config.multimodal.clone(),
+        tool_result_image_policy: entry
+            .map(|e| e.tool_result_image_policy)
+            .unwrap_or_default(),
     }
 }
 
@@ -818,6 +825,10 @@ pub fn options_for_provider_ref(
             // the fallback provider's capability flag. Clearing it falls back to
             // the family default (or the choke point's own resolution).
             options.vision = None;
+            // Tool-result image handling is provider-specific: a bare
+            // fallback family must use its own default rather than inherit
+            // the previous provider alias's policy.
+            options.tool_result_image_policy = Default::default();
             options
         }
     }
@@ -1783,9 +1794,8 @@ pub fn create_model_provider_from_ref_with_model(
 /// (`max_images = 4`, `max_image_size_mb = 5`). A configured
 /// `vision_model_provider = "ollama"` with `max_images = 8` would otherwise
 /// re-normalize already-prepared messages under the default cap at the provider
-/// boundary. Because `trim_old_images` strips a message's images as a unit, that
-/// silently drops *every* image in an over-cap message rather than trimming to
-/// the configured limit.
+/// boundary, evicting the request's oldest images down to 4 even though the
+/// operator's configuration legitimately accepted 8.
 ///
 /// Only config-owned policy is carried across; every entry-specific option
 /// (kind, URI, credentials, `vision`, ...) stays at its default, since a bare
@@ -2747,6 +2757,20 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_image_policy_config_field_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, ToolResultImagePolicy};
+        let entry = ModelProviderConfig {
+            tool_result_image_policy: ToolResultImagePolicy::Omit,
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert_eq!(opts.tool_result_image_policy, ToolResultImagePolicy::Omit);
+    }
+
+    #[test]
     fn openai_responses_alias_honors_configured_vision_capability() {
         use zeroclaw_config::schema::{
             Config, ModelProviderConfig, OpenAIModelProviderConfig, WireApi,
@@ -3103,10 +3127,11 @@ mod tests {
     }
 
     #[test]
-    fn route_provider_options_clear_primary_only_state_for_bare_routes() {
+    fn route_provider_options_clear_alias_only_state_for_bare_routes() {
         let inherited = ModelProviderRuntimeOptions {
             provider_kind: Some("openai-compatible".to_string()),
             provider_api_url: Some("http://primary.example/v1".to_string()),
+            tool_result_image_policy: zeroclaw_config::schema::ToolResultImagePolicy::Omit,
             ..Default::default()
         };
         let config = zeroclaw_config::schema::Config::default();
@@ -3115,6 +3140,10 @@ mod tests {
 
         assert_eq!(route_options.provider_kind, None);
         assert_eq!(route_options.provider_api_url, None);
+        assert_eq!(
+            route_options.tool_result_image_policy,
+            zeroclaw_config::schema::ToolResultImagePolicy::ImageUrl
+        );
     }
 
     #[test]
@@ -3493,9 +3522,8 @@ mod tests {
         // The runtime prepares history under the configured policy, then the
         // vision provider re-normalizes the already-prepared markers. Running
         // that second pass under defaults re-trims a history the operator's
-        // configuration had legitimately accepted — and because
-        // `trim_old_images` strips a message's images as a unit, an over-cap
-        // message loses every image rather than being trimmed to the cap.
+        // configuration had legitimately accepted, evicting the oldest images
+        // down to the default cap of 4.
         //
         // Dotted aliases already resolved this through
         // `provider_runtime_options_for_alias`; this pins the bare branch.
