@@ -245,34 +245,39 @@ async fn resolve_ws_memory_handle(
 }
 
 /// Provider, model, and temperature for the turn-end WS memory
-/// consolidation: the agent's own provider entry and the model that served
-/// the turn — the same pairing the channel orchestrator passes to its
-/// consolidation — instead of the gateway-wide boot default. `turn_model`
-/// (which may reflect a mid-session model switch) wins when non-empty;
-/// otherwise the entry's configured model is used. Returns `None` when the
-/// agent's `model_provider` no longer resolves — e.g. the entry was removed
-/// by a config reload between turn start and turn end — in which case
-/// consolidation is skipped rather than silently rerouted to an unrelated
-/// entry.
+/// consolidation, resolved from the live provider reference the agent
+/// reports after the turn. A mid-session model switch replaces the agent's
+/// active provider and model together without touching the agent's
+/// configured default, so the consolidation must be built from that live
+/// pair — resolving from the configured default and overriding only the
+/// model would pair one entry's provider with another entry's model. The
+/// live model wins when non-empty; otherwise the entry's configured model
+/// is used. Returns `None` when the reference no longer resolves (e.g. the
+/// entry was removed by a config reload, or the reference is not a dotted
+/// `<family>.<alias>`), in which case consolidation is skipped rather than
+/// silently rerouted to an unrelated entry.
 fn ws_consolidation_model(
     config: &zeroclaw_config::schema::Config,
-    agent_alias: &str,
-    turn_model: &str,
+    provider_ref: &str,
+    model: &str,
 ) -> Option<(
     Box<dyn zeroclaw_api::model_provider::ModelProvider>,
     String,
     Option<f64>,
 )> {
-    let (provider_type, provider_alias, entry) =
-        config.resolved_model_provider_for_agent(agent_alias)?;
-    let provider_ref = format!("{provider_type}.{provider_alias}");
-    let (provider, _, model) = zeroclaw_runtime::agent::agent::build_session_model_provider(
-        config,
-        &provider_ref,
-        Some(turn_model),
-    )
-    .ok()?;
-    Some((provider, model, entry.temperature))
+    let (provider_type, provider_alias) = provider_ref.split_once('.')?;
+    let entry = config
+        .providers
+        .models
+        .find(provider_type, provider_alias)?;
+    let (provider, _, resolved_model) =
+        zeroclaw_runtime::agent::agent::build_session_model_provider(
+            config,
+            provider_ref,
+            Some(model),
+        )
+        .ok()?;
+    Some((provider, resolved_model, entry.temperature))
 }
 
 async fn handle_ws_sop_frame<S>(
@@ -1446,14 +1451,18 @@ async fn process_chat_message(
             // are extracted to long-term memory (Daily + Core categories).
             if state.auto_save {
                 if let Some(mem) = ws_memory.clone() {
-                    // Consolidate with the agent's own provider entry and the
-                    // model that served the turn — the same pairing the
-                    // channel orchestrator hands to its consolidation — so
-                    // background extraction runs on the entry the
-                    // conversation actually used, not the gateway-wide boot
+                    // Read the live provider/model AFTER the turn: a
+                    // mid-session model switch replaces the agent's active
+                    // provider and model together (without touching the
+                    // agent's configured default), and consolidation must
+                    // follow the pair that actually finished the turn — the
+                    // same pairing the channel orchestrator hands to its
+                    // consolidation, instead of the gateway-wide boot
                     // default.
-                    let agent_alias = turn_alias.clone();
-                    let turn_model_owned = turn_model.clone();
+                    let (live_provider_ref, live_model) = {
+                        let (_, provider_ref, model) = agent.attribution_fields();
+                        (provider_ref, model)
+                    };
                     let memory_config = state.config.read().memory.clone();
                     let user_msg = content.to_string();
                     let assistant_resp = outcome.response.clone();
@@ -1461,7 +1470,7 @@ async fn process_chat_message(
                     zeroclaw_spawn::spawn!(async move {
                         let config = live_config.read().clone();
                         let Some((model_provider, model, temperature)) =
-                            ws_consolidation_model(&config, &agent_alias, &turn_model_owned)
+                            ws_consolidation_model(&config, &live_provider_ref, &live_model)
                         else {
                             ::zeroclaw_log::record!(
                                 DEBUG,
@@ -2402,7 +2411,8 @@ data: {\"type\":\"message_stop\"}\n\n",
     }
 
     #[test]
-    fn ws_consolidation_model_uses_agent_entry_not_install_default() {
+    fn ws_consolidation_model_pairs_the_active_provider_with_its_model() {
+        use zeroclaw_api::attribution::{ModelProviderKind, ProviderKind, Role};
         use zeroclaw_config::schema::{
             AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig,
             OpenAIModelProviderConfig,
@@ -2410,8 +2420,8 @@ data: {\"type\":\"message_stop\"}\n\n",
 
         let mut config = zeroclaw_config::schema::Config::default();
         // The install-wide first configured model (the openai slot precedes
-        // ollama in slot order) differs from the agent's entry, so the
-        // assertions prove the agent binding wins over the install-wide pick.
+        // ollama in slot order) is also the agent's CONFIGURED default; a
+        // session can still switch to the ollama entry mid-conversation.
         config.providers.models.openai.insert(
             "install".to_string(),
             OpenAIModelProviderConfig {
@@ -2436,30 +2446,70 @@ data: {\"type\":\"message_stop\"}\n\n",
         config.agents.insert(
             "worker".to_string(),
             AliasedAgentConfig {
-                model_provider: "ollama.agent".into(),
+                model_provider: "openai.install".into(),
                 ..Default::default()
             },
         );
 
-        // The turn model (possibly session-switched) wins over the entry model.
-        let (_, model, temperature) =
-            ws_consolidation_model(&config, "worker", "session-switched-model")
-                .expect("the agent's entry must resolve");
-        assert_eq!(model, "session-switched-model");
+        // After a mid-session switch to the ollama entry — on the switching
+        // turn and every following one — the post-turn live pair is
+        // ("ollama.agent", "llama3"). Consolidation must build the ollama
+        // entry's provider (NOT the agent's configured openai default) and
+        // carry the switched model plus the switched entry's temperature.
+        // The ollama family builds through the OpenAI-compatible provider,
+        // so its attribution kind is Plugin; the entry alias is what pins
+        // the provider to the live reference.
+        let (provider, model, temperature) =
+            ws_consolidation_model(&config, "ollama.agent", "llama3")
+                .expect("the switched reference must resolve");
+        assert_eq!(model, "llama3");
         assert_eq!(
             temperature,
             Some(0.3),
-            "consolidation must use the agent entry's temperature"
+            "consolidation must use the switched entry's temperature"
+        );
+        assert!(matches!(
+            provider.as_ref().role(),
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Plugin))
+        ));
+        assert_eq!(
+            provider.as_ref().alias(),
+            "agent",
+            "the consolidation provider must follow the live reference, not the configured default"
         );
 
-        // Without a turn model, the agent entry's model is used.
-        let (_, model, _) =
-            ws_consolidation_model(&config, "worker", "").expect("the agent's entry must resolve");
+        // Without a live model (empty), the switched entry's own model is used.
+        let (provider, model, temperature) = ws_consolidation_model(&config, "ollama.agent", "")
+            .expect("the switched reference must resolve");
         assert_eq!(model, "agent-entry-model");
+        assert_eq!(temperature, Some(0.3));
+        assert!(matches!(
+            provider.as_ref().role(),
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Plugin))
+        ));
+        assert_eq!(provider.as_ref().alias(), "agent");
 
-        // An agent whose entry no longer resolves skips consolidation
-        // instead of falling back to an unrelated entry.
-        assert!(ws_consolidation_model(&config, "missing-agent", "m").is_none());
+        // The un-switched agent default resolves through the same path and
+        // stays paired with its own model and temperature. The openai family
+        // builds its dedicated provider, so the attribution kind differs
+        // from the switched ollama entry — both must follow their own
+        // reference.
+        let (provider, model, temperature) =
+            ws_consolidation_model(&config, "openai.install", "install-wide-model")
+                .expect("the configured reference must resolve");
+        assert_eq!(model, "install-wide-model");
+        assert_eq!(temperature, Some(0.9));
+        assert!(matches!(
+            provider.as_ref().role(),
+            Role::Provider(ProviderKind::Model(ModelProviderKind::OpenAi))
+        ));
+        assert_eq!(provider.as_ref().alias(), "install");
+
+        // A reference that no longer resolves — or one that is not a dotted
+        // `<family>.<alias>` — skips consolidation instead of falling back
+        // to an unrelated entry.
+        assert!(ws_consolidation_model(&config, "ollama.gone", "m").is_none());
+        assert!(ws_consolidation_model(&config, "not-dotted", "m").is_none());
     }
 
     #[test]
