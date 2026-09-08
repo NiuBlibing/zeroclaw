@@ -1514,14 +1514,6 @@ impl RpcDispatcher {
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        // NOTE: unlike master, `session/new` here does NOT take the session
-        // admission permit up front: this branch's incarnation fencing lives
-        // INSIDE `SessionStore::insert` (the permit is acquired there, around
-        // the publication itself). Taking it here as well would deadlock the
-        // permit-1 per-session semaphore against insert. The end-to-end
-        // property is unchanged — a same-ID successor is still published only
-        // after an admitted turn for the predecessor releases the permit.
-
         let chat_mode = req
             .chat_mode
             .clone()
@@ -1536,8 +1528,31 @@ impl RpcDispatcher {
         }
         let mut resolved_interaction_surface = req.interaction_surface;
 
+        // Session replacement and prompt execution share one admission
+        // permit. Acquire it BEFORE any durable state is read so the whole
+        // incarnation — transcript load, Agent build, publish, history
+        // restore — runs after the previous same-ID turn has fully
+        // finalized its durable writes. In particular the ACP transcript
+        // load below must not observe a predecessor's pre-turn snapshot.
+        //
+        // The guard is held through the history restore after
+        // `insert_admitted` publishes the successor: a prompt cannot be
+        // admitted against the successor until its restored history is in
+        // place. Publishing goes through `insert_admitted` (which does NOT
+        // re-acquire the permit) rather than `insert`, so the permit-1
+        // per-session semaphore is never acquired twice.
+        let _admission = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(&session_id)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+
         // Load resumed ACP metadata once, before constructing the live Agent.
         // The durable row owns the original workspace and interaction surface.
+        // Runs under the admission permit, so a predecessor turn's persisted
+        // messages are already part of this snapshot.
         let mut preloaded_acp: Option<zeroclaw_infra::acp_session_store::AcpSessionData> = None;
         if resuming
             && matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
@@ -1700,9 +1715,15 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
+        // Publish through `insert_admitted`: the admission permit acquired at
+        // the top of this handler is held across publication AND the history
+        // restore below, so a same-ID prompt cannot be admitted against the
+        // successor until its transcript is restored. Re-acquiring inside
+        // `insert` would deadlock against that guard.
         self.ctx
             .sessions
-            .insert(
+            .insert_admitted(
+                &_admission,
                 session_id.clone(),
                 super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
                     .with_owner(self.tui_id.clone()),
@@ -2560,28 +2581,6 @@ impl RpcDispatcher {
             .await
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
 
-        // Mirror the gateway WS path so `session/state` and stuck-session
-        // detection see RPC-driven turns too. The durable row lives under the
-        // same `rpc_{sid}` key the Chat-mode message persistence below and
-        // `session/state` both use. The HTTP running-sessions listing stays
-        // blind to these rows: it derives its caller-facing id by stripping a
-        // `gw_` prefix, and the sibling lookup and abort paths resolve only
-        // gateway keys, so surfacing a row here would hand callers an id those
-        // endpoints cannot act on.
-        //
-        // Scoped to Chat sessions only. Session IDs are caller-supplied and
-        // the two persistence modes share that namespace, so an ACP prompt
-        // reusing the ID of a closed Chat session would otherwise mutate that
-        // session's retained `rpc_{sid}` row — making a stale Chat record
-        // report `running`/`idle`/`error` from an ACP turn, and surfacing it
-        // in stuck-session queries. ACP state belongs to `AcpSessionStore`.
-        let persist_session_state = !matches!(chat_mode, crate::rpc::types::ChatMode::Acp);
-        let session_key = format!("rpc_{sid}");
-        let turn_id = uuid::Uuid::new_v4().to_string();
-        if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
-            let _ = backend.set_session_state(&session_key, "running", Some(&turn_id));
-        }
-
         // Wait for a provisional binding to be confirmed before entering the
         // turn. A session rehydrated while a route-affecting commit held the
         // config writer gate is live but bound to an unconfirmed generation;
@@ -2654,6 +2653,36 @@ impl RpcDispatcher {
             .get_agent(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        // Mark the durable row running only after every preflight wait has
+        // passed. The generation waits and the canonical Agent lookup above
+        // can all still fail this prompt (SESSION_BUSY / SESSION_NOT_FOUND)
+        // before any provider turn starts; writing "running" earlier would
+        // leave a false operational state — `session/state` reporting work
+        // and stuck-session queries surfacing a turn id that never ran — on
+        // every such retryable exit, with no terminal write to correct it.
+        //
+        // Mirror the gateway WS path so `session/state` and stuck-session
+        // detection see RPC-driven turns too. The durable row lives under the
+        // same `rpc_{sid}` key the Chat-mode message persistence below and
+        // `session/state` both use. The HTTP running-sessions listing stays
+        // blind to these rows: it derives its caller-facing id by stripping a
+        // `gw_` prefix, and the sibling lookup and abort paths resolve only
+        // gateway keys, so surfacing a row here would hand callers an id those
+        // endpoints cannot act on.
+        //
+        // Scoped to Chat sessions only. Session IDs are caller-supplied and
+        // the two persistence modes share that namespace, so an ACP prompt
+        // reusing the ID of a closed Chat session would otherwise mutate that
+        // session's retained `rpc_{sid}` row — making a stale Chat record
+        // report `running`/`idle`/`error` from an ACP turn, and surfacing it
+        // in stuck-session queries. ACP state belongs to `AcpSessionStore`.
+        let persist_session_state = !matches!(chat_mode, crate::rpc::types::ChatMode::Acp);
+        let session_key = format!("rpc_{sid}");
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+            let _ = backend.set_session_state(&session_key, "running", Some(&turn_id));
+        }
 
         self.ctx.sessions.touch(sid).await;
         ::zeroclaw_log::record!(
@@ -15166,6 +15195,100 @@ mod tests {
         );
     }
 
+    /// A Chat prompt that fails preflight must not leave the durable session
+    /// row "running".
+    ///
+    /// The running transition is written only after the generation waits and
+    /// the canonical Agent lookup have passed. Every earlier exit — the
+    /// SESSION_BUSY generation/provider-update timeouts, the SESSION_NOT_FOUND
+    /// lookup failures — happens with no provider turn started, so marking
+    /// the row before those waits would strand a false operational state
+    /// (`session/state` reporting work, stuck-session queries surfacing a
+    /// turn id that never ran) with no terminal write to correct it.
+    ///
+    /// Paused tokio time lets the 30-second provider-update wait elapse
+    /// instantly; the test holds that lock so the prompt can only fail at
+    /// preflight.
+    #[tokio::test(start_paused = true)]
+    async fn prompt_preflight_timeout_leaves_no_running_chat_row() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("test provider exists")
+            .uri = Some(server.uri());
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let session_key = format!("rpc_{session_id}");
+
+        // A settled prior turn left the durable row idle with no turn id —
+        // the state a retryable preflight failure must preserve.
+        chat_backend
+            .set_session_state(&session_key, "idle", None)
+            .unwrap();
+
+        // Hold the per-session provider-update lock so the prompt's
+        // preflight can only end in the SESSION_BUSY timeout — no admission
+        // of a turn, no provider call.
+        let update_guard = sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": session_id,
+                "prompt": "preflight timeout",
+            }))
+            .await;
+
+        drop(update_guard);
+        let err = result.expect_err("the held provider-update lock must fail the prompt");
+        assert_eq!(
+            err.code, SESSION_BUSY,
+            "the prompt must fail at preflight, not dispatch a turn: {err:?}"
+        );
+
+        // No provider turn started: nothing reached the mock.
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("mock server must retain received requests")
+                .is_empty(),
+            "a preflight-timeout prompt must make no provider call"
+        );
+
+        // And the durable row is untouched by the failed prompt: still idle,
+        // still no turn id — not stranded as "running" with a phantom turn.
+        let after = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("the durable Chat row must still exist");
+        assert_eq!(
+            after.state, "idle",
+            "a preflight failure must not mark the row running"
+        );
+        assert!(
+            after.turn_id.is_none(),
+            "a preflight failure must not stamp a turn id that never ran"
+        );
+    }
+
     #[tokio::test]
     async fn same_id_chat_replacement_waits_for_blocked_acp_prompt_finalization() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -15285,6 +15408,177 @@ mod tests {
         assert!(
             chat_backend.load(&key).is_empty(),
             "the finalized ACP prompt must not append into the replacement Chat transcript"
+        );
+    }
+
+    /// A same-ID ACP resume must restore the transcript of the predecessor
+    /// turn that was still running when the resume started.
+    ///
+    /// `session/new` holds the session admission permit for the whole
+    /// incarnation, so the resume's transcript load cannot run until the
+    /// admitted predecessor prompt has fully finalized — including the
+    /// `persist_acp_turn` write that appends its messages to the durable
+    /// store. If the transcript were loaded before that wait (as a plain
+    /// preload outside the permit would), the successor would be seeded from
+    /// a snapshot that predates the completed turn and every later prompt
+    /// would silently miss that context. Asserted on the wire: the successor
+    /// session's next provider request must contain the predecessor's
+    /// completed turn.
+    #[tokio::test]
+    async fn acp_resume_restores_transcript_of_finalized_predecessor_turn() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        // 500 keeps the successor's own turn short; its request body is the
+        // evidence that the restored transcript traveled into the provider
+        // call.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("test provider exists")
+            .uri = Some(server.uri());
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-resume-transcript";
+        acp_store
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .unwrap();
+
+        // The predecessor session runs a hand-built provider that gates its
+        // one chat call: the prompt is admitted, its turn is inside the
+        // provider, and the transcript is NOT yet persisted.
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Acp,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let prompt_handle = dispatcher.spawn_handle();
+        let sid_for_prompt = sid.to_string();
+        let prompt_task = zeroclaw_spawn::spawn!(async move {
+            prompt_handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid_for_prompt,
+                    "prompt": "predecessor turn prompt",
+                }))
+                .await
+        });
+        started_rx
+            .recv()
+            .await
+            .expect("the predecessor prompt must reach its gated provider call");
+
+        // Same-ID ACP resume without a caller cwd: it must queue behind the
+        // admitted predecessor. No cwd forces the resume through the durable
+        // transcript load, which is exactly the read that must not observe a
+        // pre-finalization snapshot.
+        let resume_handle = dispatcher.spawn_handle();
+        let sid_for_resume = sid.to_string();
+        let resume_task = zeroclaw_spawn::spawn!(async move {
+            resume_handle
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": sid_for_resume,
+                    "chat_mode": "acp",
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if sessions.session_queue.queue_depth(sid).await == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the same-ID resume must register behind the admitted predecessor prompt");
+
+        // Finalize the predecessor: its turn completes and persists its
+        // messages before the resume can load the transcript.
+        release_tx.send(()).unwrap();
+        let prompt_result = prompt_task.await.expect("prompt task must not panic");
+        assert!(
+            prompt_result.is_ok(),
+            "predecessor prompt should finish: {prompt_result:?}"
+        );
+        let resume_result = resume_task.await.expect("resume task must not panic");
+        assert!(
+            resume_result.is_ok(),
+            "ACP resume should succeed after predecessor finalization: {resume_result:?}"
+        );
+
+        // The successor session's first prompt must carry the predecessor's
+        // completed turn into the provider request — both the user prompt and
+        // the assistant reply that were persisted by the finalized turn.
+        let prompt_result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "hello from the successor",
+            }))
+            .await;
+        assert!(
+            prompt_result.is_err(),
+            "the mock intentionally returns a provider error"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock server must retain received requests");
+        assert!(
+            !requests.is_empty(),
+            "the successor prompt must reach the provider"
+        );
+        let bodies: Vec<String> = requests
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body).to_string())
+            .collect();
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains("predecessor turn prompt")),
+            "the successor's provider request must contain the predecessor's \
+             persisted user turn; bodies so far: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|body| body.contains("turn finished")),
+            "the successor's provider request must contain the predecessor's \
+             persisted assistant reply; bodies so far: {bodies:?}"
         );
     }
 

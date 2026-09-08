@@ -228,7 +228,7 @@ impl SessionStore {
         }
     }
 
-    pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<u64, &'static str> {
+    pub async fn insert(&self, id: String, session: RpcSession) -> Result<u64, &'static str> {
         // Replacement is part of the session actor lifecycle. Serialize it
         // with prompts so a same-ID successor cannot be published midway
         // through a turn admitted for the predecessor.
@@ -237,6 +237,42 @@ impl SessionStore {
             .acquire(&id)
             .await
             .map_err(|_| "session busy")?;
+        self.publish_session(&id, session).await
+    }
+
+    /// Publish a session while the caller already owns the session's
+    /// admission permit. `handle_session_new` drives the whole incarnation —
+    /// predecessor wait, transcript load, build, publish, history restore —
+    /// under ONE permit acquisition: the transcript is only read after the
+    /// predecessor turn has fully finalized, and no prompt can be admitted
+    /// against the successor until the caller drops its guard after the
+    /// history restore. Re-acquiring the permit internally (as [`insert`]
+    /// does) would deadlock against the caller's guard.
+    ///
+    /// The caller must hold `admission` for exactly `id` (debug-asserted)
+    /// and must keep it alive until the published session is fully restored.
+    pub async fn insert_admitted(
+        &self,
+        admission: &zeroclaw_infra::session_queue::SessionGuard,
+        id: String,
+        session: RpcSession,
+    ) -> Result<u64, &'static str> {
+        debug_assert_eq!(
+            admission.session_id(),
+            id,
+            "insert_admitted requires the admission permit for the session being published"
+        );
+        self.publish_session(&id, session).await
+    }
+
+    /// Map-write half shared by [`insert`] and [`insert_admitted`]: stamp the
+    /// incarnation generation and publish. Callers own the admission
+    /// boundary.
+    async fn publish_session(
+        &self,
+        id: &str,
+        mut session: RpcSession,
+    ) -> Result<u64, &'static str> {
         let mut sessions = self.sessions.lock().await;
         if sessions.len() >= self.max_sessions {
             return Err("session limit reached");
@@ -246,7 +282,7 @@ impl SessionStore {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .wrapping_add(1);
         session.generation = generation;
-        sessions.insert(id, session);
+        sessions.insert(id.to_string(), session);
         Ok(generation)
     }
 
