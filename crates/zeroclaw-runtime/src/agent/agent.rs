@@ -29,6 +29,14 @@ pub fn build_session_model_provider(
     model_provider_ref: &str,
     model_override: Option<&str>,
 ) -> Result<(Box<dyn ModelProvider>, String, String)> {
+    // RPC-surface contract: an override ref must name a profile. The bare
+    // family form is a CLI `--provider` legacy that only the headless driver
+    // accepts.
+    if !model_provider_ref.contains('.') {
+        return Err(anyhow::Error::msg(format!(
+            "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
+        )));
+    }
     let rt = build_model(
         config,
         agent_alias,
@@ -79,7 +87,8 @@ pub struct ModelRuntime {
 /// The single model constructor: initial construction, runtime switches, live
 /// refresh, and session overrides all rebuild through here.
 ///
-/// Callers supply only the ref (two- or three-segment), an optional explicit
+/// Callers supply only the ref (two- or three-segment, or a bare family name
+/// for the legacy CLI `--provider <family>` form), an optional explicit
 /// model, and the credential policy; everything else (agent config, entry
 /// overlay, temperature, context window, dispatcher, identity) is derived
 /// from the full config. The raw ref is passed through to the providers
@@ -93,31 +102,42 @@ pub fn build_model(
     model_override: Option<&str>,
     credentials: BuildCredentials,
 ) -> anyhow::Result<ModelRuntime> {
-    // A ref must be at least `<type>.<alias>`; a third segment selects a model
-    // entry under the profile's `models` map. The entry itself may be absent
-    // (e.g. auth via env) — resolution stays lenient so an override can still
-    // build a provider, mirroring the pre-multi-model behavior.
-    let (model_provider_name, model_provider_alias) = model_provider_ref
+    // A two- or three-segment ref names a profile; a third segment selects a
+    // model entry under the profile's `models` map. A bare family name keeps
+    // the legacy family-default construction: no profile lookup, options
+    // inherited from the agent's own profile with the provider-specific bits
+    // cleared (exactly what `options_for_provider_ref` gives a bare name).
+    // The entry itself may be absent (e.g. auth via env) — resolution stays
+    // lenient so an override can still build a provider.
+    let (model_provider_name, model_provider_alias, bare_family) = match model_provider_ref
         .split_once('.')
-        .map(|(t, a)| {
-            (
-                t.to_string(),
-                a.split_once('.').map_or(a, |(al, _)| al).to_string(),
-            )
-        })
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
-            ))
-        })?;
+    {
+        Some((family, rest)) => (
+            family.to_string(),
+            rest.split_once('.')
+                .map_or(rest, |(al, _)| al)
+                .to_string(),
+            false,
+        ),
+        None => (model_provider_ref.to_string(), String::new(), true),
+    };
 
-    let entry = config
-        .providers
-        .models
-        .find(&model_provider_name, &model_provider_alias);
+    let entry = if bare_family {
+        None
+    } else {
+        config
+            .providers
+            .models
+            .find(&model_provider_name, &model_provider_alias)
+    };
     // Rich resolution: picks the model entry (three-segment or `models.default`
-    // / sole-entry fallback) and the model id. `None` when the entry is absent.
-    let selection = config.resolve_model_selection(model_provider_ref);
+    // / sole-entry fallback) and the model id. `None` when the entry is absent
+    // or the ref names a bare family.
+    let selection = if bare_family {
+        None
+    } else {
+        config.resolve_model_selection(model_provider_ref)
+    };
     let model_entry = selection.as_ref().and_then(|s| s.model_entry);
 
     let model_name = model_override
@@ -149,11 +169,20 @@ pub fn build_model(
             model_id: model_name.clone(),
         });
 
-    let mut runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
-        config,
-        &model_provider_name,
-        &model_provider_alias,
-    );
+    let mut runtime_options = if bare_family {
+        // Bare family: inherit the agent's own profile options with the
+        // provider-specific bits cleared — the legacy `--provider <family>`
+        // semantics preserved by `options_for_provider_ref`'s bare arm.
+        let agent_options =
+            zeroclaw_providers::provider_runtime_options_for_agent(config, agent_alias);
+        zeroclaw_providers::options_for_provider_ref(config, model_provider_ref, &agent_options)
+    } else {
+        zeroclaw_providers::provider_runtime_options_for_alias(
+            config,
+            &model_provider_name,
+            &model_provider_alias,
+        )
+    };
     zeroclaw_providers::apply_model_entry_options(&mut runtime_options, model_entry);
 
     // Credential fallback per policy; the construction chain's own order is
@@ -206,7 +235,14 @@ pub fn build_model(
 
     Ok(ModelRuntime {
         provider,
-        provider_name: format!("{model_provider_name}.{model_provider_alias}"),
+        // A bare family name stays as-is (billing falls back through
+        // `provider_pricing`'s unique-alias arm); a dotted ref commits the
+        // normalised two-segment profile name.
+        provider_name: if bare_family {
+            model_provider_ref.to_string()
+        } else {
+            format!("{model_provider_name}.{model_provider_alias}")
+        },
         model_name,
         temperature,
         context_window,
@@ -3612,6 +3648,94 @@ mod tests {
 
         assert_eq!(provider_ref, "openai.fast");
         assert_eq!(model, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn build_model_resolves_derived_values_from_the_selected_entry() {
+        use zeroclaw_config::schema::{ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        // The profile carries one temperature/window; the entries carry
+        // their own. What the runtime derives must follow the selected
+        // entry, not the profile defaults.
+        let mut config = Config::default();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "default".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o".to_string()),
+                ..Default::default()
+            },
+        );
+        entries.insert(
+            "cheap".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o-mini".to_string()),
+                temperature: Some(0.2),
+                context_window: Some(8_000),
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "gw".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("https://gw.internal/v1".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    temperature: Some(0.9),
+                    context_window: Some(100_000),
+                    models: entries,
+                    ..Default::default()
+                },
+            },
+        );
+
+        // Three-segment ref: the selected entry's tuning wins.
+        let rt = build_model(
+            &config,
+            "tester",
+            "openai.gw.cheap",
+            None,
+            BuildCredentials::TargetOnly,
+        )
+        .unwrap();
+        assert_eq!(rt.temperature, Some(0.2), "entry temperature beats profile");
+        assert_eq!(rt.context_window, 8_000, "entry context window beats profile");
+
+        // Two-segment ref: the profile's values (default entry sets none).
+        let rt = build_model(
+            &config,
+            "tester",
+            "openai.gw",
+            None,
+            BuildCredentials::TargetOnly,
+        )
+        .unwrap();
+        assert_eq!(rt.temperature, Some(0.9));
+        assert_eq!(rt.context_window, 100_000);
+
+        // Unconfigured window falls back to the shared stub.
+        let mut bare = Config::default();
+        bare.providers.models.openai.insert(
+            "minimal".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("m".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let rt = build_model(
+            &bare,
+            "tester",
+            "openai.minimal",
+            None,
+            BuildCredentials::TargetOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            rt.context_window,
+            zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        );
     }
 
     #[test]

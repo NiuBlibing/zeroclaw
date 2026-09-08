@@ -1145,22 +1145,6 @@ static AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK: LazyLock<
     Mutex<Option<AgentTurnSopReassemblyTestHook>>,
 > = LazyLock::new(|| Mutex::new(None));
 
-fn api_key_and_uri_for_provider(
-    config: &zeroclaw_config::schema::Config,
-    provider_name: &str,
-    fallback: Option<&zeroclaw_config::schema::ModelProviderConfig>,
-) -> (Option<String>, Option<String>) {
-    if let Some((fam, al)) = zeroclaw_config::schema::provider_profile_ref(provider_name)
-        && let Some(entry) = config.providers.models.find(fam, al)
-    {
-        return (entry.api_key.clone(), entry.uri.clone());
-    }
-    (
-        fallback.and_then(|e| e.api_key.clone()),
-        fallback.and_then(|e| e.uri.clone()),
-    )
-}
-
 /// Project a typed terminal-completion failure only at the direct CLI boundary.
 ///
 /// The typed error's `Display` remains the stable diagnostic used by provider
@@ -1245,7 +1229,6 @@ pub async fn run(
         let eff_max_history_messages = agent.resolved.max_history_messages;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
-        let eff_model_context_window = agent.resolved.model_context_window;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
@@ -1458,26 +1441,26 @@ pub async fn run(
             })?
             .to_string();
 
-        // Resolve the model selection from the reference actually in effect
-        // (a `--provider` override wins over the agent's configured ref). This
-        // honors three-segment `<family>.<alias>.<model_alias>` refs, picking
-        // the model entry's `id` (and its per-model tuning below) rather than
-        // the profile's base `model`.
-        let model_selection = config.resolve_model_selection(
-            provider_override
-                .as_deref()
-                .unwrap_or_else(|| agent.model_provider.as_str()),
-        );
-        let mut model_name = match model_override
-            .as_deref()
-            .or_else(|| model_selection.as_ref().and_then(|s| s.model_id.as_deref()))
-        {
-            Some(m) => m.to_string(),
-            None => anyhow::bail!(
-                "no model configured for agent {agent_alias}: \
-             [providers.models.{provider_name}.<alias>].model is unset and --model was not passed"
-            ),
-        };
+        // Build the complete model runtime from the reference actually in
+        // effect (a `--provider` override wins over the agent's configured
+        // ref, a `--model` override over the resolved model id). The raw ref
+        // — two- or three-segment, or a bare family for `--provider <family>`
+        // — reaches the construction chain; the committed name is the
+        // normalised two-segment billing key. `model_temperature` is the
+        // config-derived base (`entry ∨ profile`); the CLI flag overlays it
+        // per request below, and a mid-run switch re-derives it.
+        let entry_rt = crate::agent::agent::build_model(
+            &config,
+            agent_alias,
+            &provider_name,
+            model_override.as_deref(),
+            crate::agent::agent::BuildCredentials::Switch,
+        )?;
+        let mut model_provider = entry_rt.provider;
+        let mut model_temperature = entry_rt.temperature;
+        let mut model_name = entry_rt.model_name;
+        provider_name = entry_rt.provider_name;
+        let mut eff_model_context_window = entry_rt.context_window;
 
         {
             let span = zeroclaw_log::Span::current();
@@ -1488,45 +1471,6 @@ pub async fn run(
             span.record("model_provider", mp_composite.as_str());
             span.record("model", model_name.as_str());
         }
-
-        let agent_runtime_options = match agent_provider_resolved.as_ref() {
-            Some((ty, alias, _)) => {
-                zeroclaw_providers::provider_runtime_options_for_alias(&config, ty, alias)
-            }
-            None => zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias),
-        };
-        // Resolve every alias-owned option, including vision, through the shared
-        // provider-ref resolver. This keeps a --provider override isolated from
-        // the agent alias without a second capability-specific lookup.
-        let mut provider_runtime_options = zeroclaw_providers::options_for_provider_ref(
-            &config,
-            &provider_name,
-            &agent_runtime_options,
-        );
-        // Overlay per-model tuning (max_tokens/think/vision/native_tools/…)
-        // for the selected model entry on top of the profile-level options.
-        zeroclaw_providers::apply_model_entry_options(
-            &mut provider_runtime_options,
-            model_selection.as_ref().and_then(|s| s.model_entry),
-        );
-
-        // Resolve api_key and uri from the actual provider being constructed.
-        // For dotted aliases (e.g. "openai.shartgpt"), look up the alias-specific
-        // config so a -p override does not leak the agent's current provider key
-        // (e.g. an xai key) to a different provider family that doesn't expect it.
-        let (initial_api_key, initial_uri) =
-            api_key_and_uri_for_provider(&config, &provider_name, agent_model_provider);
-        let mut model_provider: Box<dyn ModelProvider> =
-            zeroclaw_providers::create_routed_model_provider_with_options(
-                &config,
-                &provider_name,
-                initial_api_key.as_deref(),
-                initial_uri.as_deref(),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
 
         let mut turn_guard = crate::observability::AgentTurnGuard::start(
             observer.as_ref(),
@@ -1790,10 +1734,13 @@ pub async fn run(
                 thinking_level,
                 &agent.resolved.thinking,
             );
-            let effective_temperature: Option<f64> = model_selection
-                .as_ref()
-                .and_then(|s| s.model_entry.and_then(|m| m.temperature))
-                .or(temperature)
+            // The CLI flag is an explicit per-invocation override; the model
+            // runtime's config-derived temperature (`entry ∨ profile`) is the
+            // base. The flag wins when both are set, matching the session
+            // override semantics on the RPC side. Mutable: a mid-run switch
+            // re-derives it from the new model below.
+            let mut effective_temperature: Option<f64> = temperature
+                .or(model_temperature)
                 .map(|t| {
                     crate::agent::thinking::clamp_temperature(
                         t + thinking_params.temperature_adjustment,
@@ -2048,44 +1995,34 @@ pub async fn run(
                                 )
                             );
 
-                            let (switch_api_key, switch_uri) = api_key_and_uri_for_provider(
+                            // Rebuild the complete runtime from scratch — same
+                            // constructor as the initial construction. The
+                            // switch policy lets a keyless target borrow the
+                            // agent's credential; the raw ref (three-segment
+                            // switches carry the entry's tuning) reaches the
+                            // construction chain, and the derived values
+                            // (temperature, billing name) move with the new
+                            // model.
+                            let rt = crate::agent::agent::build_model(
                                 &config,
+                                agent_alias,
                                 &new_model_provider,
-                                agent_model_provider,
-                            );
-                            // Profile-level options plus the selected model
-                            // entry's per-model tuning — a three-segment switch
-                            // ref must carry the nested entry's knobs.
-                            let mut switch_options =
-                                zeroclaw_providers::options_for_provider_ref(
-                                    &config,
-                                    &new_model_provider,
-                                    &zeroclaw_providers::provider_runtime_options_for_agent(
-                                        &config,
-                                        agent_alias,
-                                    ),
-                                );
-                            zeroclaw_providers::apply_model_entry_options(
-                                &mut switch_options,
-                                config
-                                    .resolve_model_selection(&new_model_provider)
-                                    .as_ref()
-                                    .and_then(|s| s.model_entry),
-                            );
-                            model_provider =
-                                zeroclaw_providers::create_routed_model_provider_with_options(
-                                    &config,
-                                    &new_model_provider,
-                                    switch_api_key.as_deref(),
-                                    switch_uri.as_deref(),
-                                    &config.reliability,
-                                    &config.model_routes,
-                                    &new_model,
-                                    &switch_options,
-                                )?;
-
-                            provider_name = new_model_provider;
-                            model_name = new_model;
+                                Some(&new_model),
+                                crate::agent::agent::BuildCredentials::Switch,
+                            )?;
+                            model_provider = rt.provider;
+                            provider_name = rt.provider_name;
+                            model_name = rt.model_name;
+                            model_temperature = rt.temperature;
+                            // The retry below re-reads `effective_temperature`
+                            // when rebuilding the model access — re-derive it
+                            // from the switched model so the retry (and every
+                            // later turn) runs at the new model's temperature.
+                            effective_temperature = temperature.or(model_temperature).map(|t| {
+                                crate::agent::thinking::clamp_temperature(
+                                    t + thinking_params.temperature_adjustment,
+                                )
+                            });
 
                             turn_guard.set_model_route(provider_name.clone(), model_name.clone());
 
@@ -2332,7 +2269,11 @@ pub async fn run(
                     thinking_level,
                     &agent.resolved.thinking,
                 );
-                let turn_temperature: Option<f64> = temperature.map(|t| {
+                // Same composition as the first message: explicit CLI flag
+                // over the model runtime's config-derived temperature. Before
+                // this, interactive turns dropped the entry-level temperature
+                // entirely — only the CLI param was consulted.
+                let turn_temperature: Option<f64> = temperature.or(model_temperature).map(|t| {
                     crate::agent::thinking::clamp_temperature(
                         t + thinking_params.temperature_adjustment,
                     )
@@ -2622,45 +2563,20 @@ pub async fn run(
                                     )
                                 );
 
-                                let (switch_api_key2, switch_uri2) = api_key_and_uri_for_provider(
+                                // Same rebuild as the one-shot path above —
+                                // one construction site for both loops.
+                                let rt = crate::agent::agent::build_model(
                                     &config,
+                                    agent_alias,
                                     &new_model_provider,
-                                    agent_model_provider,
-                                );
-                                // Profile-level options plus the selected model
-                                // entry's per-model tuning — a three-segment
-                                // switch ref must carry the nested entry's
-                                // knobs.
-                                let mut switch_options2 =
-                                    zeroclaw_providers::options_for_provider_ref(
-                                        &config,
-                                        &new_model_provider,
-                                        &zeroclaw_providers::provider_runtime_options_for_agent(
-                                            &config,
-                                            agent_alias,
-                                        ),
-                                    );
-                                zeroclaw_providers::apply_model_entry_options(
-                                    &mut switch_options2,
-                                    config
-                                        .resolve_model_selection(&new_model_provider)
-                                        .as_ref()
-                                        .and_then(|s| s.model_entry),
-                                );
-                                model_provider =
-                                    zeroclaw_providers::create_routed_model_provider_with_options(
-                                        &config,
-                                        &new_model_provider,
-                                        switch_api_key2.as_deref(),
-                                        switch_uri2.as_deref(),
-                                        &config.reliability,
-                                        &config.model_routes,
-                                        &new_model,
-                                        &switch_options2,
-                                    )?;
-
-                                provider_name = new_model_provider;
-                                model_name = new_model;
+                                    Some(&new_model),
+                                    crate::agent::agent::BuildCredentials::Switch,
+                                )?;
+                                model_provider = rt.provider;
+                                provider_name = rt.provider_name;
+                                model_name = rt.model_name;
+                                model_temperature = rt.temperature;
+                                eff_model_context_window = rt.context_window;
 
                                 turn_guard
                                     .set_model_route(provider_name.clone(), model_name.clone());
@@ -2946,7 +2862,7 @@ pub async fn process_message(
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-        let (provider_name, provider_alias, agent_model_provider) = match config
+        let (_, _, agent_model_provider) = match config
             .resolved_model_provider_for_agent(agent_alias)
         {
             Some(resolved) => (resolved.0, resolved.1.to_string(), Some(resolved.2.clone())),
@@ -2964,10 +2880,6 @@ pub async fn process_message(
                 );
             }
         };
-        // Resolve the (possibly three-segment) model selection so a
-        // `<family>.<alias>.<model_alias>` ref picks the model entry's `id`
-        // and per-model tuning rather than the profile base `model`.
-        let model_selection = config.resolve_model_selection(agent.model_provider.as_str());
         let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
         let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
             &config,
@@ -3093,45 +3005,21 @@ pub async fn process_message(
             );
         }
 
-        let model_name = match model_selection
-            .as_ref()
-            .and_then(|s| s.model_id.as_deref())
-            .or_else(|| {
-                agent_model_provider
-                    .as_ref()
-                    .and_then(|e| e.model.as_deref())
-            })
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
-            Some(m) => m.to_string(),
-            None => anyhow::bail!(
-                "agents.{agent_alias}.model_provider resolves to a model_provider entry with no \
-             `model` set. Configure [providers.models.{provider_name}.<alias>] model = \"...\"."
-            ),
-        };
-        let mut provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+        // Build the complete model runtime from the agent's configured ref —
+        // the same constructor every other path uses. A three-segment ref
+        // carries the selected entry's tuning, and the raw ref reaches the
+        // construction chain (a normalised two-segment ref would clobber the
+        // selected entry's overlay with `models.default`'s).
+        let entry_rt = crate::agent::agent::build_model(
             &config,
-            provider_name,
-            provider_alias.as_str(),
-        );
-        zeroclaw_providers::apply_model_entry_options(
-            &mut provider_runtime_options,
-            model_selection.as_ref().and_then(|s| s.model_entry),
-        );
-        let model_provider: Box<dyn ModelProvider> =
-            zeroclaw_providers::create_routed_model_provider_with_options(
-                &config,
-                &format!("{provider_name}.{provider_alias}"),
-                agent_model_provider
-                    .as_ref()
-                    .and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.as_ref().and_then(|e| e.uri.as_deref()),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
+            agent_alias,
+            agent.model_provider.as_str(),
+            None,
+            crate::agent::agent::BuildCredentials::Switch,
+        )?;
+        let model_provider = entry_rt.provider;
+        let provider_name = entry_rt.provider_name;
+        let model_name = entry_rt.model_name;
 
         let hardware_rag: Option<crate::rag::HardwareRag> = config
             .peripherals
@@ -3318,15 +3206,9 @@ pub async fn process_message(
             thinking_level,
             &agent.resolved.thinking,
         );
-        let effective_temperature: Option<f64> = model_selection
-            .as_ref()
-            .and_then(|s| s.model_entry.and_then(|m| m.temperature))
-            .or_else(|| agent_model_provider.as_ref().and_then(|e| e.temperature))
-            .map(|t| {
-                crate::agent::thinking::clamp_temperature(
-                    t + thinking_params.temperature_adjustment,
-                )
-            });
+        let effective_temperature: Option<f64> = entry_rt.temperature.map(|t| {
+            crate::agent::thinking::clamp_temperature(t + thinking_params.temperature_adjustment)
+        });
 
         // Prepend thinking system prompt prefix when present.
         if let Some(ref prefix) = thinking_params.system_prompt_prefix {
@@ -3417,7 +3299,7 @@ pub async fn process_message(
                     &mut history,
                     &tools_registry,
                     observer.as_ref(),
-                    provider_name,
+                    &provider_name,
                     &model_name,
                     effective_temperature,
                     true,

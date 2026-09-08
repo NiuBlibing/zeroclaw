@@ -647,7 +647,8 @@ Examples:
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature (0.0 - 2.0, defaults to `providers.models.<type>.<alias>.temperature`)
+        /// Temperature (0.0 - 2.0; defaults to the selected model's configured
+        /// temperature — the model entry's, else the provider profile's)
         #[arg(short, long, value_parser = parse_temperature)]
         temperature: Option<f64>,
 
@@ -4948,11 +4949,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
             temperature,
             peripheral,
         } => {
-            let final_temperature: Option<f64> = temperature.or_else(|| {
-                config
-                    .model_provider_for_agent(&agent_alias)
-                    .and_then(|e| e.temperature)
-            });
+            // `temperature` reaches `run` as the explicit per-invocation
+            // override only. The config-derived default (`entry ∨ profile`)
+            // is resolved inside the run loop from the model actually in
+            // effect, so it follows `--provider`/`--model` overrides and
+            // mid-run switches.
+            let final_temperature = temperature;
 
             // Validate up-front: bail with a clear message if the alias
             // isn't configured. The runtime would error too, but this
