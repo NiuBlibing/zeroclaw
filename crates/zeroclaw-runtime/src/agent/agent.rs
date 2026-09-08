@@ -1799,25 +1799,30 @@ impl Agent {
             policy
         });
 
-        let (provider_name, provider_alias, agent_model_provider) =
-            match config.resolved_model_provider_for_agent(agent_alias) {
-                Some(resolved) => (resolved.0, resolved.1, Some(resolved.2)),
-                None => {
-                    let agent_ref = agent_cfg.model_provider.as_str();
-                    if !agent_ref.is_empty() {
-                        anyhow::bail!(
-                            "agents.{agent_alias}.model_provider = \"{agent_ref}\" does not \
-                             resolve to a configured [providers.models.<type>.<alias>] entry"
-                        );
-                    }
-                    // V3 schema requires every agent to set model_provider.
-                    // Empty is a config error rather than a silent fallback.
+        // The provider resolution here is a guard: it proves the agent's ref
+        // names a configured profile before anything is built (the model
+        // runtime itself is built from the raw ref further below). Only the
+        // profile entry survives — the memory backend wants its api_key.
+        let (_, _, agent_model_provider) = match config
+            .resolved_model_provider_for_agent(agent_alias)
+        {
+            Some(resolved) => (resolved.0, resolved.1, Some(resolved.2)),
+            None => {
+                let agent_ref = agent_cfg.model_provider.as_str();
+                if !agent_ref.is_empty() {
                     anyhow::bail!(
-                        "agents.{agent_alias}.model_provider is empty — set it to a \
-                         configured \"<type>.<alias>\" (e.g. \"anthropic.{agent_alias}\")"
+                        "agents.{agent_alias}.model_provider = \"{agent_ref}\" does not \
+                         resolve to a configured [providers.models.<type>.<alias>] entry"
                     );
                 }
-            };
+                // V3 schema requires every agent to set model_provider.
+                // Empty is a config error rather than a silent fallback.
+                anyhow::bail!(
+                    "agents.{agent_alias}.model_provider is empty — set it to a \
+                     configured \"<type>.<alias>\" (e.g. \"anthropic.{agent_alias}\")"
+                );
+            }
+        };
         let memory: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
             config,
             agent_alias,
@@ -1949,56 +1954,20 @@ impl Agent {
         // takes a `ScopedToolRegistry`, so no `into_inner()` unwrap here.
         let tools = registry;
 
-        // Resolve the (possibly three-segment) model_provider ref into the
-        // selected model entry, so a single provider profile can host multiple
-        // models. Two-segment refs fall back to the legacy single-model path.
-        let selection = config.resolve_model_selection(agent_cfg.model_provider.as_str());
-        let model_identity = selection.as_ref().map(|s| s.identity(None));
-        let model_selection_temperature =
-            selection.as_ref().and_then(|s| s.model_entry?.temperature);
-        let model_entry_owned = selection.as_ref().and_then(|s| s.model_entry.cloned());
-
-        let model_name = match selection
-            .as_ref()
-            .and_then(|s| s.model_id.clone())
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string)
-        {
-            Some(m) => m,
-            None => anyhow::bail!(
-                "agents.{agent_alias}.model_provider resolves to a model_provider entry \
-                 with no model id. Set [providers.models.{provider_name}.<alias>] model = \"...\" \
-                 or a [providers.models.{provider_name}.<alias>.models.<name>] id = \"...\".",
-            ),
-        };
-
-        let provider_ref = format!("{provider_name}.{provider_alias}");
-        let mut provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+        // Build the complete model runtime from the agent's configured ref —
+        // the same constructor every other path uses (switches, live
+        // refresh, session overrides). The raw ref reaches the construction
+        // chain so a three-segment agent ref carries the selected entry's
+        // tuning; TargetOnly credentials because a config-driven
+        // construction must not borrow another profile's key.
+        let entry_rt = build_model(
             config,
-            provider_name,
-            provider_alias,
-        );
-        zeroclaw_providers::apply_model_entry_options(
-            &mut provider_runtime_options,
-            model_entry_owned.as_ref(),
-        );
-
-        let model_provider: Box<dyn ModelProvider> =
-            zeroclaw_providers::create_routed_model_provider_with_options(
-                config,
-                &provider_ref,
-                agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.and_then(|e| e.uri.as_deref()),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
-
-        let tool_dispatcher =
-            tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref(), &model_name);
+            agent_alias,
+            agent_cfg.model_provider.as_str(),
+            None,
+            BuildCredentials::TargetOnly,
+        )
+        .with_context(|| format!("agents.{agent_alias}.model_provider"))?;
 
         let route_model_by_hint: HashMap<String, String> = config
             .model_routes
@@ -2043,12 +2012,12 @@ impl Agent {
         #[cfg(test)]
         let builder = builder.delegate_tool(built_delegate_tool);
         let mut agent = builder
-            .model_provider(model_provider)
+            .model_provider(entry_rt.provider)
             .tools(tools)
             .memory(memory.clone())
             .observer(observer)
             .response_cache(response_cache)
-            .tool_dispatcher(tool_dispatcher)
+            .tool_dispatcher(entry_rt.tool_dispatcher)
             .memory_inject_cfg(
                 crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                     &config.memory,
@@ -2065,20 +2034,10 @@ impl Agent {
             .structured_history_cap_resolver(structured_history_cap_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
-            .model_name(model_name)
-            .model_provider_name(provider_ref.clone())
-            .model_identity(model_identity.unwrap_or_else(|| {
-                zeroclaw_config::schema::ModelIdentity {
-                    family: provider_name.to_string(),
-                    alias: provider_alias.to_string(),
-                    entry_alias: None,
-                    model_id: String::new(),
-                }
-            }))
-            .temperature(
-                model_selection_temperature
-                    .or_else(|| agent_model_provider.and_then(|e| e.temperature)),
-            )
+            .model_name(entry_rt.model_name)
+            .model_provider_name(entry_rt.provider_name)
+            .model_identity(entry_rt.identity)
+            .temperature(entry_rt.temperature)
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
             .classification_config(config.query_classification.clone())
