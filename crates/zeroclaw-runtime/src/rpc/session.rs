@@ -246,8 +246,9 @@ impl SessionStore {
     /// under ONE permit acquisition: the transcript is only read after the
     /// predecessor turn has fully finalized, and no prompt can be admitted
     /// against the successor until the caller drops its guard after the
-    /// history restore. Re-acquiring the permit internally (as [`insert`]
-    /// does) would deadlock against the caller's guard.
+    /// history restore. Re-acquiring the permit internally (as
+    /// [`SessionStore::insert`](Self::insert) does) would deadlock against
+    /// the caller's guard.
     ///
     /// The caller must hold `admission` for exactly `id` (debug-asserted)
     /// and must keep it alive until the published session is fully restored.
@@ -265,7 +266,8 @@ impl SessionStore {
         self.publish_session(&id, session).await
     }
 
-    /// Map-write half shared by [`insert`] and [`insert_admitted`]: stamp the
+    /// Map-write half shared by [`SessionStore::insert`](Self::insert) and
+    /// [`insert_admitted`](Self::insert_admitted): stamp the
     /// incarnation generation and publish. Callers own the admission
     /// boundary.
     async fn publish_session(
