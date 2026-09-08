@@ -109,11 +109,11 @@ pub enum BuiltinPredicate {
     SupervisedMediumRisk,
 }
 
-/// Where a rule came from. `Explicit` rules (user-written
-/// `tool_policy.rules`) are the only `Allow` source that can carve out of
-/// the overridable risk-default `Ask` tiers; legacy and session `Allow`
-/// rules cannot (the design decision behind RFC 7155 §2.2's
-/// `Shell(cargo test:*) = allow` example).
+/// Where a rule came from. Under the strict `Deny > Ask > Allow`
+/// precedence (RFC 7155 §1.3, confirmed by the approving Core ballot) no
+/// `Allow` source — explicit, legacy, or session — can downgrade a
+/// matching `Ask`; the source is provenance for audit records and the
+/// shadowing warnings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuleSource {
     /// User-written in `risk_profiles.<alias>.tool_policy.rules`.
@@ -167,12 +167,17 @@ pub enum RuleMatcher {
 pub struct PolicyRule {
     pub matcher: RuleMatcher,
     pub decision: Decision,
-    /// `false` = hard rule: no `Allow` of any source may override it.
-    /// Hard rules: `always_ask`, the High-risk block, read-only autonomy,
-    /// and every explicit user `Deny`/`Ask` (a matched `Ask` is mandatory
-    /// approval — RFC 7155 §1.3: "Allow rules and auto_approve cannot
-    /// downgrade it" — so it must survive any `Allow`). Only the legacy
-    /// Supervised risk-tier predicates stay overridable.
+    /// Whether the rule was compiled as hard (`false`: `always_ask`, the
+    /// High-risk block, read-only autonomy, every explicit user
+    /// `Deny`/`Ask`) or as a risk default (`true`: the legacy Supervised
+    /// risk-tier predicates).
+    ///
+    /// Under the strict `Deny > Ask > Allow` precedence (confirmed by the
+    /// approving Core ballot) this flag is NOT consulted by the resolver:
+    /// a matched `Ask` beats every `Allow` regardless. It is kept as rule
+    /// provenance for audit output and for the Phase 2 scope-merge
+    /// semantics, where source precedence can distinguish tiers at equal
+    /// strictness.
     pub overridable: bool,
     pub source: RuleSource,
 }
@@ -999,18 +1004,16 @@ impl Resolution {
 /// Adjudicate a tool action against the scopes: the single authority
 /// (RFC 7155 §3.2).
 ///
-/// Per matched-rule precedence — the algorithm of record, step by step:
+/// Strict precedence, confirmed by the approving Core ballot — a matching
+/// `Ask` prompts even when a more specific `Allow` also matches:
 ///
 /// 1. any matched `Deny` → `Deny` (absolute: any source, including the
 ///    High-risk block predicate);
-/// 2. any matched hard `Ask` (`always_ask`, explicit user `Ask`) → `Ask`;
-/// 3. any matched `Allow` with source `Explicit` → `Allow` — the precise
-///    carve-out that lifts the *overridable* risk-default `Ask` tiers
-///    (step 4) but never steps 1–2;
-/// 4. any matched `Ask` (the Supervised risk-tier predicates) → `Ask`;
-/// 5. any matched `Allow` (legacy allowlist / auto-approve / session) →
-///    `Allow`;
-/// 6. no match → `Ask` (fail-closed into approval).
+/// 2. any matched `Ask` (`always_ask`, explicit user `Ask`, the Supervised
+///    risk tiers) → `Ask` — never downgraded by any `Allow`;
+/// 3. any matched `Allow` (explicit rule, legacy allowlist, session
+///    grant) → `Allow`;
+/// 4. no match → `Ask` (fail-closed into approval).
 ///
 /// Compound commands resolve segment-by-segment and combine to the most
 /// restrictive decision. Degraded parses downgrade an apparent `Allow` to
@@ -1130,7 +1133,10 @@ fn resolve_segment(
     resolve_matched_rules(matched)
 }
 
-/// The six-step algorithm over the matched rules.
+/// The precedence algorithm over the matched rules: strict
+/// `Deny > Ask > Allow`, unmatched → `Ask` (RFC 7155 §1.3, confirmed by the
+/// approving Core ballot: a matching `Ask` prompts even when a more
+/// specific `Allow` also matches).
 fn resolve_matched_rules<'r, I>(matched: I) -> Resolution
 where
     I: Iterator<Item = &'r PolicyRule>,
@@ -1154,40 +1160,10 @@ where
             },
         );
     }
-    // Step 2: hard Ask (always_ask, explicit user Ask).
-    if let Some(rule) = matched
-        .iter()
-        .find(|rule| rule.decision == Decision::Ask && !rule.overridable)
-    {
-        return Resolution::new(
-            Decision::Ask,
-            ResolutionReason::MatchedRule {
-                decision: Decision::Ask,
-                source: rule.source.clone(),
-                pattern: describe_matcher(&rule.matcher),
-            },
-        );
-    }
-    // Step 3: an Explicit or Session Allow lifts the overridable
-    // risk-default Ask. Both are precise operator allowances — one written
-    // in config, one granted live by an "always approve" answer (RFC 7155
-    // §3.3.4: an Always grant crosses the risk-default Ask exactly like
-    // today's session allowlist did, but never Deny and never a hard Ask).
-    // Neither crosses steps 1–2.
-    if let Some(rule) = matched.iter().find(|rule| {
-        rule.decision == Decision::Allow
-            && matches!(rule.source, RuleSource::Explicit | RuleSource::Session)
-    }) {
-        return Resolution::new(
-            Decision::Allow,
-            ResolutionReason::MatchedRule {
-                decision: Decision::Allow,
-                source: rule.source.clone(),
-                pattern: describe_matcher(&rule.matcher),
-            },
-        );
-    }
-    // Step 4: overridable Ask (the Supervised risk tiers).
+    // Step 2: Ask is mandatory approval — hard asks (always_ask, explicit
+    // user Ask) and the Supervised risk tiers alike. NO Allow of any
+    // source (explicit rule, legacy allowlist, session grant) may
+    // downgrade it.
     if let Some(rule) = matched.iter().find(|rule| rule.decision == Decision::Ask) {
         return Resolution::new(
             Decision::Ask,
@@ -1210,7 +1186,8 @@ where
             },
         );
     }
-    // Step 5: legacy / session Allow.
+    // Step 3: Allow (explicit rule, legacy allowlist entry, or session
+    // grant — all the same tier).
     if let Some(rule) = matched.iter().find(|rule| rule.decision == Decision::Allow) {
         return Resolution::new(
             Decision::Allow,
@@ -1221,7 +1198,7 @@ where
             },
         );
     }
-    // Step 6: fail-closed default.
+    // Step 4: fail-closed default.
     Resolution::new(Decision::Ask, ResolutionReason::Unmatched)
 }
 
@@ -1269,42 +1246,29 @@ fn arg_pattern_matches(arg_pattern: &Option<ArgPattern>, segment: &ShellSegment)
 }
 
 /// Today's `is_command_explicitly_allowed`, compiled-table form: every
-/// segment matches a non-wildcard allowlist entry — or, additionally, an
-/// Explicit-source `Allow` rule, which is the same kind of precise operator
-/// allowance (this is what lets `Shell(rm:*) = allow` exempt from the
-/// High-risk block exactly like a non-wildcard `allowed_commands` entry).
+/// segment matches a non-wildcard `allowed_commands` entry. That is the
+/// ONLY thing that exempts from the High-risk block — the exact legacy
+/// exception, nothing more.
 ///
-/// Session grants deliberately do NOT count: an "always approve" answer is
-/// a live, session-scoped grant and must never defeat the hard
-/// `block_high_risk_commands` Deny — today's session allowlist never
-/// exempted the block either (it only suppressed the approval ask).
+/// Explicit `tool_policy` Allow rules and session grants deliberately do
+/// NOT count: under the strict `Deny > Ask > Allow` precedence (confirmed
+/// by the approving Core ballot), a hard `Deny` predicate must not be
+/// defeatable by any `Allow` source, and "explicitly allowlisted" is a
+/// statement about the legacy allowlist, not about user-written rules.
 fn command_explicitly_allowed(shell: &ShellAction, scopes: &ResolvedScopes) -> bool {
     if shell.segments.is_empty() {
         return false;
     }
     shell.segments.iter().all(|segment| {
-        scopes
-            .profile
-            .rules()
-            .iter()
-            .chain(scopes.session_rules.iter())
-            .any(|rule| match (&rule.source, &rule.matcher) {
+        scopes.profile.rules().iter().any(|rule| {
+            matches!(
+                (&rule.source, &rule.matcher),
                 (
                     RuleSource::Legacy(LegacyField::AllowedCommands),
                     RuleMatcher::ShellCommand { executable, .. },
-                ) => is_allowlist_entry_match(executable, &segment.executable, &segment.base),
-                (
-                    RuleSource::Explicit,
-                    RuleMatcher::ShellCommand {
-                        executable,
-                        arg_pattern,
-                    },
-                ) if rule.decision == Decision::Allow => {
-                    is_allowlist_entry_match(executable, &segment.executable, &segment.base)
-                        && arg_pattern_matches(arg_pattern, segment)
-                }
-                _ => false,
-            })
+                ) if is_allowlist_entry_match(executable, &segment.executable, &segment.base)
+            )
+        })
     })
 }
 
@@ -1949,27 +1913,42 @@ mod tests {
     }
 
     #[test]
-    fn explicit_allow_lifts_risk_default_ask() {
+    fn explicit_allow_does_not_lift_risk_default_ask() {
         let mut cfg = profile(AutonomyLevel::Supervised, &[]);
+        cfg.tool_policy.rules = vec![PolicyRuleConfig {
+            pattern: "Shell(git push:*)".into(),
+            decision: Decision::Allow,
+        }];
+        // git push is Medium risk under Supervised → the risk-tier Ask.
+        // A matching Ask prompts even when a more specific Allow also
+        // matches (strict Deny > Ask > Allow, confirmed by the approving
+        // Core ballot) — the explicit Allow rule cannot downgrade it.
+        let resolution = resolve_with(&cfg, "git push", ShellDialect::Posix);
+        assert_eq!(resolution.decision, Decision::Ask);
+        assert_eq!(
+            resolution.reason,
+            ResolutionReason::SupervisedRiskAsk {
+                level: CommandRiskLevel::Medium
+            }
+        );
+        // An explicit Allow still covers the unmatched default (the RFC's
+        // `Shell(cargo test:*) = allow` example: a low-risk, unallowlisted
+        // command runs without a prompt because the rule matches).
         cfg.tool_policy.rules = vec![PolicyRuleConfig {
             pattern: "Shell(cargo test:*)".into(),
             decision: Decision::Allow,
         }];
-        // cargo test is Medium risk under Supervised → legacy-compiled Ask,
-        // but the explicit rule is the precise carve-out (the RFC 7155
-        // §2.2 example).
         let resolution = resolve_with(&cfg, "cargo test --lib", ShellDialect::Posix);
         assert_eq!(resolution.decision, Decision::Allow);
     }
 
     #[test]
-    fn explicit_allow_exempts_high_risk_block_like_precise_allowlist() {
-        // A precise non-wildcard allowlist entry exempts a High-risk
-        // command from the block_high_risk block today
-        // (is_command_explicitly_allowed). An explicit Allow rule is the
-        // same kind of precise operator allowance: it exempts from the
-        // block, and then lifts the overridable Supervised High-risk Ask
-        // (step 3 over step 4) — the user wrote exactly this allowance.
+    fn explicit_allow_does_not_exempt_high_risk_block() {
+        // A precise non-wildcard `allowed_commands` entry exempts a
+        // High-risk command from the block_high_risk block today — that
+        // legacy exception is preserved. An explicit `tool_policy` Allow
+        // rule is NOT an exemption: under strict precedence a hard Deny
+        // predicate cannot be defeated by any Allow source.
         let mut cfg = profile(AutonomyLevel::Supervised, &[]);
         cfg.block_high_risk_commands = true;
         cfg.tool_policy.rules = vec![PolicyRuleConfig {
@@ -1977,7 +1956,20 @@ mod tests {
             decision: Decision::Allow,
         }];
         let resolution = resolve_with(&cfg, "rm -rf /tmp/x", ShellDialect::Posix);
-        assert_eq!(resolution.decision, Decision::Allow);
+        assert_eq!(resolution.decision, Decision::Deny);
+        assert_eq!(resolution.reason, ResolutionReason::HighRiskBlocked);
+        // The legacy exemption still works: a non-wildcard allowlist
+        // entry keeps the block predicate from firing (then the
+        // Supervised High-risk Ask applies, as it always did).
+        let cfg = profile(AutonomyLevel::Supervised, &["rm"]);
+        let resolution = resolve_with(&cfg, "rm -rf /tmp/x", ShellDialect::Posix);
+        assert_eq!(resolution.decision, Decision::Ask);
+        assert_eq!(
+            resolution.reason,
+            ResolutionReason::SupervisedRiskAsk {
+                level: CommandRiskLevel::High
+            }
+        );
     }
 
     #[test]
@@ -2069,10 +2061,11 @@ mod tests {
     }
 
     #[test]
-    fn session_allow_crosses_risk_default_ask_but_not_the_block() {
-        // Mirrors today's session-allowlist behavior: an "Always" answer
-        // suppressed the Supervised approval ask (approved=true was
-        // injected) but never exempted the block_high_risk Deny.
+    fn session_allow_does_not_cross_risk_default_ask() {
+        // Strict precedence (Core ballot): a matching Ask prompts even
+        // when a session Allow also matches — an "Always" grant can no
+        // longer suppress the Supervised risk-tier asks, only the
+        // unmatched default and other Allow-tier outcomes.
         let cfg = profile(AutonomyLevel::Supervised, &["curl"]);
         let compiled = CompiledRuleSet::compile(&cfg);
         let session = vec![PolicyRule {
@@ -2090,15 +2083,15 @@ mod tests {
             profile: &compiled,
             session_rules: &session,
         };
-        // Allowlisted curl is High risk → Supervised ask; the narrow
-        // session grant crosses exactly that ask (step 3 over step 4).
+        // Allowlisted curl is High risk → Supervised ask; the session
+        // grant does NOT cross it.
         let action = extract_shell_action(
             "curl https://internal.corp/health",
             ShellDialect::Posix,
             None,
         );
-        assert_eq!(resolve_decision(&action, &scopes).decision, Decision::Allow);
-        // Outside the granted pattern, the ask stands.
+        assert_eq!(resolve_decision(&action, &scopes).decision, Decision::Ask);
+        // Outside the granted pattern, the ask stands too.
         let action = extract_shell_action("curl https://example.com", ShellDialect::Posix, None);
         assert_eq!(resolve_decision(&action, &scopes).decision, Decision::Ask);
 
@@ -2563,36 +2556,38 @@ mod tests {
         let mut cfg = profile(AutonomyLevel::Supervised, &[]);
         cfg.block_high_risk_commands = false;
         cfg.tool_policy.rules = vec![PolicyRuleConfig {
-            pattern: "Shell(git push)".into(),
+            pattern: "Shell(git status)".into(),
             decision: Decision::Allow,
         }];
-        // Literal: exactly `git push`, no more args.
+        // Literal: exactly `git status`, no more args. (`git status` is
+        // Low risk, so no risk-tier Ask competes with the rule and the
+        // matcher boundary is what is under test.)
         assert_eq!(
-            resolve_with(&cfg, "git push", ShellDialect::Posix).decision,
+            resolve_with(&cfg, "git status", ShellDialect::Posix).decision,
             Decision::Allow
         );
         assert_eq!(
-            resolve_with(&cfg, "git push --force", ShellDialect::Posix).decision,
+            resolve_with(&cfg, "git status --short", ShellDialect::Posix).decision,
             Decision::Ask
         );
     }
 
     #[test]
     fn rule_matching_respects_executable_boundary() {
-        // An Allow for `git push:*` must not authorize a name-sibling like
-        // `gitx`.
+        // An Allow for `git status:*` must not authorize a name-sibling
+        // like `gitx`. (Low-risk verb, so no risk-tier Ask competes.)
         let mut cfg = profile(AutonomyLevel::Supervised, &[]);
         cfg.block_high_risk_commands = false;
         cfg.tool_policy.rules = vec![PolicyRuleConfig {
-            pattern: "Shell(git push:*)".into(),
+            pattern: "Shell(git status:*)".into(),
             decision: Decision::Allow,
         }];
         assert_eq!(
-            resolve_with(&cfg, "git push origin", ShellDialect::Posix).decision,
+            resolve_with(&cfg, "git status --short", ShellDialect::Posix).decision,
             Decision::Allow
         );
         assert_eq!(
-            resolve_with(&cfg, "gitx push origin", ShellDialect::Posix).decision,
+            resolve_with(&cfg, "gitx status --short", ShellDialect::Posix).decision,
             Decision::Ask
         );
     }
