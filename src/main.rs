@@ -6062,30 +6062,48 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 )
             );
             println!();
+            // One ModelProvider header per profile, one Model line per
+            // configured model — nested entries each get their own line, so
+            // a profile hosting a `models` map no longer reports "(none)".
             let mut shown_provider = false;
-            for (family, alias, entry) in config.providers.models.iter_entries() {
-                let model = entry.model.as_deref().unwrap_or("(none)");
-                if shown_provider {
+            let mut shown_profile = String::new();
+            for configured in config.configured_model_entries(None) {
+                if configured.profile_ref != shown_profile {
+                    // First profile uses the emoji-anchored line; later ones
+                    // the indented variant — the original layout.
+                    let (key, fallback) = if shown_provider {
+                        ("cli-status-provider-indent", "ModelProvider")
+                    } else {
+                        ("cli-status-provider", "ModelProvider")
+                    };
                     println!(
                         "{}",
                         ta(
-                            "cli-status-provider-indent",
-                            &[("family", family), ("alias", alias)],
-                            "ModelProvider"
+                            key,
+                            &[
+                                ("family", configured.profile_ref.split('.').next().unwrap_or("")),
+                                ("alias", configured.profile_ref.split_once('.').map_or("", |(_, a)| a)),
+                            ],
+                            fallback
                         )
                     );
-                    println!("{}", ta("cli-status-model", &[("model", model)], "Model"));
-                } else {
-                    println!(
-                        "{}",
-                        ta(
-                            "cli-status-provider",
-                            &[("family", family), ("alias", alias)],
-                            "ModelProvider"
-                        )
-                    );
-                    println!("{}", ta("cli-status-model", &[("model", model)], "Model"));
                     shown_provider = true;
+                    shown_profile = configured.profile_ref;
+                }
+                let model = configured.model_id.as_deref().unwrap_or("(none)");
+                match &configured.model_alias {
+                    Some(model_alias) => println!(
+                        "{}",
+                        ta(
+                            "cli-status-model-entry",
+                            &[("alias", model_alias), ("model", model)],
+                            "Model [{$alias}]: {$model}"
+                        )
+                    ),
+                    None => println!(
+                        "{}",
+                        ta("cli-status-model", &[("model", model)], "Model")
+                    ),
                 }
             }
             if !shown_provider {
@@ -9971,29 +9989,47 @@ async fn dispatch_models_command(model_command: ModelCommands, config: &mut Conf
         }
         ModelCommands::Set { model } => handle_models_set(config, &model).await,
         ModelCommands::Status => {
-            match config
-                .providers
-                .models
-                .iter_entries()
-                .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
-            {
-                Some((ty, alias, entry)) => {
-                    let model = entry.model.as_deref().unwrap_or("unknown");
-                    println!(
-                        "{}",
-                        crate::i18n::get_required_cli_string_with_args(
-                            "cli-models-status-current",
-                            &[("model", model), ("provider", &format!("{ty}.{alias}")),]
-                        )
-                    );
-                }
-                None => {
-                    println!(
-                        "{}",
-                        crate::i18n::get_required_cli_string("cli-models-status-none")
-                    );
-                }
-            }
+            // The same enumeration `models list` reports, so a nested-only
+            // configuration is no longer reported as "none". When the
+            // winning profile has a default resolution (`models.default` or
+            // a sole entry), that is the reported "Default model"; otherwise
+            // the first enumerated entry.
+            let Some(winner) = config
+                .configured_model_entries(None)
+                .into_iter()
+                .find(|entry| {
+                    entry
+                        .model_id
+                        .as_deref()
+                        .is_some_and(|m| !m.trim().is_empty())
+                })
+            else {
+                println!(
+                    "{}",
+                    crate::i18n::get_required_cli_string("cli-models-status-none")
+                );
+                return Ok(());
+            };
+            let (provider, model) = config
+                .resolve_model_selection(&winner.profile_ref)
+                .and_then(|s| s.model_id)
+                .filter(|m| !m.trim().is_empty())
+                .map(|m| (winner.profile_ref.clone(), m))
+                .unwrap_or_else(|| {
+                    (
+                        winner.provider_ref.clone(),
+                        winner
+                            .model_id
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    )
+                });
+            println!(
+                "{}",
+                crate::i18n::get_required_cli_string_with_args(
+                    "cli-models-status-current",
+                    &[("model", &model), ("provider", &provider)]
+                )
+            );
             Ok(())
         }
     }

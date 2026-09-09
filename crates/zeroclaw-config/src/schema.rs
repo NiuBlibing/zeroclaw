@@ -923,6 +923,24 @@ impl ModelSelection<'_> {
     }
 }
 
+/// One configured model as the CLI surfaces report it — the shared
+/// enumeration behind `models list` / `models status` / `zeroclaw status`
+/// and the doctor commands, so they can never disagree about what a
+/// profile hosts. Produced by [`Config::configured_model_entries`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredModelEntry {
+    /// `family.alias` on the legacy single-model path,
+    /// `family.alias.model_alias` when the profile hosts multiple models.
+    pub provider_ref: String,
+    /// The two-segment profile ref.
+    pub profile_ref: String,
+    /// The nested model entry's alias; `None` on the legacy path.
+    pub model_alias: Option<String>,
+    /// Resolved model id (the entry's `id`, else the profile `model`);
+    /// `None` when neither is set.
+    pub model_id: Option<String>,
+}
+
 /// Extract the `(family, alias)` provider-profile pair from a model_provider
 /// reference. Accepts both the two-segment `<family>.<alias>` form and the
 /// three-segment `<family>.<alias>.<model_alias>` form (the model alias is
@@ -4630,6 +4648,63 @@ impl Config {
             model_alias: model_entry.map(|(k, _)| k.to_string()),
             model_id,
         })
+    }
+
+    /// Enumerate every configured model across all provider profiles, as the
+    /// CLI surfaces (`models list/status`, `zeroclaw status`) and `doctor`
+    /// report them. A legacy single-model profile yields one entry with
+    /// `model_alias: None`; a profile hosting a `models` map yields one entry
+    /// per nested model alias (deterministically sorted), each resolving its
+    /// model id the same way [`Self::resolve_model_selection`] does.
+    ///
+    /// `provider_override` narrows the enumeration, matched by full
+    /// `type.alias` ref or by bare family name — the same filter the doctor
+    /// commands accept.
+    #[must_use]
+    pub fn configured_model_entries(
+        &self,
+        provider_override: Option<&str>,
+    ) -> Vec<ConfiguredModelEntry> {
+        let filter = provider_override.map(str::trim).filter(|p| !p.is_empty());
+        let mut entries = Vec::new();
+        for (ty, alias, entry) in self.providers.models.iter_entries() {
+            let profile_ref = format!("{ty}.{alias}");
+            let passes = match filter {
+                Some(f) => profile_ref == f || profile_ref.split('.').next() == Some(f),
+                None => true,
+            };
+            if !passes {
+                continue;
+            }
+            if !entry.models.is_empty() {
+                // One three-segment entry per nested model alias, using the
+                // resolved model id from the model entry (or profile
+                // fallback).
+                let mut model_aliases: Vec<&str> = entry.models.keys().map(String::as_str).collect();
+                model_aliases.sort_unstable();
+                for model_alias in model_aliases {
+                    let three_seg = format!("{profile_ref}.{model_alias}");
+                    let model_id = self
+                        .resolve_model_selection(&three_seg)
+                        .and_then(|s| s.model_id);
+                    entries.push(ConfiguredModelEntry {
+                        provider_ref: three_seg,
+                        profile_ref: profile_ref.clone(),
+                        model_alias: Some(model_alias.to_string()),
+                        model_id,
+                    });
+                }
+            } else {
+                // Legacy path: no nested models, the profile-level model.
+                entries.push(ConfiguredModelEntry {
+                    provider_ref: profile_ref.clone(),
+                    profile_ref,
+                    model_alias: None,
+                    model_id: entry.model.clone(),
+                });
+            }
+        }
+        entries
     }
 
     /// Reverse-lookup the agent alias that owns a configured channel
@@ -43894,6 +43969,72 @@ id = "gpt-4o"
         let overridden = three.identity(Some("custom-id"));
         assert_eq!(overridden.model_id, "custom-id");
         assert_ne!(overridden, three.identity(None));
+    }
+
+    #[::core::prelude::v1::test]
+    fn configured_model_entries_enumerates_nested_and_legacy_profiles() {
+        let raw = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+uri = "https://gw.internal/v1"
+model = "legacy-fallback"
+
+[providers.models.openai.gw.models.cheap]
+id = "gpt-4o-mini"
+
+[providers.models.openai.gw.models.big]
+id = "gpt-4o"
+
+[providers.models.groq.legacy]
+model = "llama-3.3-70b"
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+
+        // Nested profile: one entry per alias (sorted), each with its
+        // resolved id; the profile's legacy `model` is only a fallback.
+        // Legacy profile: one entry with the profile-level model.
+        let all = config.configured_model_entries(None);
+        let refs: Vec<&str> = all.iter().map(|e| e.provider_ref.as_str()).collect();
+        assert_eq!(
+            refs,
+            vec!["openai.gw.big", "openai.gw.cheap", "groq.legacy"]
+        );
+        let cheap = &all[1];
+        assert_eq!(cheap.profile_ref, "openai.gw");
+        assert_eq!(cheap.model_alias.as_deref(), Some("cheap"));
+        assert_eq!(cheap.model_id.as_deref(), Some("gpt-4o-mini"));
+        let legacy = &all[2];
+        assert_eq!(legacy.model_alias, None);
+        assert_eq!(legacy.model_id.as_deref(), Some("llama-3.3-70b"));
+
+        // An entry without an id falls back to the profile-level model.
+        let raw_no_id = r#"
+schema_version = 4
+
+[providers.models.openai.gw]
+model = "legacy-fallback"
+
+[providers.models.openai.gw.models.bare]
+temperature = 0.3
+"#;
+        let config: Config = toml::from_str(raw_no_id).unwrap();
+        let all = config.configured_model_entries(None);
+        assert_eq!(
+            all[0].model_id.as_deref(),
+            Some("legacy-fallback"),
+            "an id-less entry inherits the profile-level model"
+        );
+
+        // The filter narrows by full ref or bare family, matching the doctor
+        // commands.
+        let config: Config = toml::from_str(raw).unwrap();
+        assert_eq!(config.configured_model_entries(Some("openai.gw")).len(), 2);
+        assert_eq!(config.configured_model_entries(Some("groq")).len(), 1);
+        assert!(config
+            .configured_model_entries(Some("anthropic.missing")
+        )
+        .is_empty());
     }
 
     #[::core::prelude::v1::test]
