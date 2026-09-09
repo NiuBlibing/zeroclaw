@@ -776,11 +776,14 @@ impl AnthropicModelProvider {
     fn tool_result_content(content: &str) -> ToolResultContent {
         let (cleaned, refs) = crate::multimodal::parse_image_markers(content);
         if refs.is_empty() {
-            // The early return still sweeps. An unterminated marker yields zero
-            // references and copies its payload verbatim into the cleaned text,
-            // so returning here without sweeping would leave raw base64 in a
-            // text position on exactly the path that has no references.
-            return ToolResultContent::Text(Self::sweep_residual_image_data(content).into_owned());
+            // Sweep the *cleaned* text, never the original. An over-ceiling
+            // marker yields zero references and lands in `cleaned` as the
+            // fixed refusal note — returning the original instead would
+            // forward its raw oversized body past the marker ceiling. The
+            // sweep is still needed on top of `cleaned` because an
+            // unterminated marker also yields zero references and copies its
+            // payload verbatim into the cleaned text.
+            return ToolResultContent::Text(Self::sweep_residual_image_data(&cleaned).into_owned());
         }
 
         let (sources, omitted) = Self::deliverable_image_sources(&refs);
@@ -5762,6 +5765,60 @@ data: {\"type\":\"message_stop\"}\n\n";
             assert!(
                 !wire.contains(rejected_payload),
                 "{label}: the rejected payload must not reach the wire"
+            );
+        }
+    }
+
+    /// An oversized local-path marker in a tool result is refused with the
+    /// fixed note, never forwarded as raw text.
+    ///
+    /// The zero-reference early return in `tool_result_content` used to sweep
+    /// the *original* carrier, so a local marker over the parser's marker
+    /// ceiling reached the wire verbatim: the residual sweep only removes
+    /// data-URI-shaped material, and a path marker carries none. The early
+    /// return now sweeps the cleaned text, which carries the refusal note in
+    /// place of the body. The terminated and unterminated shapes both produce
+    /// zero references with refusal text in `cleaned`, so both must land on
+    /// the note.
+    #[test]
+    fn oversized_local_tool_result_marker_is_refused_not_forwarded() {
+        for (label, marker) in [
+            (
+                "terminated",
+                format!(
+                    "[IMAGE:/tmp/{}.png]",
+                    "A".repeat(crate::multimodal::MAX_IMAGE_MARKER_BYTES + 1)
+                ),
+            ),
+            (
+                "unterminated",
+                format!(
+                    "[IMAGE:/tmp/{}",
+                    "A".repeat(crate::multimodal::MAX_IMAGE_MARKER_BYTES + 1)
+                ),
+            ),
+        ] {
+            let messages = history_with_tool_result(&format!("screenshot {marker}"));
+
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let tool_result = first_tool_result_on_the_wire(&native_msgs);
+
+            let text = tool_result["content"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{label}: expected plain text content: {tool_result}"));
+            assert!(
+                text.contains("screenshot"),
+                "{label}: prose must survive: {text}"
+            );
+            assert!(
+                text.contains("[image omitted: image marker exceeds safety limit]"),
+                "{label}: the refusal note must replace the oversized marker: {text}"
+            );
+
+            let wire = serde_json::to_string(&native_msgs).expect("serialize");
+            assert!(
+                !wire.contains("AAAA"),
+                "{label}: the raw oversized body must not reach the wire"
             );
         }
     }
