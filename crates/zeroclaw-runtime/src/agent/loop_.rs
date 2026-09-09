@@ -1421,45 +1421,49 @@ pub async fn run(
 
         // ── Resolve model_provider ─────────────────────────────────────────
         let agent_provider_ref = agent_provider_composite(&config, agent_alias);
-        let mut provider_name = provider_override
+        // Guard first (same diagnostics as before): without a `--provider`
+        // override, the agent's ref must resolve to a configured profile.
+        if provider_override.is_none() && agent_provider_ref.is_none() {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"agent_alias": agent_alias})),
+                "agent loop refused: agent.model_provider unresolved and no --provider override"
+            );
+            anyhow::bail!(
+                "agents.{agent_alias}.model_provider does not resolve and no provider override \
+                 was passed on the CLI. Either set `[agents.{agent_alias}] model_provider` or \
+                 pass --provider."
+            );
+        }
+        // The RAW effective ref the runtime builds from (a `--provider`
+        // override wins over the agent's configured ref): a three-segment
+        // ref names the model entry to select, which the two-segment
+        // composite above cannot express.
+        let effective_model_ref = provider_override
             .as_deref()
-            .or(agent_provider_ref.as_deref())
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"agent_alias": agent_alias})),
-                    "agent loop refused: agent.model_provider unresolved and no --provider override"
-                );
-                anyhow::Error::msg(format!(
-                    "agents.{agent_alias}.model_provider does not resolve and no provider override \
-                     was passed on the CLI. Either set `[agents.{agent_alias}] model_provider` or \
-                     pass --provider."
-                ))
-            })?
-            .to_string();
+            .unwrap_or(agent.model_provider.as_str());
 
-        // Build the complete model runtime from the reference actually in
-        // effect (a `--provider` override wins over the agent's configured
-        // ref, a `--model` override over the resolved model id). The raw ref
-        // — two- or three-segment, or a bare family for `--provider <family>`
-        // — reaches the construction chain; the committed name is the
-        // normalised two-segment billing key. `model_temperature` is the
-        // config-derived base (`entry ∨ profile`); the CLI flag overlays it
-        // per request below, and a mid-run switch re-derives it.
+        // Build the complete model runtime from that reference. The raw ref
+        // — two- or three-segment, or a bare family for `--provider
+        // <family>` — reaches the construction chain; the committed name is
+        // the normalised two-segment billing key. `model_temperature` is
+        // the config-derived base (`entry ∨ profile`); the CLI flag
+        // overlays it per request below, and a mid-run switch re-derives
+        // it.
         let entry_rt = crate::agent::agent::build_model(
             &config,
             agent_alias,
-            &provider_name,
+            effective_model_ref,
             model_override.as_deref(),
             crate::agent::agent::BuildCredentials::Switch,
         )?;
         let mut model_provider = entry_rt.provider;
         let mut model_temperature = entry_rt.temperature;
         let mut model_name = entry_rt.model_name;
-        provider_name = entry_rt.provider_name;
+        let mut provider_name = entry_rt.provider_name;
         let mut eff_model_context_window = entry_rt.context_window;
 
         {
@@ -1739,9 +1743,8 @@ pub async fn run(
             // base. The flag wins when both are set, matching the session
             // override semantics on the RPC side. Mutable: a mid-run switch
             // re-derives it from the new model below.
-            let mut effective_temperature: Option<f64> = temperature
-                .or(model_temperature)
-                .map(|t| {
+            let mut effective_temperature: Option<f64> =
+                temperature.or(model_temperature).map(|t| {
                     crate::agent::thinking::clamp_temperature(
                         t + thinking_params.temperature_adjustment,
                     )
@@ -16303,6 +16306,118 @@ Let me check the result."#;
         .expect("single-shot run should finish");
         assert_eq!(response, "final answer");
 
+        server_handle.abort();
+    }
+
+    /// The run entry must build from the agent's RAW ref: a three-segment
+    /// agent ref names a specific model entry, and a profile hosting several
+    /// entries without a `models.default` resolves nothing at the
+    /// two-segment composite. Passing the composite into the model
+    /// construction stranded such configs with "no model configured".
+    #[tokio::test]
+    async fn run_resolves_three_segment_agent_ref_without_default_entry() {
+        use axum::{Json, Router, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig, RiskProfileConfig};
+
+        let seen_models = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let capture = Arc::clone(&seen_models);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                capture.lock().unwrap().push(model);
+                async move {
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test provider");
+        let mock_addr = listener.local_addr().expect("test provider address");
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider serves");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "gw")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".to_string());
+        provider.uri = Some(format!("http://{mock_addr}"));
+        provider.models.insert(
+            "fast".to_string(),
+            ModelEntryConfig {
+                id: Some("fast-model".to_string()),
+                ..Default::default()
+            },
+        );
+        provider.models.insert(
+            "big".to_string(),
+            ModelEntryConfig {
+                id: Some("big-model".to_string()),
+                ..Default::default()
+            },
+        );
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.gw.fast".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let response = super::run(
+            config,
+            "test-agent",
+            Some("hi".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            Some(tmp.path().join("session.json")),
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await
+        .expect("a three-segment agent ref must resolve the named entry");
+
+        assert_eq!(response, "ok");
+        let seen = seen_models.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            ["fast-model"],
+            "the request must dispatch the named entry's model id, got: {seen:?}"
+        );
+        drop(seen);
         server_handle.abort();
     }
 

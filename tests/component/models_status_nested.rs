@@ -63,8 +63,7 @@ fn run(config_dir: &std::path::Path, args: &[&str]) -> String {
 #[test]
 fn models_status_prefers_the_default_entry_of_a_nested_profile() {
     let dir = tempfile::TempDir::new().expect("temp config dir");
-    std::fs::write(dir.path().join("config.toml"), CONFIG_WITH_DEFAULT)
-        .expect("write config.toml");
+    std::fs::write(dir.path().join("config.toml"), CONFIG_WITH_DEFAULT).expect("write config.toml");
 
     let stdout = run(dir.path(), &["models", "status"]);
     assert!(
@@ -80,8 +79,7 @@ fn models_status_prefers_the_default_entry_of_a_nested_profile() {
 #[test]
 fn models_status_reports_a_nested_only_profile_without_a_default() {
     let dir = tempfile::TempDir::new().expect("temp config dir");
-    std::fs::write(dir.path().join("config.toml"), CONFIG_NO_DEFAULT)
-        .expect("write config.toml");
+    std::fs::write(dir.path().join("config.toml"), CONFIG_NO_DEFAULT).expect("write config.toml");
 
     // No `models.default` and multiple entries: the first enumerated entry
     // (deterministic sorted order → `big`) is reported. The claim under test
@@ -96,8 +94,7 @@ fn models_status_reports_a_nested_only_profile_without_a_default() {
 #[test]
 fn zeroclaw_status_lists_each_nested_model_entry() {
     let dir = tempfile::TempDir::new().expect("temp config dir");
-    std::fs::write(dir.path().join("config.toml"), CONFIG_NO_DEFAULT)
-        .expect("write config.toml");
+    std::fs::write(dir.path().join("config.toml"), CONFIG_NO_DEFAULT).expect("write config.toml");
 
     let stdout = run(dir.path(), &["status"]);
     assert!(
