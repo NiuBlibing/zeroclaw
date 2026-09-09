@@ -1773,7 +1773,7 @@ pub fn create_model_provider_from_ref_with_model(
             .map(ToString::to_string);
         return Ok(ResolvedModelProviderRef { provider, model });
     }
-    let options = bare_family_runtime_options(config);
+    let options = provider_runtime_options_for_bare_family(config);
     let provider = create_model_provider_inner(None, name, "default", None, None, &options)?;
     Ok(ResolvedModelProviderRef {
         provider,
@@ -1800,7 +1800,13 @@ pub fn create_model_provider_from_ref_with_model(
 /// Only config-owned policy is carried across; every entry-specific option
 /// (kind, URI, credentials, `vision`, ...) stays at its default, since a bare
 /// family name names no entry to take them from.
-fn bare_family_runtime_options(
+///
+/// Public because the runtime's live model-switch path builds a replacement
+/// provider from the same config and must resolve the same options — a bare
+/// family switch that fell back to `ModelProviderRuntimeOptions::default()`
+/// would rebuild the provider boundary under default caps, exactly the
+/// mismatch above.
+pub fn provider_runtime_options_for_bare_family(
     config: &zeroclaw_config::schema::Config,
 ) -> ModelProviderRuntimeOptions {
     ModelProviderRuntimeOptions {
@@ -3531,7 +3537,7 @@ mod tests {
         config.multimodal.max_images = 8;
         config.multimodal.max_image_size_mb = 10;
 
-        let options = bare_family_runtime_options(&config);
+        let options = provider_runtime_options_for_bare_family(&config);
 
         assert_eq!(
             options.multimodal.max_images, 8,

@@ -2212,16 +2212,8 @@ impl Agent {
                     .and_then(|r| r.api_key.as_deref());
                 let api_key = route_api_key.or(default_api_key);
 
-                let runtime_options = new_model_provider
-                    .split_once('.')
-                    .map(|(family, alias)| {
-                        zeroclaw_providers::provider_runtime_options_for_alias(
-                            full_config.as_ref(),
-                            family,
-                            alias,
-                        )
-                    })
-                    .unwrap_or_default();
+                let runtime_options =
+                    switch_runtime_options(full_config.as_ref(), &new_model_provider);
 
                 zeroclaw_providers::create_routed_model_provider_with_options(
                     full_config.as_ref(),
@@ -3323,6 +3315,30 @@ impl Agent {
 
         listen_handle.abort();
         Ok(())
+    }
+}
+
+/// Runtime options for the provider a live model switch rebuilds.
+///
+/// Dotted aliases resolve their entry through `provider_runtime_options_for_alias`;
+/// a bare family reference has no entry, and must take the config-owned
+/// `[multimodal]` policy through `provider_runtime_options_for_bare_family`
+/// rather than `ModelProviderRuntimeOptions::default()`. The default embeds
+/// `max_images = 4` / `max_image_size_mb = 5`, so a bare-family switch built
+/// on defaults would re-normalize already-prepared history under narrower
+/// caps than the operator configured and silently drop images.
+///
+/// A free function so a regression can pin the switch path's options
+/// directly — the rebuilt provider box is opaque to the runtime's tests.
+fn switch_runtime_options(
+    config: &zeroclaw_config::schema::Config,
+    new_model_provider: &str,
+) -> zeroclaw_providers::ModelProviderRuntimeOptions {
+    match new_model_provider.split_once('.') {
+        Some((family, alias)) => {
+            zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias)
+        }
+        None => zeroclaw_providers::provider_runtime_options_for_bare_family(config),
     }
 }
 
@@ -11652,6 +11668,31 @@ mod tests {
             "provider_name must update on a provider-only switch"
         );
         assert_eq!(agent.model_name, "shared-name");
+    }
+
+    #[test]
+    fn model_switch_options_carry_the_configured_policy_for_bare_families() {
+        // A live switch to a bare family rebuilds the provider from the
+        // config. Building it on `ModelProviderRuntimeOptions::default()`
+        // reset the provider boundary to `max_images = 4` /
+        // `max_image_size_mb = 5`, so a request the operator had configured
+        // for 8 images was re-trimmed to 4 after the switch. The switch path
+        // must resolve the config-owned policy for bare families, the same
+        // way dotted aliases resolve theirs.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.multimodal.max_images = 8;
+        config.multimodal.max_image_size_mb = 10;
+
+        let options = switch_runtime_options(&config, "ollama");
+
+        assert_eq!(
+            options.multimodal.max_images, 8,
+            "a bare-family switch must carry the configured max_images, not the default 4"
+        );
+        assert_eq!(
+            options.multimodal.max_image_size_mb, 10,
+            "a bare-family switch must carry the configured max_image_size_mb, not the default 5"
+        );
     }
 
     #[test]
