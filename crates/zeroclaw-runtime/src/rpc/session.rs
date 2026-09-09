@@ -151,6 +151,9 @@ type GatedOpPause = (
 #[cfg(test)]
 type PromptRegistrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
+#[cfg(test)]
+type RehydrateSeedPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
@@ -175,6 +178,11 @@ pub struct SessionStore {
     /// prompt owns admission but before any fallible setup or provider work.
     #[cfg(test)]
     test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only pause between a rehydration's publication and its history
+    /// restore, letting a regression drive another RPC deterministically
+    /// inside the window where the successor is live but unseeded.
+    #[cfg(test)]
+    test_rehydrate_seed_pause: std::sync::Mutex<Option<RehydrateSeedPause>>,
 }
 
 /// Generation-owned handle for the canonical cancellation-token registration.
@@ -225,6 +233,8 @@ impl SessionStore {
             test_gated_op_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_registration_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_rehydrate_seed_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -538,6 +548,36 @@ impl SessionStore {
     pub fn clear_test_gated_op_pause(&self) {
         *self.test_gated_op_pause.lock().unwrap() = None;
     }
+
+    /// Install a test-only pause between a rehydration's publication and its
+    /// history restore. Returns `(arrived, release)`.
+    #[cfg(test)]
+    pub fn set_test_rehydrate_seed_pause(&self) -> RehydrateSeedPause {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_rehydrate_seed_pause.lock().unwrap() =
+            Some((Arc::clone(&arrived), Arc::clone(&release)));
+        (arrived, release)
+    }
+
+    /// Pause point for [`Self::set_test_rehydrate_seed_pause`]: signals
+    /// `arrived` and parks on `release`. No-op unless the pause is armed.
+    #[cfg(test)]
+    pub(crate) async fn wait_test_rehydrate_seed_pause(&self) {
+        let (arrived, release) = {
+            let guard = self.test_rehydrate_seed_pause.lock().unwrap();
+            match &*guard {
+                Some((a, r)) => (a.clone(), r.clone()),
+                None => return,
+            }
+        };
+        arrived.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_rehydrate_seed_pause(&self) {}
 
     pub async fn touch(&self, id: &str) {
         if let Some(s) = self.sessions.lock().await.get_mut(id) {

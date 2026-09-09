@@ -1853,25 +1853,10 @@ impl RpcDispatcher {
                             .await;
                         self.forward_seed_event(&session_id, seed_event).await;
                         // Restore the durable TodoWrite plan into the fresh
-                        // in-memory session and re-emit it so the resuming /
-                        // reconnecting client's tracker repopulates without a
-                        // model round-trip. Robust against tmux detach, socket
-                        // drop, suspend/resume, and daemon restart.
-                        if let Some(ref store) = self.ctx.acp_session_store {
-                            let store = store.clone();
-                            let sid = session_id.clone();
-                            let plan = tokio::task::spawn_blocking(move || {
-                                store.get_plan(&sid).unwrap_or_default()
-                            })
-                            .await
-                            .unwrap_or_default();
-                            if !plan.is_empty() {
-                                self.ctx.sessions.set_plan(&session_id, plan.clone()).await;
-                                if let Some(n) = plan_replay_notification(&session_id, &plan) {
-                                    let _ = self.rpc.send_raw(n).await;
-                                }
-                            }
-                        }
+                        // in-memory session. Robust against tmux detach, socket
+                        // drop, suspend/resume, and daemon restart. Shared
+                        // with the prompt-triggered rehydration path.
+                        self.restore_acp_plan(&session_id).await;
                     }
                     Ok(Ok(AcpSessionNewLoad::Created)) => {}
                     Ok(Ok(AcpSessionNewLoad::Killed)) => {
@@ -2131,10 +2116,47 @@ impl RpcDispatcher {
     /// prompt recovers to a working session instead of hanging. Returns the
     /// live agent on success; returns `None` for missing, killed, or unreadable
     /// durable state.
+    /// Restore the durable ACP TodoWrite plan into the live session and emit
+    /// the replay notification so the resuming / reconnecting client's
+    /// tracker repopulates without a model round-trip.
+    ///
+    /// Shared by both reanimation paths — `session/new` resume and
+    /// prompt-triggered rehydration — so a session recovers its plan state
+    /// identically whether it comes back through an explicit reconnect or
+    /// through its first prompt after being reaped.
+    async fn restore_acp_plan(&self, session_id: &str) {
+        let Some(ref store) = self.ctx.acp_session_store else {
+            return;
+        };
+        let store = store.clone();
+        let sid = session_id.to_string();
+        let plan = tokio::task::spawn_blocking(move || store.get_plan(&sid).unwrap_or_default())
+            .await
+            .unwrap_or_default();
+        if !plan.is_empty() {
+            self.ctx.sessions.set_plan(session_id, plan.clone()).await;
+            if let Some(n) = plan_replay_notification(session_id, &plan) {
+                let _ = self.rpc.send_raw(n).await;
+            }
+        }
+    }
+
     async fn rehydrate_reaped_session(
         &self,
         sid: &str,
     ) -> Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>> {
+        // Own the session admission permit for the WHOLE incarnation, exactly
+        // like `handle_session_new`: the durable transcript must not be read
+        // until a same-ID predecessor has fully finalized (its
+        // `persist_acp_turn` write lands before it releases this permit), and
+        // the published successor must not be observable by an admitted
+        // prompt, `session/new`, or a competing rehydration until its history
+        // and plan are restored. Publishing goes through `insert_admitted` —
+        // re-acquiring inside `insert` would deadlock against this guard.
+        // The permit is released on return, before the calling prompt takes
+        // its own admission.
+        let _admission = self.ctx.sessions.session_queue.acquire(sid).await.ok()?;
+
         let store = self.ctx.acp_session_store.clone()?;
         let sid_owned = sid.to_string();
         let loaded =
@@ -2283,16 +2305,25 @@ impl RpcDispatcher {
             Some(notify) => session.with_pending_generation(Arc::clone(notify)),
             None => session,
         };
+        // Publish through `insert_admitted`: the admission permit acquired at
+        // the top of this helper is held across publication AND the history
+        // and plan restore below, so no prompt, `session/new`, or competing
+        // rehydration can observe the successor before it is fully restored.
         let published_generation = self
             .ctx
             .sessions
-            .insert(sid.to_string(), session)
+            .insert_admitted(&_admission, sid.to_string(), session)
             .await
             .ok()?;
 
         // Release only after the session is published, so a commit that starts
         // next sees it in `list_ids()`.
         drop(config_generation_guard);
+
+        // Test-only: park between publication and the history restore so a
+        // regression can prove the admission permit keeps other RPCs out of
+        // the unseeded window.
+        self.ctx.sessions.wait_test_rehydrate_seed_pause().await;
 
         // Pending-generation reconciliation when the config writer gate was
         // contended and `try_lock_owned` returned `None`.
@@ -2347,6 +2378,11 @@ impl RpcDispatcher {
             .seed_conversation_history_with_event(sid, data.messages)
             .await;
         self.forward_seed_event(sid, seed_event).await;
+        // The durable TodoWrite plan travels with the transcript: restore it
+        // into the live session and replay it to the client, exactly like the
+        // `session/new` resume path, so a reaped session recovers its Code
+        // pane plan state on first prompt instead of losing it.
+        self.restore_acp_plan(sid).await;
         self.ctx.sessions.touch(sid).await;
 
         ::zeroclaw_log::record!(
@@ -15579,6 +15615,230 @@ mod tests {
             bodies.iter().any(|body| body.contains("turn finished")),
             "the successor's provider request must contain the predecessor's \
              persisted assistant reply; bodies so far: {bodies:?}"
+        );
+    }
+
+    /// A rehydrated session must not be admittable before its history is
+    /// restored.
+    ///
+    /// Prompt-triggered rehydration publishes the successor through
+    /// `insert_admitted` under ONE admission permit held across publication
+    /// and the history/plan restore. This regression parks the rehydration
+    /// between publication and the seed (test-only pause) and drives a
+    /// second prompt into that window: with the permit held, the second
+    /// prompt must be blocked at admission — asserted via a bounded yield
+    /// loop — and once the rehydration finishes, both prompts' provider
+    /// requests must contain the durable transcript. On the pre-fix shape
+    /// (plain `insert` releasing the permit at publication) the second
+    /// prompt is admitted against the unseeded successor and its provider
+    /// request dispatches without the restored conversation.
+    #[tokio::test]
+    async fn rehydrated_session_not_admittable_before_history_restore() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::model_provider::ConversationMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("test provider exists")
+            .uri = Some(server.uri());
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "rehydrate-unseeded-window";
+        acp_store
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .unwrap();
+        // The durable conversation a rehydration must restore.
+        acp_store
+            .append_turn(
+                sid,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("durable turn")),
+                    ConversationMessage::Chat(ChatMessage::assistant("durable reply")),
+                ],
+            )
+            .unwrap();
+        // Reaped: absent from the live store, restorable from the durable row.
+        assert!(sessions.get_agent(sid).await.is_none());
+
+        let (arrived, release) = sessions.set_test_rehydrate_seed_pause();
+
+        // The first prompt triggers the rehydration and parks between the
+        // successor's publication and its history restore.
+        let first_handle = dispatcher.spawn_handle();
+        let sid_for_first = sid.to_string();
+        let first_prompt = zeroclaw_spawn::spawn!(async move {
+            first_handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid_for_first,
+                    "prompt": "first prompt",
+                }))
+                .await
+        });
+        arrived.notified().await;
+
+        // The successor is published but unseeded. A second prompt must not
+        // be admitted against it: the rehydration still owns the session
+        // admission permit, so this prompt parks at admission no matter how
+        // many times it is polled.
+        let second_handle = dispatcher.spawn_handle();
+        let sid_for_second = sid.to_string();
+        let second_prompt = zeroclaw_spawn::spawn!(async move {
+            second_handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid_for_second,
+                    "prompt": "second prompt",
+                }))
+                .await
+        });
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            assert!(
+                !second_prompt.is_finished(),
+                "a prompt must not be admitted against a rehydrated session \
+                 before its history is restored"
+            );
+        }
+
+        // Finish the rehydration: history and plan are restored before the
+        // permit is released, so both turns dispatch on the seeded session.
+        release.notify_one();
+        let first_result = first_prompt.await.expect("first prompt must not panic");
+        assert!(
+            first_result.is_err(),
+            "the mock intentionally returns a provider error"
+        );
+        let second_result = second_prompt.await.expect("second prompt must not panic");
+        assert!(
+            second_result.is_err(),
+            "the mock intentionally returns a provider error"
+        );
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock server must retain received requests");
+        assert!(!requests.is_empty(), "both prompts must reach the provider");
+        for request in requests {
+            let body = String::from_utf8_lossy(&request.body).to_string();
+            assert!(
+                body.contains("durable reply"),
+                "every admitted turn must carry the restored transcript; \
+                 request body: {body}"
+            );
+        }
+    }
+
+    /// The prompt-triggered rehydration must restore the durable TodoWrite
+    /// plan, not just the transcript — the same recovery the `session/new`
+    /// resume path provides. A reaped session whose first prompt rehydrates
+    /// it must end up with the persisted plan in the live session AND emit
+    /// the plan replay notification so the Code pane tracker repopulates.
+    #[tokio::test]
+    async fn rehydrated_session_restores_persisted_plan() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("test provider exists")
+            .uri = Some(server.uri());
+        let data_dir = config.data_dir.clone();
+
+        // Manual wiring (not the persistence constructor) so the outbound
+        // receiver stays ours and the replay notification can be observed.
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(Arc::clone(&acp_store)),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rehydrate-plan".into());
+
+        let sid = "rehydrate-plan-restore";
+        acp_store
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .unwrap();
+        let plan = vec![
+            PlanEntry {
+                content: "Analyze codebase".to_string(),
+                status: PlanStatus::InProgress,
+                priority: PlanPriority::High,
+                active_form: Some("Analyzing codebase".to_string()),
+            },
+            PlanEntry {
+                content: "Ship the fix".to_string(),
+                status: PlanStatus::Pending,
+                priority: PlanPriority::Medium,
+                active_form: None,
+            },
+        ];
+        acp_store.set_plan(sid, &plan).unwrap();
+        assert!(sessions.get_agent(sid).await.is_none());
+
+        // The first prompt on the reaped session rehydrates it; the turn
+        // itself fails against the mock, which is irrelevant to the plan
+        // restoration that happens during rehydration.
+        let prompt_result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "hello",
+            }))
+            .await;
+        assert!(
+            prompt_result.is_err(),
+            "the mock intentionally returns a provider error"
+        );
+
+        let restored = sessions.get_plan(sid).await;
+        assert_eq!(
+            restored.as_deref(),
+            Some(plan.as_slice()),
+            "the rehydrated session must carry the persisted TodoWrite plan"
+        );
+
+        // The replay notification must have been emitted so a connected
+        // client's tracker repopulates without a model round-trip.
+        let mut saw_plan_replay = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("Analyze codebase") && raw.contains("session/update") {
+                saw_plan_replay = true;
+            }
+        }
+        assert!(
+            saw_plan_replay,
+            "rehydration must emit the plan replay notification"
         );
     }
 
