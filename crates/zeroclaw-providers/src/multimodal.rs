@@ -26,7 +26,12 @@ const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 /// `max_image_size_mb` (which clamps at 20 MiB decoded → ~27 MB base64 encoded)
 /// to avoid false rejections while still bounding parser-internal allocations
 /// against pathological input.
-const MAX_IMAGE_MARKER_BYTES: usize = 50 * 1024 * 1024; // 50 MiB
+/// Hard sanity ceiling on a single `[IMAGE:...]` marker span. Well above any
+/// legitimate configured `max_image_size_mb` (clamped at 20 MiB decoded),
+/// yet small enough that a pathological marker cannot dominate memory before
+/// a ceiling refuses it. `pub(crate)` so the Anthropic adapter's regressions
+/// can pin tool-result behavior against the same bound.
+pub(crate) const MAX_IMAGE_MARKER_BYTES: usize = 50 * 1024 * 1024; // 50 MiB
 
 /// Bounds for the content-validation decode in
 /// [`validate_image_content_with_projection`].
@@ -444,12 +449,16 @@ enum MarkerSpanClass {
 
 /// Classify a marker span without owning its attacker-sized body.
 ///
-/// The regular parser collapses line wrapping before classifying a reference,
-/// so inspect a small collapsed prefix here as well. Every supported absolute
-/// reference shape is identifiable from this bounded prefix. The limit covers
-/// the longest classification decision any legal reference needs — a UNC path
-/// `\\<253-byte DNS hostname>\<share>` requires 257 bytes to decide, so the
-/// prefix is sized with margin rather than exactly.
+/// The regular parser collapses line wrapping and trims the collapsed
+/// candidate before classifying it, so the bounded prefix here must follow
+/// the same rules: leading whitespace never consumes prefix budget (it would
+/// be trimmed away by the full check anyway, and a span padded past the limit
+/// would otherwise classify as prose and be forwarded verbatim), and
+/// whitespace after a newline is collapsed. Every supported absolute
+/// reference shape is then identifiable from this bounded prefix. The limit
+/// covers the longest classification decision any legal reference needs — a
+/// UNC path `\\<253-byte DNS hostname>\<share>` requires 257 bytes to decide,
+/// so the prefix is sized with margin rather than exactly.
 ///
 /// A span that starts as a UNC reference but is still undecided when the
 /// prefix runs out returns [`MarkerSpanClass::Undecidable`] — the full span
@@ -475,6 +484,12 @@ fn marker_span_class(raw: &str) -> MarkerSpanClass {
                 continue;
             }
             skip_ws = false;
+        }
+        // Leading whitespace is free: the full check trims the collapsed
+        // candidate, so a span padded past the prefix limit still has to
+        // classify by what follows the padding, not by the padding itself.
+        if prefix.is_empty() && ch.is_whitespace() {
+            continue;
         }
         if prefix.len().saturating_add(ch.len_utf8()) > PREFIX_LIMIT {
             truncated = true;
@@ -6419,6 +6434,40 @@ mod tests {
             matches!(marker_span_class(wrapped), MarkerSpanClass::Loadable),
             is_loadable_image_reference(&collapse_wrapped_marker(wrapped))
         );
+
+        // Leading whitespace never consumes prefix budget: the full check
+        // trims the collapsed candidate, so a span padded past the limit must
+        // still classify by what follows the padding. Before this rule the
+        // prefix filled with spaces, trimmed to empty, and classified as
+        // prose — forwarding a valid reference verbatim and, for an
+        // image-shaped oversized span, its whole body.
+        let short_padded_unc = format!(r"\\{}\share\h.png", "s".repeat(15));
+        for padded in [
+            format!("{}{}", " ".repeat(600), "/padded/absolute.png"),
+            format!(
+                "{}{}",
+                " ".repeat(600),
+                "data:image/png;base64,iVBORw0KGgo="
+            ),
+            format!("{}{}", " ".repeat(600), short_padded_unc),
+        ] {
+            assert!(matches!(
+                marker_span_class(&padded),
+                MarkerSpanClass::Loadable
+            ));
+            assert!(is_loadable_image_reference(&collapse_wrapped_marker(
+                &padded
+            )));
+        }
+        // Padding in front of an undecidable UNC still lands on the refusal
+        // path, not on prose: the spaces are skipped before the `\\` shape
+        // is examined.
+        let absurd_unc = format!(r"\\{}\share\g.png", "s".repeat(600));
+        let padded_absurd_unc = format!("{}{}", " ".repeat(600), absurd_unc);
+        assert!(matches!(
+            marker_span_class(&padded_absurd_unc),
+            MarkerSpanClass::Undecidable
+        ));
     }
 
     #[tokio::test]
@@ -6467,6 +6516,65 @@ mod tests {
         assert!(
             !content.contains("data:image") && !content.contains(&payload[..128]),
             "the raw oversized body must not reach provider-visible content"
+        );
+        assert_eq!(base64_decodes, 0, "nothing is base64-decoded");
+        assert_eq!(pixel_decodes, 0, "no decode budget is consumed");
+    }
+
+    #[tokio::test]
+    async fn space_padded_references_classify_by_content_not_padding() {
+        // Regression for the leading-whitespace bypass: the bounded prefix
+        // classifier used to let leading spaces consume its budget, so a
+        // reference padded past the prefix limit classified as prose — a
+        // valid image was forwarded verbatim instead of normalized, and an
+        // oversized image-shaped span took the same prose path with its whole
+        // body. Padding is now free: the padded valid reference normalizes,
+        // and the padded oversized marker lands on the refusal note.
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("padded.png");
+        std::fs::write(&image_path, valid_png()).unwrap();
+        let padding = " ".repeat(600);
+
+        let valid_marker = format!("[IMAGE:{padding}{}]", image_path.display());
+        let valid_messages = vec![ChatMessage::user(format!("look {valid_marker}"))];
+        let prepared = prepare_messages_for_provider(&valid_messages, &MultimodalConfig::default())
+            .await
+            .expect("a padded but valid reference must prepare normally");
+        assert!(
+            prepared.contains_images,
+            "the padded reference must normalize rather than pass through as prose"
+        );
+        assert!(
+            prepared.messages[0]
+                .content
+                .contains("data:image/png;base64,"),
+            "the image must reach the provider as a data URI: {}",
+            prepared.messages[0].content
+        );
+
+        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
+        let oversized_marker = format!("[IMAGE:{padding}/tmp/{payload}.png]");
+        let oversized_messages = vec![ChatMessage::user(format!("shot {oversized_marker}"))];
+
+        let ((result, base64_decodes), pixel_decodes) = counting_base64_decodes(async {
+            counting_decodes(async {
+                prepare_messages_for_provider(&oversized_messages, &MultimodalConfig::default())
+                    .await
+                    .expect("preparation must not hard-fail on a refused marker")
+            })
+            .await
+        })
+        .await;
+
+        let content = &result.messages[0].content;
+        assert!(content.contains("shot"), "surrounding prose must survive");
+        assert!(
+            content.contains(REJECTED_IMAGE_MARKER_NOTE),
+            "the padded oversized marker must land on the refusal note: {content}"
+        );
+        assert!(
+            !content.contains("data:image") && !content.contains(&payload[..128]),
+            "the raw padded body must not reach provider-visible content"
         );
         assert_eq!(base64_decodes, 0, "nothing is base64-decoded");
         assert_eq!(pixel_decodes, 0, "no decode budget is consumed");
