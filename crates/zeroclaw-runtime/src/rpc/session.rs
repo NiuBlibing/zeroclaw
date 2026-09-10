@@ -101,6 +101,15 @@ pub struct RpcSession {
     pending_generation: Option<Arc<tokio::sync::Notify>>,
 }
 
+/// Canonical live-session data returned when `session/new` reattaches to an
+/// ID that is already present in the process-local session store.
+pub struct ResumedRpcSession {
+    pub agent: Arc<Mutex<Agent>>,
+    pub agent_alias: String,
+    pub workspace_dir: String,
+    pub message_count: usize,
+}
+
 impl RpcSession {
     pub fn new(
         agent: Agent,
@@ -260,6 +269,14 @@ impl SessionStore {
     /// [`SessionStore::insert`](Self::insert) does) would deadlock against
     /// the caller's guard.
     ///
+    /// This REPLACES any live incarnation already present under `id`:
+    /// rehydration legitimately swaps a same-ID successor for the published
+    /// session while holding the permit, so absence is not required here.
+    /// The `session/new` external boundary, which must never overwrite a
+    /// concurrent incarnation, uses
+    /// [`SessionStore::insert_admitted_if_absent`](Self::insert_admitted_if_absent)
+    /// instead.
+    ///
     /// The caller must hold `admission` for exactly `id` (debug-asserted)
     /// and must keep it alive until the published session is fully restored.
     pub async fn insert_admitted(
@@ -273,6 +290,34 @@ impl SessionStore {
             id,
             "insert_admitted requires the admission permit for the session being published"
         );
+        self.publish_session(&id, session).await
+    }
+
+    /// Absence-safe variant of [`SessionStore::insert_admitted`](Self::insert_admitted)
+    /// for the `session/new` external boundary, combining the admission
+    /// permit contract with
+    /// [`SessionStore::insert_if_absent`](Self::insert_if_absent)'s refusal
+    /// to overwrite a live incarnation: under the caller's permit the slot
+    /// was cleared (or never occupied) before the rebuild began, so a live
+    /// entry here means a concurrent resume won the race. Two concurrent
+    /// resume requests therefore cannot silently replace one another.
+    ///
+    /// The caller must hold `admission` for exactly `id` (debug-asserted)
+    /// and must keep it alive until the published session is fully restored.
+    pub async fn insert_admitted_if_absent(
+        &self,
+        admission: &zeroclaw_infra::session_queue::SessionGuard,
+        id: String,
+        session: RpcSession,
+    ) -> Result<u64, &'static str> {
+        debug_assert_eq!(
+            admission.session_id(),
+            id,
+            "insert_admitted_if_absent requires the admission permit for the session being published"
+        );
+        if self.sessions.lock().await.contains_key(&id) {
+            return Err("session already exists");
+        }
         self.publish_session(&id, session).await
     }
 
@@ -296,6 +341,69 @@ impl SessionStore {
         session.generation = generation;
         sessions.insert(id.to_string(), session);
         Ok(generation)
+    }
+
+    /// Publish a newly constructed session only when no live incarnation is
+    /// already present. `session/new` uses this at the external boundary so
+    /// two concurrent resume requests cannot replace one another.
+    pub async fn insert_if_absent(
+        &self,
+        id: String,
+        mut session: RpcSession,
+    ) -> Result<(), &'static str> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(&id) {
+            return Err("session already exists");
+        }
+        if sessions.len() >= self.max_sessions {
+            return Err("session limit reached");
+        }
+        let generation = self
+            .session_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        session.generation = generation;
+        sessions.insert(id, session);
+        Ok(())
+    }
+
+    /// Rebind a caller to the canonical live session without replacing its
+    /// `Agent`. A supplied session ID is a resume selector: when the live
+    /// incarnation already exists, rebuilding it would fork provider history
+    /// from an in-flight predecessor turn.
+    pub async fn resume_existing(
+        &self,
+        id: &str,
+        agent_alias: &str,
+        chat_mode: &crate::rpc::types::ChatMode,
+        owner_tui_id: Option<String>,
+    ) -> Result<Option<ResumedRpcSession>, &'static str> {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(id) else {
+            return Ok(None);
+        };
+        if session.agent_alias != agent_alias {
+            return Err("session belongs to a different agent");
+        }
+        if &session.chat_mode != chat_mode {
+            return Err("session uses a different chat mode");
+        }
+
+        if owner_tui_id.is_some() {
+            session.owner_tui_id = owner_tui_id;
+        }
+        session.last_active = Instant::now();
+        let message_count = session
+            .agent
+            .try_lock()
+            .map(|agent| agent.history().len())
+            .unwrap_or_default();
+        Ok(Some(ResumedRpcSession {
+            agent: Arc::clone(&session.agent),
+            agent_alias: session.agent_alias.clone(),
+            workspace_dir: session.workspace_dir.clone(),
+            message_count,
+        }))
     }
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
@@ -687,10 +795,12 @@ impl SessionStore {
     /// `generation` is the orthogonal SESSION-identity fence: it must match the
     /// session's current generation (captured before the caller built the
     /// provider box). If the session was replaced under the same ID — e.g. by
-    /// `session/new` or ACP rehydration — while the provider was being built,
-    /// the generations won't match and this call becomes a no-op (returns
-    /// `false`). `config_generation` answers "which config was this built
-    /// from"; `generation` answers "is this still the same session".
+    /// a cross-mode `session/new` replacement or ACP rehydration — while the
+    /// provider was being built, the generations won't match and this call
+    /// becomes a no-op (returns `false`). `config_generation` answers "which
+    /// config was this built from"; `generation` answers "is this still the
+    /// same session". Live same-ID `session/new` requests resume the existing
+    /// incarnation rather than replacing it.
     ///
     /// When `temperature` is `Some(v)`, the captured agent's temperature is
     /// set to `v` (which may be `None`, clearing a prior profile temperature).
@@ -1081,6 +1191,17 @@ impl SessionStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(id)
+    }
+
+    /// Generation of the runtime-owned turn currently executing for a
+    /// session. This is the authoritative live-turn identity for RPC status;
+    /// persisted session metadata is not updated on every RPC turn.
+    pub fn inflight_turn_generation(&self, id: &str) -> Option<u64> {
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(id)
+            .map(|(generation, _)| *generation)
     }
 
     pub async fn kill_session(&self, id: &str) -> bool {
