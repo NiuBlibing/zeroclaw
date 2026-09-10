@@ -1713,24 +1713,43 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
     ) -> Result<Self> {
-        let config = live_config.read().clone();
-        Self::from_config_with_session_cwd_and_mcp_approval_mode(
-            &config,
-            agent_alias,
-            session_cwd,
-            initialize_mcp,
-            true,
-            exclude_memory,
-            // TUI turns never transport an ACP file attachment.
-            false,
-            tui_env,
-            sop_engine,
-            sop_audit,
-            None,
-            Some(Arc::clone(&live_config)),
-            Some(live_config),
-        )
+        // Stack-budget boundary for the daemon-backed construction paths
+        // (`session/new`, rehydration, plugin agents). The whole incarnation
+        // build — config snapshot, security policy, provider + route
+        // resolver, memory backends, MCP, tool registry — is a deep
+        // debug-build call chain that must not consume the RPC caller's
+        // stack budget (the 2 MiB `session/new` regression contract): it
+        // runs on a blocking-pool thread and the caller's stack pays only
+        // the dispatch layers. The construction's own awaits (fs, memory
+        // backends, MCP init) are driven through the captured runtime
+        // handle, so their timing semantics are unchanged. Callers that
+        // hold the config writer gate (`session/new`, rehydration) keep
+        // holding it across this boundary, so the snapshot read below
+        // still observes the same committed config generation.
+        let handle = tokio::runtime::Handle::current();
+        let agent_alias = agent_alias.to_string();
+        let session_cwd = session_cwd.map(|p| p.to_path_buf());
+        tokio::task::spawn_blocking(move || {
+            let config = live_config.read().clone();
+            handle.block_on(Self::from_config_with_session_cwd_and_mcp_approval_mode(
+                &config,
+                &agent_alias,
+                session_cwd.as_deref(),
+                initialize_mcp,
+                true,
+                exclude_memory,
+                // TUI turns never transport an ACP file attachment.
+                false,
+                tui_env,
+                sop_engine,
+                sop_audit,
+                None,
+                Some(Arc::clone(&live_config)),
+                Some(live_config),
+            ))
+        })
         .await
+        .map_err(|join| anyhow::Error::msg(format!("agent construction task failed: {join}")))?
     }
 
     #[allow(clippy::too_many_arguments)]
