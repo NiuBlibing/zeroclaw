@@ -827,6 +827,7 @@ fn warm_lazy_regexes() {
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KEY_REGEX);
     std::sync::LazyLock::force(&crate::agent::loop_::IMAGE_DATA_URI_REGEX);
     std::sync::LazyLock::force(&crate::agent::history::LOCAL_IMAGE_PATH_RE);
+    zeroclaw_providers::multimodal::warm_lazy_regexes();
 }
 
 /// Create the full tool registry on a dedicated builder thread.
@@ -889,6 +890,13 @@ pub fn all_tools_with_runtime(
     let agents = agents.clone();
     let root_config = root_config.clone();
     let builder = move || {
+        // Warm the lazy regexes BEFORE the registry build and BEFORE any
+        // turn can start: LazyLock runs the initializer on whichever thread
+        // reaches it first, so a turn racing an un-joined warmup would
+        // compile the regex (a ~40-frame regex_automata recursion) on the
+        // turn's own stack. Doing this first on the builder thread also
+        // means the compile never lands on a turn stack; it costs one
+        // cold-process delay of a few hundred milliseconds, once.
         warm_lazy_regexes();
         all_tools_with_runtime_on_thread(
             config,
