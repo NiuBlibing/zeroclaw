@@ -6,9 +6,12 @@ mod config_patch_cli;
 mod config_persistence;
 mod config_schema;
 #[cfg(feature = "agent-runtime")]
+mod cost_status_cli;
+#[cfg(feature = "agent-runtime")]
 mod cron_delivery_cli;
 mod cron_help_examples;
 mod daemon_startup_feedback;
+mod degraded_config_remediation;
 #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
 mod desktop_cli_linux;
 mod direct_cli_terminal_completion;
@@ -17,6 +20,7 @@ mod gateway;
 mod gemini_capabilities;
 #[cfg(feature = "agent-runtime")]
 mod models_status_nested;
+mod hardware_probe_feature_graph;
 mod otel_dependency_feature_regression;
 mod plugin_feature_graph;
 mod provider_resolution;
