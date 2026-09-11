@@ -1078,9 +1078,22 @@ async fn normalize_native_tool_result_json(
         return None;
     };
 
-    let (cleaned_text, refs) = parse_image_markers(&inner);
+    let parsed = parse_image_markers_inner(&inner, ParseMode::RewriteAndCollect);
+    let cleaned_text = parsed.cleaned;
+    let refs = parsed.refs;
     if refs.is_empty() {
-        return None;
+        // A rejected marker still changes the nested text. Preserve the native
+        // tool-result envelope even when no image candidate remains; falling
+        // through would serialize the outer object as plain text and can lose
+        // `tool_call_id` during provider conversion.
+        if parsed.rejected_count == 0 {
+            return None;
+        }
+        obj.insert(
+            "content".to_string(),
+            serde_json::Value::String(cleaned_text),
+        );
+        return Some((serde_json::Value::Object(obj).to_string(), false));
     }
 
     let normalized = normalize_image_references(
@@ -1097,7 +1110,7 @@ async fn normalize_native_tool_result_json(
         &cleaned_text,
         &normalized.data_uris,
         normalized.skipped_count,
-        refs.len(),
+        refs.len() + parsed.rejected_count,
     );
     obj.insert("content".to_string(), serde_json::Value::String(new_inner));
 
@@ -6969,6 +6982,38 @@ mod tests {
             pixel_decodes, 0,
             "rejection must happen before any pixel decode"
         );
+    }
+
+    #[tokio::test]
+    async fn native_tool_result_preserves_envelope_when_image_is_rejected() {
+        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc-envelope",
+            "content": format!("screenshot [IMAGE:data:image/png;base64,{payload}]"),
+        })
+        .to_string();
+
+        let prepared = prepare_messages_for_provider(
+            &[ChatMessage::tool(native_tool_content)],
+            &MultimodalConfig::default(),
+        )
+        .await
+        .expect("rejected image should degrade without failing preparation");
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("native tool-result envelope must remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc-envelope")
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("screenshot"));
+        assert!(inner.contains(REJECTED_IMAGE_MARKER_NOTE));
+        assert!(!inner.contains("data:image"));
+        assert!(!inner.contains(&payload[..128]));
     }
 
     #[tokio::test]

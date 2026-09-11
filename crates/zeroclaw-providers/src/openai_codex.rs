@@ -1768,6 +1768,26 @@ mod tests {
         (provider, captured, server_handle, temp_dir, proxy_guard)
     }
 
+    #[test]
+    fn provider_construction_carries_operator_multimodal_policy() {
+        let multimodal = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 1,
+            max_image_size_mb: 2,
+            ..Default::default()
+        };
+
+        let options = ModelProviderRuntimeOptions {
+            multimodal,
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let provider = OpenAiCodexModelProvider::new("test", &options, None).unwrap();
+
+        // Every `prepare_messages_for_provider` call in this adapter uses this
+        // field; defaults would drop the operator's image limits.
+        assert_eq!(provider.multimodal.max_images, 1);
+        assert_eq!(provider.multimodal.max_image_size_mb, 2);
+    }
+
     #[tokio::test]
     async fn codex_responses_provider_honors_runtime_proxy_after_construction() {
         use axum::{Json, Router, extract::State, routing::post};

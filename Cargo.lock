@@ -13817,6 +13817,7 @@ dependencies = [
  "clap_complete",
  "console",
  "criterion",
+ "crossterm",
  "dialoguer",
  "directories",
  "flate2",
