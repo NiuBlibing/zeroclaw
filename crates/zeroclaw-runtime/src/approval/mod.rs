@@ -247,7 +247,7 @@ impl ApprovalManager {
     /// from `risk_profile`; the session allowlist and audit trail start
     /// fresh — "Always" grants to one agent never transfer to another.
     pub fn derive_for_risk_profile(&self, risk_profile: &RiskProfileConfig) -> Self {
-        Self {
+        let derived = Self {
             auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
             always_ask: risk_profile.always_ask.iter().cloned().collect(),
             autonomy_level: risk_profile.level,
@@ -257,7 +257,15 @@ impl ApprovalManager {
             confirmation_ledger: ConfirmationLedger::new(),
             policy_context: OnceLock::new(),
             audit_log: Mutex::new(Vec::new()),
+        };
+        // Delegated managers must retain the parent's canonical policy
+        // context. Leaving this unset would fall back to the legacy boolean
+        // approval path, allowing a Full-autonomy child to bridge an explicit
+        // command-level Ask without a trusted command resolution.
+        if let Some(context) = self.policy_context.get() {
+            derived.set_policy_context(Arc::clone(&context.security), context.shell_dialect);
         }
+        derived
     }
 
     /// Returns `true` when this manager operates in non-interactive mode

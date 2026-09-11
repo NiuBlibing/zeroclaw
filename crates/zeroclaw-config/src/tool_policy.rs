@@ -236,8 +236,9 @@ pub struct ShellSegment {
     pub executable: String,
     /// Basename normalization used for name-level rule matching.
     pub base: String,
-    /// Argument tokens: whitespace split after the executable, exactly as
-    /// the legacy argument-safety checks see them (raw, quote-unstripped).
+    /// Argument tokens: whitespace split after the executable, with wrapping
+    /// quotes normalized so policy matching sees the same argv for `git push`
+    /// and `git "push"`.
     pub arguments: Vec<String>,
     /// This segment's risk classification.
     pub risk: CommandRiskLevel,
@@ -454,7 +455,9 @@ fn extract_one_posix_segment(segment: &str) -> Option<ExtractedSegment> {
         return None;
     }
 
-    let args_cased: Vec<String> = words.map(str::to_string).collect();
+    let args_cased: Vec<String> = words
+        .map(|word| strip_wrapping_quotes(word).to_string())
+        .collect();
     let args_lower: Vec<String> = args_cased
         .iter()
         .map(|word| word.to_ascii_lowercase())
@@ -563,7 +566,9 @@ fn extract_powershell_segments(command: &str) -> (Vec<ShellSegment>, ParseStatus
             .strip_suffix(".exe")
             .unwrap_or(&base_owned)
             .to_string();
-        let args_cased: Vec<String> = words.map(str::to_string).collect();
+        let args_cased: Vec<String> = words
+            .map(|word| strip_wrapping_quotes(word).to_string())
+            .collect();
         let args_lower: Vec<String> = args_cased
             .iter()
             .map(|word| word.to_ascii_lowercase())
@@ -731,6 +736,7 @@ impl ToolPolicyConfig {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
+            && self.confirmation_validity_secs == DEFAULT_CONFIRMATION_VALIDITY_SECS
     }
 }
 
@@ -1484,6 +1490,69 @@ fn allow_rule_covered(child: &PolicyRule, parent_allows: &[&PolicyRule]) -> bool
         })
 }
 
+/// Whether a child restriction covers every action restricted by a parent
+/// restriction. This is intentionally conservative for glob patterns: an
+/// unprovable containment is rejected rather than allowing a child to widen
+/// the effective policy.
+fn restriction_covers(child: &RuleMatcher, parent: &RuleMatcher) -> bool {
+    match (child, parent) {
+        (RuleMatcher::AnyShell, RuleMatcher::AnyShell) => true,
+        (RuleMatcher::AnyShell, RuleMatcher::ShellCommand { .. }) => true,
+        (
+            RuleMatcher::ShellCommand {
+                executable: child_exec,
+                arg_pattern: child_args,
+            },
+            RuleMatcher::ShellCommand {
+                executable: parent_exec,
+                arg_pattern: parent_args,
+            },
+        ) => {
+            command_names_equivalent(child_exec.trim(), parent_exec.trim())
+                && arg_pattern_covered(parent_args, child_args)
+        }
+        _ => false,
+    }
+}
+
+/// Conservative overlap check used to ensure a child `Allow` cannot punch a
+/// hole through a parent's explicit `Ask`. Exact literal/prefix pairs are
+/// compared precisely; all other same-executable combinations are treated as
+/// overlapping because proving disjointness would require glob analysis.
+fn restrictions_overlap(left: &RuleMatcher, right: &RuleMatcher) -> bool {
+    match (left, right) {
+        (RuleMatcher::AnyShell, RuleMatcher::AnyShell)
+        | (RuleMatcher::AnyShell, RuleMatcher::ShellCommand { .. })
+        | (RuleMatcher::ShellCommand { .. }, RuleMatcher::AnyShell) => true,
+        (
+            RuleMatcher::ShellCommand {
+                executable: left_exec,
+                arg_pattern: left_args,
+            },
+            RuleMatcher::ShellCommand {
+                executable: right_exec,
+                arg_pattern: right_args,
+            },
+        ) if command_names_equivalent(left_exec.trim(), right_exec.trim()) => {
+            match (left_args, right_args) {
+                (None, _) | (_, None) => true,
+                (Some(ArgPattern::Literal(left)), Some(ArgPattern::Literal(right))) => {
+                    left == right
+                }
+                (Some(ArgPattern::Literal(left)), Some(ArgPattern::Prefix(right)))
+                | (Some(ArgPattern::Prefix(right)), Some(ArgPattern::Literal(left))) => {
+                    left.starts_with(right) || right.starts_with(left)
+                }
+                (Some(ArgPattern::Prefix(left)), Some(ArgPattern::Prefix(right))) => {
+                    left.starts_with(right) || right.starts_with(left)
+                }
+                (Some(ArgPattern::Glob(_)), _) | (_, Some(ArgPattern::Glob(_))) => true,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Compare two profiles' explicit `tool_policy` sections on RESOLVED rule
 /// semantics (RFC 7155 §4.4): a delegated/child policy may only narrow.
 ///
@@ -1539,26 +1608,35 @@ pub fn ensure_no_rule_escalation(
         .iter()
         .filter(|rule| rule.decision == Decision::Deny)
     {
-        let still_denied = child_denies.iter().any(|child_deny| {
-            matches!(
-                (&child_deny.matcher, &rule.matcher),
-                (
-                    RuleMatcher::ShellCommand {
-                        executable: child_exec,
-                        ..
-                    },
-                    RuleMatcher::ShellCommand {
-                        executable: parent_exec,
-                        ..
-                    }
-                ) if command_names_equivalent(child_exec.trim(), parent_exec.trim())
-            ) || matches!(child_deny.matcher, RuleMatcher::AnyShell)
-                && matches!(rule.matcher, RuleMatcher::AnyShell)
-        });
+        let still_denied = child_denies
+            .iter()
+            .any(|child_deny| restriction_covers(&child_deny.matcher, &rule.matcher));
         if !still_denied {
             return Err(format!(
                 "parent tool_policy deny rule `{}` is dropped by the child policy",
                 describe_matcher(&rule.matcher)
+            ));
+        }
+    }
+
+    // A parent Ask is itself a restriction. A child Allow that overlaps it
+    // would turn a required prompt into silent execution, even when no Deny
+    // is involved. Keep the check conservative at this boundary.
+    let parent_asks: Vec<&PolicyRule> = parent_rules
+        .iter()
+        .filter(|rule| rule.decision == Decision::Ask)
+        .collect();
+    for child_allow in child_rules
+        .iter()
+        .filter(|rule| rule.decision == Decision::Allow)
+    {
+        if parent_asks
+            .iter()
+            .any(|parent_ask| restrictions_overlap(&child_allow.matcher, &parent_ask.matcher))
+        {
+            return Err(format!(
+                "tool_policy allow rule `{}` overlaps a parent ask rule",
+                describe_matcher(&child_allow.matcher)
             ));
         }
     }
@@ -2299,6 +2377,62 @@ mod tests {
         assert_eq!(
             cfg.tool_policy.confirmation_validity_secs,
             DEFAULT_CONFIRMATION_VALIDITY_SECS
+        );
+    }
+
+    #[test]
+    fn quoted_arguments_share_the_same_deny_decision() {
+        let cfg = policy_config(&[("Shell(git push:*)", Decision::Deny)], 300);
+        let compiled = CompiledRuleSet::compile_from_fields(
+            AutonomyLevel::Full,
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            &cfg,
+        );
+        let scopes = ResolvedScopes::profile_only(&compiled);
+        for command in ["git push", "git \"push\""] {
+            let action = extract_shell_action(command, ShellDialect::Posix, None);
+            assert_eq!(
+                resolve_decision(&action, &scopes).decision,
+                Decision::Deny,
+                "quoted form must not evade the explicit deny: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn child_deny_must_cover_parent_arguments() {
+        let parent = policy_config(&[("Shell(echo:*)", Decision::Deny)], 300);
+        let child = policy_config(&[("Shell(echo secret:*)", Decision::Deny)], 300);
+        let error = ensure_no_rule_escalation(&child, &parent).unwrap_err();
+        assert!(error.contains("dropped"), "{error}");
+    }
+
+    #[test]
+    fn child_allow_cannot_punch_through_parent_ask() {
+        let parent = policy_config(
+            &[
+                ("Shell(echo secret:*)", Decision::Ask),
+                ("Shell(echo:*)", Decision::Allow),
+            ],
+            300,
+        );
+        let child = policy_config(&[("Shell(echo secret:*)", Decision::Allow)], 300);
+        let error = ensure_no_rule_escalation(&child, &parent).unwrap_err();
+        assert!(error.contains("parent ask"), "{error}");
+    }
+
+    #[test]
+    fn non_default_validity_keeps_empty_policy_section_serialized() {
+        let mut profile = RiskProfileConfig::default();
+        profile.tool_policy.confirmation_validity_secs = 1;
+        let serialized = toml::to_string(&profile).expect("profile serializes");
+        assert!(
+            serialized.contains("confirmation_validity_secs = 1"),
+            "custom validity must not be dropped when rules are empty: {serialized}"
         );
     }
 
