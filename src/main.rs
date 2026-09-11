@@ -6670,8 +6670,17 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         ta(
                             key,
                             &[
-                                ("family", configured.profile_ref.split('.').next().unwrap_or("")),
-                                ("alias", configured.profile_ref.split_once('.').map_or("", |(_, a)| a)),
+                                (
+                                    "family",
+                                    configured.profile_ref.split('.').next().unwrap_or("")
+                                ),
+                                (
+                                    "alias",
+                                    configured
+                                        .profile_ref
+                                        .split_once('.')
+                                        .map_or("", |(_, a)| a)
+                                ),
                             ],
                             fallback
                         )
@@ -6689,10 +6698,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "Model [{$alias}]: {$model}"
                         )
                     ),
-                    None => println!(
-                        "{}",
-                        ta("cli-status-model", &[("model", model)], "Model")
-                    ),
+                    None => println!("{}", ta("cli-status-model", &[("model", model)], "Model")),
                 }
             }
             if !shown_provider {
@@ -10763,9 +10769,7 @@ async fn dispatch_models_command(model_command: ModelCommands, config: &mut Conf
                 .unwrap_or_else(|| {
                     (
                         winner.provider_ref.clone(),
-                        winner
-                            .model_id
-                            .unwrap_or_else(|| "unknown".to_string()),
+                        winner.model_id.unwrap_or_else(|| "unknown".to_string()),
                     )
                 });
             println!(

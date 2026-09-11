@@ -787,7 +787,6 @@ pub async fn run_gateway(
                 }
             },
         }
-        model.unwrap_or_default()
     };
     // Preserve `Option<f64>` end-to-end. Substituting a hardcoded default
     // here would clobber the "let the provider decide" intent for models

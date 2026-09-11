@@ -777,7 +777,11 @@ pub async fn update_context_windows(
                     format!("{profile_ref}.{model_alias}"),
                     ty.to_string(),
                     alias.to_string(),
-                    nested.id.clone().or_else(|| entry.model.clone()).unwrap_or_default(),
+                    nested
+                        .id
+                        .clone()
+                        .or_else(|| entry.model.clone())
+                        .unwrap_or_default(),
                     entry.uri.clone(),
                     entry.api_key.clone(),
                     nested.context_window,
@@ -3637,11 +3641,8 @@ mod tests {
         // model each probe (and therefore each write) targeted.
         let mock_fetch: FetchContextWindowFn = Box::new(
             |_type: &str, cfg: &zeroclaw_config::schema::ModelProviderConfig| {
-                Box::pin(async move {
-                    cfg.model
-                        .as_deref()
-                        .map(|m| m.chars().count() * 1000)
-                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send>>
+                Box::pin(async move { cfg.model.as_deref().map(|m| m.chars().count() * 1000) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send>>
             },
         );
         let updated = update_context_windows(&mut config, None, false, Some(mock_fetch))

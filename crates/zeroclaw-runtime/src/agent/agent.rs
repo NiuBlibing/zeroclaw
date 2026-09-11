@@ -111,18 +111,15 @@ pub fn build_model(
     // cleared (exactly what `options_for_provider_ref` gives a bare name).
     // The entry itself may be absent (e.g. auth via env) — resolution stays
     // lenient so an override can still build a provider.
-    let (model_provider_name, model_provider_alias, bare_family) = match model_provider_ref
-        .split_once('.')
-    {
-        Some((family, rest)) => (
-            family.to_string(),
-            rest.split_once('.')
-                .map_or(rest, |(al, _)| al)
-                .to_string(),
-            false,
-        ),
-        None => (model_provider_ref.to_string(), String::new(), true),
-    };
+    let (model_provider_name, model_provider_alias, bare_family) =
+        match model_provider_ref.split_once('.') {
+            Some((family, rest)) => (
+                family.to_string(),
+                rest.split_once('.').map_or(rest, |(al, _)| al).to_string(),
+                false,
+            ),
+            None => (model_provider_ref.to_string(), String::new(), true),
+        };
 
     let entry = if bare_family {
         None
@@ -194,12 +191,9 @@ pub fn build_model(
             entry.and_then(|e| e.api_key.as_deref()),
             entry.and_then(|e| e.uri.as_deref()),
         ),
-        BuildCredentials::Switch => switch_credential_fallback(
-            config,
-            agent_alias,
-            model_provider_ref,
-            &model_name,
-        ),
+        BuildCredentials::Switch => {
+            switch_credential_fallback(config, agent_alias, model_provider_ref, &model_name)
+        }
     };
 
     let provider = zeroclaw_providers::create_routed_model_provider_with_options(
@@ -223,9 +217,11 @@ pub fn build_model(
     // `entry ∨ profile` for the temperature; the same shape as
     // `Config::effective_model_context_window` for the window, but resolved
     // from THIS ref so a switch moves the trim budget with the model.
-    let temperature = selection
-        .as_ref()
-        .and_then(|s| s.model_entry.and_then(|e| e.temperature).or(s.entry.temperature));
+    let temperature = selection.as_ref().and_then(|s| {
+        s.model_entry
+            .and_then(|e| e.temperature)
+            .or(s.entry.temperature)
+    });
     let context_window = selection
         .as_ref()
         .and_then(|s| {
@@ -1821,26 +1817,25 @@ impl Agent {
         // names a configured profile before anything is built (the model
         // runtime itself is built from the raw ref further below). Only the
         // profile entry survives — the memory backend wants its api_key.
-        let (_, _, agent_model_provider) = match config
-            .resolved_model_provider_for_agent(agent_alias)
-        {
-            Some(resolved) => (resolved.0, resolved.1, Some(resolved.2)),
-            None => {
-                let agent_ref = agent_cfg.model_provider.as_str();
-                if !agent_ref.is_empty() {
-                    anyhow::bail!(
-                        "agents.{agent_alias}.model_provider = \"{agent_ref}\" does not \
+        let (_, _, agent_model_provider) =
+            match config.resolved_model_provider_for_agent(agent_alias) {
+                Some(resolved) => (resolved.0, resolved.1, Some(resolved.2)),
+                None => {
+                    let agent_ref = agent_cfg.model_provider.as_str();
+                    if !agent_ref.is_empty() {
+                        anyhow::bail!(
+                            "agents.{agent_alias}.model_provider = \"{agent_ref}\" does not \
                          resolve to a configured [providers.models.<type>.<alias>] entry"
+                        );
+                    }
+                    // V3 schema requires every agent to set model_provider.
+                    // Empty is a config error rather than a silent fallback.
+                    anyhow::bail!(
+                        "agents.{agent_alias}.model_provider is empty — set it to a \
+                     configured \"<type>.<alias>\" (e.g. \"anthropic.{agent_alias}\")"
                     );
                 }
-                // V3 schema requires every agent to set model_provider.
-                // Empty is a config error rather than a silent fallback.
-                anyhow::bail!(
-                    "agents.{agent_alias}.model_provider is empty — set it to a \
-                     configured \"<type>.<alias>\" (e.g. \"anthropic.{agent_alias}\")"
-                );
-            }
-        };
+            };
         let memory: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
             config,
             agent_alias,
@@ -3590,12 +3585,7 @@ mod tests {
     fn build_session_model_provider_requires_a_model() {
         // No configured entry and no override → cannot resolve a model name.
         let config = Config::default();
-        let err = match build_session_model_provider(
-            &config,
-            "tester",
-            "anthropic.default",
-            None,
-        ) {
+        let err = match build_session_model_provider(&config, "tester", "anthropic.default", None) {
             Ok(_) => panic!("missing model must error"),
             Err(e) => e,
         };
@@ -3630,7 +3620,9 @@ mod tests {
 
     #[test]
     fn build_model_resolves_derived_values_from_the_selected_entry() {
-        use zeroclaw_config::schema::{ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig};
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
 
         // The profile carries one temperature/window; the entries carry
         // their own. What the runtime derives must follow the selected
@@ -3677,7 +3669,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rt.temperature, Some(0.2), "entry temperature beats profile");
-        assert_eq!(rt.context_window, 8_000, "entry context window beats profile");
+        assert_eq!(
+            rt.context_window, 8_000,
+            "entry context window beats profile"
+        );
 
         // Two-segment ref: the profile's values (default entry sets none).
         let rt = build_model(
@@ -3718,7 +3713,9 @@ mod tests {
 
     #[test]
     fn build_model_keeps_selected_entry_tuning_over_default_entry() {
-        use zeroclaw_config::schema::{ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig};
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
 
         // `default` carries a tuning field; a three-segment ref selecting
         // `cheap` must not have that field clobbered by the default entry.
@@ -11999,7 +11996,9 @@ mod tests {
         // A switch to the model that is already running — however the ref
         // spells it: the two-segment ref and the three-segment ref naming the
         // selected entry are the same model — must not rebuild.
-        use zeroclaw_config::schema::{ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig};
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
 
         let mut config = zeroclaw_config::schema::Config::default();
         config.providers.models.openai.insert(
@@ -12048,7 +12047,9 @@ mod tests {
         // models: once provider names normalise to two segments, the entry
         // name is the only thing distinguishing them, so the switch must
         // rebuild (and pick up the entry's own tuning) rather than no-op.
-        use zeroclaw_config::schema::{ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig};
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
 
         let mut config = zeroclaw_config::schema::Config::default();
         let mut entries = HashMap::new();

@@ -4709,7 +4709,8 @@ impl Config {
                 // One three-segment entry per nested model alias, using the
                 // resolved model id from the model entry (or profile
                 // fallback).
-                let mut model_aliases: Vec<&str> = entry.models.keys().map(String::as_str).collect();
+                let mut model_aliases: Vec<&str> =
+                    entry.models.keys().map(String::as_str).collect();
                 model_aliases.sort_unstable();
                 for model_alias in model_aliases {
                     let three_seg = format!("{profile_ref}.{model_alias}");
@@ -44587,10 +44588,11 @@ temperature = 0.3
         let config: Config = toml::from_str(raw).unwrap();
         assert_eq!(config.configured_model_entries(Some("openai.gw")).len(), 2);
         assert_eq!(config.configured_model_entries(Some("groq")).len(), 1);
-        assert!(config
-            .configured_model_entries(Some("anthropic.missing")
-        )
-        .is_empty());
+        assert!(
+            config
+                .configured_model_entries(Some("anthropic.missing"))
+                .is_empty()
+        );
     }
 
     #[::core::prelude::v1::test]

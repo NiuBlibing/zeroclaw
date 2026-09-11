@@ -1555,7 +1555,10 @@ mod tests {
 
     /// Minimal [`crate::agent::agent::ModelRuntime`] for store tests: the
     /// fields the assertions below read, with stub provider/dispatcher boxes.
-    fn test_model_runtime(provider_name: &str, model_name: &str) -> crate::agent::agent::ModelRuntime {
+    fn test_model_runtime(
+        provider_name: &str,
+        model_name: &str,
+    ) -> crate::agent::agent::ModelRuntime {
         crate::agent::agent::ModelRuntime {
             provider: Box::new(StubProvider),
             provider_name: provider_name.to_string(),
