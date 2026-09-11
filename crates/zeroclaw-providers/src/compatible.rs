@@ -6322,12 +6322,14 @@ mod tests {
         // config field alone would still pass if the expansion pass kept
         // using library defaults.
         let temp = tempfile::tempdir().unwrap();
-        // Minimal PNG signature bytes are enough for MIME detection.
-        let png = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        // Use a complete decodable image: content validation now performs
+        // pixel decoding after MIME detection, so a bare signature is
+        // correctly rejected as a corrupt image.
+        let png = boundary_test_png();
         let first = temp.path().join("first.png");
         let second = temp.path().join("second.png");
-        std::fs::write(&first, png).unwrap();
-        std::fs::write(&second, png).unwrap();
+        std::fs::write(&first, &png).unwrap();
+        std::fs::write(&second, &png).unwrap();
 
         // One image per message: `trim_old_images` evicts whole messages, so
         // co-locating both in a single message would exercise that eviction
