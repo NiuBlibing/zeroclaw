@@ -823,6 +823,11 @@ fn scan_segment(
                     error = ?err,
                     "log: skipping malformed JSONL line"
                 );
+                // A UTF-8 line that is not a LogEvent is still retained
+                // history we could not interpret. Keep scanning so later
+                // readable events remain useful, but never present this page
+                // as a complete view of the stream.
+                *unreadable = true;
                 continue;
             }
         };
@@ -993,9 +998,19 @@ fn anchor_is_at_offset(
         if trimmed.is_empty() {
             continue;
         }
-        return serde_json::from_str::<LogEvent>(trimmed)
-            .map(|e| e.id == anchor_id)
-            .unwrap_or(false);
+        return match serde_json::from_str::<LogEvent>(trimmed) {
+            Ok(event) => event.id == anchor_id,
+            Err(err) => {
+                tracing::trace!(
+                    target: "zeroclaw_log",
+                    error = ?err,
+                    path = %seg.path.display(),
+                    "log: malformed JSONL while validating a cursor anchor"
+                );
+                *unreadable = true;
+                false
+            }
+        };
     }
 }
 
@@ -1043,12 +1058,22 @@ fn find_anchor_offset(seg: &SegmentMeta, anchor_id: &str, unreadable: &mut bool)
         }
         let line_end = byte_off + n as u64;
         let trimmed = buf.trim();
-        if !trimmed.is_empty()
-            && serde_json::from_str::<LogEvent>(trimmed)
-                .map(|e| e.id == anchor_id)
-                .unwrap_or(false)
-        {
-            return Some(line_end);
+        if !trimmed.is_empty() {
+            match serde_json::from_str::<LogEvent>(trimmed) {
+                Ok(event) if event.id == anchor_id => return Some(line_end),
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::trace!(
+                        target: "zeroclaw_log",
+                        error = ?err,
+                        path = %seg.path.display(),
+                        "log: malformed JSONL while searching for a cursor anchor"
+                    );
+                    // Continue searching: a later readable line may contain
+                    // the anchor, but the resulting page remains incomplete.
+                    *unreadable = true;
+                }
+            }
         }
         byte_off = line_end;
     }
@@ -1478,13 +1503,25 @@ pub fn find_event_across_segments(
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Ok(event) = serde_json::from_str::<LogEvent>(trimmed)
-                    && event.id == id
-                {
-                    return Ok(SegmentLookup {
-                        event: Some(event),
-                        incomplete: false,
-                    });
+                match serde_json::from_str::<LogEvent>(trimmed) {
+                    Ok(event) if event.id == id => {
+                        return Ok(SegmentLookup {
+                            event: Some(event),
+                            incomplete: false,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::trace!(
+                            target: "zeroclaw_log",
+                            error = ?err,
+                            path = %seg.path.display(),
+                            "log: skipping malformed JSONL line during id lookup"
+                        );
+                        // Keep searching other lines and segments, but a miss
+                        // cannot be authoritative after skipping this record.
+                        incomplete = true;
+                    }
                 }
             }
         }
@@ -3448,6 +3485,87 @@ mod tests {
         assert!(
             miss.incomplete,
             "a miss over an unread remainder must not be reported as `not found`"
+        );
+    }
+
+    #[test]
+    fn malformed_json_lines_mark_queries_and_anchor_pagination_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+        let archive = tmp.path().join("trace.0000000001-20260101-000000.jsonl");
+
+        let mut older = make_event("x", None);
+        older.id = "older".into();
+        older.timestamp = "2026-01-01T00:00:00.000Z".into();
+        older.message = Some("before-malformed".into());
+
+        let mut anchor = make_event("x", None);
+        anchor.id = "anchor".into();
+        anchor.timestamp = "2026-01-01T00:00:01.000Z".into();
+        anchor.message = Some("anchor-after-malformed".into());
+
+        let mut newest = make_event("x", None);
+        newest.id = "newest".into();
+        newest.timestamp = "2026-01-01T00:00:02.000Z".into();
+        newest.message = Some("newest".into());
+
+        // Keep the malformed line valid UTF-8 so it exercises JSON
+        // deserialization rather than BufRead's invalid-encoding path.
+        let mut file = std::fs::File::create(&active).unwrap();
+        for (index, event) in [&older, &anchor, &newest].into_iter().enumerate() {
+            if index == 1 {
+                file.write_all(b"{this-is-not-a-log-event}\n").unwrap();
+            }
+            file.write_all(serde_json::to_string(event).unwrap().as_bytes())
+                .unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+
+        let first = query_log_page(&active, true, &LogFilter::default(), 2, None).unwrap();
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest", "anchor"]
+        );
+        assert!(
+            first.incomplete,
+            "a malformed JSONL line must make the page visibly partial"
+        );
+        let cursor_wire = first
+            .next_segment_cursor
+            .clone()
+            .expect("the active page must issue an anchored cursor");
+
+        // Rotate the file so resolving the anchored cursor scans across the
+        // malformed line in the archive before finding the anchor.
+        std::fs::rename(&active, &archive).unwrap();
+        let mut replacement = make_event("x", None);
+        replacement.id = "replacement".into();
+        replacement.message = Some("new-active".into());
+        write_jsonl(&active, &[replacement]);
+
+        let cursor = SegmentCursor::from_wire(&cursor_wire).expect("valid cursor");
+        let page = query_log_page(&active, true, &LogFilter::default(), 10, Some(&cursor)).unwrap();
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["older"]
+        );
+        assert!(
+            page.incomplete,
+            "anchor resolution and scanning must preserve the malformed-line warning"
+        );
+
+        let miss = find_event_across_segments(&active, true, "missing").unwrap();
+        assert!(miss.event.is_none());
+        assert!(
+            miss.incomplete,
+            "logs/get misses past malformed JSONL cannot be authoritative"
         );
     }
 
