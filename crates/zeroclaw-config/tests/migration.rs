@@ -2269,10 +2269,10 @@ fn generate_v3_channel_breadth_lower_bound() {
     // The V1 fixture covers a wide channel surface. Lower-bound count
     // catches accidental loss of a whole channel during migration.
     // Raise the bound only when adding more channels to the fixture.
-    // The V4 cut removes the twitter/reddit/notion listen paths on
-    // purpose, so those channel maps are empty by the time the config
-    // reaches V5 and are not counted here.
-    const MIN_CHANNEL_ALIASES: usize = 24;
+    // The retired `[channels.notion.*]` spelling is intentionally absent;
+    // Twitter and Reddit remain live aliased channels and count toward the
+    // migration breadth guard.
+    const MIN_CHANNEL_ALIASES: usize = 26;
 
     let cfg = migrate_to_current(
         &generate(CURRENT_SCHEMA_VERSION, &GenerateOptions::default())
@@ -2299,7 +2299,9 @@ fn generate_v3_channel_breadth_lower_bound() {
         + cfg.channels.wecom.len()
         + cfg.channels.wechat.len()
         + cfg.channels.qq.len()
+        + cfg.channels.twitter.len()
         + cfg.channels.mochat.len()
+        + cfg.channels.reddit.len()
         + cfg.channels.bluesky.len()
         + cfg.channels.email.len()
         + cfg.channels.gmail_push.len()

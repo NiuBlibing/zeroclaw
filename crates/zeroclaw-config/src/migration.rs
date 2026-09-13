@@ -3500,6 +3500,81 @@ summary_model = "legacy-summary-model"
     }
 
     #[test]
+    fn v3_to_v4_drops_only_retired_integration_and_channel_spellings() {
+        let raw = r#"
+schema_version = 3
+
+[twitter]
+enabled = true
+
+[reddit]
+enabled = true
+
+[notion]
+enabled = true
+api_key = "notion-test-token"
+database_id = "tasks"
+
+[channels.twitter.main]
+enabled = true
+bearer_token = "twitter-test-token"
+
+[channels.reddit.community]
+enabled = true
+client_id = "reddit-client"
+client_secret = "reddit-secret"
+refresh_token = "reddit-refresh"
+username = "zeroclaw-test"
+
+[channels.notion.legacy]
+enabled = true
+
+[agents.assistant]
+channels = ["twitter.main", "reddit.community", "notion.legacy"]
+
+[peer_groups.social]
+channel = "twitter.main"
+agents = ["assistant"]
+
+[peer_groups.legacy_notion]
+channel = "notion.legacy"
+agents = ["assistant"]
+"#;
+        let migrated = migrate_file(raw)
+            .expect("migrate_file succeeds")
+            .expect("V3 input triggers migration");
+        let value: toml::Value = toml::from_str(&migrated).expect("migrated TOML parses");
+        let root = value.as_table().expect("migrated config is a table");
+
+        assert!(!root.contains_key("twitter") && !root.contains_key("reddit"));
+        assert!(
+            root.contains_key("notion"),
+            "live top-level Notion survives"
+        );
+
+        let channels = root["channels"]
+            .as_table()
+            .expect("channels table survives");
+        assert!(channels.contains_key("twitter") && channels.contains_key("reddit"));
+        assert!(!channels.contains_key("notion"));
+
+        let agent_channels = root["agents"]["assistant"]["channels"]
+            .as_array()
+            .expect("agent channel refs survive");
+        let refs: Vec<&str> = agent_channels
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(refs, vec!["twitter.main", "reddit.community"]);
+
+        let peer_groups = root["peer_groups"]
+            .as_table()
+            .expect("supported peer groups survive");
+        assert!(peer_groups.contains_key("social"));
+        assert!(!peer_groups.contains_key("legacy_notion"));
+    }
+
+    #[test]
     fn v3_to_v4_is_lossless_for_untouched_config() {
         let raw = r#"
 schema_version = 3

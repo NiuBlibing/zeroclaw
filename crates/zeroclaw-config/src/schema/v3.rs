@@ -4,8 +4,9 @@
 use serde::{Deserialize, Serialize};
 
 /// V3 partial typed lens. V4 removes only fields that this binary no longer
-/// supports: inert agent-inline tunables and the superseded summary-model
-/// swap. Everything else flows through `passthrough` unchanged.
+/// supports: inert agent-inline tunables, the superseded summary-model swap,
+/// and retired integration/channel spellings. Everything else flows through
+/// `passthrough` unchanged.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct V3Config {
     #[serde(default = "default_v3_schema_version")]
@@ -46,6 +47,15 @@ const V4_INERT_AGENT_KEYS: &[&str] = &[
     "strict_tool_parsing",
 ];
 
+/// Retired top-level integration spellings. Twitter and Reddit remain live as
+/// aliased channels under `[channels]`; only their old singleton roots are
+/// unsupported by the current `Config` schema.
+const V4_RETIRED_TOP_LEVEL_KEYS: &[&str] = &["twitter", "reddit"];
+
+/// Retired aliased-channel spellings. Notion remains live as the singleton
+/// top-level `[notion]` integration, not as `[channels.notion.<alias>]`.
+const V4_RETIRED_CHANNEL_KEYS: &[&str] = &["notion"];
+
 impl V3Config {
     /// Returns a V4-shaped `toml::Value`. The caller deserializes it into
     /// `Config` — that round-trip is the gate that catches any structural
@@ -70,6 +80,10 @@ impl V3Config {
                 toml::Value::Table(new_profiles),
             );
         }
+
+        drop_retired_top_level_keys(&mut passthrough);
+        drop_retired_channel_keys(&mut passthrough);
+        drop_retired_peer_groups(&mut passthrough);
 
         passthrough.insert("schema_version".to_string(), toml::Value::Integer(4));
 
@@ -97,6 +111,7 @@ fn drop_inert_agent_keys(agents: std::collections::HashMap<String, toml::Value>)
                         )
                     );
                 }
+                prune_retired_channel_refs(&alias, &mut agent_table);
                 toml::Value::Table(agent_table)
             }
             other => other,
@@ -104,6 +119,31 @@ fn drop_inert_agent_keys(agents: std::collections::HashMap<String, toml::Value>)
         out.insert(alias, cleaned);
     }
     out
+}
+
+fn prune_retired_channel_refs(alias: &str, agent_table: &mut toml::Table) {
+    let Some(toml::Value::Array(channels)) = agent_table.get_mut("channels") else {
+        return;
+    };
+    let mut removed = Vec::new();
+    channels.retain(|entry| {
+        let Some(reference) = entry.as_str() else {
+            return true;
+        };
+        let channel_type = reference.split('.').next().unwrap_or(reference);
+        let retired = V4_RETIRED_CHANNEL_KEYS.contains(&channel_type);
+        if retired {
+            removed.push(reference.to_string());
+        }
+        !retired
+    });
+    if !removed.is_empty() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("[agents.{alias}.channels] dropped refs to retired channels: {removed:?}")
+        );
+    }
 }
 
 fn drop_summary_model_swap(
@@ -131,4 +171,68 @@ fn drop_summary_model_swap(
         out.insert(alias, cleaned);
     }
     out
+}
+
+fn drop_retired_top_level_keys(passthrough: &mut toml::Table) {
+    let mut dropped = Vec::new();
+    for key in V4_RETIRED_TOP_LEVEL_KEYS {
+        if passthrough.remove(*key).is_some() {
+            dropped.push(*key);
+        }
+    }
+    if !dropped.is_empty() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("retired top-level integration sections dropped: {dropped:?}")
+        );
+    }
+}
+
+fn drop_retired_channel_keys(passthrough: &mut toml::Table) {
+    let Some(toml::Value::Table(channels)) = passthrough.get_mut("channels") else {
+        return;
+    };
+    let mut dropped = Vec::new();
+    for key in V4_RETIRED_CHANNEL_KEYS {
+        if channels.remove(*key).is_some() {
+            dropped.push(*key);
+        }
+    }
+    if !dropped.is_empty() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("retired channel sections dropped: {dropped:?}")
+        );
+    }
+}
+
+fn drop_retired_peer_groups(passthrough: &mut toml::Table) {
+    let Some(toml::Value::Table(peer_groups)) = passthrough.get_mut("peer_groups") else {
+        return;
+    };
+    let removed: Vec<String> = peer_groups
+        .iter()
+        .filter_map(|(name, group)| {
+            let channel_type = group
+                .as_table()
+                .and_then(|table| table.get("channel"))
+                .and_then(toml::Value::as_str)
+                .map(|reference| reference.split('.').next().unwrap_or(reference));
+            channel_type
+                .is_some_and(|kind| V4_RETIRED_CHANNEL_KEYS.contains(&kind))
+                .then(|| name.clone())
+        })
+        .collect();
+    for name in &removed {
+        peer_groups.remove(name);
+    }
+    if !removed.is_empty() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("peer groups bound to retired channels dropped: {removed:?}")
+        );
+    }
 }
