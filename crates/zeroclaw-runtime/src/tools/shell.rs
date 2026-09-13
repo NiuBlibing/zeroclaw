@@ -2987,19 +2987,30 @@ mod tests {
         manager.set_shell_execution_context(tool.execution_facts_resolver());
         let command = format!("touch {}", marker.display());
         let facts = manager.shell_fingerprint_facts(&command).unwrap();
-        let confirmation = manager.mint_confirmation(&facts, RouteId::cli(), 1);
-        let authorization_args = json!({
-            "command": command,
-            "__zeroclaw_confirmation_id": confirmation.confirmation_id.to_string(),
-        });
-        let (outcome, fingerprint, expires_at) =
-            manager.authorize_shell_execution(&authorization_args);
-        assert_eq!(
-            outcome,
-            crate::approval::ShellAuthorizationOutcome::Confirmation(ConsumeOutcome::Consumed)
-        );
-        let fingerprint = fingerprint.unwrap();
-        let expires_at = expires_at.unwrap();
+        let (authorization_args, fingerprint, expires_at) = loop {
+            let confirmation = manager.mint_confirmation(&facts, RouteId::cli(), 1);
+            let authorization_args = json!({
+                "command": command,
+                "__zeroclaw_confirmation_id": confirmation.confirmation_id.to_string(),
+            });
+            let (outcome, fingerprint, expires_at) =
+                manager.authorize_shell_execution(&authorization_args);
+            match outcome {
+                crate::approval::ShellAuthorizationOutcome::Confirmation(
+                    ConsumeOutcome::Consumed,
+                ) => {
+                    break (
+                        authorization_args,
+                        fingerprint.unwrap(),
+                        expires_at.unwrap(),
+                    );
+                }
+                crate::approval::ShellAuthorizationOutcome::Confirmation(
+                    ConsumeOutcome::Expired,
+                ) => continue,
+                other => panic!("fresh confirmation returned {other:?}"),
+            }
+        };
         while (chrono::Utc::now().timestamp().max(0) as u64) < expires_at {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

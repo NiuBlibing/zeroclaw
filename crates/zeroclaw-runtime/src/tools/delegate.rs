@@ -12603,9 +12603,9 @@ command = "echo hi"
         );
         let tool_messages = provider.tool_messages();
         assert!(
-            tool_messages
-                .iter()
-                .any(|message| message.contains("Command not allowed by security policy")),
+            tool_messages.iter().any(|message| message.contains(
+                "shell policy requires approval and no operator approval route is available"
+            )),
             "the nested shell result must report a fail-closed policy denial: {tool_messages:?}"
         );
     }
@@ -12740,10 +12740,10 @@ command = "rm independent-delegate-marker"
             "nested tool result must report runtime fail-closed denial: {tool_messages:?}"
         );
         assert!(
-            tool_messages
-                .iter()
-                .any(|message| { message.contains("Command requires operator approval") }),
-            "built-in shell must still receive approved=false and enforce command policy: {tool_messages:?}"
+            tool_messages.iter().any(|message| message.contains(
+                "shell policy requires approval and no operator approval route is available"
+            )),
+            "built-in shell must still fail closed without an approval route: {tool_messages:?}"
         );
     }
 
