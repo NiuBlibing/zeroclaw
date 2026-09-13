@@ -1367,6 +1367,7 @@ pub async fn run(
             sop_audit,
             None,
         );
+        let shell_execution = all_tools_result.shell_execution.clone();
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
@@ -1722,6 +1723,9 @@ pub async fn run(
             // RFC 7155: the gate resolves the actual shell command, which
             // needs the policy and the runtime's dialect.
             manager.set_policy_context(Arc::clone(&security), runtime.shell_dialect());
+            if let Some(resolver) = shell_execution.as_ref() {
+                manager.set_shell_execution_context(Arc::clone(resolver));
+            }
             Some(manager)
         } else {
             None
@@ -2989,6 +2993,9 @@ pub async fn process_message(
             sop_audit,
             None,
         );
+        if let Some(resolver) = all_tools_result_pm.shell_execution.as_ref() {
+            approval_manager.set_shell_execution_context(Arc::clone(resolver));
+        }
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
@@ -13891,6 +13898,7 @@ Let me check the result."#;
         });
         let risk_profile = RiskProfileConfig::default();
         let built = crate::tools::AllToolsResult {
+            shell_execution: None,
             tools: vec![mock_tool("shell")],
             delegate_handle: None,
             ask_user_handle: None,

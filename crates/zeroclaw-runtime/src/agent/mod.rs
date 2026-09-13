@@ -50,6 +50,38 @@ pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
 /// Runtime-only confirmation handle. This key is never advertised in a tool
 /// schema and is stripped/replaced by the tool loop before dispatch.
 pub(crate) const RUNTIME_CONFIRMATION_ID_ARG: &str = "__zeroclaw_confirmation_id";
+pub(crate) const RUNTIME_CONFIRMATION_FINGERPRINT_ARG: &str = "__zeroclaw_confirmation_fingerprint";
+pub(crate) const RUNTIME_CONFIRMATION_EXPIRES_AT_ARG: &str = "__zeroclaw_confirmation_expires_at";
+pub(crate) const RUNTIME_POLICY_ALLOW_ARG: &str = "__zeroclaw_policy_allowed";
+pub(crate) const RUNTIME_AUTHORIZATION_REJECTED_ARG: &str = "__zeroclaw_authorization_rejected";
+
+/// Remove shell authorization plumbing before arguments cross any
+/// presentation, logging, hook, receipt, or persistence boundary. Execution
+/// keeps a separate copy and reattaches trusted values immediately before the
+/// tool wrapper stack.
+pub(crate) fn strip_runtime_authorization_args(tool_name: &str, args: &mut serde_json::Value) {
+    if tool_name != "shell" {
+        return;
+    }
+    if let Some(args) = args.as_object_mut() {
+        args.remove("approved");
+        args.remove(RUNTIME_CONFIRMATION_ID_ARG);
+        args.remove(RUNTIME_CONFIRMATION_FINGERPRINT_ARG);
+        args.remove(RUNTIME_CONFIRMATION_EXPIRES_AT_ARG);
+        args.remove(RUNTIME_POLICY_ALLOW_ARG);
+        args.remove(RUNTIME_AUTHORIZATION_REJECTED_ARG);
+        args.remove("__zeroclaw_confirmation_consumed");
+    }
+}
+
+pub(crate) fn visible_tool_arguments(
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    let mut visible = args.clone();
+    strip_runtime_authorization_args(tool_name, &mut visible);
+    visible
+}
 
 pub(crate) fn set_runtime_confirmation_id(
     tool_name: &str,
@@ -60,6 +92,10 @@ pub(crate) fn set_runtime_confirmation_id(
         && let Some(args) = args.as_object_mut()
     {
         args.remove(RUNTIME_CONFIRMATION_ID_ARG);
+        args.remove(RUNTIME_CONFIRMATION_FINGERPRINT_ARG);
+        args.remove(RUNTIME_CONFIRMATION_EXPIRES_AT_ARG);
+        args.remove(RUNTIME_POLICY_ALLOW_ARG);
+        args.remove(RUNTIME_AUTHORIZATION_REJECTED_ARG);
         if let Some(id) = confirmation_id {
             args.insert(
                 RUNTIME_CONFIRMATION_ID_ARG.to_string(),

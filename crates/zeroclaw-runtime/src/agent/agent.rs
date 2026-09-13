@@ -1701,6 +1701,7 @@ impl Agent {
             // documented snapshot fallback.
             live_config.clone(),
         );
+        let shell_execution = all_tools_result.shell_execution.clone();
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
         // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
@@ -1823,6 +1824,9 @@ impl Agent {
         // RFC 7155: the gate resolves the actual shell command, which
         // needs the policy and the runtime's dialect.
         approval_manager.set_policy_context(Arc::clone(&security), runtime.shell_dialect());
+        if let Some(resolver) = shell_execution {
+            approval_manager.set_shell_execution_context(resolver);
+        }
 
         let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
             if let Some(cap_config) = live_config {

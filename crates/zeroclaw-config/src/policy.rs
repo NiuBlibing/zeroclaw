@@ -983,27 +983,65 @@ fn workspace_prefixed_relative_suffix(path: &Path, workspace_dir: &Path) -> Opti
         .map(|suffix| PathBuf::from(suffix.replace('/', std::path::MAIN_SEPARATOR_STR)))
 }
 
-/// Skip leading environment variable assignments (e.g. `FOO=bar cmd args`).
-/// Returns the remainder starting at the first non-assignment word.
-pub(crate) fn skip_env_assignments(s: &str) -> &str {
+/// Return the remainder after simple leading POSIX environment assignments.
+///
+/// The surrounding command parser is deliberately whitespace-based, so it
+/// cannot safely model quoting or backslash escapes inside an assignment word.
+/// In particular, the shell parses `FOO=bar\ baz cmd` as one assignment plus
+/// `cmd`, while `split_whitespace` would incorrectly identify `baz` as the
+/// executable. Return `None` for those prefixes so callers can fail closed.
+pub(crate) fn simple_posix_env_assignment_remainder(s: &str) -> Option<&str> {
     let mut rest = s;
     loop {
         let Some(word) = rest.split_whitespace().next() else {
-            return rest;
+            return Some(rest);
         };
-        // Environment assignment: contains '=' and starts with a letter or underscore
-        if word.contains('=')
-            && word
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        {
+        if is_posix_env_append_assignment_word(word) {
+            return None;
+        }
+        if is_posix_env_assignment_word(word) {
+            let Some((name, value)) = word.split_once('=') else {
+                return None;
+            };
+            if word.contains(['\\', '\'', '"'])
+                || (matches!(name, "PATH" | "PATHEXT") && value.contains('~'))
+            {
+                return None;
+            }
             // Advance past this word
             rest = rest[word.len()..].trim_start();
         } else {
-            return rest;
+            return Some(rest);
         }
     }
+}
+
+/// Skip leading environment variable assignments (e.g. `FOO=bar cmd args`).
+/// Ambiguous prefixes are left intact so legacy callers fail closed instead
+/// of silently selecting the wrong executable.
+pub(crate) fn skip_env_assignments(s: &str) -> &str {
+    simple_posix_env_assignment_remainder(s).unwrap_or(s)
+}
+
+/// Whether a shell word is a POSIX `NAME=value` assignment word.
+pub(crate) fn is_posix_env_assignment_word(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    is_posix_env_name(name)
+}
+
+fn is_posix_env_append_assignment_word(word: &str) -> bool {
+    word.split_once("+=")
+        .is_some_and(|(name, _)| is_posix_env_name(name))
+}
+
+fn is_posix_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1013,9 +1051,20 @@ enum QuoteState {
     Double,
 }
 
-pub(crate) fn split_unquoted_segments(command: &str) -> Vec<String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandSeparator {
+    Sequence,
+    And,
+    Or,
+    Pipeline,
+}
+
+pub(crate) fn split_unquoted_segments_with_separators(
+    command: &str,
+) -> Vec<(Option<CommandSeparator>, String)> {
     let mut segments = Vec::new();
     let mut current = String::new();
+    let mut separator = None;
     let mut quote = QuoteState::None;
     let mut escaped = false;
     // Heredoc state: Some(delim) while inside a heredoc body.
@@ -1027,10 +1076,12 @@ pub(crate) fn split_unquoted_segments(command: &str) -> Vec<String> {
     let mut heredoc_word_buf = String::new();
     let mut chars = command.chars().peekable();
 
-    let push_segment = |segments: &mut Vec<String>, current: &mut String| {
+    let push_segment = |segments: &mut Vec<(Option<CommandSeparator>, String)>,
+                        current: &mut String,
+                        separator: &mut Option<CommandSeparator>| {
         let trimmed = current.trim();
         if !trimmed.is_empty() {
-            segments.push(trimmed.to_string());
+            segments.push((separator.take(), trimmed.to_string()));
         }
         current.clear();
     };
@@ -1107,7 +1158,8 @@ pub(crate) fn split_unquoted_segments(command: &str) -> Vec<String> {
                             // Terminator line reached — end of heredoc body.
                             heredoc_delimiter = None;
                             heredoc_line_buf.clear();
-                            push_segment(&mut segments, &mut current);
+                            push_segment(&mut segments, &mut current, &mut separator);
+                            separator = Some(CommandSeparator::Sequence);
                         } else {
                             heredoc_line_buf.clear();
                         }
@@ -1126,17 +1178,24 @@ pub(crate) fn split_unquoted_segments(command: &str) -> Vec<String> {
                         quote = QuoteState::Double;
                         current.push(ch);
                     }
-                    ';' | '\n' => push_segment(&mut segments, &mut current),
+                    ';' | '\n' => {
+                        push_segment(&mut segments, &mut current, &mut separator);
+                        separator = Some(CommandSeparator::Sequence);
+                    }
                     '|' => {
                         if chars.next_if_eq(&'|').is_some() {
-                            // Consume full `||`; both characters are separators.
+                            push_segment(&mut segments, &mut current, &mut separator);
+                            separator = Some(CommandSeparator::Or);
+                        } else {
+                            push_segment(&mut segments, &mut current, &mut separator);
+                            separator = Some(CommandSeparator::Pipeline);
                         }
-                        push_segment(&mut segments, &mut current);
                     }
                     '&' => {
                         if chars.next_if_eq(&'&').is_some() {
                             // `&&` is a separator; single `&` is handled separately.
-                            push_segment(&mut segments, &mut current);
+                            push_segment(&mut segments, &mut current, &mut separator);
+                            separator = Some(CommandSeparator::And);
                         } else {
                             current.push(ch);
                         }
@@ -1162,10 +1221,17 @@ pub(crate) fn split_unquoted_segments(command: &str) -> Vec<String> {
 
     let trimmed = current.trim();
     if !trimmed.is_empty() {
-        segments.push(trimmed.to_string());
+        segments.push((separator, trimmed.to_string()));
     }
 
     segments
+}
+
+pub(crate) fn split_unquoted_segments(command: &str) -> Vec<String> {
+    split_unquoted_segments_with_separators(command)
+        .into_iter()
+        .map(|(_, segment)| segment)
+        .collect()
 }
 
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
@@ -1279,6 +1345,10 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
     }
 
     false
+}
+
+pub(crate) fn contains_unquoted_posix_grouping(command: &str) -> bool {
+    contains_unquoted_char(command, '(') || contains_unquoted_char(command, ')')
 }
 
 /// Returns true if `command` contains an unquoted `>` that is NOT a safe
@@ -2734,6 +2804,7 @@ impl SecurityPolicy {
             || command.contains("<(")
             || command.contains(">(")
             || contains_mixed_quoted_token(command)
+            || (dialect == ShellDialect::Posix && contains_unquoted_posix_grouping(command))
         {
             return false;
         }
@@ -2771,7 +2842,9 @@ impl SecurityPolicy {
         let segments = split_unquoted_segments(command);
         for segment in &segments {
             // Strip leading env var assignments (e.g. FOO=bar cmd)
-            let cmd_part = skip_env_assignments(segment);
+            let Some(cmd_part) = simple_posix_env_assignment_remainder(segment) else {
+                return false;
+            };
 
             let mut words = cmd_part.split_whitespace();
             let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
@@ -5946,6 +6019,22 @@ mod tests {
         assert!(p.is_command_allowed("LANG=C grep pattern file"));
         // env assignment + disallowed command — blocked
         assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
+    }
+
+    #[test]
+    fn command_env_var_prefix_with_escaped_whitespace_is_blocked() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["baz".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // POSIX shells execute `printf`: the escaped space belongs to the
+        // assignment value. A whitespace-only parser must not allow the decoy
+        // executable `baz` instead.
+        assert!(!p.is_command_allowed(r"FOO=bar\ baz printf ACTUAL"));
+        assert!(!p.is_command_allowed("PATH+=:subdir baz"));
+        assert!(!p.is_command_allowed("PATH=~/bin baz"));
     }
 
     #[test]

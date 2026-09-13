@@ -17,10 +17,28 @@ pub(crate) enum ApprovalGateOutcome {
     Proceed {
         approved: bool,
         confirmation_id: Option<uuid::Uuid>,
+        prompted: bool,
     },
-    Deny(ToolExecutionOutcome),
-    Replace(ToolExecutionOutcome),
+    Deny {
+        outcome: ToolExecutionOutcome,
+        prompted: bool,
+    },
+    Replace {
+        outcome: ToolExecutionOutcome,
+        prompted: bool,
+    },
     Cancelled,
+}
+
+impl ApprovalGateOutcome {
+    pub(crate) fn prompted(&self) -> bool {
+        match self {
+            Self::Proceed { prompted, .. }
+            | Self::Deny { prompted, .. }
+            | Self::Replace { prompted, .. } => *prompted,
+            Self::Cancelled => false,
+        }
+    }
 }
 
 /// Run the approval flow for one tool call (upstream loop body, approval
@@ -47,14 +65,16 @@ pub(crate) async fn gate_tool_approval(
         .approval
         .map(|mgr| mgr.approval_requirement(tool_name))
         .unwrap_or(ApprovalRequirement::NotRequired);
+    let mut prompted = false;
 
     // ── RFC 7155 shell resolution ──────────────────────────────────
     // Only when the manager carries a policy context; everything else
     // (non-shell tools, configless paths) keeps the legacy tool-name flow.
     let mut shell_confirmation: Option<uuid::Uuid> = None;
+    let mut shell_request_facts: Option<serde_json::Value> = None;
     if let Some(mgr) = ctx.approval
         && let Some(security) = mgr.policy()
-        && crate::agent::is_runtime_approved_arg_tool(tool_name)
+        && tool_name == "shell"
         && let Some(command) = tool_args.get("command").and_then(serde_json::Value::as_str)
     {
         let resolution =
@@ -69,17 +89,63 @@ pub(crate) async fn gate_tool_approval(
                 return ApprovalGateOutcome::Proceed {
                     approved: false,
                     confirmation_id: None,
+                    prompted: false,
                 };
             }
             Decision::Allow | Decision::Ask => {
-                if approval_requirement != ApprovalRequirement::Prompt {
-                    // An Ask-tier command on a route that cannot ask
-                    // (full autonomy, auto_approve, or a non-interactive
-                    // manager without a back-channel): proceed unapproved —
-                    // the shell tool's confirmed validation then fails
-                    // closed. Tool-level approval can never bypass a
-                    // command-level Ask (RFC 7155 §1.3).
-                    shell_confirmation = None;
+                if resolution.decision == Decision::Ask
+                    && approval_requirement != ApprovalRequirement::Prompt
+                {
+                    if mgr.can_request_shell_approval() {
+                        approval_requirement = ApprovalRequirement::Prompt;
+                    } else {
+                        let denied = crate::i18n::get_required_cli_string(
+                            "tool-shell-approval-route-unavailable",
+                        );
+                        return ApprovalGateOutcome::Deny {
+                            outcome: ToolExecutionOutcome {
+                                output: denied.clone(),
+                                success: false,
+                                error_reason: Some(denied),
+                                duration: Duration::ZERO,
+                                receipt: None,
+                                output_data: None,
+                            },
+                            prompted: false,
+                        };
+                    }
+                }
+                if approval_requirement == ApprovalRequirement::Prompt {
+                    shell_request_facts = match mgr.shell_fingerprint_facts(command) {
+                        Ok(facts) => Some(facts),
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Tool)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                                "shell approval request facts could not be resolved"
+                            );
+                            let denied = crate::i18n::get_required_cli_string(
+                                "tool-shell-execution-context-unverified",
+                            );
+                            return ApprovalGateOutcome::Deny {
+                                outcome: ToolExecutionOutcome {
+                                    output: denied.clone(),
+                                    success: false,
+                                    error_reason: Some(denied),
+                                    duration: Duration::ZERO,
+                                    receipt: None,
+                                    output_data: None,
+                                },
+                                prompted: false,
+                            };
+                        }
+                    };
                 }
                 // Prompt flow below; the Yes/Always branch mints the
                 // confirmation.
@@ -90,6 +156,7 @@ pub(crate) async fn gate_tool_approval(
     if let Some(mgr) = ctx.approval
         && approval_requirement == ApprovalRequirement::Prompt
     {
+        prompted = true;
         let request = ApprovalRequest {
             tool_name: tool_name.to_string(),
             arguments: tool_args.clone(),
@@ -193,23 +260,46 @@ pub(crate) async fn gate_tool_approval(
         if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always)
             && let Some(command) = tool_args.get("command").and_then(serde_json::Value::as_str)
             && let Some(security) = mgr.policy()
-            && crate::agent::is_runtime_approved_arg_tool(tool_name)
+            && tool_name == "shell"
         {
-            let dialect = mgr.shell_dialect();
-            let action = zeroclaw_config::tool_policy::extract_shell_action(
-                command,
-                dialect,
-                Some(&security.workspace_dir),
-            );
-            let zeroclaw_config::tool_policy::ToolAction::Shell(shell_action) = &action;
-            let facts = shell_action.fingerprint_facts();
+            let facts = match shell_request_facts.as_ref() {
+                Some(facts) => facts,
+                None => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(
+                                ::serde_json::json!({"command_present": !command.is_empty()})
+                            ),
+                        "shell approval request facts were unavailable"
+                    );
+                    mgr.record_decision(tool_name, tool_args, &decision, &decision_channel, None);
+                    let denied = crate::i18n::get_required_cli_string(
+                        "tool-shell-execution-context-unverified",
+                    );
+                    return ApprovalGateOutcome::Deny {
+                        outcome: ToolExecutionOutcome {
+                            output: denied.clone(),
+                            success: false,
+                            error_reason: Some(denied),
+                            duration: Duration::ZERO,
+                            receipt: None,
+                            output_data: None,
+                        },
+                        prompted: true,
+                    };
+                }
+            };
             let confirmation = mgr.mint_confirmation(
-                &facts,
+                facts,
                 zeroclaw_api::permission::RouteId::from(decision_channel.clone()),
                 security.tool_policy.confirmation_validity_secs,
             );
             shell_confirmation = Some(confirmation.confirmation_id);
             confirmation_audit = Some(crate::approval::ConfirmationAudit {
+                confirmation_id: confirmation.confirmation_id.to_string(),
                 action_fingerprint: confirmation.action_fingerprint.as_hex(),
                 trusted_route: confirmation.trusted_route.to_string(),
                 terminal_state: "pending".to_string(),
@@ -296,14 +386,17 @@ pub(crate) async fn gate_tool_approval(
                     )))
                     .await;
             }
-            return ApprovalGateOutcome::Deny(ToolExecutionOutcome {
-                output: denied.clone(),
-                success: false,
-                error_reason: Some(denied),
-                duration: Duration::ZERO,
-                receipt: None,
-                output_data: None,
-            });
+            return ApprovalGateOutcome::Deny {
+                outcome: ToolExecutionOutcome {
+                    output: denied.clone(),
+                    success: false,
+                    error_reason: Some(denied),
+                    duration: Duration::ZERO,
+                    receipt: None,
+                    output_data: None,
+                },
+                prompted: true,
+            };
         }
 
         if let ApprovalResponse::ReplaceWith(replacement) = &decision {
@@ -331,14 +424,17 @@ pub(crate) async fn gate_tool_approval(
                     })),
                 "tool_call_result"
             );
-            return ApprovalGateOutcome::Replace(ToolExecutionOutcome {
-                output: crate::approval::sanitize_tool_replacement(replacement),
-                success: true,
-                error_reason: None,
-                duration: Duration::ZERO,
-                receipt: None,
-                output_data: None,
-            });
+            return ApprovalGateOutcome::Replace {
+                outcome: ToolExecutionOutcome {
+                    output: crate::approval::sanitize_tool_replacement(replacement),
+                    success: true,
+                    error_reason: None,
+                    duration: Duration::ZERO,
+                    receipt: None,
+                    output_data: None,
+                },
+                prompted: true,
+            };
         }
 
         if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
@@ -350,6 +446,7 @@ pub(crate) async fn gate_tool_approval(
         approved: shell_confirmation.is_some()
             || approval_requirement == ApprovalRequirement::Approved,
         confirmation_id: shell_confirmation,
+        prompted,
     }
 }
 
@@ -399,29 +496,246 @@ async fn shell_denied_outcome(
             )))
             .await;
     }
-    ApprovalGateOutcome::Deny(ToolExecutionOutcome {
-        output: denied.clone(),
-        success: false,
-        error_reason: Some(denied),
-        duration: Duration::ZERO,
-        receipt: None,
-        output_data: None,
-    })
+    ApprovalGateOutcome::Deny {
+        outcome: ToolExecutionOutcome {
+            output: denied.clone(),
+            success: false,
+            error_reason: Some(denied),
+            duration: Duration::ZERO,
+            receipt: None,
+            output_data: None,
+        },
+        prompted: false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ApprovalGateOutcome, gate_tool_approval};
     use crate::agent::turn::context::TurnCtx;
-    use crate::approval::ApprovalManager;
+    use crate::approval::{ApprovalManager, ApprovalResponse, ShellAuthorizationOutcome};
     use crate::observability::NoopObserver;
+    use crate::platform::{NativeRuntime, RuntimeAdapter, ShellDialect};
     use crate::rpc::approval_channel::RpcApprovalChannel;
     use crate::rpc::context::ApprovalPendingMap;
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use zeroclaw_api::jsonrpc::RpcOutbound;
+    use zeroclaw_api::tool::Tool;
     use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig, StreamReasoningMode};
+    use zeroclaw_config::tool_policy::{Decision, PolicyRuleConfig};
+
+    fn full_auto_approve_profile_with_shell_ask() -> RiskProfileConfig {
+        let mut profile = RiskProfileConfig {
+            level: crate::security::AutonomyLevel::Full,
+            auto_approve: vec!["shell".to_string()],
+            ..RiskProfileConfig::default()
+        };
+        profile.tool_policy.rules.push(PolicyRuleConfig {
+            pattern: "Shell(echo:*)".to_string(),
+            decision: Decision::Ask,
+        });
+        profile
+    }
+
+    #[tokio::test]
+    async fn full_auto_approve_does_not_bypass_shell_ask_with_or_without_route() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let profile = full_auto_approve_profile_with_shell_ask();
+        let security = Arc::new(crate::security::SecurityPolicy::from_risk_profile(
+            &profile,
+            workspace.path(),
+        ));
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let shell =
+            crate::tools::shell::ShellTool::new(Arc::clone(&security), Arc::clone(&runtime));
+        let commands = ["echo ask", "printf unmatched"];
+        assert!(matches!(
+            security
+                .resolve_shell_decision(commands[1], ShellDialect::Posix, &[])
+                .reason,
+            zeroclaw_config::tool_policy::ResolutionReason::Unmatched
+        ));
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+
+        let no_route = ApprovalManager::for_non_interactive(&profile);
+        no_route.set_policy_context(Arc::clone(&security), ShellDialect::Posix);
+        no_route.set_shell_execution_context(shell.execution_facts_resolver());
+        let no_route_ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test",
+            model: "test-model",
+            temperature: None,
+            approval: Some(&no_route),
+            channel_name: "background",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "turn-no-route",
+            agent_alias: Some("default"),
+            parent_agent_alias: None,
+        };
+        for command in commands {
+            let arguments = serde_json::json!({"command": command});
+            assert!(matches!(
+                gate_tool_approval(
+                    &no_route_ctx,
+                    "shell",
+                    &arguments,
+                    0,
+                    zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+                )
+                .await,
+                ApprovalGateOutcome::Deny { .. }
+            ));
+        }
+
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(4);
+        let pending = Arc::new(ApprovalPendingMap::default());
+        let channel = RpcApprovalChannel::new(
+            "rpc",
+            "session-ask",
+            Arc::new(RpcOutbound::new(writer_tx)),
+            Arc::clone(&pending),
+            Default::default(),
+        );
+        let with_route = ApprovalManager::for_non_interactive_backchannel(&profile);
+        with_route.set_policy_context(security, ShellDialect::Posix);
+        with_route.set_shell_execution_context(shell.execution_facts_resolver());
+        let route_ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test",
+            model: "test-model",
+            temperature: None,
+            approval: Some(&with_route),
+            channel_name: "rpc",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: Some(&channel),
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "turn-with-route",
+            agent_alias: Some("default"),
+            parent_agent_alias: None,
+        };
+        for command in commands {
+            let arguments = serde_json::json!({"command": command});
+            let approval_wait = gate_tool_approval(
+                &route_ctx,
+                "shell",
+                &arguments,
+                0,
+                zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+            );
+            tokio::pin!(approval_wait);
+            let line = tokio::select! {
+                outcome = &mut approval_wait => panic!("Ask unexpectedly bypassed the approval route: {}", matches!(outcome, ApprovalGateOutcome::Proceed { .. })),
+                line = writer_rx.recv() => line.expect("approval request notification"),
+            };
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let request_id = frame["params"]["request_id"].as_str().unwrap();
+            assert!(pending.resolve(
+                request_id,
+                zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+            ));
+            assert!(matches!(
+                approval_wait.await,
+                ApprovalGateOutcome::Proceed {
+                    approved: true,
+                    confirmation_id: Some(_),
+                    prompted: true,
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn session_always_revalidates_policy_fingerprint_at_shell_boundary() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let profile = RiskProfileConfig::default();
+        let mut security =
+            crate::security::SecurityPolicy::from_risk_profile(&profile, workspace.path());
+        security.allowed_commands.clear();
+        let security = Arc::new(security);
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let shell =
+            crate::tools::shell::ShellTool::new(Arc::clone(&security), Arc::clone(&runtime));
+        let approval = ApprovalManager::from_risk_profile(&profile);
+        approval.set_policy_context(Arc::clone(&security), ShellDialect::Posix);
+        approval.set_shell_execution_context(shell.execution_facts_resolver());
+        let arguments = serde_json::json!({"command": "echo session-approved"});
+        approval.record_decision("shell", &arguments, &ApprovalResponse::Always, "cli", None);
+
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test",
+            model: "test-model",
+            temperature: None,
+            approval: Some(&approval),
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "turn-session-always",
+            agent_alias: Some("default"),
+            parent_agent_alias: None,
+        };
+
+        assert!(matches!(
+            gate_tool_approval(
+                &ctx,
+                "shell",
+                &arguments,
+                0,
+                zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+            )
+            .await,
+            ApprovalGateOutcome::Proceed {
+                approved: false,
+                confirmation_id: None,
+                prompted: false,
+            }
+        ));
+        let (authorization, fingerprint, _expires_at) =
+            approval.authorize_shell_execution(&arguments);
+        assert_eq!(authorization, ShellAuthorizationOutcome::SessionAllow);
+        let result = shell
+            .execute(serde_json::json!({
+                "command": "echo session-approved",
+                (crate::agent::RUNTIME_POLICY_ALLOW_ARG): true,
+                (crate::agent::RUNTIME_CONFIRMATION_FINGERPRINT_ARG):
+                    fingerprint.unwrap().as_hex(),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "session-approved command failed: {result:?}"
+        );
+    }
 
     #[tokio::test]
     async fn cancelling_turn_drops_pending_channel_approval() {

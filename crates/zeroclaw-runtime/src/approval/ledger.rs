@@ -42,6 +42,10 @@ enum EntryState {
     Pending,
     /// Consumed by exactly one execution; any further use is `Replay`.
     Consumed,
+    /// The validity window elapsed before the first valid consumption.
+    Expired,
+    /// The first consumption attempt presented different action facts.
+    Stale,
     /// A duplicate response lost the race; the entry is dead. Returns
     /// `Superseded` rather than `Replay` so the caller can tell "this
     /// confirmation was never the operative one" from "this confirmation
@@ -82,43 +86,60 @@ impl ConfirmationLedger {
     /// Try to consume a confirmation for the action with this fingerprint.
     ///
     /// `Consumed` is the only outcome that authorizes execution; every
-    /// other outcome fails closed. Evaluation order: the window first
-    /// (an expired confirmation reports `Expired` even if it was also
-    /// already consumed — expiry is the more actionable fact for the
-    /// caller), then single-use state, then the fingerprint match.
+    /// other outcome fails closed. Existing terminal states are returned
+    /// before evaluating the window so an entry's outcome stays deterministic;
+    /// only a pending entry can transition to `Expired`, `Stale`, or
+    /// `Consumed`.
     pub fn consume(
         &self,
         confirmation_id: &Uuid,
         action_fingerprint: &ActionFingerprint,
         now_unix: u64,
     ) -> ConsumeOutcome {
+        self.consume_with_expiry(confirmation_id, action_fingerprint, now_unix)
+            .0
+    }
+
+    /// Consume and return the trusted validity deadline on success so a
+    /// downstream spawn boundary can reject work delayed past the window.
+    pub fn consume_with_expiry(
+        &self,
+        confirmation_id: &Uuid,
+        action_fingerprint: &ActionFingerprint,
+        now_unix: u64,
+    ) -> (ConsumeOutcome, Option<u64>, bool) {
         let mut entries = self.entries.lock();
         let Some(entry) = entries.get_mut(confirmation_id) else {
             // Unknown id: the confirmation never existed (or belonged to a
             // different manager/turn). Fail closed; `Stale` is the closest
             // terminal state — nothing about this action was confirmed.
-            return ConsumeOutcome::Stale;
+            return (ConsumeOutcome::Stale, None, false);
         };
-        if !entry.confirmation.is_valid_at(now_unix) {
-            return ConsumeOutcome::Expired;
-        }
         match entry.state {
-            EntryState::Consumed => return ConsumeOutcome::Replay,
-            EntryState::Superseded => return ConsumeOutcome::Superseded,
+            EntryState::Consumed => return (ConsumeOutcome::Replay, None, false),
+            EntryState::Expired => return (ConsumeOutcome::Expired, None, false),
+            EntryState::Stale => return (ConsumeOutcome::Stale, None, false),
+            EntryState::Superseded => return (ConsumeOutcome::Superseded, None, false),
             EntryState::Pending => {}
         }
+        if !entry.confirmation.is_valid_at(now_unix) {
+            entry.state = EntryState::Expired;
+            return (ConsumeOutcome::Expired, None, true);
+        }
         if &entry.confirmation.action_fingerprint != action_fingerprint {
-            return ConsumeOutcome::Stale;
+            entry.state = EntryState::Stale;
+            return (ConsumeOutcome::Stale, None, true);
         }
         if entry.confirmation.decision == ApproveOrDeny::Deny {
             // A minted deny records the operator's refusal; consuming it
             // must not authorize anything. Report it as the replay-guard
             // outcome so the caller fails closed with a distinct reason.
             entry.state = EntryState::Consumed;
-            return ConsumeOutcome::Replay;
+            return (ConsumeOutcome::Replay, None, true);
         }
+        let expires_at = entry.confirmation.validity_window.expires_at_unix();
         entry.state = EntryState::Consumed;
-        ConsumeOutcome::Consumed
+        (ConsumeOutcome::Consumed, Some(expires_at), true)
     }
 
     /// Mark an entry superseded (a duplicate response lost the race).
@@ -195,6 +216,7 @@ mod tests {
 
         let other = ActionFingerprint::compute(&facts("rm -rf /"));
         assert_eq!(ledger.consume(&id, &other, 1_100), ConsumeOutcome::Stale);
+        assert_eq!(ledger.consume(&id, &other, 1_500), ConsumeOutcome::Stale);
     }
 
     #[test]
@@ -216,6 +238,7 @@ mod tests {
         ledger.supersede(&id);
 
         assert_eq!(ledger.consume(&id, &fp, 1_100), ConsumeOutcome::Superseded);
+        assert_eq!(ledger.consume(&id, &fp, 1_500), ConsumeOutcome::Superseded);
         // Superseding an already-consumed entry changes nothing.
         ledger.supersede(&id);
     }
@@ -231,15 +254,12 @@ mod tests {
     }
 
     #[test]
-    fn expired_reports_before_replayed() {
-        // Expiry is checked before the single-use state so the caller gets
-        // the more actionable fact ("re-request approval") rather than
-        // "you already used this".
+    fn consumed_entry_remains_replay_after_expiry() {
         let ledger = ConfirmationLedger::new();
         let id = Uuid::new_v4();
         let fp = ActionFingerprint::compute(&facts("ls"));
         ledger.mint(confirmation(id, &facts("ls"), ApproveOrDeny::Approve));
         assert_eq!(ledger.consume(&id, &fp, 1_100), ConsumeOutcome::Consumed);
-        assert_eq!(ledger.consume(&id, &fp, 1_500), ConsumeOutcome::Expired);
+        assert_eq!(ledger.consume(&id, &fp, 1_500), ConsumeOutcome::Replay);
     }
 }

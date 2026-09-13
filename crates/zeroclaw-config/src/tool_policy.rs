@@ -38,12 +38,13 @@ use serde::{Deserialize, Serialize};
 use zeroclaw_api::runtime_traits::ShellDialect;
 
 use crate::policy::{
-    CommandRiskLevel, args_safe, command_basename, command_names_equivalent,
-    contains_unquoted_input_redirect, contains_unquoted_shell_variable_expansion,
-    contains_unquoted_single_ampersand, contains_unsafe_output_redirect_for_shell,
-    generic_segment_risk, is_allowlist_entry_match, is_powershell_provider_argument,
-    powershell_segment_risk, skip_env_assignments, split_simple_powershell_pipeline,
-    split_unquoted_segments, strip_fd_merge_redirects, strip_windows_exe_suffix,
+    CommandRiskLevel, CommandSeparator, args_safe, command_basename, command_names_equivalent,
+    contains_unquoted_input_redirect, contains_unquoted_posix_grouping,
+    contains_unquoted_shell_variable_expansion, contains_unquoted_single_ampersand,
+    contains_unsafe_output_redirect_for_shell, generic_segment_risk, is_allowlist_entry_match,
+    is_powershell_provider_argument, powershell_segment_risk,
+    simple_posix_env_assignment_remainder, split_simple_powershell_pipeline,
+    split_unquoted_segments_with_separators, strip_fd_merge_redirects, strip_windows_exe_suffix,
     strip_wrapping_quotes,
 };
 use crate::schema::RiskProfileConfig;
@@ -230,6 +231,8 @@ pub enum ParseStatus {
 /// allowlist applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellSegment {
+    /// How the shell reaches this segment from the preceding one.
+    pub connector: Option<ShellConnector>,
     /// Leading `NAME=value` words (preserved for fingerprinting; the
     /// executable extraction skips them exactly like the legacy
     /// allowlist's env-assignment skip).
@@ -248,6 +251,14 @@ pub struct ShellSegment {
     pub risk: CommandRiskLevel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellConnector {
+    Sequence,
+    And,
+    Or,
+    Pipeline,
+}
+
 /// A normalized shell action: what every shell rule, fingerprint, and
 /// revalidation compares against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +272,9 @@ pub struct ShellAction {
     pub cwd: Option<PathBuf>,
     pub dialect: ShellDialect,
     pub parse_status: ParseStatus,
+    /// Whether executable lookup can be reconstructed without evaluating
+    /// shell-managed state such as aliases, command hashes, or PATH exports.
+    pub execution_context_static: bool,
 }
 
 /// The normalized action a rule table adjudicates. v1 registers only the
@@ -296,11 +310,13 @@ pub fn extract_shell_action(
         }
         ShellDialect::PowerShell => extract_powershell_segments(command),
     };
+    let execution_context_static = shell_execution_context_is_static(dialect, command, &segments);
     ToolAction::Shell(ShellAction {
         segments,
         cwd: cwd.map(Path::to_path_buf),
         dialect,
         parse_status,
+        execution_context_static,
     })
 }
 
@@ -335,6 +351,7 @@ impl ShellAction {
                     .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
                     .collect();
                 serde_json::json!({
+                    "connector": segment.connector.map(shell_connector_name),
                     "env": env,
                     "executable": segment.executable,
                     "arguments": segment.arguments,
@@ -348,8 +365,208 @@ impl ShellAction {
                 .cwd
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
+            "execution_context_static": self.execution_context_static,
             "segments": segments,
         })
+    }
+}
+
+fn shell_execution_context_is_static(
+    dialect: ShellDialect,
+    source: &str,
+    segments: &[ShellSegment],
+) -> bool {
+    if segments
+        .iter()
+        .any(|segment| !literal_executable_token(dialect, &segment.executable))
+    {
+        return false;
+    }
+
+    if dialect == ShellDialect::WindowsCmd {
+        if source.contains(['%', '^', '!', '(', ')']) {
+            return false;
+        }
+        return segments.iter().enumerate().all(|(index, segment)| {
+            let has_later_segment = index + 1 < segments.len();
+            !matches!(
+                segment.base.as_str(),
+                "set" | "path" | "pushd" | "popd" | "call" | "start" | "if" | "for"
+            ) && !(has_later_segment && matches!(segment.base.as_str(), "cd" | "chdir"))
+                && !((segment.base == "cmd" || segment.base == "cmd.exe")
+                    && segment.arguments.iter().any(|argument| {
+                        matches!(argument.to_ascii_lowercase().as_str(), "/c" | "/k")
+                    }))
+        });
+    }
+
+    if dialect == ShellDialect::PowerShell {
+        return segments.iter().enumerate().all(|(index, segment)| {
+            let has_later_segment = index + 1 < segments.len();
+            !matches!(
+                segment.base.to_ascii_lowercase().as_str(),
+                "." | "&" | "invoke-expression" | "iex"
+            ) && !(has_later_segment
+                && matches!(
+                    segment.base.to_ascii_lowercase().as_str(),
+                    "cd" | "sl"
+                        | "set-location"
+                        | "pushd"
+                        | "push-location"
+                        | "popd"
+                        | "pop-location"
+                ))
+        });
+    }
+
+    if dialect != ShellDialect::Posix {
+        return false;
+    }
+
+    if contains_unquoted_posix_grouping(source) {
+        return false;
+    }
+
+    segments.iter().enumerate().all(|(index, segment)| {
+        let has_later_segment = index + 1 < segments.len();
+        let lookup_assignment = segment
+            .env_assignments
+            .iter()
+            .any(|(name, _)| lookup_variable_name(name));
+        let lookup_append_assignment = segment
+            .env_assignments
+            .iter()
+            .any(|(name, _)| name.ends_with('+') && lookup_variable_name(name));
+        let escaped_special_builtin_argument = has_later_segment
+            && posix_special_builtin(&segment.base)
+            && (segment
+                .arguments
+                .iter()
+                .any(|argument| argument.contains('\\'))
+                || segment
+                    .env_assignments
+                    .iter()
+                    .any(|(name, value)| name.contains('\\') || value.contains('\\')));
+        if segment.base.is_empty()
+            || lookup_append_assignment
+            || escaped_special_builtin_argument
+            || (has_later_segment && lookup_assignment && posix_special_builtin(&segment.base))
+        {
+            return false;
+        }
+        match segment.base.as_str() {
+            "cd" => {
+                segment.env_assignments.is_empty()
+                    && segment.arguments.len() == 1
+                    && literal_directory_argument(&segment.arguments[0])
+                    && (!has_later_segment
+                        || !matches!(
+                            segments[index + 1].connector,
+                            Some(ShellConnector::Or | ShellConnector::Pipeline)
+                        ))
+            }
+            "." | "source" | "eval" | "hash" | "alias" | "unalias" => false,
+            "export" => {
+                !has_later_segment
+                    || !segment.arguments.iter().any(|argument| {
+                        argument
+                            .split_once('=')
+                            .is_some_and(|(name, _)| lookup_variable_name(name))
+                    })
+            }
+            "readonly" => {
+                !has_later_segment
+                    || !segment.arguments.iter().any(|argument| {
+                        let name = argument
+                            .split_once('=')
+                            .map_or(argument.as_str(), |(name, _)| name);
+                        lookup_variable_name(name)
+                    })
+            }
+            "printf" => {
+                !has_later_segment
+                    || !segment
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "-v" || argument.starts_with("-v"))
+            }
+            "read" | "getopts" => !has_later_segment,
+            "unset" => {
+                !has_later_segment
+                    || !segment
+                        .arguments
+                        .iter()
+                        .any(|argument| lookup_variable_name(argument))
+            }
+            "command" => segment
+                .arguments
+                .first()
+                .is_none_or(|argument| matches!(argument.as_str(), "-v" | "-V")),
+            "fc" | "trap" | "xargs" | "time" | "if" | "then" | "else" | "elif" | "fi" | "for"
+            | "while" | "until" | "case" | "esac" | "select" | "function" | "coproc" | "do"
+            | "done" | "in" | "!" => false,
+            "env" | "exec" | "nice" | "nohup" | "timeout" | "sudo" | "doas" | "chroot"
+            | "setsid" | "stdbuf" => segment.arguments.is_empty(),
+            // A nested shell with any option or operand can load startup
+            // files, read a script, or execute command text that is absent
+            // from this action's segment list. Only a no-argument invocation
+            // has no additional code source (and receives null stdin).
+            "sh" | "dash" | "ash" | "bash" | "zsh" | "ksh" | "mksh" => segment.arguments.is_empty(),
+            _ => true,
+        }
+    })
+}
+
+fn literal_executable_token(dialect: ShellDialect, executable: &str) -> bool {
+    if executable.is_empty() {
+        return false;
+    }
+    let common_ambiguous = [
+        '\'', '"', '`', '$', '*', '?', '[', ']', '{', '}', '\n', '\r',
+    ];
+    if executable.contains(common_ambiguous) || executable.starts_with('~') {
+        return false;
+    }
+    dialect == ShellDialect::WindowsCmd || !executable.contains('\\')
+}
+
+fn posix_special_builtin(base: &str) -> bool {
+    matches!(
+        base,
+        ":" | "."
+            | "break"
+            | "continue"
+            | "eval"
+            | "exec"
+            | "exit"
+            | "export"
+            | "readonly"
+            | "return"
+            | "set"
+            | "shift"
+            | "trap"
+            | "unset"
+    )
+}
+
+fn lookup_variable_name(name: &str) -> bool {
+    let name = name.strip_suffix('+').unwrap_or(name);
+    name == "PATH" || name == "PATHEXT"
+}
+
+fn literal_directory_argument(argument: &str) -> bool {
+    !argument.is_empty()
+        && argument != "-"
+        && !argument.starts_with('~')
+        && !argument.contains(['*', '?', '[', ']', '\\'])
+}
+
+fn shell_connector_name(connector: ShellConnector) -> &'static str {
+    match connector {
+        ShellConnector::Sequence => "sequence",
+        ShellConnector::And => "and",
+        ShellConnector::Or => "or",
+        ShellConnector::Pipeline => "pipeline",
     }
 }
 
@@ -417,14 +634,46 @@ fn extract_posix_like_segments(
     }
 
     let mut segments = Vec::new();
-    for segment in split_unquoted_segments(command) {
-        let Some(extracted) = extract_one_posix_segment(&segment) else {
+    for (connector, segment) in split_unquoted_segments_with_separators(command) {
+        let Some(extracted) = extract_one_posix_segment(&segment, dialect) else {
+            if degradation.is_none() && !segment.trim().is_empty() {
+                degradation = Some(DegradationReason::UnsafeExecutableArguments);
+            }
+            let env_assignments = if dialect == ShellDialect::Posix {
+                simple_posix_env_assignment_remainder(&segment)
+                    .map(|remainder| capture_env_assignments(&segment, remainder))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if !env_assignments.is_empty() {
+                segments.push(ShellSegment {
+                    connector: connector.map(|separator| match separator {
+                        CommandSeparator::Sequence => ShellConnector::Sequence,
+                        CommandSeparator::And => ShellConnector::And,
+                        CommandSeparator::Or => ShellConnector::Or,
+                        CommandSeparator::Pipeline => ShellConnector::Pipeline,
+                    }),
+                    env_assignments,
+                    executable: String::new(),
+                    base: String::new(),
+                    arguments: Vec::new(),
+                    risk: CommandRiskLevel::High,
+                });
+            }
             continue;
         };
         if degradation.is_none() && !extracted.args_safe {
             degradation = Some(DegradationReason::UnsafeExecutableArguments);
         }
-        segments.push(extracted.segment);
+        let mut extracted = extracted.segment;
+        extracted.connector = connector.map(|separator| match separator {
+            CommandSeparator::Sequence => ShellConnector::Sequence,
+            CommandSeparator::And => ShellConnector::And,
+            CommandSeparator::Or => ShellConnector::Or,
+            CommandSeparator::Pipeline => ShellConnector::Pipeline,
+        });
+        segments.push(extracted);
     }
 
     (
@@ -446,25 +695,39 @@ struct ExtractedSegment {
 /// skip, quote strip + trim, inline-redirect strip, basename + suffix +
 /// lowercase, raw whitespace argument tokens (cased and lowered for the
 /// argument-safety check).
-fn extract_one_posix_segment(segment: &str) -> Option<ExtractedSegment> {
-    let cmd_part = skip_env_assignments(segment);
-    let env_assignments = capture_env_assignments(segment);
+fn extract_one_posix_segment(segment: &str, dialect: ShellDialect) -> Option<ExtractedSegment> {
+    let (cmd_part, env_assignments) = if dialect == ShellDialect::Posix {
+        let cmd_part = simple_posix_env_assignment_remainder(segment)?;
+        (cmd_part, capture_env_assignments(segment, cmd_part))
+    } else {
+        (segment, Vec::new())
+    };
 
     let mut words = cmd_part.split_whitespace();
     let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-    let executable = match raw_executable.find(['<', '>']) {
-        Some(idx) => &raw_executable[..idx],
-        None => raw_executable,
+    let mut executable = match raw_executable.find(['<', '>']) {
+        Some(idx) => raw_executable[..idx].to_string(),
+        None => raw_executable.to_string(),
     };
-    let base_owned = command_basename(executable).to_ascii_lowercase();
+    let mut args_cased: Vec<String> = words
+        .map(|word| strip_wrapping_quotes(word).to_string())
+        .collect();
+    let initial_base =
+        strip_windows_exe_suffix(&command_basename(&executable).to_ascii_lowercase()).to_string();
+    if dialect == ShellDialect::Posix
+        && initial_base == "command"
+        && args_cased
+            .first()
+            .is_some_and(|argument| !argument.starts_with('-'))
+    {
+        executable = args_cased.remove(0);
+    }
+    let base_owned = command_basename(&executable).to_ascii_lowercase();
     let base = strip_windows_exe_suffix(&base_owned).to_string();
     if base.is_empty() {
         return None;
     }
 
-    let args_cased: Vec<String> = words
-        .map(|word| strip_wrapping_quotes(word).to_string())
-        .collect();
     let args_lower: Vec<String> = args_cased
         .iter()
         .map(|word| word.to_ascii_lowercase())
@@ -477,6 +740,7 @@ fn extract_one_posix_segment(segment: &str) -> Option<ExtractedSegment> {
 
     Some(ExtractedSegment {
         segment: ShellSegment {
+            connector: None,
             env_assignments,
             executable: executable.to_string(),
             base,
@@ -487,20 +751,12 @@ fn extract_one_posix_segment(segment: &str) -> Option<ExtractedSegment> {
     })
 }
 
-/// Capture the leading `NAME=value` words the executable extraction skips.
-/// Mirrors [`crate::policy::skip_env_assignments`]'s recognition rule:
-/// contains `=` and starts with an ASCII letter or underscore.
-fn capture_env_assignments(segment: &str) -> Vec<(String, String)> {
+/// Capture the leading `NAME=value` words accepted by the canonical simple
+/// assignment-prefix parser.
+fn capture_env_assignments(segment: &str, command_remainder: &str) -> Vec<(String, String)> {
     let mut assignments = Vec::new();
-    for word in segment.split_whitespace() {
-        let is_assignment = word.contains('=')
-            && word
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
-        if !is_assignment {
-            break;
-        }
+    let prefix_len = segment.len() - command_remainder.len();
+    for word in segment[..prefix_len].split_whitespace() {
         if let Some((name, value)) = word.split_once('=') {
             assignments.push((name.to_string(), value.to_string()));
         }
@@ -513,6 +769,7 @@ fn capture_env_assignments(segment: &str) -> Vec<(String, String)> {
 /// predicates applying exactly like the legacy whole-command classification.
 fn phantom_high_risk_segment() -> ShellSegment {
     ShellSegment {
+        connector: None,
         env_assignments: Vec::new(),
         executable: String::new(),
         base: String::new(),
@@ -561,6 +818,7 @@ fn extract_powershell_segments(command: &str) -> (Vec<ShellSegment>, ParseStatus
         {
             degradation = Some(DegradationReason::UnsafePowerShellSegment);
             segments.push(ShellSegment {
+                connector: (!segments.is_empty()).then_some(ShellConnector::Pipeline),
                 env_assignments: Vec::new(),
                 executable: base_raw.to_string(),
                 base: String::new(),
@@ -590,6 +848,7 @@ fn extract_powershell_segments(command: &str) -> (Vec<ShellSegment>, ParseStatus
             degradation = Some(DegradationReason::UnsafeExecutableArguments);
         }
         segments.push(ShellSegment {
+            connector: (!segments.is_empty()).then_some(ShellConnector::Pipeline),
             env_assignments: Vec::new(),
             executable: base_raw.to_string(),
             base,
@@ -1006,11 +1265,20 @@ pub enum ResolutionReason {
 pub struct Resolution {
     pub decision: Decision,
     pub reason: ResolutionReason,
+    /// Whether this outcome would be more restrictive without at least one
+    /// matching session rule. This is aggregated across every segment so
+    /// callers never infer session dependence from whichever equal-tier
+    /// reason happened to be retained for display.
+    pub relies_on_session: bool,
 }
 
 impl Resolution {
     fn new(decision: Decision, reason: ResolutionReason) -> Self {
-        Self { decision, reason }
+        Self {
+            decision,
+            reason,
+            relies_on_session: false,
+        }
     }
 }
 
@@ -1053,7 +1321,11 @@ pub fn resolve_decision(action: &ToolAction, scopes: &ResolvedScopes) -> Resolut
         let segment_resolution = resolve_segment(segment, explicit, scopes);
         combined = Some(match combined {
             None => segment_resolution,
-            Some(prev) if prev.decision <= segment_resolution.decision => prev,
+            Some(mut prev) if prev.decision == segment_resolution.decision => {
+                prev.relies_on_session |= segment_resolution.relies_on_session;
+                prev
+            }
+            Some(prev) if prev.decision < segment_resolution.decision => prev,
             Some(_) => segment_resolution,
         });
     }
@@ -1115,20 +1387,34 @@ pub fn resolve_decision(action: &ToolAction, scopes: &ResolvedScopes) -> Resolut
 /// Only [`RuleMatcher::ToolName`] rules participate; a `ToolName` entry of
 /// `"*"` matches any tool, mirroring the legacy wildcard semantics.
 pub fn resolve_tool_name(tool_name: &str, scopes: &ResolvedScopes) -> Resolution {
-    let matched = scopes
-        .profile
-        .rules()
-        .iter()
-        .chain(scopes.session_rules.iter())
-        .filter(|rule| {
-            matches!(
-                &rule.matcher,
-                RuleMatcher::ToolName { tool }
-                    if tool == tool_name || tool.trim() == "*"
-            )
-        });
+    let profile_matches = || {
+        scopes
+            .profile
+            .rules()
+            .iter()
+            .filter(|rule| rule_matches_tool_name(rule, tool_name))
+    };
+    let matched = profile_matches().chain(
+        scopes
+            .session_rules
+            .iter()
+            .filter(|rule| rule_matches_tool_name(rule, tool_name)),
+    );
 
-    resolve_matched_rules(matched)
+    let mut resolution = resolve_matched_rules(matched);
+    if resolution.decision == Decision::Allow
+        && resolve_matched_rules(profile_matches()).decision != Decision::Allow
+    {
+        resolution.relies_on_session = true;
+    }
+    resolution
+}
+
+fn rule_matches_tool_name(rule: &PolicyRule, tool_name: &str) -> bool {
+    matches!(
+        &rule.matcher,
+        RuleMatcher::ToolName { tool } if tool == tool_name || tool.trim() == "*"
+    )
 }
 
 fn resolve_segment(
@@ -1136,14 +1422,27 @@ fn resolve_segment(
     command_explicit: bool,
     scopes: &ResolvedScopes,
 ) -> Resolution {
-    let matched = scopes
-        .profile
-        .rules()
-        .iter()
-        .chain(scopes.session_rules.iter())
-        .filter(|rule| rule_matches_segment(rule, segment, command_explicit));
+    let profile_matches = || {
+        scopes
+            .profile
+            .rules()
+            .iter()
+            .filter(|rule| rule_matches_segment(rule, segment, command_explicit))
+    };
+    let matched = profile_matches().chain(
+        scopes
+            .session_rules
+            .iter()
+            .filter(|rule| rule_matches_segment(rule, segment, command_explicit)),
+    );
 
-    resolve_matched_rules(matched)
+    let mut resolution = resolve_matched_rules(matched);
+    if resolution.decision == Decision::Allow
+        && resolve_matched_rules(profile_matches()).decision != Decision::Allow
+    {
+        resolution.relies_on_session = true;
+    }
+    resolution
 }
 
 /// The precedence algorithm over the matched rules: strict
@@ -1801,6 +2100,67 @@ mod tests {
     }
 
     #[test]
+    fn extraction_does_not_skip_invalid_posix_assignment_names() {
+        let action = extract_shell_action("bin/tool=x echo safe", ShellDialect::Posix, None);
+        let ToolAction::Shell(shell) = &action;
+        assert_eq!(shell.segments.len(), 1);
+        assert!(shell.segments[0].env_assignments.is_empty());
+        assert_eq!(shell.segments[0].executable, "bin/tool=x");
+        assert_eq!(shell.segments[0].arguments, ["echo", "safe"]);
+        assert_eq!(shell.parse_status, ParseStatus::Clean);
+    }
+
+    #[test]
+    fn extraction_fails_closed_on_ambiguous_assignments() {
+        for command in [
+            r"FOO=bar\ baz printf ACTUAL",
+            "PATH+=:subdir helper",
+            "PATH=~/bin helper",
+        ] {
+            let action = extract_shell_action(command, ShellDialect::Posix, None);
+            let ToolAction::Shell(shell) = &action;
+
+            assert!(
+                shell
+                    .segments
+                    .iter()
+                    .all(|segment| segment.base != "baz" && segment.base != "helper"),
+                "{command}"
+            );
+            assert_eq!(
+                shell.parse_status,
+                ParseStatus::Degraded(DegradationReason::UnsafeExecutableArguments),
+                "{command}"
+            );
+
+            let cfg = profile(AutonomyLevel::Full, &["baz", "helper"]);
+            let resolution = resolve_with(&cfg, command, ShellDialect::Posix);
+            assert_ne!(resolution.decision, Decision::Allow, "{command}");
+            assert!(
+                matches!(
+                    resolution.reason,
+                    ResolutionReason::DegradedSyntax {
+                        reason: DegradationReason::UnsafeExecutableArguments,
+                        ..
+                    }
+                ),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn unquoted_posix_grouping_is_not_a_static_execution_context() {
+        let action = extract_shell_action("(cd child; helper)", ShellDialect::Posix, None);
+        let ToolAction::Shell(shell) = action;
+        assert!(!shell.execution_context_static);
+
+        let quoted = extract_shell_action("printf '(safe)'", ShellDialect::Posix, None);
+        let ToolAction::Shell(quoted) = quoted;
+        assert!(quoted.execution_context_static);
+    }
+
+    #[test]
     fn extraction_splits_compound_commands() {
         let action = extract_shell_action("ls -la && rm -rf /tmp/x", ShellDialect::Posix, None);
         let ToolAction::Shell(shell) = &action;
@@ -2175,6 +2535,37 @@ mod tests {
         // But the session grant is narrow: other cargo verbs still ask.
         let action = extract_shell_action("cargo build --release", ShellDialect::Posix, None);
         assert_eq!(resolve_decision(&action, &scopes).decision, Decision::Ask);
+    }
+
+    #[test]
+    fn compound_allow_records_session_dependency_independent_of_segment_order() {
+        let cfg = profile(AutonomyLevel::Full, &["echo"]);
+        let compiled = CompiledRuleSet::compile(&cfg);
+        let session = vec![PolicyRule {
+            matcher: RuleMatcher::ShellCommand {
+                executable: "printf".into(),
+                arg_pattern: Some(ArgPattern::Prefix(vec!["session".into()])),
+            },
+            decision: Decision::Allow,
+            overridable: true,
+            source: RuleSource::Session,
+        }];
+        let scopes = ResolvedScopes {
+            profile: &compiled,
+            session_rules: &session,
+        };
+
+        for command in ["echo static; printf session", "printf session; echo static"] {
+            let action = extract_shell_action(command, ShellDialect::Posix, None);
+            let resolution = resolve_decision(&action, &scopes);
+            assert_eq!(resolution.decision, Decision::Allow, "{command}");
+            assert!(resolution.relies_on_session, "{command}");
+        }
+
+        let static_action = extract_shell_action("echo one; echo two", ShellDialect::Posix, None);
+        let static_resolution = resolve_decision(&static_action, &scopes);
+        assert_eq!(static_resolution.decision, Decision::Allow);
+        assert!(!static_resolution.relies_on_session);
     }
 
     #[test]

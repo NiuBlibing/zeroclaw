@@ -134,6 +134,74 @@ pub struct ToolExecutionOutcome {
     pub receipt: Option<String>,
 }
 
+fn attach_shell_authorization(
+    call_name: &str,
+    authorization_arguments: &serde_json::Value,
+    call_arguments: &mut serde_json::Value,
+    approval: Option<&ApprovalManager>,
+) {
+    if call_name != "shell" {
+        return;
+    }
+    if approval.and_then(ApprovalManager::policy).is_none() {
+        return;
+    }
+    let (authorization, fingerprint, expires_at) = approval
+        .map(|manager| manager.authorize_shell_execution(authorization_arguments))
+        .unwrap_or((
+            crate::approval::ShellAuthorizationOutcome::Rejected,
+            None,
+            None,
+        ));
+    if let Some(args) = call_arguments.as_object_mut() {
+        args.remove(crate::agent::RUNTIME_CONFIRMATION_ID_ARG);
+        args.remove(crate::agent::RUNTIME_CONFIRMATION_FINGERPRINT_ARG);
+        args.remove(crate::agent::RUNTIME_CONFIRMATION_EXPIRES_AT_ARG);
+        args.remove(crate::agent::RUNTIME_POLICY_ALLOW_ARG);
+        args.remove(crate::agent::RUNTIME_AUTHORIZATION_REJECTED_ARG);
+        args.insert(
+            "__zeroclaw_confirmation_consumed".to_string(),
+            serde_json::Value::Bool(matches!(
+                authorization,
+                crate::approval::ShellAuthorizationOutcome::Confirmation(
+                    zeroclaw_api::permission::ConsumeOutcome::Consumed
+                )
+            )),
+        );
+        args.insert(
+            crate::agent::RUNTIME_POLICY_ALLOW_ARG.to_string(),
+            serde_json::Value::Bool(matches!(
+                authorization,
+                crate::approval::ShellAuthorizationOutcome::SessionAllow
+            )),
+        );
+        args.insert(
+            crate::agent::RUNTIME_AUTHORIZATION_REJECTED_ARG.to_string(),
+            serde_json::Value::Bool(!matches!(
+                authorization,
+                crate::approval::ShellAuthorizationOutcome::StaticAllow
+                    | crate::approval::ShellAuthorizationOutcome::SessionAllow
+                    | crate::approval::ShellAuthorizationOutcome::Confirmation(
+                        zeroclaw_api::permission::ConsumeOutcome::Consumed
+                    )
+            )),
+        );
+        if let Some(fingerprint) = fingerprint {
+            args.insert(
+                crate::agent::RUNTIME_CONFIRMATION_FINGERPRINT_ARG.to_string(),
+                serde_json::Value::String(fingerprint.as_hex()),
+            );
+        }
+        if let Some(expires_at) = expires_at {
+            args.insert(
+                crate::agent::RUNTIME_CONFIRMATION_EXPIRES_AT_ARG.to_string(),
+                serde_json::Value::Number(expires_at.into()),
+            );
+        }
+        args.insert("approved".to_string(), serde_json::Value::Bool(false));
+    }
+}
+
 // ── Single tool execution ────────────────────────────────────────────────
 
 pub(crate) async fn execute_one_tool(
@@ -148,26 +216,8 @@ pub(crate) async fn execute_one_tool(
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<ToolExecutionOutcome> {
     let mut call_arguments = call_arguments;
-    // Confirmation is consumed immediately before dispatch, after any queue
-    // or approval wait. The shell tool receives only this runtime-owned marker;
-    // the model-visible `approved` boolean is never an authority.
-    if call_name == "shell" {
-        let confirmed = dispatch
-            .approval
-            .map(|manager| {
-                manager.consume_shell_confirmation(&call_arguments)
-                    == zeroclaw_api::permission::ConsumeOutcome::Consumed
-            })
-            .unwrap_or(false);
-        if let Some(args) = call_arguments.as_object_mut() {
-            args.remove(crate::agent::RUNTIME_CONFIRMATION_ID_ARG);
-            args.insert(
-                "__zeroclaw_confirmation_consumed".to_string(),
-                serde_json::Value::Bool(confirmed),
-            );
-            args.insert("approved".to_string(), serde_json::Value::Bool(false));
-        }
-    }
+    let shell_authorization_arguments = (call_name == "shell").then(|| call_arguments.clone());
+    crate::agent::strip_runtime_authorization_args(call_name, &mut call_arguments);
     let full_args = call_arguments.to_string();
     let tool_call_id_owned = tool_call_id.map(str::to_string);
     observer.record_event(&ObserverEvent::ToolCallStart {
@@ -301,8 +351,21 @@ pub(crate) async fn execute_one_tool(
             .await;
     }
 
+    // Consume only after the last orchestration await and immediately before
+    // entering the tool wrapper stack. ShellTool rechecks the returned expiry
+    // after its own preparation and directly before spawn.
+    let mut execution_arguments = call_arguments.clone();
+    if let Some(authorization_arguments) = shell_authorization_arguments.as_ref() {
+        attach_shell_authorization(
+            call_name,
+            authorization_arguments,
+            &mut execution_arguments,
+            dispatch.approval,
+        );
+    }
+
     let tool_future = tool
-        .execute(call_arguments.clone())
+        .execute(execution_arguments)
         .instrument(tool_span.clone());
     let execute = async {
         if let Some(token) = cancellation_token {
@@ -1487,24 +1550,42 @@ mod tests {
     /// distinct from what `ToolExecutionOutcome.output` sends to the model.
     struct RecordingObserver {
         last_result: Mutex<Option<String>>,
+        arguments: Mutex<Vec<String>>,
     }
 
     impl RecordingObserver {
         fn new() -> Self {
             Self {
                 last_result: Mutex::new(None),
+                arguments: Mutex::new(Vec::new()),
             }
         }
 
         fn last_result(&self) -> Option<String> {
             self.last_result.lock().unwrap().clone()
         }
+
+        fn arguments(&self) -> Vec<String> {
+            self.arguments.lock().unwrap().clone()
+        }
     }
 
     impl Observer for RecordingObserver {
         fn record_event(&self, event: &ObserverEvent) {
-            if let ObserverEvent::ToolCall { result, .. } = event {
-                *self.last_result.lock().unwrap() = result.clone();
+            match event {
+                ObserverEvent::ToolCallStart {
+                    arguments: Some(arguments),
+                    ..
+                } => self.arguments.lock().unwrap().push(arguments.clone()),
+                ObserverEvent::ToolCall {
+                    arguments, result, ..
+                } => {
+                    if let Some(arguments) = arguments {
+                        self.arguments.lock().unwrap().push(arguments.clone());
+                    }
+                    *self.last_result.lock().unwrap() = result.clone();
+                }
+                _ => {}
             }
         }
 
@@ -1517,6 +1598,264 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    struct CapturingShellTool {
+        seen: Arc<Mutex<Option<serde_json::Value>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for CapturingShellTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+
+        fn alias(&self) -> &str {
+            "test-capturing-shell"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CapturingShellTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+
+        fn description(&self) -> &str {
+            "Capture shell execution arguments"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            *self.seen.lock().unwrap() = Some(args);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn shell_runtime_authorization_is_visible_only_to_the_execution_boundary() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut log_rx = zeroclaw_log::subscribe_or_install();
+        while log_rx.try_recv().is_ok() {}
+        let workspace = tempfile::TempDir::new().unwrap();
+        let profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        let mut security =
+            crate::security::SecurityPolicy::from_risk_profile(&profile, workspace.path());
+        security.allowed_commands.clear();
+        let security = Arc::new(security);
+        let shell = crate::tools::shell::ShellTool::new(
+            Arc::clone(&security),
+            Arc::new(crate::platform::NativeRuntime::new()),
+        );
+        let approval = crate::approval::ApprovalManager::from_risk_profile(&profile);
+        approval.set_policy_context(security, zeroclaw_api::runtime_traits::ShellDialect::Posix);
+        approval.set_shell_execution_context(shell.execution_facts_resolver());
+        let facts = approval.shell_fingerprint_facts("echo dispatch").unwrap();
+        let confirmation =
+            approval.mint_confirmation(&facts, zeroclaw_api::permission::RouteId::cli(), 300);
+        let call_args = serde_json::json!({
+            "command": "echo dispatch",
+            "approved": true,
+            (crate::agent::RUNTIME_CONFIRMATION_ID_ARG): confirmation.confirmation_id.to_string(),
+            (crate::agent::RUNTIME_CONFIRMATION_FINGERPRINT_ARG): "model-value",
+            (crate::agent::RUNTIME_CONFIRMATION_EXPIRES_AT_ARG): 1,
+            (crate::agent::RUNTIME_POLICY_ALLOW_ARG): true,
+            (crate::agent::RUNTIME_AUTHORIZATION_REJECTED_ARG): true,
+            "__zeroclaw_confirmation_consumed": true,
+        });
+        let seen = Arc::new(Mutex::new(None));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(CapturingShellTool {
+            seen: Arc::clone(&seen),
+        })];
+        let observer = RecordingObserver::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        let outcome = execute_one_tool(
+            "shell",
+            call_args,
+            Some("call-shell"),
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+                approval: Some(&approval),
+            },
+            &test_turn_meta(),
+            &observer,
+            None,
+            None,
+            Some(&event_tx),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.success);
+        let execution_args = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(execution_args["__zeroclaw_confirmation_consumed"], true);
+        assert_eq!(
+            execution_args[crate::agent::RUNTIME_AUTHORIZATION_REJECTED_ARG],
+            false
+        );
+        assert_eq!(execution_args["approved"], false);
+        assert!(
+            execution_args
+                .get(crate::agent::RUNTIME_CONFIRMATION_FINGERPRINT_ARG)
+                .is_some()
+        );
+
+        let forbidden = [
+            "approved",
+            crate::agent::RUNTIME_CONFIRMATION_ID_ARG,
+            crate::agent::RUNTIME_CONFIRMATION_FINGERPRINT_ARG,
+            crate::agent::RUNTIME_CONFIRMATION_EXPIRES_AT_ARG,
+            crate::agent::RUNTIME_POLICY_ALLOW_ARG,
+            crate::agent::RUNTIME_AUTHORIZATION_REJECTED_ARG,
+            "__zeroclaw_confirmation_consumed",
+        ];
+        for arguments in observer.arguments() {
+            for key in forbidden {
+                assert!(
+                    !arguments.contains(key),
+                    "observer leaked {key}: {arguments}"
+                );
+            }
+        }
+        let event = event_rx.recv().await.unwrap();
+        let zeroclaw_api::agent::TurnEvent::ToolCall { args, .. } = event else {
+            panic!("expected ToolCall event");
+        };
+        for key in forbidden {
+            assert!(args.get(key).is_none(), "TurnEvent leaked {key}: {args}");
+        }
+        let mut matching_logs = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while matching_logs.len() < 2 && tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, log_rx.recv()).await {
+                Ok(Ok(value))
+                    if value
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|message| {
+                            message == "tool call: shell" || message == "tool result: shell"
+                        }) =>
+                {
+                    matching_logs.push(value)
+                }
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => break,
+            }
+        }
+        assert_eq!(matching_logs.len(), 2, "missing shell debug lifecycle logs");
+        for value in matching_logs {
+            let rendered = value.to_string();
+            for key in forbidden {
+                assert!(
+                    !rendered.contains(key),
+                    "debug log leaked {key}: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_consumes_confirmation_and_rejects_replay_through_rate_limited_shell_tool() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: crate::security::AutonomyLevel::Full,
+            allowed_commands: vec!["echo".to_string()],
+            always_ask: vec!["shell".to_string()],
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        let security = Arc::new(crate::security::SecurityPolicy::from_risk_profile(
+            &profile,
+            workspace.path(),
+        ));
+        let shell = crate::tools::shell::ShellTool::new(
+            Arc::clone(&security),
+            Arc::new(crate::platform::NativeRuntime::new()),
+        );
+        let resolver = shell.execution_facts_resolver();
+        let approval = crate::approval::ApprovalManager::from_risk_profile(&profile);
+        approval.set_policy_context(
+            Arc::clone(&security),
+            zeroclaw_api::runtime_traits::ShellDialect::Posix,
+        );
+        approval.set_shell_execution_context(resolver);
+        let facts = approval
+            .shell_fingerprint_facts("echo rate-limited")
+            .unwrap();
+        let confirmation =
+            approval.mint_confirmation(&facts, zeroclaw_api::permission::RouteId::cli(), 300);
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(
+            zeroclaw_tools::wrappers::RateLimitedTool::new(shell, security),
+        )];
+        let outcome = execute_one_tool(
+            "shell",
+            serde_json::json!({
+                "command": "echo rate-limited",
+                (crate::agent::RUNTIME_CONFIRMATION_ID_ARG): confirmation.confirmation_id.to_string(),
+            }),
+            Some("call-real-shell"),
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+                approval: Some(&approval),
+            },
+            &test_turn_meta(),
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            outcome.success,
+            "real shell dispatch failed: {}",
+            outcome.output
+        );
+        assert!(outcome.output.contains("rate-limited"));
+
+        let replay = execute_one_tool(
+            "shell",
+            serde_json::json!({
+                "command": "echo rate-limited",
+                (crate::agent::RUNTIME_CONFIRMATION_ID_ARG): confirmation.confirmation_id.to_string(),
+            }),
+            Some("call-real-shell-replay"),
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+                approval: Some(&approval),
+            },
+            &test_turn_meta(),
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!replay.success, "replayed confirmation must not execute");
+        assert!(!replay.output.contains("rate-limited"));
     }
 
     /// Fake tool whose detailed `output` embeds a credential-shaped string,

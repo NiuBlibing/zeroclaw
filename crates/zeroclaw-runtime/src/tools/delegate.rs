@@ -303,6 +303,7 @@ pub(crate) struct IndependentTargetTools {
     activated_handle: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     workspace_dir: PathBuf,
     skills: Vec<crate::skills::Skill>,
+    shell_execution: Option<Arc<crate::tools::shell::ShellExecutionFactsResolver>>,
 }
 
 impl DelegateTool {
@@ -922,6 +923,7 @@ impl DelegateTool {
             // handle (one-shot callers), which keeps the snapshot fallback.
             self.live_config.clone(),
         );
+        let shell_execution = all_tools_result.shell_execution.clone();
 
         let target_workspace = config.agent_workspace_dir(agent_name);
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_name);
@@ -970,6 +972,7 @@ impl DelegateTool {
             activated_handle,
             workspace_dir: target_workspace,
             skills,
+            shell_execution,
         })
     }
 
@@ -3537,6 +3540,12 @@ impl DelegateTool {
                     .await
                 {
                     Ok(independent) => {
+                        if let (Some(manager), Some(resolver)) = (
+                            approval_manager.as_ref(),
+                            independent.shell_execution.as_ref(),
+                        ) {
+                            manager.set_shell_execution_context(Arc::clone(resolver));
+                        }
                         sub_deferred_section = independent.deferred_section;
                         sub_activated = independent.activated_handle;
                         sub_workspace = Some(independent.workspace_dir);
