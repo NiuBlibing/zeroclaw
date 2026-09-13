@@ -603,7 +603,7 @@ pub fn all_tools(
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
-) -> AllToolsResult {
+) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime(
         config,
         security,
@@ -875,7 +875,7 @@ pub fn all_tools_with_runtime(
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
-) -> AllToolsResult {
+) -> anyhow::Result<AllToolsResult> {
     let builder = move || {
         // Warm the lazy regexes BEFORE the registry build and BEFORE any
         // turn can start: LazyLock runs the initializer on whichever thread
@@ -909,19 +909,23 @@ pub fn all_tools_with_runtime(
             live_config,
         )
     };
-    std::thread::scope(|scope| {
+    std::thread::scope(|scope| -> anyhow::Result<AllToolsResult> {
         let handle = std::thread::Builder::new()
             .name("zeroclaw-tool-registry".into())
             .stack_size(TOOL_REGISTRY_BUILD_STACK_BYTES)
             .spawn_scoped(scope, builder)
-            .expect("tool-registry builder thread should spawn");
-        match handle.join() {
+            .map_err(|error| {
+                anyhow::Error::msg(format!(
+                    "failed to spawn tool-registry builder thread: {error}"
+                ))
+            })?;
+        Ok(match handle.join() {
             Ok(result) => result,
             // Preserve the inline build's panic semantics: a builder panic is
             // resumed on the caller's thread exactly as if it had unwound
             // through the caller's frames.
             Err(panic) => std::panic::resume_unwind(panic),
-        }
+        })
     })
 }
 
@@ -2829,6 +2833,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         assert!(
@@ -2898,6 +2903,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let web_search = tools
@@ -2963,6 +2969,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -3028,6 +3035,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let send_via = tools
@@ -3089,6 +3097,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -3236,6 +3245,7 @@ permissions = ["http_client"]
                 None,
                 None,
             )
+            .expect("tool registry builds")
             .tools;
             let tool = tools
                 .iter()
@@ -3325,6 +3335,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
 
@@ -3388,6 +3399,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -3444,7 +3456,8 @@ permissions = ["http_client"]
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
             None,
-        );
+        )
+        .expect("first tool registry builds");
         let session_b = all_tools_with_runtime(
             Arc::new(Config::default()),
             &security,
@@ -3467,7 +3480,8 @@ permissions = ["http_client"]
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
             None,
-        );
+        )
+        .expect("second tool registry builds");
 
         for tools in [&session_a.tools, &session_b.tools] {
             assert!(tools.iter().any(|t| t.name() == "sop_status"));
@@ -3594,6 +3608,7 @@ permissions = ["http_client"]
                 None,
                 None,
             )
+            .expect("tool registry builds")
             .tools
         };
         let unauthorized_tools = build("ZeroClawAgent", mem.clone());
@@ -3690,6 +3705,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -3896,6 +3912,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
@@ -3944,6 +3961,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
@@ -4009,6 +4027,7 @@ permissions = ["http_client"]
                 Some(sop_audit),
                 None,
             )
+            .expect("tool registry builds")
             .tools
         };
 
@@ -4167,6 +4186,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
@@ -4206,6 +4226,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
@@ -4247,6 +4268,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_skill"));
@@ -4287,6 +4309,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
@@ -4321,6 +4344,7 @@ permissions = ["http_client"]
             is_subagent_caller,
             None,
         )
+        .expect("tool registry builds")
         .tools
         .iter()
         .map(|t| t.name().to_string())
@@ -4395,6 +4419,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
@@ -4458,6 +4483,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
@@ -4503,6 +4529,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("tool registry builds")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -4603,6 +4630,7 @@ permissions = ["http_client"]
             None,
             None,
         )
+        .expect("tool registry builds")
         .tools;
 
         let llm_task = tools

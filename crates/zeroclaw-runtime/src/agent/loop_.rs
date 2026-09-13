@@ -1391,7 +1391,7 @@ pub async fn run(
             sop_engine,
             sop_audit,
             None,
-        );
+        )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
@@ -3032,7 +3032,7 @@ pub(crate) async fn process_message_shared(
             sop_engine,
             sop_audit,
             None,
-        );
+        )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
@@ -17305,7 +17305,8 @@ Let me check the result."#;
             None,
             false,
             None,
-        );
+        )
+        .expect("tool registry builds");
 
         let before = tool_names(&built.tools);
         assert!(

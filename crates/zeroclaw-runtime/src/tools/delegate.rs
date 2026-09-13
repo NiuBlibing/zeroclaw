@@ -923,7 +923,7 @@ impl DelegateTool {
             // lifetime. `None` only when the parent registry itself had no live
             // handle (one-shot callers), which keeps the snapshot fallback.
             self.live_config.clone(),
-        );
+        )?;
 
         let target_workspace = config.agent_workspace_dir(agent_name);
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_name);

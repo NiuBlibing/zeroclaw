@@ -1918,7 +1918,7 @@ impl Agent {
             // whole lifetime. One-shot callers pass `None` and keep the
             // documented snapshot fallback.
             live_config.clone(),
-        );
+        )?;
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
         // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.

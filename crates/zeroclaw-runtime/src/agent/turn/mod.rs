@@ -1899,7 +1899,7 @@ pub(crate) async fn assemble_owned_execution(
         Some(sop_engine),
         sop_audit,
         None,
-    );
+    )?;
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
     // Capture before `runtime` is moved into `ScopedAssembly` below.
     let shell_profile = runtime.shell_profile();

@@ -12622,7 +12622,7 @@ pub async fn start_channels_with_plugin_webhooks(
             sop_engine.clone(),
             sop_audit.clone(),
             Some(Arc::clone(&config_arc)),
-        );
+        )?;
         // Route the per-agent tool registry through the one gated seam - see
         // `assemble_channel_agent_tools` for the knobs and why. `mut` because the
         // text-tool prompt policy below may clear `deferred_section` for a
@@ -14188,7 +14188,8 @@ pub(crate) mod tests {
             None,
             false,
             None,
-        );
+        )
+        .expect("tool registry builds");
         let schemas: HashMap<String, Arc<serde_json::Value>> = registry
             .tools
             .iter()
