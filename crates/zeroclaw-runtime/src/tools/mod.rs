@@ -841,11 +841,10 @@ fn warm_lazy_regexes() {
 ///
 /// Ordering and panic semantics are unchanged: the caller blocks until the
 /// registry is built (as the inline build did), and a builder panic is
-/// resumed on the caller's thread. The borrowed parameters
-/// (`browser_config`/`http_config`/`web_fetch_config`/`agents`/
-/// `root_config`) are semantically independent at the API boundary — tests
-/// deliberately pass divergent values — so they are cloned once on the
-/// caller and moved into the builder.
+/// resumed on the caller's thread. A scoped thread keeps the borrowed
+/// parameters (`browser_config`/`http_config`/`web_fetch_config`/`agents`/
+/// `root_config`) semantically independent at the API boundary while avoiding
+/// deep clones on the caller's limited stack.
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_arguments,
@@ -877,18 +876,6 @@ pub fn all_tools_with_runtime(
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 ) -> AllToolsResult {
-    let security = Arc::clone(security);
-    let risk_profile = risk_profile.clone();
-    let agent_alias = agent_alias.to_string();
-    let composio_key = composio_key.map(str::to_string);
-    let composio_entity_id = composio_entity_id.map(str::to_string);
-    let fallback_api_key = fallback_api_key.map(str::to_string);
-    let workspace_dir = workspace_dir.to_path_buf();
-    let browser_config = browser_config.clone();
-    let http_config = http_config.clone();
-    let web_fetch_config = web_fetch_config.clone();
-    let agents = agents.clone();
-    let root_config = root_config.clone();
     let builder = move || {
         // Warm the lazy regexes BEFORE the registry build and BEFORE any
         // turn can start: LazyLock runs the initializer on whichever thread
@@ -900,20 +887,20 @@ pub fn all_tools_with_runtime(
         warm_lazy_regexes();
         all_tools_with_runtime_on_thread(
             config,
-            &security,
-            &risk_profile,
-            &agent_alias,
+            security,
+            risk_profile,
+            agent_alias,
             runtime,
             memory,
-            composio_key.as_deref(),
-            composio_entity_id.as_deref(),
-            &browser_config,
-            &http_config,
-            &web_fetch_config,
-            &workspace_dir,
-            &agents,
-            fallback_api_key.as_deref(),
-            &root_config,
+            composio_key,
+            composio_entity_id,
+            browser_config,
+            http_config,
+            web_fetch_config,
+            workspace_dir,
+            agents,
+            fallback_api_key,
+            root_config,
             canvas_store,
             is_subagent_caller,
             tui_env,
@@ -922,18 +909,20 @@ pub fn all_tools_with_runtime(
             live_config,
         )
     };
-    let handle = std::thread::Builder::new()
-        .name("zeroclaw-tool-registry".into())
-        .stack_size(TOOL_REGISTRY_BUILD_STACK_BYTES)
-        .spawn(builder)
-        .expect("tool-registry builder thread should spawn");
-    match handle.join() {
-        Ok(result) => result,
-        // Preserve the inline build's panic semantics: a builder panic is
-        // resumed on the caller's thread exactly as if it had unwound
-        // through the caller's frames.
-        Err(panic) => std::panic::resume_unwind(panic),
-    }
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("zeroclaw-tool-registry".into())
+            .stack_size(TOOL_REGISTRY_BUILD_STACK_BYTES)
+            .spawn_scoped(scope, builder)
+            .expect("tool-registry builder thread should spawn");
+        match handle.join() {
+            Ok(result) => result,
+            // Preserve the inline build's panic semantics: a builder panic is
+            // resumed on the caller's thread exactly as if it had unwound
+            // through the caller's frames.
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
 }
 
 /// Registry build body; runs on the dedicated builder thread spawned by
