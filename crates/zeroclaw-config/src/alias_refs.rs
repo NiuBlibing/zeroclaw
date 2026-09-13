@@ -448,6 +448,11 @@ fn scrub_model_alias_refs(cfg: &mut Config, target: &str) {
                 crate::providers::ModelProviderRef::default();
         }
     }
+    for (_family, _alias, profile) in cfg.providers.models.iter_entries_mut() {
+        profile
+            .fallback
+            .retain(|fallback| fallback.trim() != target);
+    }
     cfg.model_routes
         .retain(|r| r.model_provider.trim() != target);
     cfg.embedding_routes
@@ -953,6 +958,20 @@ fn rewrite_model_alias_refs(
             ));
         }
     }
+    for (provider_family, provider_alias, profile) in cfg.providers.models.iter_entries_mut() {
+        let mut touched = false;
+        for fallback in &mut profile.fallback {
+            if fallback.trim() == old_target {
+                *fallback = new_target.as_str().into();
+                touched = true;
+            }
+        }
+        if touched {
+            dirty.push(format!(
+                "providers.models.{provider_family}.{provider_alias}"
+            ));
+        }
+    }
     let mut routes_touched = false;
     for r in cfg.model_routes.iter_mut() {
         if r.model_provider.trim() == old_target {
@@ -1240,6 +1259,19 @@ fn collect_model_alias_refs(
                     format!("runtime_profiles.{pname}.context_compression.summary_provider"),
                     ScrubAction::ClearOptional,
                     sp.as_str(),
+                ));
+            }
+        }
+    }
+    for (provider_family, provider_alias, profile) in cfg.providers.models.iter_entries() {
+        for (index, fallback) in profile.fallback.iter().enumerate() {
+            if fallback.trim() == target {
+                sites.push(RefSite::soft(
+                    format!(
+                        "providers.models.{provider_family}.{provider_alias}.fallback[{index}]"
+                    ),
+                    ScrubAction::DropFromVec { index },
+                    fallback.as_str(),
                 ));
             }
         }
@@ -3295,6 +3327,83 @@ mod tests {
                 .map(|p| p.base.models.contains_key("turbo") && !p.base.models.contains_key("fast"))
                 .unwrap_or(false),
             "model entry must be renamed in the config"
+        );
+    }
+
+    #[test]
+    fn model_alias_fallback_refs_follow_rename_and_delete_cascades() {
+        use crate::schema::{CustomModelProviderConfig, ModelEntryConfig, ModelProviderConfig};
+
+        let mut cfg = empty_config();
+        let mut target = ModelProviderConfig::default();
+        target.models.insert(
+            "fast".to_string(),
+            ModelEntryConfig {
+                id: Some("fast-id".to_string()),
+                ..Default::default()
+            },
+        );
+        target.models.insert(
+            "slow".to_string(),
+            ModelEntryConfig {
+                id: Some("slow-id".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg.providers.models.custom.insert(
+            "rag_bot".to_string(),
+            CustomModelProviderConfig { base: target },
+        );
+        cfg.providers
+            .models
+            .ensure("openai", "main")
+            .expect("source provider")
+            .fallback = vec![" custom.rag_bot.fast ".into(), "custom.rag_bot.slow".into()];
+
+        let kind = model_alias_kind("custom", "rag_bot");
+        let refs = find_all_references(&cfg, &kind, "fast");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, "providers.models.openai.main.fallback[0]");
+        assert_eq!(refs[0].strength, RefStrength::Soft);
+
+        let renamed = rename_with_cascade(&mut cfg, &kind, "fast", "turbo")
+            .expect("fallback ref should follow model alias rename");
+        assert!(
+            renamed
+                .dirty_paths
+                .contains(&"providers.models.openai.main".to_string())
+        );
+        let source = cfg
+            .providers
+            .models
+            .find("openai", "main")
+            .expect("source provider remains");
+        assert_eq!(source.fallback[0].as_str(), "custom.rag_bot.turbo");
+        assert!(find_all_references(&cfg, &kind, "fast").is_empty());
+
+        let deleted = delete_with_cascade(&mut cfg, &kind, "turbo", CascadePolicy::RefuseOnHard)
+            .expect("soft fallback ref should be scrubbed on delete");
+        assert_eq!(
+            deleted.plan.scrubs[0].path,
+            "providers.models.openai.main.fallback[0]"
+        );
+        assert!(
+            deleted
+                .dirty_paths()
+                .contains(&"providers.models.openai.main".to_string())
+        );
+        let source = cfg
+            .providers
+            .models
+            .find("openai", "main")
+            .expect("source provider remains");
+        assert_eq!(
+            source
+                .fallback
+                .iter()
+                .map(|reference| reference.as_str())
+                .collect::<Vec<_>>(),
+            vec!["custom.rag_bot.slow"]
         );
     }
 

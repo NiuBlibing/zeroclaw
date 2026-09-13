@@ -4187,33 +4187,36 @@ impl Config {
         }
     }
 
-    /// Return the first concrete `model` string available for use as a
-    /// default: the model declared by the first entry that has one. Entries
-    /// are visited in macro slot order, then sorted alias order within each
-    /// slot, as implemented by
-    /// [`ModelProviders::first_entry_with_model`](crate::providers::ModelProviders::first_entry_with_model).
-    /// Returns `None` only when no model-provider entry has any model
-    /// configured at all.
+    /// Resolve the first provider profile that has an effective model. Entries
+    /// are visited in deterministic provider-slot and alias order. The result
+    /// keeps the profile, selected nested entry, and effective model id
+    /// together so bootstrap consumers cannot combine facts from two profiles.
     #[must_use]
-    pub fn resolve_default_model(&self) -> Option<String> {
+    pub fn resolve_default_model_selection(&self) -> Option<ModelSelection<'_>> {
         self.providers
             .models
             .iter_entries()
-            .find_map(|(family, alias, entry)| {
+            .find_map(|(family, alias, _)| {
                 let provider_ref = format!("{family}.{alias}");
                 self.resolve_model_selection(&provider_ref)
-                    .and_then(|selection| selection.model_id)
-                    .map(|model| model.trim().to_string())
-                    .filter(|model| !model.is_empty())
-                    .or_else(|| {
-                        entry
-                            .model
+                    .filter(|selection| {
+                        selection
+                            .model_id
                             .as_deref()
                             .map(str::trim)
-                            .filter(|model| !model.is_empty())
-                            .map(ToString::to_string)
+                            .is_some_and(|model| !model.is_empty())
                     })
             })
+    }
+
+    /// Return the first concrete model id available for use as a default.
+    /// This is the model-only projection of
+    /// [`Self::resolve_default_model_selection`].
+    #[must_use]
+    pub fn resolve_default_model(&self) -> Option<String> {
+        self.resolve_default_model_selection()
+            .and_then(|selection| selection.model_id)
+            .map(|model| model.trim().to_string())
     }
 
     /// Resolve the risk profile for an explicit agent alias.
@@ -13892,9 +13895,9 @@ pub struct ModelRouteConfig {
     /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
     pub model_provider: String,
-    /// Provider-local model identifier to use with that provider profile
+    /// Provider-local model identifier to use with that provider profile.
+    /// When omitted, the model selected by `model_provider` is used.
     /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
-    /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
     pub model: String,
     /// Optional API key override for this route's model provider
@@ -22526,11 +22529,18 @@ impl Config {
                     "model_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
                 ),
             }
-            if route.model.trim().is_empty() {
+            if route.model.trim().is_empty()
+                && self
+                    .resolve_model_selection(mp)
+                    .and_then(|selection| selection.model_id)
+                    .as_deref()
+                    .map(str::trim)
+                    .is_none_or(str::is_empty)
+            {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].model"),
-                    "model_routes[{i}].model must not be empty"
+                    "model_routes[{i}].model may be omitted only when model_provider resolves to a configured model id"
                 );
             }
         }
@@ -22617,10 +22627,44 @@ impl Config {
                 .api_key
                 .as_deref()
                 .is_some_and(|v| !v.trim().is_empty());
-            let has_model = profile
+            let has_profile_model = profile
                 .model
                 .as_deref()
                 .is_some_and(|v| !v.trim().is_empty());
+            for (model_alias, model_entry) in &profile.models {
+                let model_path = format!("providers.models.{profile_name}.models.{model_alias}");
+                if model_entry
+                    .id
+                    .as_deref()
+                    .is_some_and(|id| id.trim().is_empty())
+                {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("{model_path}.id"),
+                        "{model_path}.id must not be empty when set"
+                    );
+                }
+                if model_entry.id.is_none() && !has_profile_model {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("{model_path}.id"),
+                        "{model_path}.id is required when the provider profile has no model"
+                    );
+                }
+                if let Some(temp) = model_entry.temperature {
+                    validate_temperature(temp).map_err(|e| {
+                        anyhow::Error::msg(format!("{model_path}.temperature: {e}"))
+                    })?;
+                }
+                if model_entry.context_window == Some(0) {
+                    validation_bail!(
+                        InvalidNumericRange,
+                        format!("{model_path}.context_window"),
+                        "{model_path}.context_window must be greater than 0"
+                    );
+                }
+            }
+            let has_model = has_profile_model || !profile.models.is_empty();
             if !has_uri && !has_api_key && !has_model {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": profile_name, "profile_name": profile_name})), "providers.models. is empty (no uri / api_key / model). \
                      Skipping at runtime; run `zeroclaw quickstart` (or use the dashboard) \
@@ -32099,6 +32143,122 @@ model = "primary-model"
             ..Default::default()
         };
         assert_eq!(route.effective_model(&config), "");
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_accepts_nested_only_route_with_implicit_model() {
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "gateway".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-test".to_string()),
+                    models: HashMap::from([(
+                        "fast".to_string(),
+                        ModelEntryConfig {
+                            id: Some("gpt-nested".to_string()),
+                            temperature: Some(0.2),
+                            context_window: Some(16_384),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.model_routes.push(ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: "openai.gateway.fast".to_string(),
+            model: String::new(),
+            api_key: None,
+        });
+
+        assert!(
+            config.validate().is_ok(),
+            "a nested model id makes an omitted route model unambiguous: {:?}",
+            config.validate().err()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn validate_rejects_malformed_nested_model_entries() {
+        let config_with = |entry: ModelEntryConfig, profile_model: Option<&str>| {
+            let mut config = Config::default();
+            config.providers.models.openai.insert(
+                "gateway".to_string(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        api_key: Some("sk-test".to_string()),
+                        model: profile_model.map(str::to_string),
+                        models: HashMap::from([("fast".to_string(), entry)]),
+                        ..Default::default()
+                    },
+                },
+            );
+            config
+        };
+        let assert_error_path = |config: Config, expected: &str| {
+            let error = config
+                .validate()
+                .expect_err("malformed nested model entry must fail validation")
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "validation error should name {expected}, got: {error}"
+            );
+        };
+
+        assert_error_path(
+            config_with(ModelEntryConfig::default(), None),
+            "models.fast.id",
+        );
+        assert_error_path(
+            config_with(
+                ModelEntryConfig {
+                    id: Some("  ".to_string()),
+                    ..Default::default()
+                },
+                Some("profile-model"),
+            ),
+            "models.fast.id",
+        );
+        assert_error_path(
+            config_with(
+                ModelEntryConfig {
+                    id: Some("gpt-nested".to_string()),
+                    temperature: Some(f64::NAN),
+                    ..Default::default()
+                },
+                None,
+            ),
+            "models.fast.temperature",
+        );
+        assert_error_path(
+            config_with(
+                ModelEntryConfig {
+                    id: Some("gpt-nested".to_string()),
+                    context_window: Some(0),
+                    ..Default::default()
+                },
+                None,
+            ),
+            "models.fast.context_window",
+        );
+
+        let inherited = config_with(
+            ModelEntryConfig {
+                id: None,
+                temperature: Some(0.4),
+                context_window: Some(8_192),
+                ..Default::default()
+            },
+            Some("profile-model"),
+        );
+        assert!(
+            inherited.validate().is_ok(),
+            "an omitted nested id inherits the profile model: {:?}",
+            inherited.validate().err()
+        );
     }
 
     #[test]
