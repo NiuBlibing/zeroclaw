@@ -8,10 +8,9 @@ use crate::schema::v3::V3Config;
 
 /// The schema version this binary writes and expects on disk.
 ///
-/// V4 is reserved for the breaking schema cut covering channel/tool removals
-/// (the companion PR that removes deprecated channels and SaaS integrations).
-/// This branch's multi-model provider feature occupies V5 so the two cuts can
-/// land independently and in either order.
+/// V4 is the coordination slot for the preceding deprecated-schema cleanup.
+/// This branch's multi-model provider feature occupies V5 so it does not
+/// compete for that version slot.
 pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 pub(crate) struct ConfigLoadAttribution;
@@ -799,10 +798,8 @@ pub(crate) fn fold_string_into_array(
 /// compatibility; this step only mints `models.default.id` from the legacy
 /// entry-level `model` field.
 ///
-/// V4 is reserved for the breaking channel/tool-removal cut that removes
-/// deprecated channels and SaaS integrations.
-/// This step sits at V4→V5 so the two cuts can land independently and in
-/// either order without competing for the same version slot.
+/// This step sits at V4→V5 so multi-model profiles do not compete with the
+/// preceding deprecated-schema cleanup for the same version slot.
 fn migrate_v4_to_v5(value: toml::Value) -> Result<toml::Value> {
     let mut root = match value {
         toml::Value::Table(t) => t,
@@ -875,7 +872,9 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
             .context("failed to deserialize as V2 schema")?;
         v2.migrate().context("failed to migrate V2 → V3")
     },
-    // V3 → V4: breaking channel/tool-removal migration.
+    // V3 → V4: remove fields already retired by this binary. Config for live
+    // integrations and channels must survive until their consumers are
+    // removed in the same shipped runtime.
     |value| {
         let v3: V3Config = value
             .try_into()
@@ -3363,27 +3362,6 @@ temperature = 0.5
     }
 
     #[test]
-    fn v3_to_v4_drops_skills_prompt_injection_mode() {
-        let raw = r#"
-schema_version = 3
-
-[skills]
-open_skills_enabled = true
-prompt_injection_mode = "full"
-"#;
-        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
-        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
-        assert!(cfg.skills.open_skills_enabled);
-        let migrated = migrate_file(raw)
-            .expect("migrate_file succeeds")
-            .expect("V3 input triggers migration");
-        assert!(
-            !migrated.contains("prompt_injection_mode"),
-            "migrated V4 config must not carry the dropped skills key; got:\n{migrated}"
-        );
-    }
-
-    #[test]
     fn v3_to_v4_drops_inert_agent_tunable_keys() {
         let raw = r#"
 schema_version = 3
@@ -3430,57 +3408,94 @@ summary_model = "anthropic/claude-3-haiku"
     }
 
     #[test]
-    fn v3_to_v4_drops_removed_saas_and_cli_sections() {
+    fn v3_to_v5_preserves_supported_features_while_dropping_retired_fields() {
         let raw = r#"
 schema_version = 3
 
-[composio]
-enabled = true
+[skills]
+prompt_injection_mode = "compact"
 
 [jira]
 enabled = true
 base_url = "https://jira.example.test"
+api_token = "jira-test-token"
 
 [notion]
 enabled = true
+api_key = "notion-test-token"
+database_id = "tasks"
 
-[google_workspace]
+[channels.twitter.main]
 enabled = true
+bearer_token = "twitter-test-token"
 
-[claude_code]
+[channels.reddit.community]
 enabled = true
+client_id = "reddit-client"
+client_secret = "reddit-secret"
+refresh_token = "reddit-refresh"
+username = "zeroclaw-test"
+subreddits = ["rust"]
 
-[channels.twitter]
-enabled = true
+[agents.assistant]
+channels = ["twitter.main", "reddit.community"]
+runtime_profile = "default"
+max_tool_iterations = 20
 
-[channels.reddit]
-enabled = true
+[peer_groups.social]
+channel = "twitter.main"
+agents = ["assistant"]
 
-[channels.telegram.main]
+[runtime_profiles.default]
+
+[runtime_profiles.default.context_compression]
 enabled = true
-bot_token = "t"
+summary_model = "legacy-summary-model"
 "#;
         let migrated = migrate_file(raw)
             .expect("migrate_file succeeds")
             .expect("V3 input triggers migration");
-        for dropped in [
-            "[composio]",
-            "[jira]",
-            "[notion]",
-            "[google_workspace]",
-            "[claude_code]",
-            "[channels.twitter]",
-            "[channels.reddit]",
-        ] {
-            assert!(
-                !migrated.contains(dropped),
-                "migrated V4 config must not carry removed section {dropped}; got:\n{migrated}"
-            );
-        }
-        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
+
         assert!(
-            cfg.channels.telegram.contains_key("main"),
-            "surviving channels must be preserved through the drop"
+            !migrated.contains("max_tool_iterations") && !migrated.contains("summary_model"),
+            "fields retired by this binary must still be removed; got:\n{migrated}"
+        );
+        let cfg = migrate_to_current(&migrated).expect("migrated V5 config loads");
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            cfg.skills.prompt_injection_mode,
+            crate::schema::SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            cfg.channels
+                .twitter
+                .get("main")
+                .map(|channel| channel.bearer_token.as_str()),
+            Some("twitter-test-token")
+        );
+        assert_eq!(
+            cfg.channels
+                .reddit
+                .get("community")
+                .map(|channel| channel.username.as_str()),
+            Some("zeroclaw-test")
+        );
+        assert!(cfg.jira.enabled && cfg.notion.enabled);
+        assert_eq!(cfg.jira.base_url, "https://jira.example.test");
+        assert_eq!(cfg.notion.database_id, "tasks");
+        let agent = cfg.agents.get("assistant").expect("agent survives");
+        let refs: Vec<&str> = agent.channels.iter().map(|c| c.as_str()).collect();
+        assert_eq!(
+            refs,
+            vec!["twitter.main", "reddit.community"],
+            "bindings to supported channels must survive migration"
+        );
+        assert_eq!(
+            cfg.peer_groups
+                .get("social")
+                .map(|group| group.channel.as_str()),
+            Some("twitter.main"),
+            "peer groups bound to supported channels must survive migration"
         );
     }
 
@@ -3499,60 +3514,6 @@ bot_token = "t"
         let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
         assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(cfg.channels.telegram.contains_key("main"));
-    }
-
-    #[test]
-    fn v3_to_v4_prunes_agent_refs_to_removed_channels() {
-        let raw = r#"
-schema_version = 3
-
-[channels.telegram.main]
-enabled = true
-bot_token = "t"
-
-[agents.assistant]
-channels = ["telegram.main", "twitter", "reddit.default", "notion"]
-"#;
-        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
-        let agent = cfg.agents.get("assistant").expect("agent survives");
-        let refs: Vec<&str> = agent.channels.iter().map(|c| c.as_str()).collect();
-        assert_eq!(
-            refs,
-            vec!["telegram.main"],
-            "refs to removed channel types must be pruned so validate() has no dangling target"
-        );
-    }
-
-    #[test]
-    fn v3_to_v4_drops_peer_groups_bound_to_removed_channels() {
-        let raw = r#"
-schema_version = 3
-
-[channels.telegram.main]
-enabled = true
-bot_token = "t"
-
-[peer_groups.ops]
-channel = "telegram.main"
-
-[peer_groups.birdwatch]
-channel = "twitter.default"
-
-[peer_groups.frontpage]
-channel = "reddit"
-"#;
-        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
-        assert!(
-            cfg.peer_groups.contains_key("ops"),
-            "peer group on a surviving channel must be kept; got: {:?}",
-            cfg.peer_groups.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            !cfg.peer_groups.contains_key("birdwatch")
-                && !cfg.peer_groups.contains_key("frontpage"),
-            "peer groups bound to removed channels must be dropped; got: {:?}",
-            cfg.peer_groups.keys().collect::<Vec<_>>()
-        );
     }
 
     #[test]
