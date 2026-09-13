@@ -5773,9 +5773,10 @@ mod tests {
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
                 CountingTool::new("probe", Arc::clone(&invocations)),
             )]);
+        let marker_path = image_path.to_string_lossy().replace('\\', "/");
         let mut history = vec![ChatMessage::user(format!(
             "inspect [IMAGE:{}]",
-            image_path.display()
+            marker_path
         ))];
         let observer = NoopObserver;
         let turn_id = uuid::Uuid::new_v4().to_string();
