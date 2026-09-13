@@ -647,6 +647,50 @@ mod tests {
         invocations: Arc<AtomicUsize>,
     }
 
+    struct ConfirmationMarkerTool;
+
+    impl zeroclaw_api::attribution::Attributable for ConfirmationMarkerTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+
+        fn alias(&self) -> &str {
+            "test-confirmation-marker"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ConfirmationMarkerTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+
+        fn description(&self) -> &str {
+            "Records whether dispatch received a consumed confirmation"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            if args
+                .get("__zeroclaw_confirmation_consumed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                Ok(crate::tools::ToolResult::ok("confirmation consumed"))
+            } else {
+                Ok(crate::tools::ToolResult::err(
+                    "confirmation was not consumed at dispatch",
+                ))
+            }
+        }
+    }
+
     impl CountingTool {
         fn new(name: &str, invocations: Arc<AtomicUsize>) -> Self {
             Self {
@@ -829,6 +873,64 @@ mod tests {
             "Tool not available in this turn: extract_text"
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_rejects_confirmation_that_expires_before_dispatch() {
+        use std::path::Path;
+        use zeroclaw_api::permission::RouteId;
+        use zeroclaw_api::runtime_traits::ShellDialect;
+        use zeroclaw_config::policy::SecurityPolicy;
+        use zeroclaw_config::schema::RiskProfileConfig;
+        use zeroclaw_config::tool_policy::{ToolAction, extract_shell_action};
+
+        let profile = RiskProfileConfig::default();
+        let security = Arc::new(SecurityPolicy::from_risk_profile(&profile, Path::new(".")));
+        let manager = crate::approval::ApprovalManager::from_risk_profile(&profile);
+        manager.set_policy_context(Arc::clone(&security), ShellDialect::Posix);
+
+        let command = "echo delayed";
+        let ToolAction::Shell(action) =
+            extract_shell_action(command, ShellDialect::Posix, Some(&security.workspace_dir));
+        let confirmation =
+            manager.mint_confirmation(&action.fingerprint_facts(), RouteId::cli(), 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+        let mut arguments = serde_json::json!({"command": command, "approved": true});
+        arguments.as_object_mut().unwrap().insert(
+            crate::agent::RUNTIME_CONFIRMATION_ID_ARG.to_string(),
+            serde_json::Value::String(confirmation.confirmation_id.to_string()),
+        );
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ConfirmationMarkerTool)];
+        let outcome = execute_one_tool(
+            "shell",
+            arguments,
+            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+                approval: Some(&manager),
+            },
+            &test_turn_meta(),
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("expired confirmation must produce a fail-closed tool result");
+
+        assert!(!outcome.success);
+        assert!(
+            outcome
+                .output
+                .contains("confirmation was not consumed at dispatch"),
+            "the runtime-owned confirmation marker must remain false: {}",
+            outcome.output
+        );
     }
 
     /// Fake tool that always fails, with an `error` distinct from `output` —

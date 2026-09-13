@@ -4755,6 +4755,24 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_execution_rejects_posix_mixed_quoting_that_hides_deny() {
+        let mut policy = full_policy();
+        policy.allowed_commands = vec!["git".to_string()];
+        policy.block_high_risk_commands = false;
+        policy.tool_policy.rules = vec![crate::tool_policy::PolicyRuleConfig {
+            pattern: "Shell(git push:*)".to_string(),
+            decision: crate::tool_policy::Decision::Deny,
+        }];
+
+        let denied =
+            policy.validate_command_execution_confirmed("git pu\"sh\"", true, ShellDialect::Posix);
+        assert!(
+            denied.is_err(),
+            "a consumed confirmation must not authorize degraded syntax that hides an explicit Deny"
+        );
+    }
+
+    #[test]
     fn powershell_grammar_rejects_mixed_quoted_tokens() {
         // PowerShell concatenates adjacent quoted and unquoted fragments before
         // binding an argument, so a token that mixes bare and quoted characters
