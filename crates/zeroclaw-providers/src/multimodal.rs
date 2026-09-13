@@ -18,9 +18,10 @@ const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 ///
 /// This is a hard sanity guard enforced in `parse_image_markers` before
 /// `collapse_wrapped_marker` or any other owned-copy operation runs. A marker
-/// candidate whose UTF-8 byte length exceeds this ceiling is treated as
-/// non-loadable and preserved verbatim in the cleaned output, bypassing all
-/// downstream validation and normalization.
+/// candidate whose UTF-8 byte length exceeds this ceiling is classified from
+/// a bounded prefix. Image-shaped spans are replaced with a fixed refusal note,
+/// while ordinary placeholder/prose markers remain verbatim. The oversized
+/// image body never reaches downstream validation or normalization.
 ///
 /// The ceiling is deliberately set well above any legitimate configured
 /// `max_image_size_mb` (which clamps at 20 MiB decoded → ~27 MB base64 encoded)
@@ -3997,9 +3998,9 @@ mod tests {
                 "{label}: rejection must happen before any pixel decode"
             );
 
-            // The marker is preserved verbatim as prose — the same treatment
-            // placeholder markers get — so the message text survives and the
-            // rejection never reports the marker through an error path.
+            // The surrounding prose survives, but the attacker-controlled
+            // marker body is replaced with the same fixed refusal note for
+            // every over-ceiling image-shaped candidate.
             let content = &result.messages[0].content;
             assert!(
                 content.starts_with("before "),
