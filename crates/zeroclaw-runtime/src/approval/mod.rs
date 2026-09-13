@@ -429,10 +429,7 @@ impl ApprovalManager {
     /// boundary. The command facts are reconstructed from the actual tool
     /// arguments; no model-supplied boolean is trusted. A denied or malformed
     /// action never consumes a pending confirmation.
-    pub(crate) fn consume_shell_confirmation(
-        &self,
-        args: &serde_json::Value,
-    ) -> ConsumeOutcome {
+    pub(crate) fn consume_shell_confirmation(&self, args: &serde_json::Value) -> ConsumeOutcome {
         let Some(id) = args
             .get(crate::agent::RUNTIME_CONFIRMATION_ID_ARG)
             .and_then(serde_json::Value::as_str)
@@ -452,11 +449,8 @@ impl ApprovalManager {
             Some(&security.workspace_dir),
         );
         let zeroclaw_config::tool_policy::ToolAction::Shell(shell) = &action;
-        let resolution = security.resolve_shell_decision(
-            command,
-            self.shell_dialect(),
-            &self.session_rules(),
-        );
+        let resolution =
+            security.resolve_shell_decision(command, self.shell_dialect(), &self.session_rules());
         if resolution.decision == zeroclaw_config::tool_policy::Decision::Deny {
             return ConsumeOutcome::Stale;
         }

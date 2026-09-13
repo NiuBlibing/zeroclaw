@@ -248,12 +248,8 @@ pub(crate) async fn prepare_tool_calls(
                     continue;
                 }
                 ApprovalGateOutcome::Cancelled => return Err(ToolLoopCancelled.into()),
-        };
-        crate::agent::set_runtime_confirmation_id(
-            &tool_name,
-            &mut tool_args,
-            confirmation_id,
-        );
+            };
+        crate::agent::set_runtime_confirmation_id(&tool_name, &mut tool_args, confirmation_id);
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, approved);
 
         let signature = tool_call_signature(&tool_name, &tool_args);

@@ -3505,11 +3505,10 @@ impl DelegateTool {
                     // policy context and thereby bypass an explicit shell Ask.
                     manager.set_policy_context(
                         Arc::clone(&target_policy),
-                        self.runtime
-                            .as_ref()
-                            .map_or(zeroclaw_api::runtime_traits::ShellDialect::Posix, |runtime| {
-                                runtime.shell_dialect()
-                            }),
+                        self.runtime.as_ref().map_or(
+                            zeroclaw_api::runtime_traits::ShellDialect::Posix,
+                            |runtime| runtime.shell_dialect(),
+                        ),
                     );
                     manager
                 })
