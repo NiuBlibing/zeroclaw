@@ -2882,6 +2882,20 @@ pub async fn process_message(
     session_id: Option<&str>,
     origin: TurnOrigin,
 ) -> Result<String> {
+    process_message_shared(Arc::new(config), agent_alias, message, session_id, origin).await
+}
+
+/// Shared-snapshot implementation for callers that already own the canonical
+/// config behind an [`Arc`]. Keeping that allocation through the whole turn
+/// avoids placing or cloning the large [`Config`] value in detached task
+/// futures.
+pub(crate) async fn process_message_shared(
+    config: Arc<Config>,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+) -> Result<String> {
     use ::zeroclaw_log::Instrument;
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
@@ -2995,7 +3009,7 @@ pub async fn process_message(
         };
 
         let all_tools_result_pm = tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
+            Arc::clone(&config),
             &security,
             &risk_profile,
             agent_alias,
