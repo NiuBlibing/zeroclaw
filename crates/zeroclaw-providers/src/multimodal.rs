@@ -2149,6 +2149,9 @@ fn jpeg_frame_header(bytes: &[u8]) -> Option<JpegFrameHeader> {
 
     let mut offset = 2usize;
     while offset < bytes.len() {
+        if bytes.get(offset) != Some(&0xff) {
+            return None;
+        }
         while bytes.get(offset) == Some(&0xff) {
             offset += 1;
         }
@@ -3245,6 +3248,31 @@ mod tests {
         buf.into_inner()
     }
 
+    fn valid_jpeg() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0])))
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .expect("test JPEG encodes");
+        buf.into_inner()
+    }
+
+    fn jpeg_with_declared_dimensions(width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = valid_jpeg();
+        let sof = bytes
+            .windows(2)
+            .position(|marker| {
+                marker[0] == 0xff
+                    && matches!(
+                        marker[1],
+                        0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
+                    )
+            })
+            .expect("encoded test JPEG has a frame header");
+        bytes[sof + 5..sof + 7].copy_from_slice(&height.to_be_bytes());
+        bytes[sof + 7..sof + 9].copy_from_slice(&width.to_be_bytes());
+        bytes
+    }
+
     fn jpeg_sof_header(width: u16, height: u16, sampling: &[(u8, u8)]) -> Vec<u8> {
         let segment_len = 8usize + sampling.len() * 3;
         let mut bytes = vec![
@@ -3876,6 +3904,50 @@ mod tests {
         let projected = 6000u64 * 6000 + auxiliary;
         assert!(projected > MAX_DECODED_IMAGE_ALLOC_BYTES);
         assert!(per_image_cap_refusal("large.jpg", "image/jpeg", projected).is_some());
+    }
+
+    #[tokio::test]
+    async fn unprefixed_jpeg_frame_header_cannot_undercharge_admission() {
+        let ordinary = valid_jpeg();
+        assert!(
+            jpeg_frame_header(&ordinary).is_some(),
+            "ordinary marker-framed JPEG must retain its precise projection"
+        );
+
+        let mut bytes = jpeg_with_declared_dimensions(3000, 3000);
+        // An unprefixed SOF2-shaped header claims one component. zune-jpeg's
+        // non-strict parser skips these bytes and uses the later real,
+        // three-component frame header, so the projection must not accept the
+        // fake component count.
+        bytes.splice(
+            2..2,
+            [
+                0xc2, 0x00, 0x0b, 0x08, 0x0b, 0xb8, 0x0b, 0xb8, 0x01, 0x01, 0x11, 0x00,
+            ],
+        );
+        assert!(
+            jpeg_frame_header(&bytes).is_none(),
+            "every projected JPEG marker must have an 0xff prefix"
+        );
+
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        let initial_budget = budget;
+        let (error, decodes) = counting_decodes(async {
+            validate_within_budget("large.jpg", "image/jpeg", &bytes, &mut budget)
+                .await
+                .expect_err("unframed header must use the conservative refusal path")
+        })
+        .await;
+        assert_eq!(multimodal_error_kind(&error), "corrupt_image");
+        assert_eq!(decodes, 0, "refusal must happen before pixel decoding");
+        assert_eq!(
+            budget, initial_budget,
+            "a per-image refusal must preserve budget for valid siblings"
+        );
+
+        validate_within_budget("sibling.png", "image/png", &valid_png(), &mut budget)
+            .await
+            .expect("a valid sibling must remain admissible");
     }
 
     #[tokio::test]
