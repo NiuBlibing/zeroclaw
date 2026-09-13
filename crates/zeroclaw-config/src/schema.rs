@@ -13966,7 +13966,8 @@ pub struct EmbeddingRouteConfig {
     /// are rejected by `Config::validate()`.
     #[serde(default)]
     pub hint: String,
-    /// Dotted embedding-capable provider profile ref
+    /// Two-segment embedding-capable provider profile ref (`<type>.<alias>`).
+    /// Select the provider-local embedding model with the separate `model` field.
     /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
     /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
@@ -22562,11 +22563,12 @@ impl Config {
                     "embedding_routes[{i}].model_provider must not be empty"
                 );
             }
-            // Embedding routes resolve against the same model-provider map;
-            // there is no separate `providers.embeddings` typed section. Accepts
-            // an optional three-segment `<type>.<alias>.<model>` ref.
+            // Embedding routes resolve a provider profile here and carry their
+            // provider-local model id in `route.model`. The embedding runtime
+            // does not consume nested model selectors, so reject a third segment
+            // instead of accepting configuration whose selector would be ignored.
             match provider_profile_ref(mp) {
-                Some((ty, inner)) => {
+                Some((ty, inner)) if mp.splitn(3, '.').nth(2).is_none() => {
                     if self.providers.models.find(ty, inner).is_none() {
                         validation_bail!(
                             DanglingReference,
@@ -22574,25 +22576,11 @@ impl Config {
                             "embedding_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
-                    if let Some(model_alias) = mp.splitn(3, '.').nth(2)
-                        && !model_alias.is_empty()
-                        && self
-                            .providers
-                            .models
-                            .find_model(ty, inner, model_alias)
-                            .is_none()
-                    {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("embedding_routes[{i}].model_provider"),
-                            "embedding_routes[{i}].model_provider = {mp:?} but [providers.models.{ty}.{inner}.models.{model_alias}] is not configured",
-                        );
-                    }
                 }
-                None => validation_bail!(
+                _ => validation_bail!(
                     InvalidFormat,
                     format!("embedding_routes[{i}].model_provider"),
-                    "embedding_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
+                    "embedding_routes[{i}].model_provider must use two-segment `<type>.<alias>` form; set embedding_routes[{i}].model separately (got {mp:?})",
                 ),
             }
             if route.model.trim().is_empty() {
@@ -44927,10 +44915,8 @@ level = "supervised"
     }
 
     #[::core::prelude::v1::test]
-    fn validate_accepts_three_segment_model_and_embedding_routes() {
-        // model_routes / embedding_routes model_provider refs must accept a
-        // three-segment `<type>.<alias>.<model>` ref and validate the named
-        // model entry, instead of false-rejecting it as a dangling reference.
+    fn validate_route_provider_ref_segment_contracts() {
+        // Model routes select nested models through a three-segment ref.
         let base = r#"
 schema_version = 4
 
@@ -44953,11 +44939,6 @@ hint = "deep"
 model_provider = "openai.gw.fast"
 model = "gpt-4o-mini"
 
-[[embedding_routes]]
-hint = "sem"
-model_provider = "openai.gw.embed"
-model = "text-embedding-3-small"
-
 [agents.a]
 model_provider = "openai.gw.fast"
 risk_profile = "default"
@@ -44966,7 +44947,7 @@ runtime_profile = "default"
         let cfg: Config = toml::from_str(base).unwrap();
         assert!(
             cfg.validate().is_ok(),
-            "three-segment route refs must validate: {:?}",
+            "three-segment model route refs must validate: {:?}",
             cfg.validate().err()
         );
 
@@ -44983,6 +44964,33 @@ runtime_profile = "default"
         assert!(
             err.contains("models.nope"),
             "error should name the missing model entry, got: {err}"
+        );
+
+        // Embedding routes keep the model id in their separate `model` field,
+        // so a two-segment provider profile ref is the supported form.
+        let two_segment_embedding = format!(
+            "{base}\n[[embedding_routes]]\nhint = \"sem\"\nmodel_provider = \"openai.gw\"\nmodel = \"text-embedding-3-small\"\n"
+        );
+        let cfg: Config = toml::from_str(&two_segment_embedding).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "two-segment embedding route refs must validate: {:?}",
+            cfg.validate().err()
+        );
+
+        let three_segment_embedding = two_segment_embedding.replace(
+            "model_provider = \"openai.gw\"",
+            "model_provider = \"openai.gw.embed\"",
+        );
+        let cfg: Config = toml::from_str(&three_segment_embedding).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("embedding routes must reject ignored nested model selectors")
+            .to_string();
+        assert!(
+            err.contains("embedding_routes[0].model_provider")
+                && err.contains("two-segment `<type>.<alias>`"),
+            "error should explain the embedding route segment contract, got: {err}"
         );
     }
 
