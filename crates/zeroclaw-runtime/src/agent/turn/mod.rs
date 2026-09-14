@@ -5150,6 +5150,7 @@ mod tool_lifecycle_abandonment_tests {
                     model_provider: provider,
                     provider_name: "scripted",
                     model: "scripted-model",
+                    dispatch_model: "scripted-model",
                     temperature: Some(0.0),
                 },
                 tools_registry,
@@ -5168,7 +5169,8 @@ mod tool_lifecycle_abandonment_tests {
                 strict_tool_parsing: false,
                 parallel_tools,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -5188,6 +5190,7 @@ mod tool_lifecycle_abandonment_tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id,
+            served_route_sink: None,
         })
         .await
     }
