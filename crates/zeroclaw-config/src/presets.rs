@@ -88,6 +88,7 @@ fn locked_down_risk() -> RiskProfileConfig {
         tool_policy: crate::tool_policy::ToolPolicyConfig::default(),
         sandbox_enabled: Some(true),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
@@ -113,6 +114,7 @@ fn balanced_risk() -> RiskProfileConfig {
         tool_policy: crate::tool_policy::ToolPolicyConfig::default(),
         sandbox_enabled: Some(true),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
@@ -138,6 +140,7 @@ fn yolo_risk() -> RiskProfileConfig {
         tool_policy: crate::tool_policy::ToolPolicyConfig::default(),
         sandbox_enabled: Some(false),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
