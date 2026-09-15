@@ -4691,8 +4691,8 @@ impl Config {
     /// model id the same way [`Self::resolve_model_selection`] does.
     ///
     /// `provider_override` narrows the enumeration, matched by full
-    /// `type.alias` ref or by bare family name — the same filter the doctor
-    /// commands accept.
+    /// `type.alias` or `type.alias.model_alias` ref, or by bare family name —
+    /// the same filters the doctor commands accept.
     #[must_use]
     pub fn configured_model_entries(
         &self,
