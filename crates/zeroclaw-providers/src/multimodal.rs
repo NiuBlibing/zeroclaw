@@ -2158,16 +2158,16 @@ fn jpeg_frame_header(bytes: &[u8]) -> Option<JpegFrameHeader> {
         let marker = *bytes.get(offset)?;
         offset += 1;
 
-        // SOI, EOI, restart markers and TEM carry no length. A SOF must
-        // precede entropy data, so encountering a stuffed byte here means the
-        // header is malformed and cannot be projected precisely.
-        if marker == 0
-            || marker == 0xd8
-            || marker == 0xd9
-            || (0xd0..=0xd7).contains(&marker)
-            || marker == 0x01
-        {
+        // FF00 is byte stuffing and is equivalent to what zune-jpeg skips in
+        // its non-strict header parser. The other no-length markers (TEM,
+        // restart, SOI, and EOI) are handled differently by that decoder and
+        // can change where it finds the real frame header. Refuse them here
+        // instead of allowing the projection to under-account a later SOF.
+        if marker == 0 {
             continue;
+        }
+        if marker == 0xd8 || marker == 0xd9 || (0xd0..=0xd7).contains(&marker) || marker == 0x01 {
+            return None;
         }
 
         let length_bytes = bytes.get(offset..offset + 2)?;
@@ -3944,6 +3944,44 @@ mod tests {
             budget, initial_budget,
             "a per-image refusal must preserve budget for valid siblings"
         );
+
+        validate_within_budget("sibling.png", "image/png", &valid_png(), &mut budget)
+            .await
+            .expect("a valid sibling must remain admissible");
+    }
+
+    #[tokio::test]
+    async fn jpeg_tem_marker_cannot_desynchronize_admission_projection() {
+        let ordinary = valid_jpeg();
+        assert!(jpeg_frame_header(&ordinary).is_some());
+
+        let mut bytes = jpeg_with_declared_dimensions(3000, 3000);
+        // TEM is a standalone marker. zune-jpeg does not treat it like the
+        // projection's lengthless-marker path, so a fake one-component SOF
+        // after TEM could otherwise undercharge the real frame that follows.
+        bytes.splice(
+            2..2,
+            [
+                0xff, 0x01, // TEM
+                0xff, 0xc2, 0x00, 0x0b, 0x08, 0x0b, 0xb8, 0x0b, 0xb8, 0x01, 0x01, 0x11, 0x00,
+            ],
+        );
+        assert!(
+            jpeg_frame_header(&bytes).is_none(),
+            "non-FF00 no-length markers must use the conservative refusal path"
+        );
+
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        let initial_budget = budget;
+        let (error, decodes) = counting_decodes(async {
+            validate_within_budget("tem.jpg", "image/jpeg", &bytes, &mut budget)
+                .await
+                .expect_err("TEM marker framing must be refused before decoding")
+        })
+        .await;
+        assert_eq!(multimodal_error_kind(&error), "corrupt_image");
+        assert_eq!(decodes, 0, "refusal must happen before pixel decoding");
+        assert_eq!(budget, initial_budget, "refusal preserves sibling budget");
 
         validate_within_budget("sibling.png", "image/png", &valid_png(), &mut budget)
             .await
