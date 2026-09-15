@@ -1802,7 +1802,7 @@ pub(crate) fn skills_to_prompt_with_mode_and_availability(
              Skills marked `always` include full instructions below even in compact mode.\n\
              The `location` field is included for reference.\n\n\
              <available_skills>\n",
-        )
+        ),
     };
 
     for skill in skills {
