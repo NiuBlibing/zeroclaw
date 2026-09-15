@@ -1000,9 +1000,7 @@ pub(crate) fn simple_posix_env_assignment_remainder(s: &str) -> Option<&str> {
             return None;
         }
         if is_posix_env_assignment_word(word) {
-            let Some((name, value)) = word.split_once('=') else {
-                return None;
-            };
+            let (name, value) = word.split_once('=')?;
             if word.contains(['\\', '\'', '"'])
                 || (matches!(name, "PATH" | "PATHEXT") && value.contains('~'))
             {
