@@ -3228,10 +3228,18 @@ impl RpcDispatcher {
         };
 
         match outcome {
-            Ok(TurnOutcome::Completed { text, .. }) => {
+            Ok(TurnOutcome::Completed {
+                text,
+                safeguard_fallback,
+                ..
+            }) => {
                 if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
                     let _ = backend.set_session_state(&session_key, "idle", None);
                 }
+                let text = crate::agent::append_safeguard_fallback_notice(
+                    text,
+                    safeguard_fallback.as_ref(),
+                );
                 self.emit_turn_complete(
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Completed,
@@ -11458,6 +11466,7 @@ mod tests {
         let outcome = Ok(TurnOutcome::Completed {
             text: "new-assistant".into(),
             messages: new_messages.clone(),
+            safeguard_fallback: None,
         });
 
         assert_eq!(persist_acp_turn(&store, sid, &outcome).await, None);
@@ -11526,7 +11535,9 @@ mod tests {
         reviewer
             .workspace
             .read_memory_from
-            .push(AgentAlias::new("alpha"));
+            .push(zeroclaw_config::multi_agent::MemoryGrant::Agent(
+                AgentAlias::new("alpha"),
+            ));
         config.agents.insert("reviewer".to_string(), reviewer);
 
         let mut group = PeerGroupConfig::default();
@@ -11587,7 +11598,9 @@ mod tests {
         );
         assert_eq!(
             config.agents["reviewer"].workspace.read_memory_from,
-            vec![zeroclaw_config::multi_agent::AgentAlias::new("beta")]
+            vec![zeroclaw_config::multi_agent::MemoryGrant::Agent(
+                zeroclaw_config::multi_agent::AgentAlias::new("beta")
+            )]
         );
         assert_eq!(
             config.peer_groups["crew"].agents,

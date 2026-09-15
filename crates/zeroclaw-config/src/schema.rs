@@ -1182,6 +1182,18 @@ pub struct AnthropicModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    /// Models Anthropic may fall back to **server-side, inside one API call**
+    /// when the requested model's safety classifiers decline a request
+    /// (`stop_reason: "refusal"`). Sent as the native `fallbacks` parameter with
+    /// the `server-side-fallback-2026-06-01` beta; entries are tried in order,
+    /// must differ from the requested model, and must be permitted fallback
+    /// targets for it (e.g. `claude-fable-5` → `["claude-opus-4-8"]`; a
+    /// non-permitted entry is rejected by the API). Applies to non-streaming
+    /// requests only. Distinct from the generic `fallback_models`, which
+    /// ZeroClaw itself retries client-side after an error. Empty (the default)
+    /// sends no fallback parameter and no beta value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_fallback_models: Vec<String>,
 }
 
 // ── Moonshot (multi-region exemplar) ──
@@ -11438,7 +11450,9 @@ fn apply_explicit_proxy_to_builder(
 // handshake.
 
 /// Combined async IO trait for boxed WebSocket transport streams.
+#[cfg(feature = "ws-transport")]
 trait AsyncReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+#[cfg(feature = "ws-transport")]
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
 /// A boxed async IO stream used when a WebSocket connection is tunnelled
@@ -11448,8 +11462,10 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncReadWr
 /// We wrap in a newtype so we can implement `AsyncRead` and `AsyncWrite`
 /// via delegation, since Rust trait objects cannot combine multiple
 /// non-auto traits.
+#[cfg(feature = "ws-transport")]
 pub struct BoxedIo(Box<dyn AsyncReadWrite>);
 
+#[cfg(feature = "ws-transport")]
 impl tokio::io::AsyncRead for BoxedIo {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -11460,6 +11476,7 @@ impl tokio::io::AsyncRead for BoxedIo {
     }
 }
 
+#[cfg(feature = "ws-transport")]
 impl tokio::io::AsyncWrite for BoxedIo {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
@@ -11484,15 +11501,18 @@ impl tokio::io::AsyncWrite for BoxedIo {
     }
 }
 
+#[cfg(feature = "ws-transport")]
 impl Unpin for BoxedIo {}
 
 /// Convenience alias for the WebSocket stream returned by the proxy-aware
 /// connect helpers.
+#[cfg(feature = "ws-transport")]
 pub type ProxiedWsStream = tokio_tungstenite::WebSocketStream<BoxedIo>;
 
 /// Resolve the effective proxy URL for a WebSocket connection to the
 /// given `ws_url`, taking into account the per-channel `proxy_url`
 /// override, the runtime proxy config, scope and no_proxy list.
+#[cfg(feature = "ws-transport")]
 fn resolve_ws_proxy_url(
     service_key: &str,
     ws_url: &str,
@@ -11557,6 +11577,7 @@ fn resolve_ws_proxy_url(
 ///
 /// `service_key` is the proxy-service selector (e.g. `"channel.discord"`).
 /// `channel_proxy_url` is the optional per-channel proxy override.
+#[cfg(feature = "ws-transport")]
 pub async fn ws_connect_with_proxy(
     ws_url: &str,
     service_key: &str,
@@ -11656,6 +11677,7 @@ pub async fn ws_connect_with_proxy(
 }
 
 /// Establish a WebSocket connection tunnelled through the given proxy URL.
+#[cfg(feature = "ws-transport")]
 async fn ws_connect_via_proxy(
     ws_url: &str,
     proxy_url: &str,
@@ -11812,6 +11834,7 @@ async fn ws_connect_via_proxy(
 }
 
 /// Find the `\r\n\r\n` boundary marking the end of HTTP headers.
+#[cfg(feature = "ws-transport")]
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
@@ -13164,6 +13187,32 @@ fn default_always_ask() -> Vec<String> {
 }
 
 impl RiskProfileConfig {
+    /// Legacy serialized marker used by older operators to represent an
+    /// explicit deny-all profile before `deny_all_tools` existed.
+    pub const LEGACY_DENY_ALL_TOOLS_SENTINEL: &'static str = "__none__";
+
+    /// Resolve the profile's effective tool allowlist without changing the
+    /// persisted representation. `None` is unrestricted, while `Some([])` is
+    /// explicit deny-all. Mixed legacy sentinel lists retain only real tool
+    /// names.
+    #[must_use]
+    pub fn effective_allowed_tools(&self) -> Option<Vec<String>> {
+        if self.deny_all_tools {
+            return Some(Vec::new());
+        }
+
+        let real = self
+            .allowed_tools
+            .iter()
+            .filter(|name| name.as_str() != Self::LEGACY_DENY_ALL_TOOLS_SENTINEL)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !self.allowed_tools.is_empty() && real.is_empty() {
+            return Some(Vec::new());
+        }
+        (!real.is_empty()).then_some(real)
+    }
+
     /// Merge the built-in default `auto_approve` entries into the current
     /// list, preserving any user-supplied additions.
     pub fn ensure_default_auto_approve(&mut self) {
@@ -13552,19 +13601,13 @@ pub struct RiskProfileConfig {
     /// (fail-closed deny under the default `on_no_approver`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_route: Option<crate::autonomy::ApprovalRoute>,
-    /// Tools the agent may call in agentic mode. Empty = inherit / no
-    /// authorization constraint. Authorization decision: which tools is
-    /// the agent permitted to invoke at all. See `excluded_tools` for
-    /// the inverse denylist scoped to non-CLI channels.
-    ///
-    /// The TOML config does not distinguish an omitted field from
-    /// `allowed_tools = []`; both deserialize to `Vec::new()` and
-    /// `SecurityPolicy::from_profiles` maps that to "no authorization
-    /// constraint" at this layer. If you need an explicit deny-all gate,
-    /// apply it on the caller-supplied per-run `allowed_tools` (cron
-    /// jobs and other narrowers pass that list in directly to
-    /// `ToolAccessPolicy`, which honors `Some(vec![])` as deny-all) or
-    /// via `excluded_tools` covering the specific tools you want blocked.
+    /// Tools the agent may call in agentic mode. An omitted field and an
+    /// explicit `allowed_tools = []` are the same legacy state: no
+    /// authorization constraint (unrestricted). A non-empty list is an
+    /// explicit closed set for built-ins and MCP; skill tools remain
+    /// registered unless listed in `excluded_tools`. For an explicit
+    /// deny-all gate, set [`Self::deny_all_tools`] — an empty list does
+    /// NOT mean deny-all.
     ///
     /// MCP exception: when the list is non-empty, runtime-discovered MCP
     /// tools (any name containing `__`, which is the `<server>__<tool>`
@@ -13581,6 +13624,14 @@ pub struct RiskProfileConfig {
     /// will not see runtime-discovered MCP tools unless it names them.
     ///
     pub allowed_tools: Vec<String>,
+    /// Explicit deny-all for this profile: no tool may be invoked under it
+    /// (built-ins, MCP tools, and skill-defined tools alike — there is no
+    /// `__` auto-admit under deny-all). `allowed_tools = []` remains
+    /// legacy-unrestricted; setting both `deny_all_tools = true` and a
+    /// non-empty `allowed_tools` is a configuration error rejected by
+    /// [`Config::validate`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deny_all_tools: bool,
     /// Tools excluded from non-CLI channels under this profile.
     ///
     /// Also subtracts from the agentic-delegate allow-list resolved at
@@ -13618,6 +13669,7 @@ impl Default for RiskProfileConfig {
             delegation_policy: DelegationPolicy::default(),
             approval_route: None,
             allowed_tools: Vec::new(),
+            deny_all_tools: false,
             excluded_tools: Vec::new(),
             sandbox_enabled: None,
             sandbox_backend: None,
@@ -21456,6 +21508,7 @@ impl Config {
         let mut warnings = Vec::new();
         self.collect_codex_cli_extra_arg_warnings(&mut warnings);
         self.collect_fallback_warnings(&mut warnings);
+        self.collect_server_fallback_model_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
@@ -21958,6 +22011,46 @@ impl Config {
                     ),
                     path,
                 ));
+            }
+        }
+    }
+
+    /// Surface `server_fallback_models` entries the Anthropic request builder
+    /// drops before sending: blank entries and entries that duplicate the
+    /// alias's primary `model` (the requested model can never be its own
+    /// server-side fallback target). This is the Anthropic-only sibling of
+    /// [`Self::collect_fallback_model_warnings`], which iterates the flattened
+    /// `base` and cannot see this typed-slot field. The empty-entry check runs
+    /// even when the alias configures no primary `model`; only the
+    /// duplicates-primary check is gated on a primary being set.
+    fn collect_server_fallback_model_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (alias, cfg) in &self.providers.models.anthropic {
+            let primary = cfg.base.model.as_deref();
+            for (i, model) in cfg.server_fallback_models.iter().enumerate() {
+                let path =
+                    format!("providers.models.anthropic.{alias}.server_fallback_models[{i}]");
+                if model.trim().is_empty() {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        crate::validation_warnings::EMPTY_SERVER_FALLBACK_MODEL,
+                        format!(
+                            "server_fallback_models entry {i} on anthropic.{alias} is empty; \
+                             it is dropped before the request is sent"
+                        ),
+                        path,
+                    ));
+                } else if primary == Some(model.as_str()) {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        crate::validation_warnings::SERVER_FALLBACK_MODEL_DUPLICATES_PRIMARY,
+                        format!(
+                            "server_fallback_models entry {model:?} on anthropic.{alias} \
+                             duplicates the primary model; it is dropped before the request is sent"
+                        ),
+                        path,
+                    ));
+                }
             }
         }
     }
@@ -22644,6 +22737,15 @@ impl Config {
                         "risk_profiles.{profile_alias}.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
                     );
                 }
+            }
+            // `deny_all_tools` is the explicit deny-all gate; `allowed_tools = []`
+            // stays legacy-unrestricted. Combining the flag with a non-empty
+            // allowlist is contradictory — reject it instead of silently
+            // preferring one side.
+            if profile.deny_all_tools && !profile.allowed_tools.is_empty() {
+                anyhow::bail!(
+                    "risk_profiles.{profile_alias}.deny_all_tools cannot be combined with a non-empty allowed_tools list: deny_all_tools denies every tool, while allowed_tools = [] alone means unrestricted"
+                );
             }
         }
 
@@ -23808,14 +23910,36 @@ impl Config {
                 }
             }
 
-            // workspace.read_memory_from: every alias must exist as a
-            // configured agent and must use the same MemoryBackendKind
-            // as the declaring agent. Mismatched backends fail at
-            // config load rather than producing a runtime error when
-            // the per-agent memory plumbing consumes the allowlist.
+            // workspace.read_memory_from: every grant must name a configured
+            // agent, use the same MemoryBackendKind as the declaring agent,
+            // and appear at most once. Legacy string grants are unrestricted;
+            // structured grants may carry an exact category allowlist. An
+            // explicitly empty category list is invalid rather than silently
+            // becoming unrestricted. Mismatched backends fail at config load
+            // rather than producing a runtime error when the per-agent memory
+            // plumbing consumes the allowlist.
             let agent_backend = agent.memory.backend;
+            let mut seen_memory_grants: std::collections::BTreeSet<&str> =
+                std::collections::BTreeSet::new();
             for (i, target) in agent.workspace.read_memory_from.iter().enumerate() {
                 let target_str = target.as_str();
+                if target
+                    .categories()
+                    .is_some_and(|categories| categories.is_empty())
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                        "agents.{alias}.workspace.read_memory_from[{i}].categories must contain at least one category when present",
+                    );
+                }
+                if !seen_memory_grants.insert(target_str) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}].agent"),
+                        "agents.{alias}.workspace.read_memory_from[{i}].agent = {target_str:?} duplicates an earlier memory grant; combine categories into one grant",
+                    );
+                }
                 if target_str == alias.as_str() {
                     validation_bail!(
                         InvalidFormat,
@@ -23830,6 +23954,18 @@ impl Config {
                         "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
                     );
                 };
+                if target.categories().is_some()
+                    && matches!(
+                        agent_backend,
+                        crate::multi_agent::MemoryBackendKind::Markdown
+                    )
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                        "agents.{alias}.workspace.read_memory_from[{i}] uses a category-scoped grant, but Markdown memory does not preserve per-row categories; use an unrestricted grant or a backend with category attribution",
+                    );
+                }
                 if target_agent.memory.backend != agent_backend {
                     let target_backend = target_agent.memory.backend;
                     validation_bail!(
@@ -29367,6 +29503,7 @@ log_tool_io = "off"
         assert!(a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());
         assert!(a.allowed_tools.is_empty());
+        assert!(!a.deny_all_tools);
     }
 
     #[test]
@@ -30199,6 +30336,91 @@ auto_approve = []
         }
     }
 
+    /// `allowed_tools = []` keeps its legacy meaning (unrestricted): it does
+    /// not flip the profile to deny-all, and it is not a validation error.
+    #[test]
+    async fn risk_profile_empty_allowed_tools_stays_unrestricted() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+allowed_tools = []
+"#;
+        let parsed = parse_test_config(raw);
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        assert!(
+            profile.allowed_tools.is_empty(),
+            "explicit [] must deserialize as the legacy unrestricted state"
+        );
+        assert!(!profile.deny_all_tools);
+        parsed.validate().expect("allowed_tools = [] must validate");
+    }
+
+    #[test]
+    async fn risk_profile_effective_allowed_tools_normalizes_legacy_deny_all_sentinel() {
+        let mut profile = RiskProfileConfig::default();
+        assert_eq!(profile.effective_allowed_tools(), None);
+
+        profile.allowed_tools = vec![RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into()];
+        assert_eq!(profile.effective_allowed_tools(), Some(vec![]));
+
+        profile.allowed_tools = vec![
+            RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+            RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+        ];
+        assert_eq!(profile.effective_allowed_tools(), Some(vec![]));
+
+        profile.allowed_tools = vec![
+            RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+            "shell".into(),
+        ];
+        assert_eq!(
+            profile.effective_allowed_tools(),
+            Some(vec!["shell".into()])
+        );
+    }
+
+    /// `deny_all_tools = true` is the explicit deny-all representation and is
+    /// valid on its own.
+    #[test]
+    async fn risk_profile_deny_all_tools_flag_parses_and_validates() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+deny_all_tools = true
+"#;
+        let parsed = parse_test_config(raw);
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        assert!(profile.deny_all_tools);
+        parsed
+            .validate()
+            .expect("deny_all_tools = true alone must validate");
+    }
+
+    /// `deny_all_tools = true` combined with a non-empty `allowed_tools` is a
+    /// configuration error and must fail validation loudly instead of one
+    /// side silently winning.
+    #[test]
+    async fn risk_profile_deny_all_tools_with_nonempty_allowed_tools_is_rejected() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+deny_all_tools = true
+allowed_tools = ["shell"]
+"#;
+        let parsed = parse_test_config(raw);
+        let err = parsed
+            .validate()
+            .expect_err("deny_all_tools + non-empty allowed_tools must be rejected");
+        assert!(
+            err.to_string()
+                .contains("risk_profiles.default.deny_all_tools"),
+            "error must name the offending path, got: {err}"
+        );
+    }
+
     /// When no risk_profiles section is provided, defaults are applied to the
     /// synthesized "default" profile.
     #[test]
@@ -30894,6 +31116,7 @@ default_temperature = 0.7
                     model: Some("claude-sonnet-4".into()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         config.save().await.unwrap();
@@ -31088,6 +31311,7 @@ default_temperature = 0.7
                     )]),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -33159,6 +33383,7 @@ model = "primary-model"
                     temperature: Some(0.5),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -42485,7 +42710,9 @@ allowed_users = []
         alpha
             .workspace
             .read_memory_from
-            .push(crate::multi_agent::AgentAlias::new("alpha"));
+            .push(crate::multi_agent::MemoryGrant::Agent(
+                crate::multi_agent::AgentAlias::new("alpha"),
+            ));
         let err = config
             .validate()
             .expect_err("self-reference must fail validation");
@@ -42516,7 +42743,9 @@ allowed_users = []
         alpha
             .workspace
             .read_memory_from
-            .push(crate::multi_agent::AgentAlias::new("beta"));
+            .push(crate::multi_agent::MemoryGrant::Agent(
+                crate::multi_agent::AgentAlias::new("beta"),
+            ));
 
         let err = config
             .validate()
@@ -42525,6 +42754,104 @@ allowed_users = []
         assert!(
             msg.contains("same-backend siblings only"),
             "expected cross-backend explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_empty_memory_grant_categories() {
+        let mut config = multi_agent_test_config();
+        config
+            .agents
+            .get_mut("alpha")
+            .unwrap()
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Scoped {
+                agent: crate::multi_agent::AgentAlias::new("beta"),
+                categories: Some(Vec::new()),
+            });
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+
+        let err = config
+            .validate()
+            .expect_err("an explicitly empty category list must fail validation");
+        assert!(
+            err.to_string()
+                .contains("categories must contain at least one category"),
+            "expected empty-category explanation, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_scoped_grants_for_markdown_memory() {
+        let mut config = multi_agent_test_config();
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            memory: crate::multi_agent::AgentMemoryConfig {
+                backend: crate::multi_agent::MemoryBackendKind::Markdown,
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Markdown;
+        alpha
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Scoped {
+                agent: crate::multi_agent::AgentAlias::new("beta"),
+                categories: Some(vec!["core".to_string()]),
+            });
+
+        let err = config
+            .validate()
+            .expect_err("Markdown must fail closed for scoped grants");
+        assert!(
+            err.to_string()
+                .contains("Markdown memory does not preserve per-row categories"),
+            "expected Markdown fail-closed explanation, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_duplicate_memory_grants() {
+        let mut config = multi_agent_test_config();
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        config
+            .agents
+            .get_mut("alpha")
+            .unwrap()
+            .workspace
+            .read_memory_from
+            .extend([
+                crate::multi_agent::MemoryGrant::Agent(crate::multi_agent::AgentAlias::new("beta")),
+                crate::multi_agent::MemoryGrant::Scoped {
+                    agent: crate::multi_agent::AgentAlias::new("beta"),
+                    categories: Some(vec!["core".to_string()]),
+                },
+            ]);
+
+        let err = config
+            .validate()
+            .expect_err("duplicate grants for one source agent must fail validation");
+        assert!(
+            err.to_string()
+                .contains("duplicates an earlier memory grant"),
+            "expected duplicate-grant explanation, got: {err}"
         );
     }
 
@@ -44946,6 +45273,66 @@ group_policy = "all"
             .models
             .openai
             .insert("primary".to_string(), entry);
+
+        assert!(config.collect_warnings().is_empty());
+    }
+
+    #[test]
+    async fn empty_server_fallback_model_warns() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        // No primary `model` configured: the empty-entry check must still fire.
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                server_fallback_models: vec!["".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "empty_server_fallback_model");
+        assert_eq!(
+            warnings[0].path,
+            "providers.models.anthropic.primary.server_fallback_models[0]"
+        );
+    }
+
+    #[test]
+    async fn server_fallback_model_duplicates_primary_warns() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-fable-5".to_string()),
+                    ..Default::default()
+                },
+                server_fallback_models: vec!["claude-fable-5".to_string()],
+            },
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "server_fallback_model_duplicates_primary");
+    }
+
+    #[test]
+    async fn server_fallback_distinct_entries_do_not_warn() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-fable-5".to_string()),
+                    ..Default::default()
+                },
+                server_fallback_models: vec!["claude-opus-4-8".to_string()],
+            },
+        );
 
         assert!(config.collect_warnings().is_empty());
     }
