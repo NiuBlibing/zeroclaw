@@ -5434,6 +5434,7 @@ mod builtin_skill_tests {
             tools: Vec::new(),
             prompts: vec!["Keep this instruction inline.".to_string()],
             slash_options: Vec::new(),
+            always: false,
             location: Some(PathBuf::from(
                 "/tmp/workspace/skills/operator-runbook/SKILL.md",
             )),
@@ -5462,6 +5463,7 @@ mod builtin_skill_tests {
             tools: Vec::new(),
             prompts: vec!["Use the operator's instructions.".to_string()],
             slash_options: Vec::new(),
+            always: false,
             location: Some(PathBuf::from(
                 "/tmp/workspace/skills/zeroclaw-docs/SKILL.md",
             )),
