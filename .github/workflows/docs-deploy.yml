@@ -149,7 +149,7 @@ jobs:
       # a tag push / dispatch, or the stable-pointer's named release. For an old
       # release tag this replaces the workspace with that tag's source tree,
       # which may predate the deploy helpers (fetched separately below).
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.version.outputs.TAG }}
           fetch-depth: 1
@@ -163,7 +163,7 @@ jobs:
       # the helpers because pre-PR tags don't carry this workflow file and
       # cannot trigger a tag-push run.
       - name: Fetch deploy helpers from current workflow revision
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           path: .workflow-scripts
