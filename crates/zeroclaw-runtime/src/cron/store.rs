@@ -6,11 +6,77 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
 use rusqlite::{Connection, OpenFlags, params};
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex, OnceLock};
 use uuid::Uuid;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
+
+static CRON_PROCESS_LOCK_OWNER: OnceLock<String> = OnceLock::new();
+
+// A process-owned token is only safe to preserve during startup recovery while
+// its manual-run guard is still alive. The database cannot represent that
+// distinction, so keep the live set in process memory and fail closed for any
+// current-process token whose guard has terminated.
+static LIVE_AGENT_CLAIM_TOKENS: LazyLock<Mutex<HashSet<(std::path::PathBuf, String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[cfg(test)]
+static FORCED_RELEASE_FAILURES: LazyLock<Mutex<HashSet<std::path::PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn cron_process_lock_owner() -> &'static str {
+    CRON_PROCESS_LOCK_OWNER.get_or_init(|| Uuid::new_v4().to_string())
+}
+
+fn new_agent_lock_token() -> String {
+    format!("{}:{}", cron_process_lock_owner(), Uuid::new_v4())
+}
+
+fn register_live_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
+    let mut claims = LIVE_AGENT_CLAIM_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    claims.insert((
+        cron_db_path(config),
+        job_id.to_string(),
+        lock_token.to_string(),
+    ));
+}
+
+pub(crate) fn finish_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
+    let mut claims = LIVE_AGENT_CLAIM_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    claims.remove(&(
+        cron_db_path(config),
+        job_id.to_string(),
+        lock_token.to_string(),
+    ));
+}
+
+#[cfg(test)]
+pub(crate) fn force_release_failure_for_tests(config: &Config, enabled: bool) {
+    let mut failures = FORCED_RELEASE_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let db_path = cron_db_path(config);
+    if enabled {
+        failures.insert(db_path);
+    } else {
+        failures.remove(&db_path);
+    }
+}
+
+#[cfg(test)]
+fn should_force_release_failure(config: &Config) -> bool {
+    FORCED_RELEASE_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&cron_db_path(config))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RunCompletionAction {
@@ -61,6 +127,7 @@ pub fn add_job(
     add_shell_job(config, agent_alias, None, schedule, command, None)
 }
 
+#[cfg(test)]
 pub fn add_shell_job(
     config: &Config,
     agent_alias: &str,
@@ -68,6 +135,26 @@ pub fn add_shell_job(
     schedule: Schedule,
     command: &str,
     delivery: Option<DeliveryConfig>,
+) -> Result<CronJob> {
+    add_shell_job_with_format(
+        config,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        delivery,
+        CronShellOutputFormat::default(),
+    )
+}
+
+pub fn add_shell_job_with_format(
+    config: &Config,
+    agent_alias: &str,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+    shell_output_format: CronShellOutputFormat,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -84,12 +171,17 @@ pub fn add_shell_job(
         anyhow::bail!("agent_alias is required; cron jobs must name an owning agent");
     }
 
+    let shell_output_format_str = match shell_output_format {
+        CronShellOutputFormat::Wrapped => "wrapped",
+        CronShellOutputFormat::Raw => "raw",
+    };
+
     with_initialized_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, agent_alias, created_at, next_run
-             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9, ?10)",
+                enabled, delivery, delete_after_run, agent_alias, created_at, next_run, shell_output_format
+             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id,
                 expression,
@@ -101,6 +193,7 @@ pub fn add_shell_job(
                 agent_alias,
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
+                shell_output_format_str,
             ],
         )
         .context("Failed to insert cron shell job")?;
@@ -172,8 +265,8 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source, uses_memory, agent_alias
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -181,7 +274,9 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
 
         let mut jobs = Vec::new();
         for row in rows {
-            jobs.push(row?);
+            let mut job = row?;
+            resolve_declarative_shell_output_format(config, &mut job);
+            jobs.push(job);
         }
         Ok(jobs)
     })?
@@ -193,11 +288,50 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
 }
 
 pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
+    let mut job = get_job_raw(config, job_id)?;
+    resolve_declarative_shell_output_format(config, &mut job);
+    Ok(job)
+}
+
+/// Read a job only when `agent_alias` is its current owner. The ownership
+/// predicate belongs to this SELECT so an operator rename that commits before
+/// the read cannot leave the caller with a stale authorization.
+pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Result<CronJob> {
+    let Some(mut job) = with_read_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+             FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
+        )?;
+
+        let mut rows = stmt.query(params![job_id, agent_alias])?;
+        if let Some(row) = rows.next()? {
+            map_cron_job_row(row).map_err(Into::into)
+        } else {
+            anyhow::bail!("Cron job '{job_id}' not found")
+        }
+    })?
+    else {
+        anyhow::bail!("Cron job '{job_id}' not found")
+    };
+
+    resolve_declarative_shell_output_format(config, &mut job);
+    Ok(job)
+}
+
+/// Raw DB row for a job, with no config overlay applied. `shell_output_format`
+/// on the returned job is exactly what's stored in the `cron_jobs` column —
+/// for a declarative job that is a stale/default value, not the canonical
+/// one from `config.cron`. Used by [`update_job`] so unrelated patches don't
+/// re-persist a config-resolved snapshot into a column declarative jobs
+/// don't own; every other caller should use [`get_job`] instead.
+fn get_job_raw(config: &Config, job_id: &str) -> Result<CronJob> {
     let Some(job) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source, uses_memory, agent_alias
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -211,7 +345,6 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     else {
         anyhow::bail!("Cron job '{job_id}' not found")
     };
-
     Ok(job)
 }
 
@@ -220,8 +353,8 @@ pub fn resolve_job_id_or_name(
     id_or_name: &str,
     agent_alias: &str,
 ) -> Result<String> {
-    // Fast path: try exact ID lookup first.
-    if let Ok(job) = get_job(config, id_or_name) {
+    // Fast path: exact ID, scoped the same way the name fallback below is.
+    if let Ok(job) = get_job_for_agent(config, id_or_name, agent_alias) {
         return Ok(job.id);
     }
 
@@ -240,6 +373,38 @@ pub fn resolve_job_id_or_name(
             "Ambiguous name '{id_or_name}': matched {n} jobs — use the job ID instead"
         ),
     }
+}
+
+/// Delete a job only if `agent_alias` owns it, in one statement.
+///
+/// The agent-facing tools authorize with a scoped read and then write. Ownership
+/// can change without the job id changing — the operator's agent-rename cascade
+/// does exactly that — so a rename landing between the two lets the former owner
+/// still delete the job. Matching both columns in the `DELETE` closes that window.
+/// A row owned by someone else reports the same not-found error as a missing one,
+/// so the guard does not become an existence oracle.
+pub fn remove_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Result<()> {
+    let changed = with_initialized_connection(config, |conn| {
+        conn.execute(
+            "DELETE FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
+            params![id, agent_alias],
+        )
+        .context("Failed to delete cron job")
+    })?;
+
+    if changed == 0 {
+        anyhow::bail!("Cron job '{id}' not found");
+    }
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+            .with_category(::zeroclaw_log::EventCategory::Cron)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_attrs(::serde_json::json!({"job_id": id, "agent_alias": agent_alias})),
+        "Removed cron job"
+    );
+    Ok(())
 }
 
 pub fn remove_job(config: &Config, id: &str) -> Result<()> {
@@ -269,14 +434,16 @@ pub fn list_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<Vec<Cron
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source, uses_memory, agent_alias
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs WHERE agent_alias = ?1 ORDER BY next_run ASC",
         )?;
         let rows = stmt.query_map(params![agent_alias], map_cron_job_row)?;
         let mut jobs = Vec::new();
         for row in rows {
-            jobs.push(row?);
+            let mut job = row?;
+            resolve_declarative_shell_output_format(config, &mut job);
+            jobs.push(job);
         }
         Ok(jobs)
     })?
@@ -316,25 +483,42 @@ pub fn rename_jobs_by_agent(config: &Config, from: &str, to: &str) -> Result<usi
 }
 
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
-    let lim = i64::try_from(config.scheduler.max_tasks.max(1))
-        .context("Scheduler max_tasks overflows i64")?;
+    let lim = config.scheduler.max_tasks.max(1);
     let Some(jobs) = with_read_connection(config, |conn| {
+        // Fetch all eligible rows without a SQL LIMIT: orphan filtering
+        // happens in Rust, and max_tasks is applied after filtering so
+        // that stale declarative rows cannot consume the live quota.
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source, uses_memory, agent_alias
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
-             ORDER BY next_run ASC
-             LIMIT ?2",
+             ORDER BY next_run ASC",
         )?;
 
-        let rows = stmt.query_map(params![now.to_rfc3339(), lim], map_cron_job_row)?;
+        let rows = stmt.query_map(params![now.to_rfc3339()], map_cron_job_row)?;
 
         let mut jobs = Vec::new();
         for row in rows {
             match row {
-                Ok(job) => jobs.push(job),
+                Ok(mut job) => {
+                    if job.source == "declarative" && !is_valid_declarative_owner(config, &job.id) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"job_id": job.id})),
+                            "Skipping orphaned declarative cron job not present in live config"
+                        );
+                        continue;
+                    }
+                    resolve_declarative_shell_output_format(config, &mut job);
+                    jobs.push(job);
+                }
                 Err(e) => ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -350,15 +534,15 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         return Ok(Vec::new());
     };
 
-    Ok(jobs)
+    Ok(jobs.into_iter().take(lim).collect())
 }
 
 pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source, uses_memory, agent_alias
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
              ORDER BY next_run ASC",
@@ -369,7 +553,23 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
         let mut jobs = Vec::new();
         for row in rows {
             match row {
-                Ok(job) => jobs.push(job),
+                Ok(mut job) => {
+                    if job.source == "declarative" && !is_valid_declarative_owner(config, &job.id) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"job_id": job.id})),
+                            "Skipping orphaned declarative cron job not present in live config"
+                        );
+                        continue;
+                    }
+                    resolve_declarative_shell_output_format(config, &mut job);
+                    jobs.push(job);
+                }
                 Err(e) => ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -389,7 +589,35 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
 }
 
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
-    let mut job = get_job(config, job_id)?;
+    update_job_inner(config, job_id, None, patch)
+}
+
+/// Patch a job only if `agent_alias` owns it, with the ownership test carried
+/// into the `UPDATE` itself rather than performed as a separate read. See
+/// `remove_job_for_agent` for why the separate read is not enough.
+pub fn update_job_for_agent(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    patch: CronJobPatch,
+) -> Result<CronJob> {
+    // Read-side check first so an ordinary miss gets the usual error before any
+    // work happens; the WHERE guard below is what makes the write itself safe.
+    get_job_for_agent(config, job_id, agent_alias)?;
+    update_job_inner(config, job_id, Some(agent_alias), patch)
+}
+
+fn update_job_inner(
+    config: &Config,
+    job_id: &str,
+    owner: Option<&str>,
+    patch: CronJobPatch,
+) -> Result<CronJob> {
+    // Start from the raw DB row, not the config-resolved `get_job()` view:
+    // for a declarative job, `shell_output_format` isn't DB-owned, so an
+    // unrelated patch (e.g. toggling `enabled`) must not re-persist the
+    // resolved config value into the column and recreate a second owner.
+    let mut job = get_job_raw(config, job_id)?;
     let mut schedule_changed = false;
 
     if let Some(schedule) = patch.schedule {
@@ -411,6 +639,25 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         job.enabled = enabled;
     }
     if let Some(delivery) = patch.delivery {
+        // A declarative job's delivery is owned by `[cron.<id>].delivery` in
+        // config.toml. Writing it here would appear to succeed and then be
+        // silently reverted by `sync_declarative_jobs` on the next daemon
+        // start, which rewrites every declarative column from the config.
+        // Reject at this boundary rather than persist a value the next sync
+        // discards, matching how `shell_output_format` is handled below.
+        //
+        // Ownership is checked before shape: a declarative job rejects any
+        // delivery patch, so reporting a missing recipient first would imply
+        // that correcting it would let the write through.
+        if job.source == "declarative" {
+            anyhow::bail!(
+                "Cron job '{job_id}': delivery is owned by [cron.{job_id}].delivery in \
+                 config.toml for a declarative job, not the database. Edit the config \
+                 and restart the daemon."
+            );
+        }
+        // Match add_*_job: announce delivery must include channel + to.
+        validate_delivery_config(Some(&delivery))?;
         job.delivery = delivery;
     }
     if let Some(model) = patch.model {
@@ -434,37 +681,103 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
     if let Some(uses_memory) = patch.uses_memory {
         job.uses_memory = uses_memory;
     }
+    if let Some(shell_output_format) = patch.shell_output_format {
+        // Config-owned (declarative) and non-shell (agent) jobs never store
+        // this field: the gateway API already rejects both cases, but this
+        // is the core boundary every caller of `update_job` goes through,
+        // so it must reject them too rather than silently ignoring or
+        // persisting a value execution never consumes.
+        if job.source == "declarative" {
+            anyhow::bail!(
+                "Cron job '{job_id}': shell_output_format is owned by config.toml for a \
+                 declarative job, not the database"
+            );
+        }
+        if job.job_type != JobType::Shell {
+            let job_type: &str = job.job_type.into();
+            anyhow::bail!(
+                "Cron job '{job_id}': shell_output_format is shell-only and cannot be set on a '{job_type}' job"
+            );
+        }
+        job.shell_output_format = shell_output_format;
+    }
 
     if schedule_changed {
         job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
     }
 
     with_initialized_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs
-             SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
-                 session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                 allowed_tools = ?12, next_run = ?13, uses_memory = ?14
-             WHERE id = ?15",
-            params![
-                job.expression,
-                job.command,
-                serde_json::to_string(&job.schedule)?,
-                <JobType as Into<&str>>::into(job.job_type).to_string(),
-                job.prompt,
-                job.name,
-                job.session_target.as_str(),
-                job.model,
-                if job.enabled { 1 } else { 0 },
-                serde_json::to_string(&job.delivery)?,
-                if job.delete_after_run { 1 } else { 0 },
-                encode_allowed_tools(job.allowed_tools.as_ref())?,
-                job.next_run.to_rfc3339(),
-                if job.uses_memory { 1 } else { 0 },
-                job.id,
-            ],
-        )
+        // Declarative jobs don't own `shell_output_format` — the config is the
+        // canonical source, and `resolve_declarative_shell_output_format()` overlays
+        // it on every read. Writing the synthesized (Wrapped) value back into the
+        // column during an unrelated patch would overwrite whatever was stored
+        // there (NULL, garbage, or a future value) with a value the DB doesn't
+        // own. Omit the column from the UPDATE for declarative rows so the
+        // non-owned shadow stays untouched.
+        let changed = if job.source == "declarative" {
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
+                     session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
+                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14
+                 WHERE id = ?15 AND (?16 IS NULL OR agent_alias = ?16)",
+                params![
+                    job.expression,
+                    job.command,
+                    serde_json::to_string(&job.schedule)?,
+                    <JobType as Into<&str>>::into(job.job_type).to_string(),
+                    job.prompt,
+                    job.name,
+                    job.session_target.as_str(),
+                    job.model,
+                    if job.enabled { 1 } else { 0 },
+                    serde_json::to_string(&job.delivery)?,
+                    if job.delete_after_run { 1 } else { 0 },
+                    encode_allowed_tools(job.allowed_tools.as_ref())?,
+                    job.next_run.to_rfc3339(),
+                    if job.uses_memory { 1 } else { 0 },
+                    job.id,
+                    owner,
+                ],
+            )
+        } else {
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
+                     session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
+                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15
+                 WHERE id = ?16 AND (?17 IS NULL OR agent_alias = ?17)",
+                params![
+                    job.expression,
+                    job.command,
+                    serde_json::to_string(&job.schedule)?,
+                    <JobType as Into<&str>>::into(job.job_type).to_string(),
+                    job.prompt,
+                    job.name,
+                    job.session_target.as_str(),
+                    job.model,
+                    if job.enabled { 1 } else { 0 },
+                    serde_json::to_string(&job.delivery)?,
+                    if job.delete_after_run { 1 } else { 0 },
+                    encode_allowed_tools(job.allowed_tools.as_ref())?,
+                    job.next_run.to_rfc3339(),
+                    if job.uses_memory { 1 } else { 0 },
+                    match job.shell_output_format {
+                        CronShellOutputFormat::Wrapped => "wrapped",
+                        CronShellOutputFormat::Raw => "raw",
+                    },
+                    job.id,
+                    owner,
+                ],
+            )
+        }
         .context("Failed to update cron job")?;
+
+        // Zero rows means the guard matched nothing: the job moved to another
+        // owner between the read above and this write.
+        if changed == 0 {
+            anyhow::bail!("Cron job '{job_id}' not found");
+        }
         Ok(())
     })?;
 
@@ -589,10 +902,93 @@ pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bo
     })
 }
 
+/// Claim a job only while it is still owned by `agent_alias`.
+///
+/// The owner predicate is part of the atomic claim update. This is the
+/// linearization point for an agent-facing manual trigger: a rename that wins
+/// before this statement prevents the former owner from executing the job.
+pub fn claim_job_for_agent(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let token = claim_job_for_agent_with_token(config, job_id, agent_alias, now)?;
+    if let Some(token) = token.as_deref() {
+        // This compatibility wrapper cannot own a guard, so it must not leave
+        // a token marked live beyond the claim operation itself.
+        finish_agent_claim(config, job_id, token);
+    }
+    Ok(token.is_some())
+}
+
+/// Claim an agent-owned job and return the opaque claim token.
+///
+/// The token identifies this specific execution. It lets cleanup release only
+/// the claim it acquired, so a cancelled run cannot clear a later execution's
+/// lock for the same job.
+pub fn claim_job_for_agent_with_token(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
+    let lock_token = new_agent_lock_token();
+    register_live_agent_claim(config, job_id, &lock_token);
+    let result = with_initialized_connection(config, |conn| {
+        let claimed = conn
+            .execute(
+                "UPDATE cron_jobs
+                 SET locked_at = ?1, lock_token = ?2
+                 WHERE id = ?3 AND agent_alias = ?4 AND locked_at IS NULL",
+                params![now.to_rfc3339(), lock_token, job_id, agent_alias],
+            )
+            .context("Failed to claim agent-owned cron job for execution")?;
+        Ok(if claimed == 1 {
+            Some(lock_token.clone())
+        } else {
+            None
+        })
+    });
+    match result {
+        Ok(Some(token)) => Ok(Some(token)),
+        Ok(None) => {
+            finish_agent_claim(config, job_id, &lock_token);
+            Ok(None)
+        }
+        Err(error) => {
+            finish_agent_claim(config, job_id, &lock_token);
+            Err(error)
+        }
+    }
+}
+
+/// Release an agent claim only when it still owns the supplied token.
+pub fn release_job_for_token(config: &Config, job_id: &str, lock_token: &str) -> Result<bool> {
+    #[cfg(test)]
+    if should_force_release_failure(config) {
+        anyhow::bail!("forced cron lock release failure for test");
+    }
+
+    let changed = with_initialized_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs
+             SET locked_at = NULL, lock_token = NULL
+             WHERE id = ?1 AND lock_token = ?2",
+            params![job_id, lock_token],
+        )
+        .context("Failed to release cron job lock")
+    })?;
+    if changed == 1 {
+        finish_agent_claim(config, job_id, lock_token);
+    }
+    Ok(changed == 1)
+}
+
 pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     with_initialized_connection(config, |conn| {
         conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE id = ?1",
+            "UPDATE cron_jobs SET locked_at = NULL, lock_token = NULL WHERE id = ?1",
             params![job_id],
         )
         .context("Failed to release cron job lock")?;
@@ -600,15 +996,50 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     })
 }
 
-pub fn clear_stale_locks(config: &Config) -> Result<usize> {
+fn clear_stale_locks_inner(config: &Config, before_update: impl FnOnce()) -> Result<usize> {
+    // Keep the registry lock through the snapshot and the cleanup UPDATE. A
+    // new manual claim registers its token before writing the row; holding the
+    // same lock here makes that admission wait until recovery has finished, so
+    // recovery cannot clear a claim that was admitted during its stale-token
+    // snapshot.
+    let claims = LIVE_AGENT_CLAIM_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let db_path = cron_db_path(config);
+    let live_tokens = claims
+        .iter()
+        .filter_map(|(path, _, token)| (path == &db_path).then_some(token.clone()))
+        .collect::<HashSet<_>>();
+
+    before_update();
+
     let cleared = with_read_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE locked_at IS NOT NULL",
-            [],
-        )
-        .context("Failed to clear stale cron job locks")
+        let changed = if live_tokens.is_empty() {
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET locked_at = NULL, lock_token = NULL
+                 WHERE locked_at IS NOT NULL",
+                [],
+            )?
+        } else {
+            let placeholders = std::iter::repeat_n("?", live_tokens.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE cron_jobs
+                 SET locked_at = NULL, lock_token = NULL
+                 WHERE locked_at IS NOT NULL
+                   AND (lock_token IS NULL OR lock_token NOT IN ({placeholders}))"
+            );
+            conn.execute(&sql, rusqlite::params_from_iter(live_tokens.iter()))?
+        };
+        Ok(changed)
     })?;
     Ok(cleared.unwrap_or(0))
+}
+
+pub fn clear_stale_locks(config: &Config) -> Result<usize> {
+    clear_stale_locks_inner(config, || {})
 }
 
 pub fn record_run(
@@ -856,6 +1287,55 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
     Ok(runs)
 }
 
+/// List run history only while the job is owned by `agent_alias`.
+///
+/// Joining the owner row in the same SELECT keeps the authorization predicate
+/// at the history-read boundary. A rename committed before this statement
+/// therefore returns no history to the former owner.
+pub fn list_runs_for_agent(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    limit: usize,
+) -> Result<Vec<CronRun>> {
+    let Some(runs) = with_read_connection(config, |conn| {
+        let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.job_id, r.started_at, r.finished_at, r.status, r.output, r.duration_ms
+             FROM cron_runs AS r
+             INNER JOIN cron_jobs AS j ON j.id = r.job_id
+             WHERE r.job_id = ?1 AND j.agent_alias = ?2
+             ORDER BY r.started_at DESC, r.id DESC
+             LIMIT ?3",
+        )?;
+
+        let rows = stmt.query_map(params![job_id, agent_alias, lim], |row| {
+            Ok(CronRun {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                started_at: parse_rfc3339(&row.get::<_, String>(2)?)
+                    .map_err(sql_conversion_error)?,
+                finished_at: parse_rfc3339(&row.get::<_, String>(3)?)
+                    .map_err(sql_conversion_error)?,
+                status: row.get(4)?,
+                output: row.get(5)?,
+                duration_ms: row.get(6)?,
+            })
+        })?;
+
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(runs)
+}
+
 fn parse_rfc3339(raw: &str) -> Result<DateTime<Utc>> {
     let parsed = DateTime::parse_from_rfc3339(raw)
         .with_context(|| format!("Invalid RFC3339 timestamp in cron DB: {raw}"))?;
@@ -882,6 +1362,18 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let source: Option<String> = row.get(18)?;
     let uses_memory: Option<i64> = row.get(19)?;
     let agent_alias: Option<String> = row.get(20)?;
+    // Declarative jobs never own this column — sync_declarative_jobs skips it
+    // and resolve_declarative_shell_output_format() overwrites from config.
+    // Skip reading column 21 entirely for declarative rows: the source
+    // ownership is already determined, and attempting a typed String read
+    // on a non-owned BLOB shadow would fail before the ownership branch
+    // can take effect.
+    let shell_output_format = if source.as_deref() == Some("declarative") {
+        CronShellOutputFormat::default()
+    } else {
+        let raw: Option<String> = row.get(21)?;
+        decode_shell_output_format(raw.as_deref()).map_err(sql_conversion_error)?
+    };
 
     Ok(CronJob {
         id: row.get(0)?,
@@ -901,6 +1393,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         delete_after_run: row.get::<_, i64>(11)? != 0,
         source: source.unwrap_or_else(|| "imperative".to_string()),
         uses_memory: uses_memory != Some(0),
+        shell_output_format,
         created_at: parse_rfc3339(&created_at_raw).map_err(sql_conversion_error)?,
         next_run: parse_rfc3339(&next_run_raw).map_err(sql_conversion_error)?,
         last_run: match last_run_raw {
@@ -912,6 +1405,31 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         allowed_tools: decode_allowed_tools(allowed_tools_raw.as_deref())
             .map_err(sql_conversion_error)?,
     })
+}
+
+/// For declarative jobs, resolve `shell_output_format` from the canonical
+/// config source instead of the DB column (which stays at the default).
+fn resolve_declarative_shell_output_format(config: &Config, job: &mut CronJob) {
+    if job.source == "declarative"
+        && let Some(decl) = config.cron.get(&job.id)
+    {
+        job.shell_output_format = decl.shell_output_format.clone();
+    }
+}
+
+/// Returns `true` if a declarative job still has a live config owner.
+/// Covers both `config.cron` entries and derived declarations like
+/// `__builtin_backup` (from `config.backup.schedule_cron`).
+pub(crate) fn is_valid_declarative_owner(config: &Config, job_id: &str) -> bool {
+    if config.cron.contains_key(job_id) {
+        return true;
+    }
+    // __builtin_backup is derived from config.backup.schedule_cron and
+    // synced as source = 'declarative' by the scheduler startup path.
+    if job_id == "__builtin_backup" && config.backup.schedule_cron.is_some() {
+        return true;
+    }
+    false
 }
 
 fn decode_schedule(schedule_raw: Option<&str>, expression: &str) -> Result<Schedule> {
@@ -949,6 +1467,22 @@ fn encode_allowed_tools(allowed_tools: Option<&Vec<String>>) -> Result<Option<St
         .map(serde_json::to_string)
         .transpose()
         .context("Failed to serialize cron allowed_tools")
+}
+
+fn decode_shell_output_format(raw: Option<&str>) -> Result<CronShellOutputFormat> {
+    // Exact match against the canonical `#[serde(rename_all = "snake_case")]`
+    // spellings, not a JSON-string round trip: wrapping arbitrary stored text
+    // in quotes and handing it to a JSON parser would let an escape sequence
+    // in the raw column (e.g. `raw`) decode as a different value than
+    // what was actually persisted.
+    match raw {
+        None => {
+            anyhow::bail!("cron shell_output_format column is NULL; schema requires TEXT NOT NULL")
+        }
+        Some("wrapped") => Ok(CronShellOutputFormat::Wrapped),
+        Some("raw") => Ok(CronShellOutputFormat::Raw),
+        Some(other) => anyhow::bail!("Unknown cron shell_output_format value: {other:?}"),
+    }
 }
 
 fn decode_allowed_tools(raw: Option<&str>) -> Result<Option<Vec<String>>> {
@@ -1031,7 +1565,16 @@ pub fn sync_declarative_jobs(
             let expression = schedule_cron_expression(&schedule).unwrap_or_default();
             let schedule_json = serde_json::to_string(&schedule)?;
             let job_type = &decl.job_type;
-            let session_target = decl.session_target.as_deref().unwrap_or("isolated");
+            // Persist the canonical enum, not the raw config string. `try_parse`
+            // trims and lowercases; the stored-row `parse` path does not, so a
+            // value like `"  MAIN  "` would otherwise reload as Isolated.
+            let session_target = match decl.session_target.as_deref() {
+                Some(raw) => SessionTarget::try_parse(raw).map_err(|err| {
+                    anyhow::Error::msg(format!("Declarative cron job '{id}': {err}"))
+                })?,
+                None => SessionTarget::Isolated,
+            };
+            let session_target = session_target.as_str();
             let delivery = match &decl.delivery {
                 Some(d) => convert_delivery_decl(d),
                 None => DeliveryConfig::default(),
@@ -1202,12 +1745,23 @@ fn validate_decl(id: &str, decl: &zeroclaw_config::schema::CronJobDecl) -> Resul
                     "Declarative cron job '{id}': agent job requires a non-empty 'prompt'"
                 );
             }
+            if decl.shell_output_format != zeroclaw_config::schema::CronShellOutputFormat::default()
+            {
+                anyhow::bail!(
+                    "Declarative cron job '{id}': shell_output_format is shell-only and cannot be set on an agent job"
+                );
+            }
         }
         other => {
             anyhow::bail!(
                 "Declarative cron job '{id}': invalid job_type '{other}', expected 'shell' or 'agent'"
             );
         }
+    }
+
+    if let Some(raw) = decl.session_target.as_deref() {
+        SessionTarget::try_parse(raw)
+            .map_err(|err| anyhow::Error::msg(format!("Declarative cron job '{id}': {err}")))?;
     }
 
     Ok(())
@@ -1320,7 +1874,7 @@ fn with_existing_initialized_connection<T>(
     f(&conn).map(Some)
 }
 
-fn with_initialized_connection<T>(
+pub(super) fn with_initialized_connection<T>(
     config: &Config,
     f: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<T> {
@@ -1476,6 +2030,18 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // runs longer than the poll interval cannot be launched again while still in
     // flight (see `claim_job`/`release_job` and
     add_column_if_missing(conn, "locked_at", "TEXT")?;
+    // Agent-triggered claims also carry an opaque per-execution token. Startup
+    // recovery preserves only tokens whose manual-run guards are still live in
+    // this process; all other locks are eligible for cleanup.
+    add_column_if_missing(conn, "lock_token", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "shell_output_format",
+        "TEXT NOT NULL DEFAULT 'wrapped'",
+    )?;
+
+    #[cfg(feature = "plugins-wasm")]
+    super::outbox::initialize_schema(conn)?;
 
     Ok(())
 }
@@ -1495,6 +2061,190 @@ mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         config
+    }
+
+    #[test]
+    fn scoped_remove_refuses_a_job_owned_by_another_agent() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        let refused = remove_job_for_agent(&config, &job.id, "other-agent");
+        assert!(refused.is_err(), "a foreign job must not be deletable");
+        assert!(
+            get_job(&config, &job.id).is_ok(),
+            "the job must survive a refused delete"
+        );
+
+        remove_job_for_agent(&config, &job.id, "owner-agent").unwrap();
+        assert!(
+            get_job(&config, &job.id).is_err(),
+            "the owner may delete it"
+        );
+    }
+
+    #[test]
+    fn scoped_remove_guarded_delete_refuses_a_stale_owner() {
+        // The race the separate read cannot cover: the caller was authorized, then
+        // the operator's rename cascade moved the job to another agent. Matching
+        // both columns in the DELETE means the stale authorization writes nothing.
+        //
+        // `remove_job_for_agent` has no preliminary read, so this reaches the
+        // guarded DELETE itself. It is a stale-owner write, not a deterministic
+        // interleaving: the rename lands before the call rather than between a
+        // successful read and the write.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        // Stand-in for the rename landing between check and write.
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let stale = remove_job_for_agent(&config, &job.id, "owner-agent");
+        assert!(
+            stale.is_err(),
+            "an authorization from before the rename must not delete the job"
+        );
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().agent_alias,
+            "new-owner",
+            "the job must remain with its new owner"
+        );
+    }
+
+    #[test]
+    fn scoped_update_read_check_refuses_a_stale_owner() {
+        // This one stops at `update_job_for_agent`'s preliminary ownership read,
+        // so it never reaches the guarded UPDATE. The test below covers that
+        // statement directly.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        assert!(job.enabled);
+
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let stale = update_job_for_agent(
+            &config,
+            &job.id,
+            "owner-agent",
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        );
+        assert!(
+            stale.is_err(),
+            "an authorization from before the rename must not patch the job"
+        );
+        assert!(
+            get_job(&config, &job.id).unwrap().enabled,
+            "the job's state must be untouched by the refused patch"
+        );
+    }
+
+    #[test]
+    fn scoped_update_guarded_write_refuses_a_stale_owner() {
+        // Calls `update_job_inner` directly with the stale owner, which is what
+        // the guarded UPDATE sees once the preliminary read is out of the way.
+        // Without the `agent_alias` term in the WHERE clause this patch lands.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        assert!(job.enabled);
+
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let stale = update_job_inner(
+            &config,
+            &job.id,
+            Some("owner-agent"),
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        );
+        assert!(
+            stale.is_err(),
+            "the guarded UPDATE must match no row for the former owner"
+        );
+
+        let after = get_job(&config, &job.id).unwrap();
+        assert!(after.enabled, "the refused patch must not change the job");
+        assert_eq!(
+            after.agent_alias, "new-owner",
+            "the job must remain with its new owner"
+        );
+    }
+
+    #[test]
+    fn scoped_update_still_works_for_the_owner() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        let updated = update_job_for_agent(
+            &config,
+            &job.id,
+            "owner-agent",
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(!updated.enabled);
+        assert!(!get_job(&config, &job.id).unwrap().enabled);
+    }
+
+    #[test]
+    fn the_operator_shell_update_path_is_not_agent_scoped() {
+        // update_shell_job_with_approval is the gateway API's and the CLI's entry
+        // point. Its agent_alias names whose risk profile validates a command, NOT
+        // the job's owner — patching an agent-type job's prompt is not agent-gated
+        // and may name a different agent entirely. Scoping it once broke exactly
+        // that, so pin the behaviour here rather than only in the gateway crate.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        crate::cron::update_shell_job_with_approval(
+            &config,
+            "some-other-agent",
+            &job.id,
+            CronJobPatch {
+                name: Some("renamed by the operator".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .expect("an operator patch must not require owning the job");
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert_eq!(updated.name.as_deref(), Some("renamed by the operator"));
+        assert_eq!(updated.agent_alias, "owner-agent", "ownership is unchanged");
+    }
+
+    #[test]
+    fn unscoped_helpers_still_serve_operator_callers() {
+        // The gateway and scheduler call these with no agent in hand; scoping the
+        // agent-facing paths must not take that away.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(!get_job(&config, &job.id).unwrap().enabled);
+        remove_job(&config, &job.id).unwrap();
+        assert!(get_job(&config, &job.id).is_err());
     }
 
     fn cron_dir(config: &Config) -> std::path::PathBuf {
@@ -1605,6 +2355,139 @@ mod tests {
         assert!(
             claim_job(&config, &job.id, now).unwrap(),
             "claim should win again after release"
+        );
+    }
+
+    #[test]
+    fn agent_claim_rechecks_owner_at_the_claim_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        // Simulate a successful scoped authorization followed by the operator's
+        // rename before the effect. The guarded UPDATE must reject the stale owner.
+        assert_eq!(
+            get_job_for_agent(&config, &job.id, "owner-agent")
+                .unwrap()
+                .agent_alias,
+            "owner-agent"
+        );
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let now = Utc::now();
+        assert!(!claim_job_for_agent(&config, &job.id, "owner-agent", now).unwrap());
+        assert!(claim_job_for_agent(&config, &job.id, "new-owner", now).unwrap());
+        assert!(!claim_job_for_agent(&config, &job.id, "new-owner", now).unwrap());
+        release_job(&config, &job.id).unwrap();
+    }
+
+    #[test]
+    fn agent_claim_token_prevents_late_release_from_clearing_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        let first = claim_job_for_agent_with_token(&config, &job.id, "owner-agent", now)
+            .unwrap()
+            .expect("first claim should win");
+        release_job_for_token(&config, &job.id, &first).unwrap();
+
+        let second = claim_job_for_agent_with_token(&config, &job.id, "owner-agent", now)
+            .unwrap()
+            .expect("replacement claim should win");
+        assert!(!release_job_for_token(&config, &job.id, &first).unwrap());
+        assert!(due_jobs(&config, now).unwrap().is_empty());
+        assert!(release_job_for_token(&config, &job.id, &second).unwrap());
+    }
+
+    #[test]
+    fn clear_stale_locks_preserves_current_process_agent_claim() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        let token = claim_job_for_agent_with_token(&config, &job.id, "owner-agent", now)
+            .unwrap()
+            .expect("agent claim should win");
+        assert_eq!(clear_stale_locks(&config).unwrap(), 0);
+        assert!(due_jobs(&config, now).unwrap().is_empty());
+        assert!(release_job_for_token(&config, &job.id, &token).unwrap());
+    }
+
+    #[test]
+    fn clear_stale_locks_serializes_new_agent_claims() {
+        let tmp = TempDir::new().unwrap();
+        let config = std::sync::Arc::new(test_config(&tmp));
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        // A legacy/scheduled claim has no token and is eligible for startup
+        // recovery. The concurrent agent claim must not be able to register
+        // and write its replacement while recovery is between its snapshot and
+        // cleanup UPDATE.
+        assert!(claim_job(&config, &job.id, now).unwrap());
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let claim_config = config.clone();
+        let claim_job_id = job.id.clone();
+        let claim_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            claim_job_for_agent_with_token(&claim_config, &claim_job_id, "owner-agent", Utc::now())
+        });
+
+        let cleared = clear_stale_locks_inner(&config, || {
+            started_rx.recv().unwrap();
+            go_tx.send(()).unwrap();
+
+            // `claim_job_for_agent_with_token` has been released to run, but
+            // its registration must wait for recovery's registry guard.
+            assert!(LIVE_AGENT_CLAIM_TOKENS.try_lock().is_err());
+        })
+        .unwrap();
+        assert_eq!(cleared, 1, "the pre-existing stale claim should be cleared");
+
+        let token = claim_thread
+            .join()
+            .unwrap()
+            .unwrap()
+            .expect("the new claim should win after recovery");
+        assert!(
+            !claim_job_for_agent(&config, &job.id, "owner-agent", Utc::now()).unwrap(),
+            "a second execution must remain blocked by the admitted claim"
+        );
+        assert!(release_job_for_token(&config, &job.id, &token).unwrap());
+    }
+
+    #[test]
+    fn agent_run_history_rechecks_owner_in_the_history_query() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        record_run(&config, &job.id, now, now, "ok", Some("private output"), 0).unwrap();
+
+        assert_eq!(
+            list_runs_for_agent(&config, &job.id, "owner-agent", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        assert!(
+            list_runs_for_agent(&config, &job.id, "owner-agent", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            list_runs_for_agent(&config, &job.id, "new-owner", 10)
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -1873,6 +2756,45 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("delivery.to is required"));
+    }
+
+    #[test]
+    fn update_job_rejects_invalid_announce_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_shell_job(
+            &config,
+            "default",
+            Some("deliver-shell".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo ok",
+            None,
+        )
+        .unwrap();
+
+        let err = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                delivery: Some(DeliveryConfig {
+                    mode: "announce".into(),
+                    channel: Some("discord".into()),
+                    to: None,
+                    thread_id: None,
+                    best_effort: true,
+                }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("delivery.to is required"));
+        let stored = get_job(&config, &job.id).unwrap();
+        assert_ne!(stored.delivery.mode, "announce");
     }
 
     #[test]
@@ -2158,6 +3080,348 @@ mod tests {
     }
 
     #[test]
+    fn shell_output_format_from_sql_rejects_invalid_value() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now();
+
+        // "raw2": an ordinary unrecognized value. "": a present-but-empty
+        // column (distinct from the column being absent/NULL). "raw":
+        // an escaped spelling that a JSON-string round trip would have
+        // decoded as "raw" even though the persisted bytes are not the
+        // canonical value.
+        for (i, invalid) in ["raw2", "", "r\\u0061w"].into_iter().enumerate() {
+            let id = format!("shell-output-format-invalid-{i}");
+            with_initialized_connection(&config, |conn| {
+                conn.execute(
+                    "INSERT INTO cron_jobs (id, expression, command, schedule, job_type, created_at, next_run, shell_output_format)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        id,
+                        "*/5 * * * *",
+                        "echo ok",
+                        Option::<String>::None,
+                        "shell",
+                        now.to_rfc3339(),
+                        (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                        invalid,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+            assert!(
+                get_job(&config, &id).is_err(),
+                "persisted shell_output_format {invalid:?} must surface an error, not silently become Wrapped"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_output_format_from_sql_rejects_null() {
+        // Simulates a forward-compatible database where shell_output_format was
+        // added as a nullable column by a different schema version.
+        // add_column_if_missing skips the column if it already exists (regardless
+        // of type/nullability), so NULL can reach decode_shell_output_format.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let db_path = cron_db(&config);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+        // Pre-create the DB with the complete legacy table shape (all columns
+        // that get_job() SELECTs) so SQLite can prepare the statement and
+        // map_cron_job_row() reaches decode_shell_output_format. The
+        // shell_output_format column is intentionally nullable so the normal
+        // migration path sees it already exists and leaves it as-is.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cron_jobs (
+                    id                   TEXT PRIMARY KEY,
+                    expression           TEXT NOT NULL,
+                    command              TEXT NOT NULL,
+                    schedule             TEXT,
+                    job_type             TEXT NOT NULL DEFAULT 'shell',
+                    prompt               TEXT,
+                    name                 TEXT,
+                    session_target       TEXT NOT NULL DEFAULT 'isolated',
+                    model                TEXT,
+                    enabled              INTEGER NOT NULL DEFAULT 1,
+                    delivery             TEXT,
+                    delete_after_run     INTEGER NOT NULL DEFAULT 0,
+                    allowed_tools        TEXT,
+                    created_at           TEXT NOT NULL,
+                    next_run             TEXT NOT NULL,
+                    last_run             TEXT,
+                    last_status          TEXT,
+                    last_output          TEXT,
+                    source               TEXT DEFAULT 'imperative',
+                    uses_memory          INTEGER NOT NULL DEFAULT 1,
+                    agent_alias          TEXT NOT NULL DEFAULT '',
+                    shell_output_format  TEXT
+                );",
+            )
+            .unwrap();
+            let now = Utc::now();
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, shell_output_format)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                params![
+                    "shell-output-format-null",
+                    "*/5 * * * *",
+                    "echo ok",
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let err = get_job(&config, "shell-output-format-null").expect_err(
+            "NULL shell_output_format must surface an error, not silently become Wrapped",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NULL"),
+            "Error should identify the NULL shell_output_format column, got: {msg}"
+        );
+    }
+
+    /// Regression: a declarative job whose DB shadow for `shell_output_format`
+    /// is NULL or corrupt must still be visible through get_job / due_jobs /
+    /// all_overdue_jobs, with the canonical value resolved from config.
+    /// The strict decode must not kill valid config-owned jobs before the
+    /// declarative overlay runs.
+    #[test]
+    fn declarative_job_ignores_invalid_db_shadow_for_shell_output_format() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+
+        // Simulate a forward-compatible database where shell_output_format was
+        // added as a nullable column by a different schema version.
+        // add_column_if_missing skips the column if it already exists, so NULL
+        // or garbage can reach map_cron_job_row.
+        let db_path = cron_db(&config);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cron_jobs (
+                    id                   TEXT PRIMARY KEY,
+                    expression           TEXT NOT NULL,
+                    command              TEXT NOT NULL,
+                    schedule             TEXT,
+                    job_type             TEXT NOT NULL DEFAULT 'shell',
+                    prompt               TEXT,
+                    name                 TEXT,
+                    session_target       TEXT NOT NULL DEFAULT 'isolated',
+                    model                TEXT,
+                    enabled              INTEGER NOT NULL DEFAULT 1,
+                    delivery             TEXT,
+                    delete_after_run     INTEGER NOT NULL DEFAULT 0,
+                    allowed_tools        TEXT,
+                    created_at           TEXT NOT NULL,
+                    next_run             TEXT NOT NULL,
+                    last_run             TEXT,
+                    last_status          TEXT,
+                    last_output          TEXT,
+                    source               TEXT DEFAULT 'imperative',
+                    uses_memory          INTEGER NOT NULL DEFAULT 1,
+                    agent_alias          TEXT NOT NULL DEFAULT '',
+                    shell_output_format  TEXT
+                );",
+            )
+            .unwrap();
+
+            let now = Utc::now();
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, source, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'declarative', 1)",
+                params![
+                    "raw-shadow",
+                    "0 2 * * *",
+                    "echo shadow",
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::hours(1)).to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
+
+        // config.cron owns the canonical shell_output_format for this job.
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("raw-shadow".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo shadow".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+        };
+        config.cron.insert("raw-shadow".to_string(), decl);
+
+        // --- NULL shadow ---
+        // DB column is NULL (from the nullable table above), config says Raw.
+        let job = get_job(&config, "raw-shadow").unwrap();
+        assert_eq!(
+            job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            "get_job must resolve config value when DB shadow is NULL"
+        );
+        assert_eq!(job.source, "declarative");
+
+        // --- Garbage shadow ---
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET shell_output_format = 'garbage' WHERE id = ?1",
+                params!["raw-shadow"],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let job = get_job(&config, "raw-shadow").unwrap();
+        assert_eq!(
+            job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            "get_job must resolve config value when DB shadow is garbage"
+        );
+
+        // --- due_jobs / all_overdue_jobs with NULL shadow ---
+        // Reset to NULL and force into the due window.
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET shell_output_format = NULL, next_run = ?1 WHERE id = ?2",
+                params![
+                    (Utc::now() - ChronoDuration::hours(1)).to_rfc3339(),
+                    "raw-shadow"
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let now = Utc::now();
+        let due = due_jobs(&config, now).unwrap();
+        assert!(
+            due.iter().any(|j| j.id == "raw-shadow"
+                && j.shell_output_format == zeroclaw_config::schema::CronShellOutputFormat::Raw),
+            "due_jobs must include declarative job despite NULL DB shadow"
+        );
+        let overdue = all_overdue_jobs(&config, now).unwrap();
+        assert!(
+            overdue.iter().any(|j| j.id == "raw-shadow"
+                && j.shell_output_format == zeroclaw_config::schema::CronShellOutputFormat::Raw),
+            "all_overdue_jobs must include declarative job despite NULL DB shadow"
+        );
+    }
+
+    /// Regression: SQLite permits a BLOB storage class in a TEXT-affinity
+    /// column. With `x'80'` in `shell_output_format`, a declarative row must
+    /// still be readable — the typed `row.get::<String>` for column 21 must
+    /// not run before the ownership branch can skip it.
+    #[test]
+    fn declarative_job_ignores_blob_db_shadow_for_shell_output_format() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+
+        let db_path = cron_db(&config);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cron_jobs (
+                    id                   TEXT PRIMARY KEY,
+                    expression           TEXT NOT NULL,
+                    command              TEXT NOT NULL,
+                    schedule             TEXT,
+                    job_type             TEXT NOT NULL DEFAULT 'shell',
+                    prompt               TEXT,
+                    name                 TEXT,
+                    session_target       TEXT NOT NULL DEFAULT 'isolated',
+                    model                TEXT,
+                    enabled              INTEGER NOT NULL DEFAULT 1,
+                    delivery             TEXT,
+                    delete_after_run     INTEGER NOT NULL DEFAULT 0,
+                    allowed_tools        TEXT,
+                    created_at           TEXT NOT NULL,
+                    next_run             TEXT NOT NULL,
+                    last_run             TEXT,
+                    last_status          TEXT,
+                    last_output          TEXT,
+                    source               TEXT DEFAULT 'imperative',
+                    uses_memory          INTEGER NOT NULL DEFAULT 1,
+                    agent_alias          TEXT NOT NULL DEFAULT '',
+                    shell_output_format  TEXT
+                );",
+            )
+            .unwrap();
+
+            let now = Utc::now();
+            // Insert a declarative row with a BLOB in shell_output_format.
+            // SQLite allows BLOB storage in TEXT-affinity columns.
+            // Set next_run in the past so the job is due for due_jobs().
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, source, enabled, shell_output_format)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'declarative', 1, x'80')",
+                params![
+                    "blob-shadow",
+                    "0 2 * * *",
+                    "echo blob",
+                    now.to_rfc3339(),
+                    (now - ChronoDuration::hours(1)).to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("blob-shadow".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo blob".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+        };
+        config.cron.insert("blob-shadow".to_string(), decl);
+
+        // get_job must succeed despite the BLOB shadow: the ownership branch
+        // skips reading column 21 for declarative rows entirely.
+        let job = get_job(&config, "blob-shadow").unwrap();
+        assert_eq!(
+            job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            "get_job must resolve config value when DB shadow is a BLOB"
+        );
+        assert_eq!(job.source, "declarative");
+
+        // due_jobs must also succeed.
+        let now = Utc::now();
+        let due = due_jobs(&config, now).unwrap();
+        assert!(
+            due.iter().any(|j| j.id == "blob-shadow"
+                && j.shell_output_format == zeroclaw_config::schema::CronShellOutputFormat::Raw),
+            "due_jobs must include declarative job despite BLOB DB shadow"
+        );
+    }
+
+    #[test]
     fn migration_falls_back_to_legacy_expression() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -2340,6 +3604,7 @@ mod tests {
                 uses_memory: true,
                 session_target: None,
                 delivery: None,
+                shell_output_format: Default::default(),
             },
         )
     }
@@ -2366,6 +3631,7 @@ mod tests {
                 uses_memory: true,
                 session_target: None,
                 delivery: None,
+                shell_output_format: Default::default(),
             },
         )
     }
@@ -2517,6 +3783,99 @@ mod tests {
     }
 
     #[test]
+    fn sync_validates_agent_job_rejects_shell_output_format() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let (id, mut decl) = make_agent_decl("bad-agent-format", "0 2 * * *", "do stuff");
+        decl.shell_output_format = zeroclaw_config::schema::CronShellOutputFormat::Raw;
+
+        let decls = decls_map(vec![(id, decl)]);
+        let result = sync_declarative_jobs(&config, &decls);
+        assert!(
+            result.is_err(),
+            "shell_output_format is shell-only and must be rejected on a declarative agent job"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("shell_output_format")
+        );
+    }
+
+    #[test]
+    fn sync_validates_session_target() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let (id, mut decl) = make_agent_decl("bad-session", "0 2 * * *", "do stuff");
+        decl.session_target = Some("shared".to_string());
+
+        let decls = decls_map(vec![(id, decl)]);
+        let result = sync_declarative_jobs(&config, &decls);
+        assert!(
+            result.is_err(),
+            "unknown session_target must be rejected like an unknown job_type"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("session_target"), "got {err}");
+        assert!(err.contains("isolated"), "got {err}");
+        assert!(err.contains("main"), "got {err}");
+    }
+
+    #[test]
+    fn sync_agent_job_persists_session_target_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["main-session"]);
+
+        let (id, mut decl) = make_agent_decl("main-session", "*/15 * * * *", "continue the thread");
+        decl.session_target = Some("main".to_string());
+        let decls = decls_map(vec![(id, decl)]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let job = get_job(&config, "main-session").unwrap();
+        assert_eq!(job.session_target, SessionTarget::Main);
+    }
+
+    #[test]
+    fn sync_agent_job_persists_canonical_session_target_from_whitespace_padded_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["padded-main"]);
+
+        let (id, mut decl) = make_agent_decl("padded-main", "*/15 * * * *", "continue the thread");
+        decl.session_target = Some("  MAIN  ".to_string());
+        let decls = decls_map(vec![(id, decl)]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        // Reload through the stored-row parser, which does not trim. A raw
+        // `"  MAIN  "` column would come back Isolated and the scheduler
+        // would start a fresh session instead of main.
+        let job = get_job(&config, "padded-main").unwrap();
+        assert_eq!(job.session_target, SessionTarget::Main);
+    }
+
+    #[test]
+    fn sync_validates_session_target_on_shell_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let (id, mut decl) = make_shell_decl("bad-shell-session", "0 2 * * *", "echo ok");
+        decl.session_target = Some("shared".to_string());
+
+        let decls = decls_map(vec![(id, decl)]);
+        let result = sync_declarative_jobs(&config, &decls);
+        assert!(
+            result.is_err(),
+            "unknown session_target must fail closed for shell declarations too"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("session_target"), "got {err}");
+    }
+
+    #[test]
     fn sync_agent_job_inserts_correctly() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
@@ -2553,6 +3912,7 @@ mod tests {
             uses_memory: true,
             session_target: None,
             delivery: None,
+            shell_output_format: Default::default(),
         };
 
         let mut decls = std::collections::HashMap::new();
@@ -2607,13 +3967,22 @@ schedule = { kind = "every", every_ms = 300000 }
     fn skip_missed_run_advances_recurring_job_next_run() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
+        // Keep the reference one second before a minute boundary so the test
+        // exercises the exact rollover that made the old wall-clock assertion
+        // flaky. The explicit UTC zone keeps the expected occurrence stable
+        // across developer and CI machine timezones.
+        let reference = "2026-08-25T12:34:59Z".parse::<DateTime<Utc>>().unwrap();
+        let schedule = Schedule::Cron {
+            expr: "* * * * *".to_string(),
+            tz: Some("UTC".to_string()),
+        };
 
         // Add a cron job that will be "overdue" — its next_run is set based
         // on the schedule from the current time, so we need to make it past.
-        let job = add_job(&config, "test-agent", "* * * * *", "echo test").unwrap();
+        let job = add_job_with_schedule(&config, "test-agent", &schedule, "echo test").unwrap();
 
         // Force next_run into the past so the job appears overdue.
-        let past = Utc::now() - ChronoDuration::hours(1);
+        let past = reference - ChronoDuration::hours(1);
         with_initialized_connection(&config, |conn| {
             conn.execute(
                 "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
@@ -2626,20 +3995,23 @@ schedule = { kind = "every", every_ms = 300000 }
 
         // Verify it is overdue now.
         assert!(
-            !all_overdue_jobs(&config, Utc::now()).unwrap().is_empty(),
+            !all_overdue_jobs(&config, reference).unwrap().is_empty(),
             "job with past next_run must appear in overdue"
         );
 
         // Skip the missed run.
         let reloaded = get_job(&config, &job.id).unwrap();
-        skip_missed_run(&config, &reloaded, Utc::now()).unwrap();
+        skip_missed_run(&config, &reloaded, reference).unwrap();
 
-        // The job's next_run should now be in the future.
+        // The job's next_run should be the first occurrence after the same
+        // reference instant supplied to skip_missed_run.
         let updated = get_job(&config, &job.id).unwrap();
+        let expected_next_run = "2026-08-25T12:35:00Z".parse::<DateTime<Utc>>().unwrap();
         assert!(
-            updated.next_run > Utc::now(),
+            updated.next_run > reference,
             "skip_missed_run must advance next_run to the future"
         );
+        assert_eq!(updated.next_run, expected_next_run);
         assert!(updated.enabled, "recurring job must stay enabled");
     }
 
@@ -2698,6 +4070,7 @@ schedule = { kind = "every", every_ms = 300000 }
             allowed_tools: None,
             uses_memory: false,
             source: "imperative".to_string(),
+            shell_output_format: CronShellOutputFormat::default(),
             created_at: now,
             next_run: next_run_for_schedule(schedule, now).unwrap_or(now),
             last_run: None,
@@ -2790,6 +4163,52 @@ schedule = { kind = "every", every_ms = 300000 }
     }
 
     #[test]
+    fn resolve_job_id_or_name_cannot_reach_another_agents_job_by_id() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let theirs = add_shell_job(
+            &config,
+            "agent-b",
+            Some("secret_job".into()),
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "echo b",
+            None,
+        )
+        .unwrap();
+
+        let err = resolve_job_id_or_name(&config, &theirs.id, "agent-a").unwrap_err();
+        assert!(
+            err.to_string().contains("No cron job found"),
+            "another agent's job must be unreachable by ID, got: {err}"
+        );
+    }
+
+    #[test]
+    fn get_job_for_agent_reports_another_agents_job_as_missing() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let theirs = add_shell_job(
+            &config,
+            "agent-b",
+            None,
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "echo b",
+            None,
+        )
+        .unwrap();
+
+        assert!(get_job_for_agent(&config, &theirs.id, "agent-b").is_ok());
+        let err = get_job_for_agent(&config, &theirs.id, "agent-a").unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    #[test]
     fn resolve_job_id_or_name_cannot_reach_another_agents_job_by_name() {
         // Only agent-b owns `secret_job`; agent-a must not be able to resolve it.
         let tmp = TempDir::new().unwrap();
@@ -2812,5 +4231,414 @@ schedule = { kind = "every", every_ms = 300000 }
             err.to_string().contains("No cron job found"),
             "another agent's job must be unresolvable by name; got: {err}"
         );
+    }
+
+    /// Regression: a declarative shell job with `shell_output_format = raw`
+    /// must report `shell_output_format = raw` through `get_job()`/`list_jobs()`,
+    /// resolving from the config source of truth (not the DB column).
+    #[test]
+    fn sync_declarative_raw_shell_job_lists_with_raw_format() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["raw-decl"]);
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("raw-decl".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo raw-decl-output".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+        };
+        let decls = decls_map(vec![("raw-decl".to_string(), decl.clone())]);
+        // Populate config.cron so resolution finds the canonical source.
+        config.cron.insert("raw-decl".to_string(), decl);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let job = get_job(&config, "raw-decl").unwrap();
+        assert_eq!(
+            job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            "get_job must return raw format resolved from config for a declarative raw shell job"
+        );
+        assert_eq!(job.source, "declarative");
+
+        let jobs = list_jobs(&config).unwrap();
+        let listed = jobs
+            .iter()
+            .find(|j| j.id == "raw-decl")
+            .expect("job in list");
+        assert_eq!(
+            listed.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            "list_jobs must return raw format resolved from config for a declarative raw shell job"
+        );
+    }
+
+    /// Regression: an unrelated `update_job()` patch on a declarative job
+    /// must not persist a config-resolved snapshot of `shell_output_format`
+    /// into the DB column. After the update, a later config change must
+    /// still be reflected by `get_job()`, `due_jobs()`, and
+    /// `all_overdue_jobs()` — none of them may keep serving a value the
+    /// unrelated update happened to freeze at update time.
+    #[test]
+    fn update_job_unrelated_patch_does_not_snapshot_declarative_shell_output_format() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["raw-decl"]);
+
+        let mut decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("raw-decl".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo raw-decl-output".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+        };
+        let decls = decls_map(vec![("raw-decl".to_string(), decl.clone())]);
+        config.cron.insert("raw-decl".to_string(), decl.clone());
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        // Read the raw DB column value before the unrelated update.
+        // sync_declarative_jobs does not write shell_output_format, so the
+        // column stays at its DEFAULT ('wrapped'). Overwrite it with a
+        // distinct sentinel so the test can detect if the unrelated update
+        // writes the column back (which would indicate a snapshot defect).
+        with_read_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET shell_output_format = 'future-format' WHERE id = ?1",
+                params!["raw-decl"],
+            )
+            .map_err(Into::into)
+        })
+        .unwrap();
+
+        let raw_before = with_read_connection(&config, |conn| {
+            let val: Option<String> = conn
+                .query_row(
+                    "SELECT shell_output_format FROM cron_jobs WHERE id = ?1",
+                    params!["raw-decl"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            Ok(val)
+        })
+        .unwrap()
+        .expect("row exists");
+        assert_eq!(
+            raw_before.as_deref(),
+            Some("future-format"),
+            "baseline: sentinel value must be set before unrelated update"
+        );
+
+        // Unrelated patch: only toggles `uses_memory`, never touches
+        // `shell_output_format`. Must not overwrite the DB column.
+        update_job(
+            &config,
+            "raw-decl",
+            CronJobPatch {
+                uses_memory: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        // Assert the raw SQLite column was NOT modified by the unrelated update.
+        let raw_after = with_read_connection(&config, |conn| {
+            let val: Option<String> = conn
+                .query_row(
+                    "SELECT shell_output_format FROM cron_jobs WHERE id = ?1",
+                    params!["raw-decl"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            Ok(val)
+        })
+        .unwrap()
+        .expect("row exists");
+        assert_eq!(
+            raw_after, raw_before,
+            "unrelated update must not overwrite the non-owned shell_output_format column"
+        );
+
+        // Config changes after the update — if the update had snapshotted
+        // a value into the DB column, every read path below would still
+        // report the old value instead of following this change.
+        decl.shell_output_format = zeroclaw_config::schema::CronShellOutputFormat::Wrapped;
+        config.cron.insert("raw-decl".to_string(), decl);
+
+        let far_future = Utc::now() + ChronoDuration::days(365);
+
+        let job = get_job(&config, "raw-decl").unwrap();
+        assert_eq!(
+            job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            "get_job must follow the current config value, not a value snapshotted by an unrelated update"
+        );
+        assert!(
+            !job.uses_memory,
+            "the unrelated patch must still have taken effect"
+        );
+
+        let due = due_jobs(&config, far_future).unwrap();
+        let due_job = due.iter().find(|j| j.id == "raw-decl").expect("job is due");
+        assert_eq!(
+            due_job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            "due_jobs must follow the current config value, not a stored snapshot"
+        );
+
+        let overdue = all_overdue_jobs(&config, far_future).unwrap();
+        let overdue_job = overdue
+            .iter()
+            .find(|j| j.id == "raw-decl")
+            .expect("job is overdue");
+        assert_eq!(
+            overdue_job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            "all_overdue_jobs must follow the current config value, not a stored snapshot"
+        );
+    }
+
+    #[test]
+    fn update_job_rejects_shell_output_format_for_declarative_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["decl-job"]);
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("decl-job".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo ok".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+        };
+        let decls = decls_map(vec![("decl-job".to_string(), decl.clone())]);
+        config.cron.insert("decl-job".to_string(), decl);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let err = update_job(
+            &config,
+            "decl-job",
+            CronJobPatch {
+                shell_output_format: Some(zeroclaw_config::schema::CronShellOutputFormat::Raw),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("config.toml"),
+            "the core update_job boundary must reject a config-owned mutation, not silently ignore it: {err}"
+        );
+    }
+
+    /// Regression: a declarative job's delivery is owned by
+    /// `[cron.<id>].delivery`. Persisting a CLI patch here would look like it
+    /// worked and then be silently reverted by `sync_declarative_jobs` on the
+    /// next daemon start, which rewrites every declarative column from config.
+    /// The second half of this test proves that revert, so the guard is
+    /// justified by the behaviour rather than by assertion.
+    #[test]
+    fn update_job_rejects_delivery_for_declarative_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["decl-job"]);
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("decl-job".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo ok".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+        };
+        let decls = decls_map(vec![("decl-job".to_string(), decl.clone())]);
+        config.cron.insert("decl-job".to_string(), decl);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let err = update_job(
+            &config,
+            "decl-job",
+            CronJobPatch {
+                delivery: Some(DeliveryConfig {
+                    mode: "announce".to_string(),
+                    channel: Some("telegram".to_string()),
+                    to: Some("111".to_string()),
+                    thread_id: None,
+                    best_effort: true,
+                }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("config.toml"),
+            "the rejection must point at the canonical source: {msg}"
+        );
+        assert!(
+            msg.contains("[cron.decl-job].delivery"),
+            "the rejection must name the exact config key to edit: {msg}"
+        );
+
+        // The stored job is untouched, and a sync would have reverted it anyway.
+        let after = get_job(&config, "decl-job").unwrap();
+        assert_eq!(after.delivery.mode, "none");
+        sync_declarative_jobs(&config, &decls).unwrap();
+        assert_eq!(
+            get_job(&config, "decl-job").unwrap().delivery.mode,
+            "none",
+            "sync rewrites declarative delivery from config, which is why the patch is rejected"
+        );
+    }
+
+    #[test]
+    fn update_job_rejects_shell_output_format_for_agent_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["default"]);
+
+        let job = add_agent_job(
+            &config,
+            "default",
+            Some("agent-job".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "summarize logs",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let err = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                shell_output_format: Some(zeroclaw_config::schema::CronShellOutputFormat::Raw),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("shell-only"),
+            "the core update_job boundary must reject shell_output_format on a non-shell job: {err}"
+        );
+    }
+
+    /// Regression: an orphaned declarative row (source = 'declarative' but
+    /// absent from Config.cron) must be excluded from due_jobs and
+    /// all_overdue_jobs. This covers the case where sync_declarative_jobs
+    /// fails before stale-row cleanup (e.g. another invalid declaration
+    /// aborts validation), leaving a removed row in the DB that the
+    /// scheduler would otherwise still execute.
+    #[test]
+    fn due_jobs_excludes_orphaned_declarative_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["orphan-decl"]);
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("orphan-decl".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo orphan".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+        };
+        let decls = decls_map(vec![("orphan-decl".to_string(), decl.clone())]);
+        config.cron.insert("orphan-decl".to_string(), decl.clone());
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        // Confirm the row is in the DB with source = 'declarative'.
+        let source_in_db = with_read_connection(&config, |conn| {
+            let val: Option<String> = conn
+                .query_row(
+                    "SELECT source FROM cron_jobs WHERE id = ?1",
+                    params!["orphan-decl"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            Ok(val)
+        })
+        .unwrap()
+        .expect("row exists");
+        assert_eq!(source_in_db.as_deref(), Some("declarative"));
+
+        // Remove the declaration from config (simulating operator removal
+        // while sync is broken by a separate invalid declaration).
+        config.cron.remove("orphan-decl");
+
+        let far_future = Utc::now() + ChronoDuration::days(365);
+
+        // due_jobs must not return the orphaned row.
+        let due = due_jobs(&config, far_future).unwrap();
+        assert!(
+            due.iter().all(|j| j.id != "orphan-decl"),
+            "due_jobs must exclude orphaned declarative rows not in live config"
+        );
+
+        // all_overdue_jobs must not return it either.
+        let overdue = all_overdue_jobs(&config, far_future).unwrap();
+        assert!(
+            overdue.iter().all(|j| j.id != "orphan-decl"),
+            "all_overdue_jobs must exclude orphaned declarative rows not in live config"
+        );
+
+        // get_job still returns it (the row exists; the read path surfaces
+        // it for API/admin visibility, but execution won't pick it up).
+        let job = get_job(&config, "orphan-decl").unwrap();
+        assert_eq!(job.source, "declarative");
     }
 }

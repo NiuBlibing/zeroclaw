@@ -4,6 +4,7 @@
 use super::*;
 use async_trait::async_trait;
 use std::collections::VecDeque;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use zeroclaw_api::ingress::IngressContext;
@@ -12,13 +13,36 @@ use zeroclaw_providers::{ChatResponse, ToolCall};
 
 // ── shared fixtures ─────────────────────────────────────────────────────
 
-fn mem_none() -> Arc<dyn Memory> {
+struct TestAgent {
+    agent: Agent,
+    _workspace: tempfile::TempDir,
+}
+
+impl Deref for TestAgent {
+    type Target = Agent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.agent
+    }
+}
+
+impl DerefMut for TestAgent {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.agent
+    }
+}
+
+fn test_workspace() -> tempfile::TempDir {
+    tempfile::tempdir().expect("test workspace should be created")
+}
+
+fn mem_none(workspace: &Path) -> Arc<dyn Memory> {
     let cfg = zeroclaw_config::schema::MemoryConfig {
         backend: "none".into(),
         ..zeroclaw_config::schema::MemoryConfig::default()
     };
     Arc::from(
-        zeroclaw_memory::create_memory(&cfg, Path::new("/tmp"), None)
+        zeroclaw_memory::create_memory(&cfg, workspace, None)
             .expect("memory creation should succeed"),
     )
 }
@@ -54,6 +78,7 @@ fn token_usage(input: u64, output: u64) -> TokenUsage {
     TokenUsage {
         input_tokens: Some(input),
         cached_input_tokens: None,
+        cache_creation_input_tokens: None,
         output_tokens: Some(output),
     }
 }
@@ -139,36 +164,50 @@ impl Tool for CountingTool {
     }
 }
 
-fn build_agent(provider: Box<dyn ModelProvider>, tools_vec: Vec<Box<dyn Tool>>) -> Agent {
-    Agent::builder()
+fn build_agent(provider: Box<dyn ModelProvider>, tools_vec: Vec<Box<dyn Tool>>) -> TestAgent {
+    let workspace = test_workspace();
+    let agent = Agent::builder()
         .model_provider(provider)
-        .tools(tools_vec)
-        .memory(mem_none())
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools_vec,
+        ))
+        .memory(mem_none(workspace.path()))
         .observer(Arc::from(observability::NoopObserver {}))
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .workspace_dir(workspace.path().to_path_buf())
         .build()
-        .expect("agent builder should succeed")
+        .expect("agent builder should succeed");
+    TestAgent {
+        agent,
+        _workspace: workspace,
+    }
 }
 
 fn build_agent_with_runtime(
     provider: Box<dyn ModelProvider>,
     tools_vec: Vec<Box<dyn Tool>>,
     resolved: zeroclaw_config::schema::ResolvedRuntime,
-) -> Agent {
-    Agent::builder()
+) -> TestAgent {
+    let workspace = test_workspace();
+    let agent = Agent::builder()
         .model_provider(provider)
-        .tools(tools_vec)
-        .memory(mem_none())
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools_vec,
+        ))
+        .memory(mem_none(workspace.path()))
         .observer(Arc::from(observability::NoopObserver {}))
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .workspace_dir(workspace.path().to_path_buf())
         .config(zeroclaw_config::schema::AliasedAgentConfig {
             resolved,
             ..zeroclaw_config::schema::AliasedAgentConfig::default()
         })
         .build()
-        .expect("agent builder should succeed")
+        .expect("agent builder should succeed");
+    TestAgent {
+        agent,
+        _workspace: workspace,
+    }
 }
 
 // ── seam 1: dedup is OFF on the streaming and Agent::turn engines ───────
@@ -418,10 +457,11 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         calls: AtomicUsize::new(0),
     };
     let exec_count = Arc::new(AtomicUsize::new(0));
-    let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool {
-        name: "echo",
-        calls: Arc::clone(&exec_count),
-    })];
+    let tools_registry =
+        crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&exec_count),
+        })]);
     let mut history = vec![ChatMessage::user("hi")];
     let (dtx, mut drx) = mpsc::channel(256);
     let turn_id = uuid::Uuid::new_v4().to_string();
@@ -487,6 +527,10 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         let body = match &delta {
             crate::agent::loop_::StreamDelta::Text(t) => t,
             crate::agent::loop_::StreamDelta::Status(s) => s,
+            crate::agent::loop_::StreamDelta::Reasoning(t) => t,
+            crate::agent::loop_::StreamDelta::ToolStart { .. }
+            | crate::agent::loop_::StreamDelta::ToolComplete { .. }
+            | crate::agent::loop_::StreamDelta::Lifecycle(_) => continue,
         };
         assert!(
             !body.contains("SECRET"),
@@ -594,7 +638,8 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
         ..zeroclaw_config::schema::RiskProfileConfig::default()
     };
     let approval_mgr = Arc::new(ApprovalManager::for_non_interactive(&risk));
-    let mut agent = Agent::builder()
+    let workspace = test_workspace();
+    let agent = Agent::builder()
         .model_provider(Box::new(ScriptedProvider::new(vec![tool_response(vec![
             ToolCall {
                 id: "tc-5".into(),
@@ -603,17 +648,23 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
                 extra_content: None,
             },
         ])])))
-        .tools(vec![Box::new(CountingTool {
-            name: "echo",
-            calls: Arc::clone(&exec_count),
-        })])
-        .memory(mem_none())
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![Box::new(CountingTool {
+                name: "echo",
+                calls: Arc::clone(&exec_count),
+            })],
+        ))
+        .memory(mem_none(workspace.path()))
         .observer(Arc::from(observability::NoopObserver {}))
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .workspace_dir(workspace.path().to_path_buf())
         .approval_manager(Some(Arc::clone(&approval_mgr)))
         .build()
         .expect("agent builder should succeed");
+    let mut agent = TestAgent {
+        agent,
+        _workspace: workspace,
+    };
 
     let handle: tools::PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     agent.channel_handles.ask_user = Some(Arc::clone(&handle));
@@ -802,9 +853,10 @@ async fn safety_net_task_locals_probe_per_entry_path() {
     // channel/E1 path — the caller scopes thread id + session key (control)
     let seen: Probe = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let provider = ScriptedProvider::new(vec![tool_response(vec![tool_call("p3", "echo")])]);
-    let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(ProbeTool {
-        seen: Arc::clone(&seen),
-    })];
+    let tools_registry =
+        crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(ProbeTool {
+            seen: Arc::clone(&seen),
+        })]);
     let mut history = vec![ChatMessage::user("probe")];
     let turn_id = uuid::Uuid::new_v4().to_string();
     crate::agent::loop_::scope_thread_id(
@@ -1054,21 +1106,28 @@ async fn safety_net_agent_turn_agent_end_reports_token_totals() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let capture = Arc::new(EventCapture::default());
-    let mut agent = Agent::builder()
+    let workspace = test_workspace();
+    let agent = Agent::builder()
         .model_provider(Box::new(ScriptedProvider::new(vec![
             tool_round,
             final_round,
         ])))
-        .tools(vec![Box::new(CountingTool {
-            name: "echo",
-            calls: Arc::clone(&calls),
-        })])
-        .memory(mem_none())
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![Box::new(CountingTool {
+                name: "echo",
+                calls: Arc::clone(&calls),
+            })],
+        ))
+        .memory(mem_none(workspace.path()))
         .observer(Arc::clone(&capture) as Arc<dyn Observer>)
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .workspace_dir(workspace.path().to_path_buf())
         .build()
         .expect("agent builder should succeed");
+    let mut agent = TestAgent {
+        agent,
+        _workspace: workspace,
+    };
 
     agent
         .turn("count tokens")
@@ -1594,6 +1653,54 @@ async fn safety_net_graceful_summary_persists_assistant_summary() {
     );
 }
 
+// ACP and other event-driven channels render message content exclusively
+// from `TurnEvent::Chunk`. The graceful summary must reach that channel on
+// the max-iteration exit the same way an ordinary final response does, or
+// the client shows nothing even though the turn resolved successfully.
+#[tokio::test]
+async fn safety_net_graceful_summary_emits_turn_event_chunk() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent_with_runtime(
+        Box::new(ScriptedProvider::new(vec![
+            tool_response(vec![tool_call("s1", "echo")]),
+            tool_response(vec![tool_call("s2", "echo")]),
+            text_response("wrap-up summary"),
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls,
+        })],
+        zeroclaw_config::schema::ResolvedRuntime {
+            max_tool_iterations: 2,
+            ..zeroclaw_config::schema::ResolvedRuntime::default()
+        },
+    );
+    let (tx, mut rx) = mpsc::channel(256);
+    let outcome = agent
+        .turn_streamed_with_steering_state("exhaust the cap", tx, None, None)
+        .await
+        .expect("graceful summary must succeed on the streamed path");
+    assert!(
+        outcome.response.contains("wrap-up summary"),
+        "unexpected response: {}",
+        outcome.response
+    );
+
+    let mut chunk_delta = None;
+    while let Ok(ev) = rx.try_recv() {
+        if let TurnEvent::Chunk { delta } = ev {
+            chunk_delta = Some(delta);
+        }
+    }
+    let delta = chunk_delta.expect(
+        "max-iteration exit must emit a TurnEvent::Chunk so ACP clients render the summary",
+    );
+    assert!(
+        delta.contains("wrap-up summary"),
+        "chunk must carry the graceful summary text: {delta}"
+    );
+}
+
 #[tokio::test]
 async fn safety_net_failed_graceful_summary_does_not_persist_prompt() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1622,9 +1729,17 @@ async fn safety_net_failed_graceful_summary_does_not_persist_prompt() {
         .await
         .expect_err("the summary call is scripted to fail");
     assert!(
-        err.error.to_string().contains("maximum tool iterations"),
+        err.error
+            .to_string()
+            .contains("Agent exceeded maximum tool iterations (2)"),
         "unexpected error: {}",
         err.error
+    );
+    assert!(
+        err.error
+            .chain()
+            .any(|cause| cause.to_string() == "provider 500: scripted mid-turn failure"),
+        "the original summary failure must remain available for diagnostics"
     );
     assert!(
         !err.new_messages.iter().any(|m| matches!(
@@ -1725,14 +1840,17 @@ fn approval_agent(
     tools_vec: Vec<Box<dyn Tool>>,
     manager: Option<Arc<ApprovalManager>>,
     channel: Option<Arc<dyn zeroclaw_api::channel::Channel>>,
-) -> Agent {
+) -> TestAgent {
+    let workspace = test_workspace();
     let mut builder = Agent::builder()
         .model_provider(provider)
-        .tools(tools_vec)
-        .memory(mem_none())
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools_vec,
+        ))
+        .memory(mem_none(workspace.path()))
         .observer(Arc::from(observability::NoopObserver {}))
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"));
+        .workspace_dir(workspace.path().to_path_buf());
     if let Some(mgr) = manager {
         builder = builder.approval_manager(Some(mgr));
     }
@@ -1743,7 +1861,10 @@ fn approval_agent(
         agent.channel_handles.ask_user = Some(handle);
         agent.channel_handles().register_channel("acp", ch);
     }
-    agent
+    TestAgent {
+        agent,
+        _workspace: workspace,
+    }
 }
 
 #[tokio::test]

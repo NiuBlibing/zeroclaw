@@ -9,6 +9,7 @@ use crate::tools::{Tool, ToolOutput, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
+use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_config::schema::{AliasedAgentConfig, MemoryConfig};
 use zeroclaw_memory::{self, Memory};
 
@@ -335,7 +336,9 @@ fn build_agent_with(
 ) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(dispatcher)
@@ -352,7 +355,9 @@ fn build_agent_with_memory(
 ) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(mem)
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -369,7 +374,9 @@ fn build_agent_with_config(
 ) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -750,12 +757,9 @@ async fn history_trims_after_max_messages() {
         retained_messages.len(),
         max_history,
     );
-    let mut turns = retained_messages.chunks_exact(2);
-    assert!(
-        turns.remainder().is_empty(),
-        "history must retain whole turns"
-    );
-    assert!(turns.all(|turn| matches!(
+    let (turns, remainder) = retained_messages.as_chunks::<2>();
+    assert!(remainder.is_empty(), "history must retain whole turns");
+    assert!(turns.iter().all(|turn| matches!(
         turn,
         [ConversationMessage::Chat(user), ConversationMessage::Chat(assistant)]
             if user.role == "user" && assistant.role == "assistant"
@@ -882,7 +886,7 @@ async fn xml_dispatcher_does_not_send_tool_specs() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn turn_handles_empty_text_response() {
+async fn turn_rejects_empty_text_response() {
     let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
         text: Some(String::new()),
         tool_calls: vec![],
@@ -892,12 +896,18 @@ async fn turn_handles_empty_text_response() {
 
     let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
-    let response = agent.turn("hi").await.unwrap();
-    assert!(response.is_empty());
+    let err = agent
+        .turn("hi")
+        .await
+        .expect_err("empty terminal response must fail");
+    assert_eq!(
+        err.to_string(),
+        "provider completed without final text or tool calls"
+    );
 }
 
 #[tokio::test]
-async fn turn_handles_none_text_response() {
+async fn turn_rejects_none_text_response() {
     let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
         text: None,
         tool_calls: vec![],
@@ -907,9 +917,53 @@ async fn turn_handles_none_text_response() {
 
     let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
-    // Should not panic — falls back to empty string
-    let response = agent.turn("hi").await.unwrap();
-    assert!(response.is_empty());
+    let err = agent
+        .turn("hi")
+        .await
+        .expect_err("missing terminal text must fail");
+    assert_eq!(
+        err.to_string(),
+        "provider completed without final text or tool calls"
+    );
+}
+
+#[tokio::test]
+async fn turn_rejects_think_tag_only_response_and_records_usage() {
+    use crate::agent::cost::{
+        TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext,
+        TurnUsage,
+    };
+
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
+        text: Some("<think>internal reasoning</think>".to_string()),
+        tool_calls: vec![],
+        usage: Some(zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+        }),
+        reasoning_content: None,
+    }]));
+    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
+    let cost_context = ToolLoopCostTrackingContext::usage_only();
+    let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+
+    let error = TOOL_LOOP_TURN_USAGE
+        .scope(
+            Some(Arc::clone(&turn_usage)),
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_context), agent.turn("hi")),
+        )
+        .await
+        .expect_err("think-only terminal response must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "provider completed without final text or tool calls"
+    );
+    let recorded = *turn_usage.lock();
+    assert_eq!(recorded.input_tokens, 10);
+    assert_eq!(recorded.output_tokens, 5);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1104,7 +1158,9 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
 #[tokio::test]
 async fn builder_fails_without_provider() {
     let result = Agent::builder()
-        .tools(vec![])
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![],
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -1495,6 +1551,32 @@ fn xml_dispatcher_generates_tool_instructions() {
     );
 }
 
+/// This builder used to carry an abridged copy of the tool-call
+/// guidance (no `CRITICAL:` line, no worked example) while `loop_`'s builder
+/// carried the full text, so tool-use behavior depended on which builder
+/// produced the prompt. It must now emit the shared block verbatim.
+#[test]
+fn xml_dispatcher_emits_shared_tool_call_guidance() {
+    use crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS;
+
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+    let instructions = XmlToolDispatcher.prompt_instructions(&tools);
+
+    assert!(
+        instructions.contains(TOOL_CALL_PROTOCOL_INSTRUCTIONS),
+        "dispatcher prompt drifted from the shared tool-call block:\n{instructions}"
+    );
+    assert!(
+        instructions.contains("CRITICAL: Output actual <tool_call> tags"),
+        "dispatcher prompt lost the emit-real-tags directive"
+    );
+    assert!(
+        instructions
+            .contains("You MUST respond with a real call naming one of your available tools"),
+        "dispatcher prompt lost the worked example"
+    );
+}
+
 #[test]
 fn xml_dispatcher_omits_tool_instructions_without_tools() {
     let tools: Vec<Box<dyn Tool>> = vec![];
@@ -1554,5 +1636,89 @@ async fn run_single_delegates_to_turn() {
     assert!(
         !response.is_empty(),
         "Expected non-empty response from run_single"
+    );
+}
+
+#[tokio::test]
+async fn turn_history_has_exact_one_user_one_assistant() {
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
+        "hello back",
+    )]));
+    let mut agent = build_agent_with(
+        model_provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let _ = agent.turn("hi").await.unwrap();
+    let history = agent.history();
+
+    // First turn: system + user + assistant = 3
+    assert_eq!(
+        history.len(),
+        3,
+        "single-exchange turn should produce system + user + assistant, got {}: {history:?}",
+        history.len()
+    );
+
+    let roles: Vec<&str> = history
+        .iter()
+        .filter_map(|m| match m {
+            ConversationMessage::Chat(c) => Some(c.role.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["system", "user", "assistant"],
+        "history role sequence"
+    );
+
+    // No duplicate user messages
+    let user_count = roles.iter().filter(|&&r| r == "user").count();
+    assert_eq!(user_count, 1, "exactly one user message, no duplicates");
+}
+
+#[tokio::test]
+async fn turn_streamed_history_no_duplicate_user_message() {
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
+        "streamed back",
+    )]));
+    let mut agent = build_agent_with(
+        model_provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+    let (_response, new_msgs) = agent.turn_streamed("hi", event_tx, None).await.unwrap();
+    // Drain events
+    while event_rx.try_recv().is_ok() {}
+
+    // Returned messages: exactly one user and one assistant.
+    let returned_user_count = new_msgs
+        .iter()
+        .filter(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "user"))
+        .count();
+    assert_eq!(
+        returned_user_count, 1,
+        "returned new_msgs must have exactly one user, got {returned_user_count}: {new_msgs:?}"
+    );
+    assert!(
+        new_msgs
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "assistant")),
+        "returned new_msgs must include an assistant: {new_msgs:?}"
+    );
+
+    // Durable history: exactly one user message (no duplicates).
+    let history = agent.history();
+    let history_user_count = history
+        .iter()
+        .filter(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "user"))
+        .count();
+    assert_eq!(
+        history_user_count, 1,
+        "exactly one user message after turn_streamed, got {history_user_count}: {history:?}"
     );
 }

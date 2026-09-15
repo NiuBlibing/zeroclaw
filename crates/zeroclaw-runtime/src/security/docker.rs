@@ -14,7 +14,9 @@ pub struct DockerSandbox {
 impl Default for DockerSandbox {
     fn default() -> Self {
         Self {
-            image: "alpine:latest".to_string(),
+            // Read from the config crate so the sandbox default and the
+            // `[security.sandbox].image` serde default cannot drift apart.
+            image: zeroclaw_config::schema::DEFAULT_SANDBOX_IMAGE.to_string(),
             workspace_dir: None,
         }
     }
@@ -130,6 +132,12 @@ impl Sandbox for DockerSandbox {
     fn description(&self) -> &str {
         "Docker container isolation (requires docker)"
     }
+
+    fn coding_cli_unsupported_reason(&self) -> Option<&'static str> {
+        Some(
+            "docker sandbox mounts the workspace read-only, fixes the inner workdir at the workspace root, and cannot forward selected coding CLI environment names",
+        )
+    }
 }
 
 #[cfg(test)]
@@ -143,8 +151,15 @@ mod tests {
     }
 
     #[test]
-    fn docker_sandbox_default_image() {
+    fn docker_sandbox_default_image_tracks_the_config_default() {
+        // Asserting against the constant rather than a literal is the point:
+        // the sandbox default and `[security.sandbox].image` now have one
+        // source, and this fails if someone reintroduces a second one.
         let sandbox = DockerSandbox::default();
+        assert_eq!(
+            sandbox.image,
+            zeroclaw_config::schema::DEFAULT_SANDBOX_IMAGE
+        );
         assert_eq!(sandbox.image, "alpine:latest");
     }
 
@@ -325,5 +340,17 @@ mod tests {
             !args.contains(&"-v".to_string()),
             "must not emit -v when workspace_dir is None"
         );
+    }
+
+    #[test]
+    fn docker_sandbox_rejects_coding_cli_execution() {
+        let sandbox = DockerSandbox::default();
+        let reason = sandbox
+            .coding_cli_unsupported_reason()
+            .expect("docker sandbox must fail closed for coding CLIs");
+
+        assert!(reason.contains("read-only"));
+        assert!(reason.contains("workdir"));
+        assert!(reason.contains("environment"));
     }
 }

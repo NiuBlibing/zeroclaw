@@ -3,6 +3,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use zeroclaw_api::runtime_traits::ShellDialect;
 
 // Re-export from zeroclaw-config.
 pub use crate::autonomy::AutonomyLevel;
@@ -25,8 +26,15 @@ pub enum ToolOperation {
 /// Sliding-window action tracker for rate limiting.
 #[derive(Debug)]
 pub struct ActionTracker {
-    /// Timestamps of recent actions (kept within the last hour).
-    actions: Mutex<Vec<Instant>>,
+    state: Mutex<ActionTrackerState>,
+}
+
+#[derive(Debug)]
+struct ActionTrackerState {
+    /// Timestamps of successful actions (kept within the last hour).
+    committed: Vec<Instant>,
+    /// Calls admitted by a wrapper but not yet completed.
+    in_flight: usize,
 }
 
 const ACTION_WINDOW: Duration = Duration::from_secs(3600);
@@ -46,32 +54,110 @@ impl Default for ActionTracker {
 impl ActionTracker {
     pub fn new() -> Self {
         Self {
-            actions: Mutex::new(Vec::new()),
+            state: Mutex::new(ActionTrackerState {
+                committed: Vec::new(),
+                in_flight: 0,
+            }),
         }
     }
 
     /// Record an action and return the current count within the window.
     pub fn record(&self) -> usize {
-        let mut actions = self.actions.lock();
+        let mut state = self.state.lock();
         let now = Instant::now();
-        retain_actions_after(&mut actions, now.checked_sub(ACTION_WINDOW));
-        actions.push(now);
-        actions.len()
+        retain_actions_after(&mut state.committed, now.checked_sub(ACTION_WINDOW));
+        state.committed.push(now);
+        state.committed.len()
     }
 
     /// Count of actions in the current window without recording.
     pub fn count(&self) -> usize {
-        let mut actions = self.actions.lock();
-        retain_actions_after(&mut actions, Instant::now().checked_sub(ACTION_WINDOW));
-        actions.len()
+        let mut state = self.state.lock();
+        retain_actions_after(
+            &mut state.committed,
+            Instant::now().checked_sub(ACTION_WINDOW),
+        );
+        state.committed.len()
+    }
+
+    #[cfg(test)]
+    fn used(&self) -> usize {
+        self.used_at(Instant::now())
+    }
+
+    fn used_at(&self, now: Instant) -> usize {
+        let mut state = self.state.lock();
+        retain_actions_after(&mut state.committed, now.checked_sub(ACTION_WINDOW));
+        state.committed.len() + state.in_flight
+    }
+
+    fn try_record(&self, max: u32) -> bool {
+        if max == 0 {
+            return false;
+        }
+
+        let mut state = self.state.lock();
+        let now = Instant::now();
+        retain_actions_after(&mut state.committed, now.checked_sub(ACTION_WINDOW));
+        if state.committed.len() + state.in_flight >= max as usize {
+            return false;
+        }
+        state.committed.push(now);
+        true
+    }
+
+    fn reserve(&self, max: u32) -> bool {
+        if max == 0 {
+            return false;
+        }
+
+        let mut state = self.state.lock();
+        retain_actions_after(
+            &mut state.committed,
+            Instant::now().checked_sub(ACTION_WINDOW),
+        );
+        if state.committed.len() + state.in_flight >= max as usize {
+            return false;
+        }
+        state.in_flight += 1;
+        true
+    }
+
+    fn commit(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.in_flight == 0 {
+            return false;
+        }
+        state.in_flight -= 1;
+        let now = Instant::now();
+        retain_actions_after(&mut state.committed, now.checked_sub(ACTION_WINDOW));
+        state.committed.push(now);
+        true
+    }
+
+    fn release(&self) -> (bool, bool) {
+        let mut state = self.state.lock();
+        if state.in_flight == 0 {
+            return (false, false);
+        }
+        state.in_flight -= 1;
+        retain_actions_after(
+            &mut state.committed,
+            Instant::now().checked_sub(ACTION_WINDOW),
+        );
+        let is_empty = state.committed.is_empty() && state.in_flight == 0;
+        (true, is_empty)
     }
 }
 
 impl Clone for ActionTracker {
     fn clone(&self) -> Self {
-        let actions = self.actions.lock();
+        let state = self.state.lock();
         Self {
-            actions: Mutex::new(actions.clone()),
+            state: Mutex::new(ActionTrackerState {
+                committed: state.committed.clone(),
+                in_flight: 0,
+            }),
         }
     }
 }
@@ -110,13 +196,64 @@ impl PerSenderTracker {
         self.record_within(&key, max)
     }
 
-    /// Record one action for `key`. Allows the action when count == max (≤ max);
-    /// blocks and returns false when count > max.
+    /// Record one action for `key` when a slot remains.
+    /// Rejected attempts are not recorded.
     pub fn record_within(&self, key: &str, max: u32) -> bool {
+        if max == 0 {
+            return false;
+        }
         let mut buckets = self.buckets.lock();
         let tracker = buckets.entry(key.to_string()).or_default();
-        let count = tracker.record();
-        count <= max as usize
+        tracker.try_record(max)
+    }
+
+    /// Atomically reserve one action slot for the current sender.
+    pub fn reserve_for_current(&self, max: u32) -> Option<ActionReservation> {
+        let key = Self::current_key();
+        self.reserve_within(key, max)
+    }
+
+    fn reserve_within(&self, key: String, max: u32) -> Option<ActionReservation> {
+        if max == 0 {
+            return None;
+        }
+        {
+            let mut buckets = self.buckets.lock();
+            let admitted = match buckets.get(&key) {
+                Some(tracker) => tracker.reserve(max),
+                None => {
+                    let tracker = ActionTracker::new();
+                    let admitted = tracker.reserve(max);
+                    buckets.insert(key.clone(), tracker);
+                    admitted
+                }
+            };
+            if !admitted {
+                return None;
+            }
+        }
+        Some(ActionReservation {
+            tracker: self.clone(),
+            key,
+            finished: false,
+        })
+    }
+
+    fn commit_reservation(&self, key: &str) -> bool {
+        let buckets = self.buckets.lock();
+        buckets.get(key).is_some_and(ActionTracker::commit)
+    }
+
+    fn release_reservation(&self, key: &str) -> bool {
+        let mut buckets = self.buckets.lock();
+        let Some(tracker) = buckets.get(key) else {
+            return false;
+        };
+        let (released, remove_bucket) = tracker.release();
+        if remove_bucket {
+            buckets.remove(key);
+        }
+        released
     }
 
     /// Check if the current sender is at or over the limit (without recording).
@@ -126,13 +263,42 @@ impl PerSenderTracker {
     }
 
     pub fn is_exhausted(&self, key: &str, max: u32) -> bool {
-        if max == 0 {
-            return true;
-        }
+        self.is_exhausted_at(key, max, Instant::now())
+    }
+
+    fn is_exhausted_at(&self, key: &str, max: u32, now: Instant) -> bool {
         let mut buckets = self.buckets.lock();
-        match buckets.get_mut(key) {
-            Some(tracker) => tracker.count() >= max as usize,
-            None => false,
+        let used = buckets.get(key).map_or(0, |tracker| tracker.used_at(now));
+        if used == 0 {
+            buckets.remove(key);
+        }
+        max == 0 || used >= max as usize
+    }
+}
+
+/// One sender-scoped in-flight action slot.
+///
+/// Dropping an uncommitted reservation releases only this invocation's slot.
+#[must_use = "dropping the reservation releases the action slot"]
+pub struct ActionReservation {
+    tracker: PerSenderTracker,
+    key: String,
+    finished: bool,
+}
+
+impl ActionReservation {
+    /// Convert this in-flight slot into one committed action.
+    pub fn commit(mut self) {
+        let committed = self.tracker.commit_reservation(&self.key);
+        assert!(committed, "owned action reservation must still exist");
+        self.finished = true;
+    }
+}
+
+impl Drop for ActionReservation {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.tracker.release_reservation(&self.key);
         }
     }
 }
@@ -210,6 +376,10 @@ pub struct SecurityPolicy {
     /// Extra arguments forwarded to firejail when `sandbox_backend`
     /// resolves to `"firejail"`.
     pub firejail_args: Vec<String>,
+    /// Container image for the docker sandbox backend. `None` inherits the
+    /// built-in default; carried here so status surfaces report the image the
+    /// sandbox will actually run rather than assuming the default.
+    pub sandbox_image: Option<String>,
     pub tracker: PerSenderTracker,
 }
 
@@ -361,6 +531,109 @@ fn path_contains(parent: &Path, child: &Path) -> bool {
     canonical_child.starts_with(&canonical_parent) || child.starts_with(parent)
 }
 
+/// Depth, in normal path components, of `prefix` when `target` starts with it.
+/// Returns `None` when `prefix` is not a prefix of `target`.
+///
+/// Used to rank competing allow/deny matches by specificity so the most
+/// specific rule wins: an explicit `forbidden_paths` entry nested under a
+/// broad `allowed_roots` entry denies, while an `allowed_roots` entry nested
+/// under a broad default forbidden root (e.g. `/home`) still allows.
+fn prefix_match_depth(prefix: &Path, target: &Path) -> Option<usize> {
+    if target.starts_with(prefix) {
+        Some(
+            prefix
+                .components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .count(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Namespace in which competing path-policy rules are compared.
+///
+/// Lexical checks compare the configured spellings because they have not yet
+/// resolved filesystem aliases. Resolved checks compare every rule after
+/// symlink resolution so an alias cannot make an equivalent deny disappear.
+#[derive(Clone, Copy)]
+enum PathMatchNamespace {
+    Configured,
+    Resolved,
+}
+
+fn namespace_prefix_match_depth(
+    prefix: &Path,
+    target: &Path,
+    namespace: PathMatchNamespace,
+) -> Option<usize> {
+    match namespace {
+        PathMatchNamespace::Configured => prefix_match_depth(prefix, target),
+        PathMatchNamespace::Resolved => resolve_symlinked_path(prefix)
+            .and_then(|resolved_prefix| prefix_match_depth(&resolved_prefix, target)),
+    }
+}
+
+/// Deepest (most specific) allow-root match depth for `expanded`, considering
+/// the workspace directory and every provided allow-root list. `None` when no
+/// allow rule matches. Every rule is compared in `namespace`; callers must use
+/// the configured namespace for lexical targets and the resolved namespace for
+/// resolved targets so competing depths are never derived from different path
+/// spellings.
+fn deepest_allow_depth(
+    workspace_dir: &Path,
+    root_lists: &[&[PathBuf]],
+    expanded: &Path,
+    namespace: PathMatchNamespace,
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    let mut consider = |root: &Path| {
+        if let Some(depth) = namespace_prefix_match_depth(root, expanded, namespace) {
+            best = Some(best.map_or(depth, |b| b.max(depth)));
+        }
+    };
+    consider(workspace_dir);
+    for list in root_lists {
+        for root in *list {
+            consider(root);
+        }
+    }
+    best
+}
+
+/// Deepest (most specific) forbidden match depth for `expanded`. `None` when no
+/// forbidden entry matches. Entries are compared in the same namespace as the
+/// target and any competing allow rules.
+fn deepest_forbidden_depth(
+    forbidden_paths: &[String],
+    expanded: &Path,
+    namespace: PathMatchNamespace,
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for forbidden in forbidden_paths {
+        let forbidden_path = expand_user_path(forbidden);
+        if let Some(depth) = namespace_prefix_match_depth(&forbidden_path, expanded, namespace) {
+            best = Some(best.map_or(depth, |b| b.max(depth)));
+        }
+    }
+    best
+}
+
+/// Decide whether a `forbidden_paths` entry should deny a path even though an
+/// allow rule also matches. Deny wins when the most specific forbidden prefix
+/// is at least as deep as the most specific allowing prefix, so an explicit
+/// forbidden path nested under an allowed root takes effect, while a broad
+/// default forbidden root (e.g. `/home`) does not override an operator's more
+/// specific `allowed_roots` entry. A tie resolves to deny — an explicit "no"
+/// at the same boundary as the allow should hold.
+fn forbidden_overrides_allow(forbidden_depth: Option<usize>, allow_depth: Option<usize>) -> bool {
+    match (forbidden_depth, allow_depth) {
+        (Some(f), Some(a)) => f >= a,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 /// Specific kind of escalation violation returned by
 /// [`SecurityPolicy::ensure_no_escalation_beyond`]. Each variant names
 /// the field that violated subset semantics so the SubAgent spawn path
@@ -505,6 +778,7 @@ impl Default for SecurityPolicy {
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: vec![],
+            sandbox_image: None,
             tracker: PerSenderTracker::new(),
         }
     }
@@ -537,6 +811,78 @@ fn expand_user_path(path: &str) -> PathBuf {
     }
 
     PathBuf::from(path)
+}
+
+/// Resolve `path` to its real target, following symlinks component by component.
+///
+/// Unlike [`Path::canonicalize`] this does NOT require the target to exist, so a
+/// path whose leaf is about to be created (`touch link/new.txt`) still resolves,
+/// while a symlinked component is followed to its target even when that target
+/// does not exist yet (a *dangling* symlink `link -> /outside/new` — the write
+/// would still land outside, so it must be resolved and blocked, exactly as
+/// `file_write` blocks writing through a symlink leaf). Lexical `.`/`..` are
+/// applied without touching the filesystem. Symlink chains are bounded to guard
+/// against cycles: exhausting the hop budget returns `None` ("could not
+/// resolve"), and callers fail closed by BLOCKING the path - a crafted cycle
+/// never falls back to the literal input. An unreadable link is kept as a
+/// literal component while resolution continues on its ancestors.
+fn resolve_symlinked_path(path: &Path) -> Option<PathBuf> {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+    // Bounds the number of `..`-style retries plus symlink hops so a symlink
+    // cycle cannot spin forever. `None` on exhaustion means "could not resolve";
+    // the caller FAILS CLOSED (blocks), so a crafted deep/cyclic symlink chain
+    // cannot exhaust the budget and fall back to an allowed in-workspace path.
+    let mut budget: u32 = 64;
+    loop {
+        // Canonicalizing the deepest EXISTING prefix normalizes it the same way
+        // `is_resolved_path_allowed` normalizes the workspace root (e.g. `/tmp`
+        // vs its real location), so ordinary in-workspace paths stay in-workspace.
+        if let Ok(resolved) = current.canonicalize() {
+            let mut result = resolved;
+            for component in suffix.iter().rev() {
+                result.push(component);
+            }
+            return Some(result);
+        }
+        // A *dangling* symlink cannot be canonicalized (its target does not
+        // exist), yet a write through it still lands at the target. Follow it
+        // explicitly so the resolved path reflects where the write would go.
+        // Only symlink hops consume the budget (a symlink cycle is the only way
+        // to loop forever); stripping non-existent trailing components is bounded
+        // by the finite path depth, so a deeply-nested create is NOT false-blocked.
+        if current
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+            && let Ok(target) = std::fs::read_link(&current)
+        {
+            if budget == 0 {
+                return None;
+            }
+            budget -= 1;
+            current = if target.is_absolute() {
+                target
+            } else {
+                current
+                    .parent()
+                    .map(|parent| parent.join(&target))
+                    .unwrap_or(target)
+            };
+            continue;
+        }
+        // Otherwise strip the trailing (non-existent) component and retry on the
+        // parent. An absolute input terminates at the filesystem root, which
+        // always canonicalizes; running out of components should be unreachable
+        // for the absolute inputs the caller passes, so treat it as unresolvable
+        // and fail closed rather than trusting the literal path.
+        match (current.file_name(), current.parent()) {
+            (Some(name), Some(parent)) if !parent.as_os_str().is_empty() => {
+                suffix.push(name.to_os_string());
+                current = parent.to_path_buf();
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn is_null_device(path: &Path) -> bool {
@@ -636,18 +982,34 @@ fn skip_env_assignments(s: &str) -> &str {
         let Some(word) = rest.split_whitespace().next() else {
             return rest;
         };
-        // Environment assignment: contains '=' and starts with a letter or underscore
-        if word.contains('=')
-            && word
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        {
+        if is_env_assignment_word(word) {
             // Advance past this word
             rest = rest[word.len()..].trim_start();
         } else {
             return rest;
         }
+    }
+}
+
+fn is_env_assignment_word(word: &str) -> bool {
+    env_assignment_name(word).is_some()
+}
+
+fn env_assignment_name(word: &str) -> Option<&str> {
+    let (raw_name, _) = word.split_once('=')?;
+    normalized_assignment_name(raw_name)
+}
+
+fn normalized_assignment_name(raw_name: &str) -> Option<&str> {
+    let name = raw_name.strip_suffix('+').unwrap_or(raw_name);
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        Some(name)
+    } else {
+        None
     }
 }
 
@@ -658,11 +1020,13 @@ enum QuoteState {
     Double,
 }
 
-fn split_unquoted_segments(command: &str) -> Vec<String> {
+fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
     // Heredoc state: Some(delim) while inside a heredoc body.
     let mut heredoc_delimiter: Option<String> = None;
     // Accumulates the current line while inside a heredoc body, for terminator detection.
@@ -694,7 +1058,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                     current.push(ch);
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     current.push(ch);
                     continue;
@@ -714,7 +1078,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                     }
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     if heredoc_delimiter.is_some() {
                         heredoc_line_buf.push(ch);
@@ -763,7 +1127,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                 }
 
                 match ch {
-                    '\'' => {
+                    '\'' if single_quotes_are_syntax => {
                         quote = QuoteState::Single;
                         current.push(ch);
                     }
@@ -790,8 +1154,9 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                         current.push(ch);
                         // Detect `<<` (heredoc) but not `<<<` (here-string).
                         if chars.peek() == Some(&'<') {
-                            let second = chars.next().unwrap();
-                            current.push(second);
+                            if let Some(second) = chars.next() {
+                                current.push(second);
+                            }
                             if chars.peek() != Some(&'<') {
                                 reading_heredoc_word = true;
                             }
@@ -812,6 +1177,711 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
     segments
 }
 
+#[derive(Clone, Copy)]
+struct RedirectionMetadata {
+    marker_idx: usize,
+    operator_end: usize,
+    has_attached_word: bool,
+    prefix_is_unquoted: bool,
+    has_multiple_operators: bool,
+}
+
+struct ShellWord {
+    text: String,
+    is_assignment: bool,
+    redirection: Option<RedirectionMetadata>,
+}
+
+fn split_shell_words_with_metadata(segment: &str, dialect: ShellDialect) -> Vec<ShellWord> {
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut is_assignment = false;
+    let mut assignment_prefix_is_unquoted = true;
+    let mut word_prefix_is_unquoted = true;
+    let mut redirection: Option<RedirectionMetadata> = None;
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut in_word = false;
+
+    let push_word = |words: &mut Vec<ShellWord>,
+                     current: &mut String,
+                     is_assignment: &mut bool,
+                     assignment_prefix_is_unquoted: &mut bool,
+                     word_prefix_is_unquoted: &mut bool,
+                     redirection: &mut Option<RedirectionMetadata>,
+                     in_word: &mut bool| {
+        if *in_word {
+            words.push(ShellWord {
+                text: std::mem::take(current),
+                is_assignment: *is_assignment,
+                redirection: redirection.take(),
+            });
+            *is_assignment = false;
+            *assignment_prefix_is_unquoted = true;
+            *word_prefix_is_unquoted = true;
+            *in_word = false;
+        }
+    };
+
+    for ch in segment.chars() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                } else {
+                    current.push(ch);
+                    in_word = true;
+                }
+            }
+            QuoteState::Double => {
+                if escaped {
+                    if matches!(ch, '$' | '`' | '"' | '\\') {
+                        current.push(ch);
+                    } else if ch != '\n' {
+                        current.push('\\');
+                        current.push(ch);
+                    }
+                    escaped = false;
+                    if !is_assignment {
+                        assignment_prefix_is_unquoted = false;
+                    }
+                    if redirection.is_none() {
+                        word_prefix_is_unquoted = false;
+                    }
+                    if let Some(redirection) = &mut redirection {
+                        redirection.has_attached_word = true;
+                    }
+                    in_word = true;
+                    continue;
+                }
+                match ch {
+                    '\\' if backslash_is_literal => {
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        }
+                        current.push(ch);
+                        in_word = true;
+                    }
+                    '\\' => {
+                        escaped = true;
+                        in_word = true;
+                    }
+                    '"' => quote = QuoteState::None,
+                    _ => {
+                        current.push(ch);
+                        in_word = true;
+                    }
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    current.push(ch);
+                    escaped = false;
+                    if !is_assignment {
+                        assignment_prefix_is_unquoted = false;
+                    }
+                    if redirection.is_none() {
+                        word_prefix_is_unquoted = false;
+                    }
+                    if let Some(redirection) = &mut redirection {
+                        redirection.has_attached_word = true;
+                    }
+                    in_word = true;
+                    continue;
+                }
+                match ch {
+                    '\\' if backslash_is_literal => {
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        }
+                        current.push(ch);
+                        in_word = true;
+                    }
+                    '\\' => {
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        } else {
+                            word_prefix_is_unquoted = false;
+                        }
+                        escaped = true;
+                        in_word = true;
+                    }
+                    '\'' if single_quotes_are_syntax => {
+                        if !is_assignment {
+                            assignment_prefix_is_unquoted = false;
+                        }
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        } else {
+                            word_prefix_is_unquoted = false;
+                        }
+                        quote = QuoteState::Single;
+                        in_word = true;
+                    }
+                    '"' => {
+                        if !is_assignment {
+                            assignment_prefix_is_unquoted = false;
+                        }
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        } else {
+                            word_prefix_is_unquoted = false;
+                        }
+                        quote = QuoteState::Double;
+                        in_word = true;
+                    }
+                    _ if ch.is_whitespace() => {
+                        push_word(
+                            &mut words,
+                            &mut current,
+                            &mut is_assignment,
+                            &mut assignment_prefix_is_unquoted,
+                            &mut word_prefix_is_unquoted,
+                            &mut redirection,
+                            &mut in_word,
+                        );
+                    }
+                    _ => {
+                        if ch == '=' && !is_assignment && assignment_prefix_is_unquoted {
+                            is_assignment = normalized_assignment_name(&current).is_some();
+                        }
+                        if matches!(ch, '<' | '>') {
+                            match &mut redirection {
+                                Some(redirection)
+                                    if !redirection.has_attached_word
+                                        && current.len() == redirection.operator_end =>
+                                {
+                                    redirection.operator_end += ch.len_utf8();
+                                }
+                                None => {
+                                    redirection = Some(RedirectionMetadata {
+                                        marker_idx: current.len(),
+                                        operator_end: current.len() + ch.len_utf8(),
+                                        has_attached_word: false,
+                                        prefix_is_unquoted: word_prefix_is_unquoted,
+                                        has_multiple_operators: false,
+                                    });
+                                }
+                                Some(redirection) => {
+                                    redirection.has_multiple_operators = true;
+                                    redirection.has_attached_word = true;
+                                }
+                            }
+                        } else if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        }
+                        current.push(ch);
+                        in_word = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    push_word(
+        &mut words,
+        &mut current,
+        &mut is_assignment,
+        &mut assignment_prefix_is_unquoted,
+        &mut word_prefix_is_unquoted,
+        &mut redirection,
+        &mut in_word,
+    );
+    words
+}
+
+fn shell_words_after_env_assignments(segment: &str, dialect: ShellDialect) -> Vec<ShellWord> {
+    let words = split_shell_words_with_metadata(segment, dialect);
+    let first_command = words
+        .iter()
+        .position(|word| !word.is_assignment)
+        .unwrap_or(words.len());
+    words.into_iter().skip(first_command).collect()
+}
+
+struct NormalizedShellCommand {
+    has_leading_env_assignment: bool,
+    words: Vec<String>,
+    has_ambiguous_redirection: bool,
+}
+
+fn normalized_shell_command(segment: &str, dialect: ShellDialect) -> NormalizedShellCommand {
+    let raw_words = split_shell_words_with_metadata(segment, dialect);
+    let mut has_leading_env_assignment = false;
+    let mut words = Vec::with_capacity(raw_words.len());
+    let mut has_ambiguous_redirection = false;
+    let mut before_executable = true;
+    let mut idx = 0;
+
+    while idx < raw_words.len() {
+        let raw = raw_words[idx].text.as_str();
+        if before_executable && raw_words[idx].is_assignment {
+            has_leading_env_assignment = true;
+            idx += 1;
+            continue;
+        }
+
+        let redirection_metadata = raw_words[idx].redirection;
+        if redirection_metadata.is_some_and(|metadata| metadata.has_multiple_operators) {
+            has_ambiguous_redirection = true;
+        }
+        let redirection = redirection_metadata.map_or(RedirectionArgument::None, |metadata| {
+            parse_redirection_argument_at(raw, metadata)
+        });
+        let (prefix, consumes_next) = match redirection {
+            RedirectionArgument::Target { prefix, .. } | RedirectionArgument::FdOnly { prefix } => {
+                (prefix, false)
+            }
+            RedirectionArgument::NeedsNextToken { prefix } => (prefix, true),
+            RedirectionArgument::None => {
+                words.push(raw_words[idx].text.clone());
+                before_executable = false;
+                idx += 1;
+                continue;
+            }
+        };
+
+        let is_io_number = !prefix.is_empty()
+            && prefix.chars().all(|c| c.is_ascii_digit())
+            && redirection_metadata.is_some_and(|metadata| metadata.prefix_is_unquoted);
+        if !prefix.is_empty() && !is_io_number {
+            words.push(prefix.to_string());
+            before_executable = false;
+        }
+        idx += if consumes_next { 2 } else { 1 };
+    }
+
+    NormalizedShellCommand {
+        has_leading_env_assignment,
+        words,
+        has_ambiguous_redirection,
+    }
+}
+
+fn is_git_write_verb(verb: &str) -> bool {
+    matches!(
+        verb.to_ascii_lowercase().as_str(),
+        "am" | "commit"
+            | "push"
+            | "pull"
+            | "reset"
+            | "clean"
+            | "rebase"
+            | "merge"
+            | "cherry-pick"
+            | "revert"
+            | "branch"
+            | "checkout"
+            | "switch"
+            | "tag"
+    )
+}
+
+fn git_command_is_write(args: &[String]) -> bool {
+    let Some(subcommand_idx) = git_effective_subcommand_index(args) else {
+        return false;
+    };
+    let subcommand = args[subcommand_idx].as_str();
+    if is_git_write_verb(subcommand) {
+        return true;
+    }
+
+    match subcommand.to_ascii_lowercase().as_str() {
+        "archive" => {
+            if git_args_before_pathspec(args, subcommand_idx + 1).any(|arg| {
+                arg.starts_with("-o") || git_arg_is_long_option_or_abbreviation(arg, "--output")
+            }) {
+                return true;
+            }
+        }
+        "bundle" => {
+            if git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+                .is_some_and(|action| git_arg_eq(action, "create"))
+            {
+                return true;
+            }
+        }
+        "diff" | "log" | "show" => {
+            if git_args_before_pathspec(args, subcommand_idx + 1)
+                .any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--output"))
+            {
+                return true;
+            }
+        }
+        "format-patch" => return true,
+        _ => {}
+    }
+
+    git_arg_eq(subcommand, "worktree")
+        && git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|action| !git_arg_eq(action, "list"))
+}
+
+fn git_effective_subcommand_index(args: &[String]) -> Option<usize> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+
+        match arg {
+            "--" => return args.get(idx + 1).map(|_| idx + 1),
+            "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
+            | "--super-prefix" => {
+                idx += 2;
+            }
+            "--bare"
+            | "--no-replace-objects"
+            | "--no-lazy-fetch"
+            | "--no-optional-locks"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs"
+            | "--no-pager"
+            | "--paginate"
+            | "--version"
+            | "--help"
+            | "-h"
+            | "-p" => {
+                idx += 1;
+            }
+            _ if arg.starts_with("-C") && arg.len() > 2 => {
+                idx += 1;
+            }
+            _ if arg.starts_with("--git-dir=")
+                || arg.starts_with("--work-tree=")
+                || arg.starts_with("--namespace=")
+                || arg.starts_with("--exec-path=")
+                || arg.starts_with("--super-prefix=") =>
+            {
+                idx += 1;
+            }
+            _ if arg.starts_with('-') => {
+                idx += 1;
+            }
+            _ => return Some(idx),
+        }
+    }
+
+    None
+}
+
+fn git_subcommand_is_policy_modeled(subcommand: &str) -> bool {
+    if subcommand.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return false;
+    }
+
+    is_git_write_verb(subcommand)
+        || matches!(
+            subcommand,
+            "add"
+                | "apply"
+                | "archive"
+                | "bisect"
+                | "blame"
+                | "bundle"
+                | "cat-file"
+                | "check-attr"
+                | "check-ignore"
+                | "check-mailmap"
+                | "check-ref-format"
+                | "clone"
+                | "count-objects"
+                | "describe"
+                | "diff"
+                | "diff-files"
+                | "diff-index"
+                | "diff-tree"
+                | "fetch"
+                | "for-each-ref"
+                | "format-patch"
+                | "fsck"
+                | "gc"
+                | "grep"
+                | "help"
+                | "init"
+                | "log"
+                | "ls-files"
+                | "ls-remote"
+                | "ls-tree"
+                | "maintenance"
+                | "merge-base"
+                | "merge-tree"
+                | "mv"
+                | "name-rev"
+                | "notes"
+                | "range-diff"
+                | "reflog"
+                | "remote"
+                | "restore"
+                | "rev-list"
+                | "rev-parse"
+                | "rm"
+                | "shortlog"
+                | "show"
+                | "show-branch"
+                | "show-ref"
+                | "sparse-checkout"
+                | "stash"
+                | "status"
+                | "submodule"
+                | "verify-commit"
+                | "verify-tag"
+                | "version"
+                | "whatchanged"
+                | "worktree"
+        )
+}
+
+fn git_delegates_to_external_command(args: &[String]) -> bool {
+    let Some(subcommand_idx) = git_effective_subcommand_index(args) else {
+        return args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| git_arg_is_paginate(arg) || git_arg_is_external_diff_option(arg));
+    };
+
+    if args[..subcommand_idx]
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| git_arg_is_paginate(arg) || git_arg_is_external_diff_option(arg))
+    {
+        return true;
+    }
+
+    let subcommand = args[subcommand_idx].as_str();
+    if !git_subcommand_is_policy_modeled(subcommand) {
+        return true;
+    }
+
+    if git_subcommand_selects_remote_helper(args, subcommand_idx, subcommand) {
+        return true;
+    }
+    if git_subcommand_selects_transfer_program(args, subcommand_idx, subcommand) {
+        return true;
+    }
+    let subcommand_args = || git_args_before_pathspec(args, subcommand_idx + 1);
+    if (git_arg_eq(subcommand, "clone") && subcommand_args().any(git_arg_is_clone_process_control))
+        || (git_arg_eq(subcommand, "init")
+            && subcommand_args().any(git_arg_is_template_process_control))
+        || (git_arg_eq(subcommand, "rebase")
+            && subcommand_args().any(git_arg_is_rebase_process_control))
+    {
+        return true;
+    }
+
+    if git_arg_eq(subcommand, "difftool")
+        || git_arg_eq(subcommand, "difftool--helper")
+        || git_arg_eq(subcommand, "mergetool")
+        || git_arg_eq(subcommand, "mergetool--helper")
+        || git_arg_eq(subcommand, "submodule--helper")
+    {
+        return true;
+    }
+
+    if git_args_before_pathspec(args, subcommand_idx + 1).any(git_arg_is_external_diff_option) {
+        return true;
+    }
+
+    match subcommand.to_ascii_lowercase().as_str() {
+        "bisect" => git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|arg| git_arg_eq(arg, "run")),
+        "submodule" => git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|arg| git_arg_eq(arg, "foreach")),
+        "grep" => {
+            git_args_before_pathspec(args, subcommand_idx + 1).any(git_arg_opens_files_in_pager)
+        }
+        "help" => git_args_before_pathspec(args, subcommand_idx + 1).any(|arg| {
+            git_arg_eq(arg, "-w") || git_arg_is_long_option_or_abbreviation(arg, "--web")
+        }),
+        _ => false,
+    }
+}
+
+fn git_args_before_pathspec(args: &[String], start: usize) -> impl Iterator<Item = &str> {
+    args[start..]
+        .iter()
+        .map(String::as_str)
+        .take_while(|arg| *arg != "--")
+}
+
+fn git_first_non_option_before_pathspec(args: &[String], start: usize) -> Option<&str> {
+    git_args_before_pathspec(args, start).find(|arg| !arg.starts_with('-'))
+}
+
+fn git_arg_eq(arg: &str, expected: &str) -> bool {
+    arg.eq_ignore_ascii_case(expected)
+}
+
+fn git_arg_starts_with(arg: &str, prefix: &str) -> bool {
+    arg.get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+}
+
+fn git_arg_is_paginate(arg: &str) -> bool {
+    git_arg_eq(arg, "-p") || git_arg_eq(arg, "--paginate")
+}
+
+fn git_arg_is_external_diff_option(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--ext-diff")
+        || git_arg_eq(arg, "--extcmd")
+        || git_arg_starts_with(arg, "--extcmd=")
+}
+
+fn git_subcommand_selects_transfer_program(
+    args: &[String],
+    subcommand_idx: usize,
+    subcommand: &str,
+) -> bool {
+    let args = || git_args_before_pathspec(args, subcommand_idx + 1);
+    match subcommand {
+        "clone" | "fetch" | "ls-remote" | "pull" => {
+            args().any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--upload-pack"))
+        }
+        "push" => args().any(|arg| {
+            git_arg_is_long_option_or_abbreviation(arg, "--receive-pack")
+                || git_arg_is_long_option_or_abbreviation(arg, "--exec")
+        }),
+        "archive" => args().any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--exec")),
+        _ => false,
+    }
+}
+
+fn git_arg_is_clone_process_control(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--config")
+        || git_arg_is_template_process_control(arg)
+        || git_arg_eq(arg, "-u")
+        || git_arg_starts_with(arg, "-u")
+}
+
+fn git_arg_is_template_process_control(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--template")
+}
+
+fn git_arg_is_rebase_process_control(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--exec")
+        || arg
+            .strip_prefix('-')
+            .is_some_and(|options| !options.starts_with('-') && options.contains('x'))
+}
+
+fn git_arg_is_long_option_or_abbreviation(arg: &str, option: &str) -> bool {
+    let supplied_name = arg.split_once('=').map_or(arg, |(name, _)| name);
+    supplied_name.len() > 2 && option.starts_with(supplied_name)
+}
+
+fn git_arg_selects_remote_helper(arg: &str) -> bool {
+    let endpoint = arg
+        .split_once('=')
+        .filter(|(name, _)| git_arg_is_long_option_or_abbreviation(name, "--remote"))
+        .map_or(arg, |(_, value)| value);
+    if endpoint
+        .split_once("::")
+        .is_some_and(|(transport, address)| {
+            git_remote_helper_transport_is_valid(transport) && !address.is_empty()
+        })
+    {
+        return true;
+    }
+
+    let Some((scheme, address)) = endpoint.split_once("://") else {
+        return false;
+    };
+    git_remote_helper_transport_is_valid(scheme)
+        && !address.is_empty()
+        && ![
+            "file", "ftp", "ftps", "git", "git+ssh", "http", "https", "rsync", "ssh", "ssh+git",
+        ]
+        .iter()
+        .any(|known| scheme.eq_ignore_ascii_case(known))
+}
+
+fn git_remote_helper_transport_is_valid(transport: &str) -> bool {
+    let mut chars = transport.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn git_subcommand_selects_remote_helper(
+    args: &[String],
+    subcommand_idx: usize,
+    subcommand: &str,
+) -> bool {
+    let command_args = &args[subcommand_idx + 1..];
+    if subcommand == "archive" {
+        return git_archive_remote_selects_helper(command_args);
+    }
+
+    let scans_remote = match subcommand {
+        "clone" | "fetch" | "ls-remote" | "pull" | "push" => true,
+        "remote" | "submodule" => git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|action| git_arg_eq(action, "add") || git_arg_eq(action, "set-url")),
+        _ => false,
+    };
+    scans_remote
+        && command_args.iter().enumerate().any(|(idx, arg)| {
+            git_arg_selects_remote_helper(arg)
+                && !git_helper_like_arg_is_inert_value(command_args, idx, subcommand)
+        })
+}
+
+fn git_helper_like_arg_is_inert_value(args: &[String], idx: usize, subcommand: &str) -> bool {
+    match (subcommand, args) {
+        ("clone", [source, _]) if idx == 1 => git_arg_is_known_safe_remote_url(source),
+        ("submodule", [action, source, _]) if idx == 2 && git_arg_eq(action, "add") => {
+            git_arg_is_known_safe_remote_url(source)
+        }
+        _ => false,
+    }
+}
+
+fn git_arg_is_known_safe_remote_url(arg: &str) -> bool {
+    let Some((scheme, address)) = arg.split_once("://") else {
+        return false;
+    };
+    !address.is_empty()
+        && [
+            "file", "ftp", "ftps", "git", "git+ssh", "http", "https", "rsync", "ssh", "ssh+git",
+        ]
+        .iter()
+        .any(|known| scheme.eq_ignore_ascii_case(known))
+}
+
+fn git_archive_remote_selects_helper(args: &[String]) -> bool {
+    let mut idx = 0;
+    while let Some(arg) = args.get(idx).map(String::as_str) {
+        if arg == "--" {
+            return false;
+        }
+        if let Some((name, value)) = arg.split_once('=')
+            && git_arg_is_long_option_or_abbreviation(name, "--remote")
+            && git_arg_selects_remote_helper(value)
+        {
+            return true;
+        }
+        if !arg.contains('=') && git_arg_is_long_option_or_abbreviation(arg, "--remote") {
+            match args.get(idx + 1).map(String::as_str) {
+                Some(value) if git_arg_selects_remote_helper(value) => return true,
+                _ => {}
+            }
+            idx += 2;
+        } else {
+            idx += 1;
+        }
+    }
+    false
+}
+
+fn git_arg_opens_files_in_pager(arg: &str) -> bool {
+    arg.starts_with("-O") || git_arg_is_long_option_or_abbreviation(arg, "--open-files-in-pager")
+}
+
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
 /// Strip fd-merge redirect patterns (`N>&M`, `N<&M`, `>&N`, `<&N`, `N>&-`, etc.)
 /// so their `&` doesn't get flagged as a background operator.
@@ -827,10 +1897,12 @@ fn strip_fd_merge_redirects(command: &str) -> String {
 
 /// We treat any standalone `&` as unsafe in policy validation because it can
 /// chain hidden sub-commands and escape foreground timeout expectations.
-fn contains_unquoted_single_ampersand(command: &str) -> bool {
+fn contains_unquoted_single_ampersand(command: &str, dialect: ShellDialect) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
     let mut chars = command.chars().peekable();
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
 
     while let Some(ch) = chars.next() {
         match quote {
@@ -844,7 +1916,7 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
@@ -857,12 +1929,12 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
                 match ch {
-                    '\'' => quote = QuoteState::Single,
+                    '\'' if single_quotes_are_syntax => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     // This must consume the second '&' so `&&` is not later
                     // re-read as a lone trailing '&'.
@@ -879,9 +1951,12 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
 }
 
 /// Detect an unquoted character in a shell command.
-fn contains_unquoted_char(command: &str, target: char) -> bool {
+fn contains_unquoted_char(command: &str, target: char, dialect: ShellDialect) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax =
+        matches!(dialect, ShellDialect::Posix | ShellDialect::PowerShell);
 
     for ch in command.chars() {
         match quote {
@@ -895,7 +1970,7 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
@@ -908,12 +1983,12 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
                 match ch {
-                    '\'' => quote = QuoteState::Single,
+                    '\'' if single_quotes_are_syntax => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     _ if ch == target => return true,
                     _ => {}
@@ -927,7 +2002,7 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
 
 /// Returns true if `command` contains an unquoted `>` that is NOT a safe
 /// stderr form (`2>/dev/null`, `2>&1`).
-fn contains_unsafe_output_redirect(command: &str) -> bool {
+fn contains_unsafe_output_redirect_for_shell(command: &str, dialect: ShellDialect) -> bool {
     // Strip safe redirect-to-dev patterns (with word boundary enforcement),
     // then fd-merge patterns, then check for remaining `>`.
     use regex::Regex;
@@ -939,18 +2014,50 @@ fn contains_unsafe_output_redirect(command: &str) -> bool {
             r"\d*>[ ]?/dev/({})(\s|[;&|)]|$)",
             safe_device_redirect_names_pattern()
         ))
-        .unwrap()
+        .expect("static safe-device redirect regex must compile")
     });
 
-    let safe = re.replace_all(command, "$2").to_string();
+    let safe = if matches!(dialect, ShellDialect::Posix) {
+        re.replace_all(command, "$2").to_string()
+    } else {
+        command.to_string()
+    };
+    // Windows null device: strip `>nul`, `1>nul`, `2>nul`, `2>NUL`, and the
+    // `\\.\nul` device form (case-insensitive) — the platform equivalent of the
+    // `/dev/null` forms stripped above. A trailing non-boundary char (e.g.
+    // `>nul.txt`, `>null`) is left intact so only the bare device matches.
+    //
+    // Gated on the effective shell: only Windows `cmd.exe` resolves `nul` to
+    // the discard-only null device. Under a POSIX shell (Unix native or Docker
+    // `sh -c`) `nul` is an ordinary relative filename, so
+    // `echo x >nul` would create/truncate a workspace file — it must stay
+    // flagged as an unsafe file redirect.
+    let safe = if matches!(dialect, ShellDialect::WindowsCmd) {
+        static SAFE_NUL_OUTPUT_RE: OnceLock<Regex> = OnceLock::new();
+        let nul_re = SAFE_NUL_OUTPUT_RE.get_or_init(|| {
+            Regex::new(r"(?i)\d*>[ ]?(?:\\\\\.\\)?nul(\s|[;&|)]|$)")
+                .expect("SAFE_NUL_OUTPUT_RE regex must compile")
+        });
+        nul_re.replace_all(&safe, "$1").to_string()
+    } else {
+        safe
+    };
     // Also strip fd-merge redirects (2>&1, 1>&2, >&N, etc.)
     let safe = strip_fd_merge_redirects(&safe);
-    contains_unquoted_char(&safe, '>')
+    contains_unquoted_char(&safe, '>', dialect)
+}
+
+/// POSIX-dialect convenience wrapper for tests — the conservative default that
+/// production reaches when it has no effective shell context. Production shell
+/// tools call the `_for_shell` form with the runtime's actual dialect.
+#[cfg(test)]
+fn contains_unsafe_output_redirect(command: &str) -> bool {
+    contains_unsafe_output_redirect_for_shell(command, ShellDialect::Posix)
 }
 
 /// Returns true if `command` contains an unquoted `<` that is NOT a heredoc (`<<`)
 /// or a safe input redirect from `/dev/*`.
-fn contains_unquoted_input_redirect(command: &str) -> bool {
+fn contains_unquoted_input_redirect(command: &str, dialect: ShellDialect) -> bool {
     // Strip here-strings (`<<<`) first, then heredocs (`<<`), then safe /dev/* sources
     // with word boundary enforcement.
     use regex::Regex;
@@ -961,11 +2068,15 @@ fn contains_unquoted_input_redirect(command: &str) -> bool {
         Regex::new(r"<[ ]?/dev/(null|zero)(\s|[;&|)]|$)").expect("SAFE_INPUT_RE regex must compile")
     });
 
-    let safe = command.replace("<<<", "").replace("<<", "");
-    let safe = re.replace_all(&safe, "$2").to_string();
+    let safe = if matches!(dialect, ShellDialect::Posix) {
+        let safe = command.replace("<<<", "").replace("<<", "");
+        re.replace_all(&safe, "$2").to_string()
+    } else {
+        command.to_string()
+    };
     // Also strip fd-merge redirects (<&0, <&-, etc.) so they don't leave a bare `<`
     let safe = strip_fd_merge_redirects(&safe);
-    contains_unquoted_char(&safe, '<')
+    contains_unquoted_char(&safe, '<', dialect)
 }
 
 /// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
@@ -1030,10 +2141,155 @@ fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
         if next.is_ascii_alphanumeric()
             || matches!(
                 next,
-                '_' | '{' | '(' | '#' | '?' | '!' | '$' | '*' | '@' | '-'
+                '_' | '{'
+                    | '('
+                    | '#'
+                    | '?'
+                    | '!'
+                    | '$'
+                    | '*'
+                    | '@'
+                    | '-'
+                    | '='
+                    | '+'
+                    | '^'
+                    | '~'
+                    | '['
+                    | '<'
             )
         {
             return true;
+        }
+    }
+
+    false
+}
+
+fn contains_unmodeled_shell_word_expansion(command: &str, dialect: ShellDialect) -> bool {
+    if command.contains("\\\n") || command.contains("\\\r\n") {
+        return true;
+    }
+
+    // cmd.exe expands `%NAME%` variables, can expand `!NAME!` variables when
+    // delayed expansion is enabled by host policy, and removes caret escapes
+    // before launching the executable. The policy does not model those
+    // transforms, so reject them before command identity or Git risk is accepted.
+    if shell_uses_windows_path_syntax(dialect) && command.contains(['%', '!', '^']) {
+        return true;
+    }
+
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut at_tilde_prefix = true;
+    let mut assignment_name_valid = true;
+    let mut assignment_name_len = 0usize;
+    let mut in_assignment_value = false;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+                at_tilde_prefix = false;
+                assignment_name_valid = false;
+                continue;
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+                at_tilde_prefix = false;
+                assignment_name_valid = false;
+                continue;
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
+                    continue;
+                }
+                if ch.is_whitespace() || matches!(ch, '|' | '&' | ';' | '<' | '>') {
+                    at_tilde_prefix = true;
+                    assignment_name_valid = true;
+                    assignment_name_len = 0;
+                    in_assignment_value = false;
+                    continue;
+                }
+                if ch == '='
+                    && !in_assignment_value
+                    && assignment_name_valid
+                    && assignment_name_len > 0
+                {
+                    in_assignment_value = true;
+                    at_tilde_prefix = true;
+                    continue;
+                }
+                if ch == ':' && in_assignment_value {
+                    at_tilde_prefix = true;
+                    continue;
+                }
+                match ch {
+                    '\'' => {
+                        quote = QuoteState::Single;
+                        at_tilde_prefix = false;
+                        assignment_name_valid = false;
+                        continue;
+                    }
+                    '"' => {
+                        quote = QuoteState::Double;
+                        at_tilde_prefix = false;
+                        assignment_name_valid = false;
+                        continue;
+                    }
+                    '$' if chars.peek().is_some_and(|next| matches!(*next, '\'' | '"')) => {
+                        return true;
+                    }
+                    // Parentheses participate in extended-glob syntax in
+                    // supported configurable shells such as ksh. Even when
+                    // the operator prefix is otherwise ordinary text, the
+                    // shell can replace the token after policy validation.
+                    // zsh EXTENDED_GLOB also gives unquoted `#` and `^`
+                    // pattern meaning, while infix `~` excludes a pattern.
+                    // Preserve leading and assignment-value `~` expansion.
+                    '{' | '}' | '(' | ')' | '*' | '?' | '[' => return true,
+                    '^' | '#' if dialect == ShellDialect::Posix => return true,
+                    '~' if dialect == ShellDialect::Posix && !at_tilde_prefix => return true,
+                    _ => {}
+                }
+                if !in_assignment_value {
+                    let valid_name_char = if assignment_name_len == 0 {
+                        ch.is_ascii_alphabetic() || ch == '_'
+                    } else {
+                        ch.is_ascii_alphanumeric()
+                            || ch == '_'
+                            || (ch == '+' && chars.peek().is_some_and(|next| *next == '='))
+                    };
+                    assignment_name_valid &= valid_name_char;
+                    assignment_name_len += 1;
+                }
+                at_tilde_prefix = false;
+            }
         }
     }
 
@@ -1062,6 +2318,63 @@ fn looks_like_path(candidate: &str) -> bool {
                 || candidate.starts_with("\\\\")))
 }
 
+fn shell_uses_windows_path_syntax(dialect: ShellDialect) -> bool {
+    matches!(dialect, ShellDialect::WindowsCmd | ShellDialect::PowerShell)
+}
+
+fn shell_uses_single_quote_syntax(dialect: ShellDialect) -> bool {
+    matches!(dialect, ShellDialect::Posix | ShellDialect::PowerShell)
+}
+
+fn has_windows_drive_prefix(candidate: &str) -> bool {
+    let bytes = candidate.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn is_windows_drive_relative(candidate: &str) -> bool {
+    has_windows_drive_prefix(candidate)
+        && !candidate
+            .as_bytes()
+            .get(2)
+            .is_some_and(|separator| matches!(*separator, b'/' | b'\\'))
+}
+
+fn looks_like_path_for_shell(candidate: &str, dialect: ShellDialect) -> bool {
+    looks_like_path(candidate)
+        || (shell_uses_windows_path_syntax(dialect)
+            && (candidate.contains('\\') || has_windows_drive_prefix(candidate)))
+}
+
+fn shell_path_tokens_equal(left: &str, right: &str, dialect: ShellDialect) -> bool {
+    if shell_uses_windows_path_syntax(dialect) {
+        // Backslash acceptance is a dialect concern (PowerShell/cmd accept `\`
+        // on every host), but case sensitivity is a *host* concern. Normalize
+        // separators for both sides, then compare with the host filesystem's
+        // case rules so cross-platform `pwsh` on a case-sensitive host does not
+        // treat `/tmp/Safe/tool` and `/tmp/safe/tool` as the same executable.
+        host_path_tokens_equal(&left.replace('\\', "/"), &right.replace('\\', "/"))
+    } else {
+        expand_user_path(left) == expand_user_path(right)
+    }
+}
+
+/// Compare two path tokens with the host filesystem's case semantics after `~`
+/// expansion: case-insensitive on Windows, exact on case-sensitive Unix. An
+/// explicit path is a trust anchor, so folding case on Unix would authorize a
+/// differently cased — and potentially different — file.
+fn host_path_tokens_equal(left: &str, right: &str) -> bool {
+    let left = expand_user_path(left);
+    let right = expand_user_path(right);
+    #[cfg(target_os = "windows")]
+    {
+        left.as_os_str().eq_ignore_ascii_case(right.as_os_str())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        left == right
+    }
+}
+
 fn attached_short_option_value(token: &str) -> Option<&str> {
     // Examples:
     // -f/etc/passwd   -> /etc/passwd
@@ -1084,28 +2397,24 @@ enum RedirectionArgument<'a> {
     None,
 }
 
-fn parse_redirection_argument(token: &str) -> RedirectionArgument<'_> {
-    let Some(marker_idx) = token.find(['<', '>']) else {
-        return RedirectionArgument::None;
-    };
-    let prefix = token[..marker_idx].trim();
-    let mut rest = &token[marker_idx + 1..];
-    rest = rest.trim_start_matches(['<', '>']);
-    if let Some(after_amp) = rest.strip_prefix('&') {
-        let remaining = after_amp.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-');
-        if remaining.is_empty() {
-            return RedirectionArgument::FdOnly { prefix };
-        }
+fn parse_redirection_argument_at(
+    token: &str,
+    metadata: RedirectionMetadata,
+) -> RedirectionArgument<'_> {
+    let prefix = &token[..metadata.marker_idx];
+    let rest = &token[metadata.operator_end..];
+    if let Some(after_amp) = rest.strip_prefix('&')
+        && (after_amp == "-"
+            || (!after_amp.is_empty() && after_amp.chars().all(|c| c.is_ascii_digit())))
+    {
+        return RedirectionArgument::FdOnly { prefix };
     }
-    rest = rest.trim_start_matches('&');
-    rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
-    let trimmed = rest.trim();
-    if trimmed.is_empty() {
+    if rest.is_empty() && !metadata.has_attached_word {
         RedirectionArgument::NeedsNextToken { prefix }
     } else {
         RedirectionArgument::Target {
             prefix,
-            target: trimmed,
+            target: rest,
         }
     }
 }
@@ -1121,22 +2430,37 @@ fn safe_device_redirect_names_pattern() -> String {
         .join("|")
 }
 
-fn is_safe_device_redirect_target(target: &str) -> bool {
-    SAFE_DEVICE_REDIRECT_TARGETS.contains(&strip_wrapping_quotes(target).trim())
+fn is_safe_device_redirect_target(target: &str, dialect: ShellDialect) -> bool {
+    let target = strip_wrapping_quotes(target).trim();
+    if matches!(dialect, ShellDialect::Posix) && SAFE_DEVICE_REDIRECT_TARGETS.contains(&target) {
+        return true;
+    }
+    // Windows null device: `nul`/`NUL` (case-insensitive) and the full `\\.\nul`
+    // device form. Only under a native Windows `cmd.exe` shell does `nul` always
+    // resolve to the discard-only null device. Under a POSIX shell (Unix native
+    // or Docker `sh -c`) `nul` is an ordinary relative filename, so it
+    // must not be treated as a safe device.
+    matches!(dialect, ShellDialect::WindowsCmd)
+        && (target.eq_ignore_ascii_case("nul") || target.eq_ignore_ascii_case(r"\\.\nul"))
 }
 
-/// Extract the basename from a command path, handling both Unix (`/`) and
-/// Windows (`\`) separators so that `C:\Git\bin\git.exe` resolves to `git.exe`.
-fn command_basename(raw: &str) -> &str {
+/// Extract the basename using the shell dialect's path separators.
+/// Windows command dialects accept both `/` and `\`, while POSIX treats `\`
+/// as a literal that can escape the following character.
+fn command_basename_for_shell(raw: &str, dialect: ShellDialect) -> &str {
     let after_fwd = raw.rsplit('/').next().unwrap_or(raw);
-    after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
+    if shell_uses_windows_path_syntax(dialect) {
+        after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
+    } else {
+        after_fwd
+    }
 }
 
 /// Strip common Windows executable suffixes (.exe, .cmd, .bat) for uniform
-/// matching against allowlists and risk tables. On non-Windows platforms this
-/// is a no-op that returns the input unchanged.
-fn strip_windows_exe_suffix(name: &str) -> &str {
-    if cfg!(target_os = "windows") {
+/// matching against allowlists and risk tables. POSIX command dialects keep
+/// suffixes literal even when the host itself is Windows.
+fn strip_windows_exe_suffix_for_shell(name: &str, dialect: ShellDialect) -> &str {
+    if shell_uses_windows_path_syntax(dialect) {
         name.strip_suffix(".exe")
             .or_else(|| name.strip_suffix(".cmd"))
             .or_else(|| name.strip_suffix(".bat"))
@@ -1146,7 +2470,75 @@ fn strip_windows_exe_suffix(name: &str) -> &str {
     }
 }
 
-fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &str) -> bool {
+/// Compare two bare command names using the same semantics everywhere a
+/// command allowlist is interpreted. Path-like entries are handled by their
+/// callers and deliberately do not pass through this case-folding rule.
+fn command_names_equivalent(left: &str, right: &str) -> bool {
+    let left_lower = left.to_ascii_lowercase();
+    let right_lower = right.to_ascii_lowercase();
+    if left_lower == right_lower {
+        return true;
+    }
+
+    // On Windows, an omitted executable suffix does not distinguish command
+    // names (for example, `git` and `git.exe` grant the same command access).
+    #[cfg(target_os = "windows")]
+    {
+        for ext in &[".exe", ".cmd", ".bat"] {
+            if right_lower == format!("{left_lower}{ext}") {
+                return true;
+            }
+            if left_lower == format!("{right_lower}{ext}") {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn command_names_equivalent_for_shell(left: &str, right: &str, dialect: ShellDialect) -> bool {
+    let left_lower = left.to_ascii_lowercase();
+    let right_lower = right.to_ascii_lowercase();
+    if left_lower == right_lower {
+        return true;
+    }
+
+    if shell_uses_windows_path_syntax(dialect) {
+        for ext in &[".exe", ".cmd", ".bat"] {
+            if right_lower == format!("{left_lower}{ext}")
+                || left_lower == format!("{right_lower}{ext}")
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn command_allowlist_entries_equivalent(left: &str, right: &str) -> bool {
+    let left = strip_wrapping_quotes(left).trim();
+    let right = strip_wrapping_quotes(right).trim();
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+
+    // Preserve exact equality for paths. Case-folding a path would widen the
+    // policy on case-sensitive filesystems.
+    if looks_like_path(left) || looks_like_path(right) {
+        return left == right;
+    }
+
+    command_names_equivalent(left, right)
+}
+
+fn is_allowlist_entry_match(
+    allowed: &str,
+    executable: &str,
+    executable_base: &str,
+    dialect: ShellDialect,
+) -> bool {
     let allowed = strip_wrapping_quotes(allowed).trim();
     if allowed.is_empty() {
         return false;
@@ -1165,28 +2557,506 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
         return executable_path == allowed_path;
     }
 
-    // Command-name entries continue to match by basename.
-    // On Windows, also match when the executable has a .exe/.cmd/.bat suffix
-    // that the allowlist entry omits (e.g., allowlist "git" matches "git.exe").
-    if allowed == executable_base {
-        return true;
+    // Command-name entries continue to match by basename, case-insensitively.
+    // Callers lowercase the basename before it reaches here, so folding only
+    // one side would leave an entry written as `Git` or `Docker` unable to
+    // match anything.
+    command_names_equivalent_for_shell(allowed, executable_base, dialect)
+}
+
+/// Decide whether a completed PowerShell token must be rejected by the bounded
+/// grammar. Two shapes are rejected because the token the later provider, path,
+/// allowlist, and risk checks would inspect differs from the argument
+/// PowerShell actually binds:
+///
+///   * Mixed quoted and unquoted fragments in one token (`E'nv:'PATH`,
+///     `C':'\win.ini`). PowerShell concatenates them before binding, so the
+///     raw token with embedded quote delimiters can hide a provider path,
+///     drive prefix, or `..` traversal.
+///   * The bare stop-parsing token `--%` (also matched via the collapsed body
+///     for forms whose quote delimiters were removed).
+///
+/// Fully bare and fully quoted tokens are accepted and parsed normally.
+fn reject_powershell_token(has_bare: bool, has_quoted: bool, body: &str) -> bool {
+    has_bare && (has_quoted || body == "--%")
+}
+
+/// Split a PowerShell command into simple pipeline stages.
+///
+/// PowerShell is an expression language, not just a command launcher. The
+/// generic POSIX-oriented splitter cannot safely reason about constructs such
+/// as `(...)`, script blocks, type literals, call operators, or backtick
+/// escapes. This parser intentionally accepts only a bounded command grammar:
+/// bare command invocations, quoted/plain arguments, simple variable reads,
+/// and pipelines. Everything else fails closed.
+fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote = QuoteState::None;
+    let mut chars = command.chars().peekable();
+    // Track each whitespace-delimited token so the bounded grammar can reject
+    // two PowerShell constructs that would otherwise let policy inspect a token
+    // different from the one PowerShell binds:
+    //
+    //   * The stop-parsing token `--%`, which makes PowerShell pass the rest of
+    //     the line to a native command verbatim (`git --% push` reaches Git as
+    //     `push` while policy only sees `--%`).
+    //   * Mixed quoted/unquoted fragments in a single argument. PowerShell
+    //     concatenates adjacent fragments before binding, so `E'nv:'PATH` binds
+    //     as `Env:PATH` and `C':'\win.ini` as `C:\win.ini`. The later provider,
+    //     path, allowlist, and risk checks see the raw token with quote
+    //     delimiters still embedded, so a mixed token can hide a provider path,
+    //     drive prefix, or `..` traversal from them.
+    //
+    // `token_body` accumulates the token with quote *delimiters* removed (so
+    // `-"-"%` collapses to `--%`). `token_has_bare` records an unquoted
+    // character and `token_has_quoted` records a quote delimiter; a token with
+    // both is a mixed construction and is rejected. Fully bare and fully quoted
+    // tokens are left for normal parsing.
+    let mut token_body = String::new();
+    let mut token_has_bare = false;
+    let mut token_has_quoted = false;
+
+    while let Some(ch) = chars.next() {
+        // Backtick changes PowerShell parsing in every quoting mode. Supporting
+        // it would require a complete lexer, so the bounded grammar rejects it.
+        if ch == '`' || ch == '\0' {
+            return None;
+        }
+
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        current.push(ch);
+                        chars.next();
+                        current.push(ch);
+                        token_body.push(ch);
+                        continue;
+                    }
+                    quote = QuoteState::None;
+                    current.push(ch);
+                } else {
+                    token_body.push(ch);
+                    current.push(ch);
+                }
+            }
+            QuoteState::Double => {
+                if ch == '"' {
+                    if chars.peek() == Some(&'"') {
+                        current.push(ch);
+                        chars.next();
+                        current.push(ch);
+                        token_body.push(ch);
+                        continue;
+                    }
+                    quote = QuoteState::None;
+                    current.push(ch);
+                } else {
+                    token_body.push(ch);
+                    current.push(ch);
+                }
+            }
+            QuoteState::None => match ch {
+                '\'' => {
+                    quote = QuoteState::Single;
+                    token_has_quoted = true;
+                    current.push(ch);
+                }
+                '"' => {
+                    quote = QuoteState::Double;
+                    token_has_quoted = true;
+                    current.push(ch);
+                }
+                ' ' | '\t' => {
+                    if reject_powershell_token(token_has_bare, token_has_quoted, &token_body) {
+                        return None;
+                    }
+                    token_body.clear();
+                    token_has_bare = false;
+                    token_has_quoted = false;
+                    current.push(ch);
+                }
+                '|' => {
+                    // `||` is a control-flow operator, not a pipeline.
+                    if chars.peek() == Some(&'|') {
+                        return None;
+                    }
+                    if reject_powershell_token(token_has_bare, token_has_quoted, &token_body) {
+                        return None;
+                    }
+                    token_body.clear();
+                    token_has_bare = false;
+                    token_has_quoted = false;
+                    let segment = current.trim();
+                    if segment.is_empty() {
+                        return None;
+                    }
+                    segments.push(segment.to_string());
+                    current.clear();
+                }
+                // These characters introduce expressions, statements,
+                // redirection, splatting, or alternate invocation forms.
+                ';' | '\r' | '\n' | '&' | '(' | ')' | '{' | '}' | '[' | ']' | '<' | '>' | '@' => {
+                    return None;
+                }
+                _ => {
+                    token_body.push(ch);
+                    token_has_bare = true;
+                    current.push(ch);
+                }
+            },
+        }
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        let base_lower = executable_base.to_ascii_lowercase();
-        let allowed_lower = allowed.to_ascii_lowercase();
-        for ext in &[".exe", ".cmd", ".bat"] {
-            if base_lower == format!("{allowed_lower}{ext}") {
-                return true;
+    if quote != QuoteState::None {
+        return None;
+    }
+
+    if reject_powershell_token(token_has_bare, token_has_quoted, &token_body) {
+        return None;
+    }
+
+    let segment = current.trim();
+    if segment.is_empty() {
+        return None;
+    }
+    segments.push(segment.to_string());
+
+    Some(segments)
+}
+
+fn split_simple_powershell_pipeline(command: &str) -> Option<Vec<String>> {
+    let segments = split_powershell_pipeline_syntax(command)?;
+    powershell_variables_are_simple(command).then_some(segments)
+}
+
+/// Accept only `$Name` and `$Name.Property` reads outside single-quoted
+/// literals. Subexpressions, braced variables, scoped variables, and special
+/// variables are rejected because they change parsing or hide executable text.
+fn powershell_variables_are_simple(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    let mut quote = QuoteState::None;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    if chars.get(i + 1) == Some(&'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    quote = QuoteState::None;
+                }
+                i += 1;
+                continue;
             }
-            if allowed_lower == format!("{base_lower}{ext}") {
-                return true;
+            QuoteState::Double => {
+                if ch == '"' {
+                    if chars.get(i + 1) == Some(&'"') {
+                        i += 2;
+                        continue;
+                    }
+                    quote = QuoteState::None;
+                    i += 1;
+                    continue;
+                }
+            }
+            QuoteState::None => {
+                if ch == '\'' {
+                    quote = QuoteState::Single;
+                    i += 1;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::Double;
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        if ch != '$' {
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        if i >= chars.len() || !(chars[i].is_ascii_alphabetic() || chars[i] == '_') {
+            return false;
+        }
+        i += 1;
+        while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        if chars.get(i) == Some(&':') {
+            return false;
+        }
+        while chars.get(i) == Some(&'.') {
+            i += 1;
+            if i >= chars.len() || !(chars[i].is_ascii_alphabetic() || chars[i] == '_') {
+                return false;
+            }
+            i += 1;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
             }
         }
     }
 
-    false
+    true
+}
+
+fn is_powershell_allowlist_entry_match(
+    allowed: &str,
+    executable: &str,
+    executable_base: &str,
+) -> bool {
+    if allowed.trim() == "*" {
+        return true;
+    }
+
+    let allowed = strip_wrapping_quotes(allowed).trim();
+    if looks_like_path_for_shell(allowed, ShellDialect::PowerShell) {
+        // An explicit path is the trust anchor, so it must match with the host
+        // filesystem's case semantics: case-insensitive on Windows, exact on
+        // case-sensitive Unix. Folding case on every host would let an
+        // allowlist entry `/tmp/Safe/tool` authorize the distinct executable
+        // `/tmp/safe/tool`.
+        return shell_path_tokens_equal(allowed, executable, ShellDialect::PowerShell);
+    }
+
+    let allowed = strip_powershell_executable_suffix(allowed);
+    allowed.eq_ignore_ascii_case(executable_base)
+}
+
+fn strip_powershell_executable_suffix(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((stem, extension)) if extension.eq_ignore_ascii_case("exe") => stem,
+        _ => name,
+    }
+}
+
+fn is_powershell_batch_file(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(_, extension)| {
+        extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+    })
+}
+
+fn is_powershell_provider_argument(argument: &str) -> bool {
+    let argument = strip_wrapping_quotes(argument).to_ascii_lowercase();
+    argument.contains("::")
+        || [
+            "alias:",
+            "cert:",
+            "env:",
+            "function:",
+            "hkcu:",
+            "hklm:",
+            "variable:",
+            "wsman:",
+        ]
+        .iter()
+        .any(|provider| argument.starts_with(provider))
+}
+
+fn is_known_read_only_powershell_command(base: &str) -> bool {
+    matches!(
+        base,
+        "write-output"
+            | "echo"
+            | "get-date"
+            | "get-childitem"
+            | "gci"
+            | "dir"
+            | "ls"
+            | "get-location"
+            | "gl"
+            | "pwd"
+            | "get-content"
+            | "gc"
+            | "type"
+            | "cat"
+            | "test-path"
+            | "resolve-path"
+            | "measure-object"
+            | "select-object"
+            | "sort-object"
+            | "compare-object"
+            | "format-list"
+            | "format-table"
+            | "format-wide"
+            | "format-custom"
+    )
+}
+
+fn powershell_named_risk(base: &str) -> Option<CommandRiskLevel> {
+    if is_known_read_only_powershell_command(base) {
+        return Some(CommandRiskLevel::Low);
+    }
+
+    if matches!(
+        base,
+        "remove-item"
+            | "clear-content"
+            | "set-content"
+            | "add-content"
+            | "out-file"
+            | "start-process"
+            | "stop-process"
+            | "invoke-webrequest"
+            | "invoke-restmethod"
+            | "invoke-expression"
+            | "invoke-command"
+            | "ac"
+            | "clc"
+            | "del"
+            | "erase"
+            | "rd"
+            | "ri"
+            | "rm"
+            | "rmdir"
+            | "sc"
+            | "saps"
+            | "start"
+            | "kill"
+            | "spps"
+            | "curl"
+            | "wget"
+            | "iwr"
+            | "irm"
+            | "iex"
+            | "icm"
+    ) {
+        return Some(CommandRiskLevel::High);
+    }
+
+    if matches!(
+        base,
+        "new-item"
+            | "copy-item"
+            | "move-item"
+            | "rename-item"
+            | "ni"
+            | "copy"
+            | "cp"
+            | "cpi"
+            | "move"
+            | "mv"
+            | "mi"
+            | "ren"
+            | "rni"
+            | "mkdir"
+            | "md"
+    ) {
+        return Some(CommandRiskLevel::Medium);
+    }
+
+    None
+}
+
+fn generic_segment_risk(
+    base: &str,
+    args: &[String],
+    joined_segment: &str,
+) -> Option<CommandRiskLevel> {
+    if matches!(
+        base,
+        "rm" | "mkfs"
+            | "dd"
+            | "shutdown"
+            | "reboot"
+            | "halt"
+            | "poweroff"
+            | "sudo"
+            | "su"
+            | "chown"
+            | "chmod"
+            | "useradd"
+            | "userdel"
+            | "usermod"
+            | "passwd"
+            | "mount"
+            | "umount"
+            | "iptables"
+            | "ufw"
+            | "firewall-cmd"
+            | "curl"
+            | "wget"
+            | "nc"
+            | "ncat"
+            | "netcat"
+            | "scp"
+            | "ssh"
+            | "ftp"
+            | "telnet"
+            // Windows-specific high-risk commands retained from the existing
+            // cross-platform compatibility policy.
+            | "del"
+            | "rmdir"
+            | "format"
+            | "reg"
+            | "net"
+            | "runas"
+            | "icacls"
+            | "takeown"
+            | "powershell"
+            | "pwsh"
+            | "wmic"
+            | "sc"
+            | "netsh"
+    ) {
+        return Some(CommandRiskLevel::High);
+    }
+
+    if joined_segment.contains("rm -rf /")
+        || joined_segment.contains("rm -fr /")
+        || joined_segment.contains(":(){:|:&};:")
+        || joined_segment.contains("del /s /q")
+        || joined_segment.contains("rmdir /s /q")
+        || joined_segment.contains("format c:")
+    {
+        return Some(CommandRiskLevel::High);
+    }
+
+    match base {
+        "git" => Some(if git_command_is_write(args) {
+            CommandRiskLevel::Medium
+        } else {
+            CommandRiskLevel::Low
+        }),
+        "npm" | "pnpm" | "yarn" => Some(
+            if args.first().is_some_and(|verb| {
+                let verb = verb.to_ascii_lowercase();
+                matches!(
+                    verb.as_str(),
+                    "install" | "add" | "remove" | "uninstall" | "update" | "publish"
+                )
+            }) {
+                CommandRiskLevel::Medium
+            } else {
+                CommandRiskLevel::Low
+            },
+        ),
+        "cargo" => Some(
+            if args.first().is_some_and(|verb| {
+                let verb = verb.to_ascii_lowercase();
+                matches!(
+                    verb.as_str(),
+                    "add" | "remove" | "install" | "clean" | "publish"
+                )
+            }) {
+                CommandRiskLevel::Medium
+            } else {
+                CommandRiskLevel::Low
+            },
+        ),
+        "touch" | "mkdir" | "mv" | "cp" | "ln" | "copy" | "xcopy" | "robocopy" | "move" | "ren"
+        | "rename" | "mklink" => Some(CommandRiskLevel::Medium),
+        _ => None,
+    }
 }
 
 impl SecurityPolicy {
@@ -1197,119 +3067,132 @@ impl SecurityPolicy {
 
     /// Classify command risk. Any high-risk segment marks the whole command high.
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
+        self.command_risk_level_for_posix_like_shell(command, ShellDialect::Posix)
+    }
+
+    fn command_risk_level_for_posix_like_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> CommandRiskLevel {
         let mut saw_medium = false;
 
-        for segment in split_unquoted_segments(command) {
+        for segment in split_unquoted_segments(command, dialect) {
             let cmd_part = skip_env_assignments(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let Some(base_raw) = words.next() else {
+            let normalized = normalized_shell_command(&segment, dialect);
+            if normalized.has_ambiguous_redirection {
+                return CommandRiskLevel::High;
+            }
+            let words = normalized.words;
+            let Some(base_raw) = words.first() else {
                 continue;
             };
 
-            let base_owned = command_basename(base_raw).to_ascii_lowercase();
-            let base = strip_windows_exe_suffix(&base_owned);
+            let base_owned = command_basename_for_shell(base_raw, dialect).to_ascii_lowercase();
+            let base = strip_windows_exe_suffix_for_shell(&base_owned, dialect);
 
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            let args: Vec<String> = words.iter().skip(1).cloned().collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
 
-            // High-risk commands (Unix and Windows)
-            if matches!(
-                base,
-                "rm" | "mkfs"
-                    | "dd"
-                    | "shutdown"
-                    | "reboot"
-                    | "halt"
-                    | "poweroff"
-                    | "sudo"
-                    | "su"
-                    | "chown"
-                    | "chmod"
-                    | "useradd"
-                    | "userdel"
-                    | "usermod"
-                    | "passwd"
-                    | "mount"
-                    | "umount"
-                    | "iptables"
-                    | "ufw"
-                    | "firewall-cmd"
-                    | "curl"
-                    | "wget"
-                    | "nc"
-                    | "ncat"
-                    | "netcat"
-                    | "scp"
-                    | "ssh"
-                    | "ftp"
-                    | "telnet"
-                    // Windows-specific high-risk commands
-                    | "del"
-                    | "rmdir"
-                    | "format"
-                    | "reg"
-                    | "net"
-                    | "runas"
-                    | "icacls"
-                    | "takeown"
-                    | "powershell"
-                    | "pwsh"
-                    | "wmic"
-                    | "sc"
-                    | "netsh"
-            ) {
+            match generic_segment_risk(base, &args, &joined_segment) {
+                Some(CommandRiskLevel::High) => return CommandRiskLevel::High,
+                Some(CommandRiskLevel::Medium) => saw_medium = true,
+                Some(CommandRiskLevel::Low) | None => {}
+            }
+        }
+
+        if saw_medium {
+            CommandRiskLevel::Medium
+        } else {
+            CommandRiskLevel::Low
+        }
+    }
+
+    /// Classify command risk using the language the runtime will execute.
+    pub fn command_risk_level_for_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> CommandRiskLevel {
+        match dialect {
+            ShellDialect::Posix | ShellDialect::WindowsCmd => {
+                return self.command_risk_level_for_posix_like_shell(command, dialect);
+            }
+            ShellDialect::None => return CommandRiskLevel::High,
+            ShellDialect::PowerShell => {}
+        }
+
+        let Some(segments) = split_simple_powershell_pipeline(command) else {
+            return CommandRiskLevel::High;
+        };
+        let mut saw_medium = false;
+        let has_pipeline = segments.len() > 1;
+
+        for segment in segments {
+            let mut words = segment.split_whitespace();
+            let Some(base_raw) = words.next() else {
+                return CommandRiskLevel::High;
+            };
+            let base_owned =
+                command_basename_for_shell(base_raw, ShellDialect::PowerShell).to_ascii_lowercase();
+            if is_powershell_batch_file(&base_owned) {
                 return CommandRiskLevel::High;
             }
-
-            if joined_segment.contains("rm -rf /")
-                || joined_segment.contains("rm -fr /")
-                || joined_segment.contains(":(){:|:&};:")
-                // Windows destructive patterns
-                || joined_segment.contains("del /s /q")
-                || joined_segment.contains("rmdir /s /q")
-                || joined_segment.contains("format c:")
+            let base = strip_powershell_executable_suffix(&base_owned);
+            let arguments: Vec<&str> = words.collect();
+            let arguments_cased: Vec<String> = arguments
+                .iter()
+                .map(|argument| (*argument).to_string())
+                .collect();
+            if arguments
+                .iter()
+                .any(|argument| is_powershell_provider_argument(argument))
+                || (segment.contains('$')
+                    && (has_pipeline || !matches!(base, "write-output" | "echo")))
             {
                 return CommandRiskLevel::High;
             }
 
-            // Medium-risk commands (state-changing, but not inherently destructive)
-            let medium = match base {
-                "git" => args.first().is_some_and(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "commit"
-                            | "push"
-                            | "reset"
-                            | "clean"
-                            | "rebase"
-                            | "merge"
-                            | "cherry-pick"
-                            | "revert"
-                            | "branch"
-                            | "checkout"
-                            | "switch"
-                            | "tag"
-                    )
-                }),
-                "npm" | "pnpm" | "yarn" => args.first().is_some_and(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "install" | "add" | "remove" | "uninstall" | "update" | "publish"
-                    )
-                }),
-                "cargo" => args.first().is_some_and(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "add" | "remove" | "install" | "clean" | "publish"
-                    )
-                }),
-                "touch" | "mkdir" | "mv" | "cp" | "ln"
-                // Windows medium-risk equivalents
-                | "copy" | "xcopy" | "robocopy" | "move" | "ren" | "rename" | "mklink" => true,
-                _ => false,
-            };
+            if base_owned.ends_with(".ps1")
+                || base_owned.ends_with(".psm1")
+                || base_owned.ends_with(".psd1")
+                || matches!(
+                    base,
+                    "." | "cmd"
+                        | "command"
+                        | "powershell"
+                        | "pwsh"
+                        | "sh"
+                        | "bash"
+                        | "zsh"
+                        | "fish"
+                        | "wsl"
+                )
+            {
+                return CommandRiskLevel::High;
+            }
 
-            saw_medium |= medium;
+            match powershell_named_risk(base) {
+                Some(CommandRiskLevel::High) => return CommandRiskLevel::High,
+                Some(CommandRiskLevel::Medium) => {
+                    saw_medium = true;
+                    continue;
+                }
+                Some(CommandRiskLevel::Low) => continue,
+                None => {}
+            }
+
+            match generic_segment_risk(base, &arguments_cased, &segment.to_ascii_lowercase()) {
+                Some(CommandRiskLevel::High) => return CommandRiskLevel::High,
+                Some(CommandRiskLevel::Medium) => saw_medium = true,
+                Some(CommandRiskLevel::Low) => {}
+                // PowerShell resolves bare names through aliases, functions,
+                // cmdlets, scripts, and applications. If none of the known
+                // command families above recognizes the name, treating it as
+                // low risk would let a mutable alias or function hide behind
+                // the wildcard allowlist.
+                None => return CommandRiskLevel::High,
+            }
         }
 
         if saw_medium {
@@ -1320,19 +3203,57 @@ impl SecurityPolicy {
     }
 
     /// Validate full command execution policy (allowlist + risk gate).
+    ///
+    /// Uses the conservative POSIX shell dialect. Shell tools that know the
+    /// runtime's effective shell should call
+    /// [`validate_command_execution_for_shell`](Self::validate_command_execution_for_shell)
+    /// so the Windows `nul` null device is only accepted under `cmd.exe`.
     pub fn validate_command_execution(
         &self,
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
-        if !self.is_command_allowed(command) {
+        self.validate_command_execution_for_shell(command, approved, ShellDialect::Posix)
+    }
+
+    /// Validate a command against the policy and the runtime's shell language.
+    ///
+    /// The dialect decides platform-specific redirect safety (e.g. the Windows
+    /// `nul` null device is discard-only under `cmd.exe` but an ordinary file
+    /// under a POSIX shell).
+    pub fn validate_command_execution_for_shell(
+        &self,
+        command: &str,
+        approved: bool,
+        dialect: ShellDialect,
+    ) -> Result<CommandRiskLevel, String> {
+        if dialect == ShellDialect::None {
+            return Err("Command blocked: configured runtime has no shell access".into());
+        }
+
+        // Path confinement here is specific to Windows shell dialects, whose
+        // relative forms (`..\x`, `C:x`) the host-default PathGuardedTool
+        // scanner cannot recognize. Run it before the allowlist so a path-shaped
+        // executable cannot be rejected as merely unknown before confinement
+        // reports the actual boundary violation. POSIX path policy is already
+        // enforced by that wrapper; running it again here would reject legitimate
+        // absolute arguments an operator explicitly allowed (e.g. `rm -rf /tmp/x`).
+        if shell_uses_windows_path_syntax(dialect)
+            && let Some(path) = self.forbidden_path_argument_for_shell(command, dialect)
+        {
+            return Err(format!("Command blocked: forbidden path argument: {path}"));
+        }
+
+        if !self.is_command_allowed_for_shell(command, dialect) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
 
-        let risk = self.command_risk_level(command);
+        let risk = self.command_risk_level_for_shell(command, dialect);
 
         if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands && !self.is_command_explicitly_allowed(command) {
+            if self.block_high_risk_commands
+                && !self.is_command_explicitly_allowed_for_shell(command, dialect)
+            {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
             if self.autonomy == AutonomyLevel::Supervised && !approved {
@@ -1356,19 +3277,54 @@ impl SecurityPolicy {
         Ok(risk)
     }
 
-    fn is_command_explicitly_allowed(&self, command: &str) -> bool {
-        let segments = split_unquoted_segments(command);
+    fn is_command_explicitly_allowed_for_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> bool {
+        match dialect {
+            ShellDialect::PowerShell => {
+                let Some(segments) = split_powershell_pipeline_syntax(command) else {
+                    return false;
+                };
+                segments.iter().all(|segment| {
+                    let raw_executable =
+                        strip_wrapping_quotes(segment.split_whitespace().next().unwrap_or(""))
+                            .trim();
+                    let base_owned =
+                        command_basename_for_shell(raw_executable, dialect).to_ascii_lowercase();
+                    let base = strip_powershell_executable_suffix(&base_owned);
+                    !base.is_empty()
+                        && !is_powershell_batch_file(&base_owned)
+                        && self.allowed_commands.iter().any(|allowed| {
+                            allowed.trim() != "*"
+                                && is_powershell_allowlist_entry_match(
+                                    allowed,
+                                    raw_executable,
+                                    base,
+                                )
+                        })
+                })
+            }
+            ShellDialect::Posix | ShellDialect::WindowsCmd => {
+                self.is_command_explicitly_allowed(command, dialect)
+            }
+            ShellDialect::None => false,
+        }
+    }
+
+    fn is_command_explicitly_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
+        let segments = split_unquoted_segments(command, dialect);
         for segment in &segments {
-            let cmd_part = skip_env_assignments(segment);
-            let mut words = cmd_part.split_whitespace();
-            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
-                &raw_executable[..idx]
-            } else {
-                raw_executable
-            };
-            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
-            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+            let normalized = normalized_shell_command(segment, dialect);
+            if normalized.has_ambiguous_redirection {
+                return false;
+            }
+            let words = normalized.words;
+            let executable = words.first().map(String::as_str).unwrap_or_default();
+            let base_cmd_owned =
+                command_basename_for_shell(executable, dialect).to_ascii_lowercase();
+            let base_cmd = strip_windows_exe_suffix_for_shell(&base_cmd_owned, dialect);
 
             if base_cmd.is_empty() {
                 continue;
@@ -1380,7 +3336,7 @@ impl SecurityPolicy {
                 if allowed.is_empty() || allowed == "*" {
                     return false;
                 }
-                is_allowlist_entry_match(allowed, executable, base_cmd)
+                is_allowlist_entry_match(allowed, executable, base_cmd, dialect)
             });
 
             if !explicitly_listed {
@@ -1390,8 +3346,10 @@ impl SecurityPolicy {
 
         // At least one real command must be present.
         segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
-            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
+            normalized_shell_command(s.trim(), dialect)
+                .words
+                .first()
+                .is_some_and(|w| !w.is_empty())
         })
     }
 
@@ -1401,6 +3359,88 @@ impl SecurityPolicy {
     // technique. If any gate rejects, the whole command is blocked.
 
     pub fn is_command_allowed(&self, command: &str) -> bool {
+        self.is_command_allowed_for_shell(command, ShellDialect::Posix)
+    }
+
+    /// Check the command allowlist using the runtime's actual shell language.
+    ///
+    /// Allowlist + shell-safety check against a specific shell dialect. The
+    /// dialect selects the command grammar (PowerShell vs POSIX-like) and gates
+    /// platform-specific redirect safety (the Windows `nul` null device is only
+    /// discard-safe under `cmd.exe`).
+    pub fn is_command_allowed_for_shell(&self, command: &str, dialect: ShellDialect) -> bool {
+        match dialect {
+            ShellDialect::PowerShell => self.is_simple_powershell_command_allowed(command),
+            ShellDialect::Posix | ShellDialect::WindowsCmd => {
+                self.is_posix_like_command_allowed(command, dialect)
+            }
+            ShellDialect::None => false,
+        }
+    }
+
+    fn is_simple_powershell_command_allowed(&self, command: &str) -> bool {
+        if self.autonomy == AutonomyLevel::ReadOnly {
+            return false;
+        }
+
+        let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
+        // Preserve the existing trusted-environment escape hatch shared with
+        // POSIX/cmd policy: wildcard plus disabled high-risk blocking opts out
+        // of command-level syntax restrictions. In every other configuration,
+        // apply the complete bounded PowerShell grammar before a named command
+        // can qualify for an allowlist or high-risk exemption.
+        if has_wildcard && !self.block_high_risk_commands {
+            return true;
+        }
+
+        let Some(segments) = split_simple_powershell_pipeline(command) else {
+            return false;
+        };
+
+        for segment in &segments {
+            let mut words = segment.split_whitespace();
+            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            if raw_executable.is_empty()
+                || raw_executable.starts_with('$')
+                || raw_executable.starts_with(['\'', '"'])
+            {
+                return false;
+            }
+
+            let base_owned = command_basename_for_shell(raw_executable, ShellDialect::PowerShell)
+                .to_ascii_lowercase();
+            if is_powershell_batch_file(&base_owned) {
+                return false;
+            }
+            let base = strip_powershell_executable_suffix(&base_owned);
+            if !self
+                .allowed_commands
+                .iter()
+                .any(|allowed| is_powershell_allowlist_entry_match(allowed, raw_executable, base))
+            {
+                return false;
+            }
+
+            let args_cased: Vec<String> = words.map(str::to_string).collect();
+            if args_cased
+                .iter()
+                .any(|argument| is_powershell_provider_argument(argument))
+            {
+                return false;
+            }
+            let args: Vec<String> = args_cased
+                .iter()
+                .map(|word| word.to_ascii_lowercase())
+                .collect();
+            if !self.is_args_safe(base, &args, &args_cased) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn is_posix_like_command_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
         }
@@ -1416,6 +3456,7 @@ impl SecurityPolicy {
 
         if command.contains('`')
             || contains_unquoted_shell_variable_expansion(command)
+            || contains_unmodeled_shell_word_expansion(command, dialect)
             || command.contains("<(")
             || command.contains(">(")
         {
@@ -1426,10 +3467,10 @@ impl SecurityPolicy {
         //   - `2>/dev/null`, `>/dev/null`, `1>/dev/null` (output suppression)
         //   - `2>&1`, `1>&2` (fd merging)
         //   - `<<` heredocs, `<<<` here-strings (input literals)
-        if contains_unsafe_output_redirect(command) {
+        if contains_unsafe_output_redirect_for_shell(command, dialect) {
             return false;
         }
-        if contains_unquoted_input_redirect(command) {
+        if contains_unquoted_input_redirect(command, dialect) {
             return false;
         }
 
@@ -1447,28 +3488,22 @@ impl SecurityPolicy {
         // Strip fd-merge redirects (N>&M, N<&M) first so their `&` isn't
         // flagged as background chaining.
         let ampersand_check = strip_fd_merge_redirects(command);
-        if contains_unquoted_single_ampersand(&ampersand_check) {
+        if contains_unquoted_single_ampersand(&ampersand_check, dialect) {
             return false;
         }
 
         // Split on unquoted command separators and validate each sub-command.
-        let segments = split_unquoted_segments(command);
+        let segments = split_unquoted_segments(command, dialect);
         for segment in &segments {
-            // Strip leading env var assignments (e.g. FOO=bar cmd)
-            let cmd_part = skip_env_assignments(segment);
-
-            let mut words = cmd_part.split_whitespace();
-            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            // Strip inline redirections from the executable token, e.g.
-            // `cat</dev/null` -> `cat`, so the allowlist check sees the real
-            // command name rather than the redirect target path.
-            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
-                &raw_executable[..idx]
-            } else {
-                raw_executable
-            };
-            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
-            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+            let normalized = normalized_shell_command(segment, dialect);
+            if normalized.has_ambiguous_redirection || normalized.has_leading_env_assignment {
+                return false;
+            }
+            let words = normalized.words;
+            let executable = words.first().map(String::as_str).unwrap_or_default();
+            let base_cmd_owned =
+                command_basename_for_shell(executable, dialect).to_ascii_lowercase();
+            let base_cmd = strip_windows_exe_suffix_for_shell(&base_cmd_owned, dialect);
 
             if base_cmd.is_empty() {
                 continue;
@@ -1477,7 +3512,7 @@ impl SecurityPolicy {
             if !self
                 .allowed_commands
                 .iter()
-                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
+                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd, dialect))
             {
                 return false;
             }
@@ -1486,7 +3521,7 @@ impl SecurityPolicy {
             // Both case-preserved and lowercased argument lists are provided:
             //   - `args_cased` for case-sensitive comparisons (e.g. git -C vs -c)
             //   - `args` (lowercased) for case-insensitive matches (e.g. subcommand names)
-            let args_cased: Vec<String> = words.map(|w| w.to_string()).collect();
+            let args_cased: Vec<String> = words.iter().skip(1).cloned().collect();
             let args: Vec<String> = args_cased.iter().map(|w| w.to_ascii_lowercase()).collect();
             if !self.is_args_safe(base_cmd, &args, &args_cased) {
                 return false;
@@ -1495,8 +3530,10 @@ impl SecurityPolicy {
 
         // At least one command must be present
         segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
-            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
+            normalized_shell_command(s.trim(), dialect)
+                .words
+                .first()
+                .is_some_and(|w| !w.is_empty())
         })
     }
 
@@ -1504,18 +3541,30 @@ impl SecurityPolicy {
         let base = base.to_ascii_lowercase();
         match base.as_str() {
             "find" => {
-                // find -exec and find -ok allow arbitrary command execution
-                !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
+                // GNU/BSD find execution predicates allow arbitrary child commands.
+                !args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
             }
             "git" => {
-                !args_cased.iter().any(|arg| arg == "-c")
+                !args_cased.iter().any(|arg| arg.starts_with("-c"))
+                    && !git_delegates_to_external_command(args_cased)
                     && !args.iter().any(|arg| {
-                        arg == "config"
+                        arg == "--config-env"
+                            || arg.starts_with("--config-env=")
+                            || arg == "--exec-path"
+                            || arg.starts_with("--exec-path=")
+                            || arg == "config"
                             || arg.starts_with("config.")
                             || arg == "alias"
                             || arg.starts_with("alias.")
                     })
             }
+            // `env` is also a command carrier. Its option, assignment, and
+            // child-command grammar varies across platforms, so accepting
+            // arguments here would let the nested executable bypass this
+            // allowlist and risk-classification boundary.
+            "env" => args.is_empty(),
             "python" | "python3" => !args
                 .iter()
                 .any(|arg| arg.starts_with("-c") || arg.starts_with("-m")),
@@ -1553,20 +3602,81 @@ impl SecurityPolicy {
         }
     }
 
-    /// Return the first path-like argument blocked by path policy.
-    /// This is best-effort token parsing for shell commands and is intended
-    /// as a safety gate before command execution.
-    pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
+    /// Scan `command` for forbidden path arguments against a specific shell
+    /// dialect. The dialect gates which redirect targets count as safe devices
+    /// (the Windows `nul` null device is only a safe device under `cmd.exe`) and
+    /// which relative forms are recognized as paths — Windows-relative paths are
+    /// understood for both cmd.exe and PowerShell, including cross-platform
+    /// PowerShell runtimes.
+    pub fn forbidden_path_argument_for_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> Option<String> {
+        self.forbidden_path_argument_impl(command, dialect, false)
+    }
+
+    /// Like [`SecurityPolicy::forbidden_workspace_path_argument`], but against
+    /// a specific shell dialect: it uses the effective shell's path syntax and
+    /// classifies platform-specific safe redirect devices by the shell that will
+    /// execute the command, resolving relative candidates through symlinks
+    /// before the workspace-boundary check.
+    pub fn forbidden_workspace_path_argument_for_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> Option<String> {
+        self.forbidden_path_argument_impl(command, dialect, true)
+    }
+
+    fn forbidden_path_argument_impl(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+        resolve_workspace: bool,
+    ) -> Option<String> {
         let forbidden_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {
                 return None;
             }
-            if looks_like_path(candidate) && !self.is_path_allowed(candidate) {
-                Some(candidate.to_string())
-            } else {
-                None
+            if !looks_like_path_for_shell(candidate, dialect) {
+                return None;
             }
+            // String-level policy: absolute paths outside the workspace, `..`
+            // traversal, `~user` forms, and forbidden prefixes.
+            if !self.is_path_allowed_for_shell(candidate, dialect) {
+                return Some(candidate.to_string());
+            }
+            // A workspace-relative argument can still escape the boundary via a
+            // symlink whose target is outside the workspace: the string check
+            // above passes because the literal path has no `..` and is not
+            // absolute, yet the real target is elsewhere. The file tools already
+            // block this by canonicalizing before checking; mirror that here for
+            // the path-shaped argument forms this static scan can see (a full
+            // boundary needs the execution-time sandbox). Resolve the deepest
+            // existing ancestor (the leaf may be about to be created, e.g.
+            // `touch link/new.txt`) and re-check the resolved target with the
+            // symlink-aware policy.
+            // For a command that runs IN the workspace, also resolve symlinks and
+            // re-check: a workspace-relative arg can point outside via an
+            // in-workspace symlink, which the string check above misses. A
+            // command argument may be read OR written, so accept the resolved
+            // target if it is allowed for EITHER (mirrors the string
+            // `is_path_allowed`, which honors both read-only and write-only
+            // roots). Fail closed otherwise: a target outside every allowed root
+            // is blocked, and so is one that cannot be resolved at all (a symlink
+            // cycle exhausting the hop budget) - `None` means "unresolvable", not
+            // "allowed" - so a crafted chain cannot dodge the check.
+            if resolve_workspace {
+                match self.resolve_command_path_argument(candidate, dialect) {
+                    Some(resolved)
+                        if self.is_resolved_path_allowed(&resolved)
+                            || self.is_resolved_path_readable(&resolved) => {}
+                    _ => return Some(candidate.to_string()),
+                }
+            }
+            None
         };
         let forbidden_non_redirect_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
@@ -1588,20 +3698,44 @@ impl SecurityPolicy {
             }
             forbidden_candidate(candidate)
         };
+        let executable_has_explicit_path_allowlist = |raw: &str| {
+            let executable = strip_wrapping_quotes(raw).trim();
+            self.allowed_commands.iter().any(|allowed| {
+                let allowed = strip_wrapping_quotes(allowed).trim();
+                allowed != "*"
+                    && looks_like_path_for_shell(allowed, dialect)
+                    && shell_path_tokens_equal(allowed, executable, dialect)
+            })
+        };
 
-        for segment in split_unquoted_segments(command) {
-            let cmd_part = skip_env_assignments(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let Some(executable) = words.next() else {
+        for segment in split_unquoted_segments(command, dialect) {
+            let words = shell_words_after_env_assignments(&segment, dialect);
+            let Some(executable) = words.first() else {
                 continue;
             };
 
-            let executable_redirect = parse_redirection_argument(strip_wrapping_quotes(executable));
+            let executable_redirect = executable
+                .redirection
+                .map_or(RedirectionArgument::None, |metadata| {
+                    parse_redirection_argument_at(&executable.text, metadata)
+                });
+
+            let executable_without_redirect = match executable_redirect {
+                RedirectionArgument::Target { prefix, .. }
+                | RedirectionArgument::NeedsNextToken { prefix }
+                | RedirectionArgument::FdOnly { prefix } => strip_wrapping_quotes(prefix).trim(),
+                RedirectionArgument::None => strip_wrapping_quotes(&executable.text).trim(),
+            };
+            if !executable_has_explicit_path_allowlist(executable_without_redirect)
+                && let Some(blocked) = forbidden_non_redirect_candidate(executable_without_redirect)
+            {
+                return Some(blocked);
+            }
             let mut next_is_redirect_target = false;
             // Cover inline forms like `cat</etc/passwd`.
             match executable_redirect {
                 RedirectionArgument::Target { target, .. } => {
-                    if !is_safe_device_redirect_target(target)
+                    if !is_safe_device_redirect_target(target, dialect)
                         && let Some(blocked) = forbidden_candidate(target)
                     {
                         return Some(blocked);
@@ -1613,15 +3747,15 @@ impl SecurityPolicy {
                 RedirectionArgument::FdOnly { .. } | RedirectionArgument::None => {}
             }
 
-            for token in words {
-                let candidate = strip_wrapping_quotes(token).trim();
+            for token in words.iter().skip(1) {
+                let candidate = strip_wrapping_quotes(&token.text).trim();
                 if candidate.is_empty() {
                     continue;
                 }
 
                 if next_is_redirect_target {
                     next_is_redirect_target = false;
-                    if is_safe_device_redirect_target(candidate) {
+                    if is_safe_device_redirect_target(candidate, dialect) {
                         continue;
                     }
                     if let Some(blocked) = forbidden_candidate(candidate) {
@@ -1634,12 +3768,17 @@ impl SecurityPolicy {
                     continue;
                 }
 
-                match parse_redirection_argument(candidate) {
+                let redirection = token
+                    .redirection
+                    .map_or(RedirectionArgument::None, |metadata| {
+                        parse_redirection_argument_at(&token.text, metadata)
+                    });
+                match redirection {
                     RedirectionArgument::Target { prefix, target } => {
                         if let Some(blocked) = forbidden_non_redirect_candidate(prefix) {
                             return Some(blocked);
                         }
-                        if is_safe_device_redirect_target(target) {
+                        if is_safe_device_redirect_target(target, dialect) {
                             continue;
                         }
                         if let Some(blocked) = forbidden_candidate(target) {
@@ -1673,6 +3812,131 @@ impl SecurityPolicy {
         }
 
         None
+    }
+
+    /// Return the first path-like executable or argument blocked by path
+    /// policy using the host platform's default shell syntax.
+    ///
+    /// String-level command path guard: flags a path argument that is absolute
+    /// and outside the workspace, uses `..` traversal, a `~user` form, or a
+    /// forbidden prefix. Best-effort token parsing, intended as a safety gate
+    /// before command execution. Does NOT resolve symlinks, so it is safe for
+    /// callers whose working directory is NOT the workspace (e.g. cron jobs run
+    /// in `data_dir`). Shell/skill tools, which run IN the workspace, should use
+    /// [`SecurityPolicy::forbidden_workspace_path_argument`], which additionally
+    /// follows in-workspace symlinks to block escapes.
+    pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
+        #[cfg(target_os = "windows")]
+        let dialect = ShellDialect::WindowsCmd;
+        #[cfg(not(target_os = "windows"))]
+        let dialect = ShellDialect::Posix;
+
+        self.forbidden_path_argument_for_shell(command, dialect)
+    }
+
+    /// Like [`SecurityPolicy::forbidden_path_argument`] but for a command that
+    /// runs IN the workspace: each workspace-relative path argument is also
+    /// resolved (following symlinks, including dangling ones) and re-checked
+    /// against the workspace boundary with the host platform's default shell
+    /// syntax, catching an in-workspace symlink that points outside for the
+    /// argument forms this static scan can see.
+    ///
+    /// This is best-effort, defense-in-depth hardening over a token-scanned
+    /// command line - NOT a complete workspace boundary, and NOT equivalent to
+    /// the file tools, which resolve an operation-aware target at the call site.
+    /// It flags a *path-shaped* argument (one with a separator, e.g. `link/x`, a
+    /// redirect target, or an absolute / `..` form) that escapes via an
+    /// in-workspace symlink. It does NOT, and cannot from a static parse, cover:
+    /// a *bare* argument with no separator (`cat somelink`) that is a symlink; a
+    /// path computed at run time via variable expansion or command substitution
+    /// (`$VAR`, `$(...)`), `eval`, or a write done inside an executed script
+    /// (`sh ./x.sh`, where only the script path is scanned); a quoted path
+    /// holding whitespace (`"link dir/out"`), which the whitespace tokenizer
+    /// fragments; read-vs-write direction (an argument may be read or written, so
+    /// a resolved target allowed for EITHER passes, unlike the operation-aware
+    /// file tools); or non-Unix relative forms (a `link\file` path on Windows). A
+    /// shell command is Turing-complete; complete containment is the execution
+    /// boundary (the OS sandbox and the broader granular sandbox-policy work),
+    /// not this preflight.
+    pub fn forbidden_workspace_path_argument(&self, command: &str) -> Option<String> {
+        #[cfg(target_os = "windows")]
+        let dialect = ShellDialect::WindowsCmd;
+        #[cfg(not(target_os = "windows"))]
+        let dialect = ShellDialect::Posix;
+
+        self.forbidden_workspace_path_argument_for_shell(command, dialect)
+    }
+
+    fn is_path_allowed_for_shell(&self, path: &str, dialect: ShellDialect) -> bool {
+        if !shell_uses_windows_path_syntax(dialect) {
+            return self.is_path_allowed(path);
+        }
+
+        // `C:relative` resolves against a per-drive current directory on
+        // Windows rather than the configured workspace. There is no stable
+        // workspace-relative interpretation, so fail closed on every host.
+        if is_windows_drive_relative(path) {
+            return false;
+        }
+
+        // PowerShell accepts backslashes as path separators on every host.
+        // Normalize only for policy evaluation; the original command remains
+        // unchanged for process construction.
+        let normalized = path.replace('\\', "/");
+
+        // A drive-qualified path cannot name the Unix workspace. This matters
+        // for cross-platform PowerShell, where host-native `Path` parsing would
+        // otherwise treat `C:/outside` as an ordinary relative path.
+        #[cfg(not(target_os = "windows"))]
+        if self.workspace_only && has_windows_drive_prefix(&normalized) {
+            return false;
+        }
+
+        // On Windows, a leading slash without a drive is rooted on the current
+        // drive. It is not workspace-relative even though `Path::is_absolute`
+        // intentionally reports false for this form.
+        #[cfg(target_os = "windows")]
+        if self.workspace_only && normalized.starts_with('/') && !normalized.starts_with("//") {
+            return false;
+        }
+
+        self.is_path_allowed(&normalized)
+    }
+
+    /// Resolve a shell command path argument to the canonical target used for
+    /// workspace-boundary checks. Relative arguments are taken relative to the
+    /// workspace directory; `~` is expanded. Because a command may be about to
+    /// CREATE the leaf (e.g. `touch dir/new.txt`), symlinks are resolved on the
+    /// deepest existing ancestor and any non-existent trailing components are
+    /// re-appended, so an in-workspace symlink pointing outside is followed to
+    /// its real target. Relative arguments are joined onto the workspace
+    /// directory BEFORE resolving. Returns `None` when no trustworthy target
+    /// exists: a null byte in the input, or an unresolvable path (a symlink
+    /// cycle exhausting the resolver's hop budget). Callers MUST treat `None`
+    /// as a block (fail closed), never as "nothing to re-check" - see
+    /// `forbidden_path_argument_impl`.
+    fn resolve_command_path_argument(
+        &self,
+        candidate: &str,
+        dialect: ShellDialect,
+    ) -> Option<PathBuf> {
+        if candidate.contains('\0') {
+            return None;
+        }
+        let normalized;
+        let candidate = if shell_uses_windows_path_syntax(dialect) {
+            normalized = candidate.replace('\\', "/");
+            normalized.as_str()
+        } else {
+            candidate
+        };
+        let expanded = expand_user_path(candidate);
+        let joined = if expanded.is_absolute() {
+            expanded
+        } else {
+            self.workspace_dir.join(expanded)
+        };
+        resolve_symlinked_path(&joined)
     }
 
     /// Check if a file path is allowed (no path traversal, within workspace)
@@ -1727,6 +3991,29 @@ impl SecurityPolicy {
                 .any(|root| expanded_path.starts_with(root));
 
             if in_workspace || in_allowed_root || in_read_only_root || in_write_only_root {
+                // Deny-before-allow when a `forbidden_paths` entry is at least
+                // as specific as the allowing root, so an explicit forbidden
+                // path nested under an allowed root (or the workspace) still
+                // blocks. A broad default forbidden root (e.g. `/home`) does
+                // not override a more specific operator allowlist entry.
+                let allow_depth = deepest_allow_depth(
+                    &self.workspace_dir,
+                    &[
+                        &self.allowed_roots,
+                        &self.allowed_roots_read_only,
+                        &self.allowed_roots_write_only,
+                    ],
+                    &expanded_path,
+                    PathMatchNamespace::Configured,
+                );
+                let forbidden_depth = deepest_forbidden_depth(
+                    &self.forbidden_paths,
+                    &expanded_path,
+                    PathMatchNamespace::Configured,
+                );
+                if forbidden_overrides_allow(forbidden_depth, allow_depth) {
+                    return false;
+                }
                 return true;
             }
 
@@ -1749,6 +4036,15 @@ impl SecurityPolicy {
     }
 
     pub fn is_resolved_path_readable(&self, resolved: &Path) -> bool {
+        // Keep the target in the same filesystem namespace as every policy
+        // prefix, even when a caller supplies an absolute but not yet fully
+        // resolved spelling. Failure to resolve (for example, a symlink cycle)
+        // must deny rather than fall back to a potentially aliased path.
+        let Some(resolved_path) = resolve_symlinked_path(resolved) else {
+            return false;
+        };
+        let resolved = resolved_path.as_path();
+
         // Universal POSIX device files: any operator running on Linux,
         // macOS, or BSD expects these to be readable. Adding them to
         // the per-agent config would be friction without security
@@ -1769,24 +4065,33 @@ impl SecurityPolicy {
             .workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
-        if resolved.starts_with(&workspace_root) {
+
+        let allow_depth = deepest_allow_depth(
+            &workspace_root,
+            &[&self.allowed_roots, &self.allowed_roots_read_only],
+            resolved,
+            PathMatchNamespace::Resolved,
+        );
+
+        if allow_depth.is_some() {
+            // Deny-before-allow: an explicit `forbidden_paths` entry at least as
+            // specific as the allowing root denies reads even inside the
+            // workspace or a read allowlist. A broad default forbidden root
+            // (e.g. `/home`) does not override a more specific allowlist entry.
+            let forbidden_depth = deepest_forbidden_depth(
+                &self.forbidden_paths,
+                resolved,
+                PathMatchNamespace::Resolved,
+            );
+            if forbidden_overrides_allow(forbidden_depth, allow_depth) {
+                return false;
+            }
             return true;
         }
-        for root in &self.allowed_roots {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
-        }
-        for root in &self.allowed_roots_read_only {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
-        }
+
         for root in &self.allowed_roots_write_only {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
+            if namespace_prefix_match_depth(root, resolved, PathMatchNamespace::Resolved).is_some()
+            {
                 return false;
             }
         }
@@ -1794,11 +4099,14 @@ impl SecurityPolicy {
         // Forbidden paths gate after the explicit allowlists so the
         // allowlists can coexist with broad default forbidden roots
         // such as `/home` and `/tmp`.
-        for forbidden in &self.forbidden_paths {
-            let forbidden_path = expand_user_path(forbidden);
-            if resolved.starts_with(&forbidden_path) {
-                return false;
-            }
+        if deepest_forbidden_depth(
+            &self.forbidden_paths,
+            resolved,
+            PathMatchNamespace::Resolved,
+        )
+        .is_some()
+        {
+            return false;
         }
         if !self.workspace_only {
             return true;
@@ -1837,6 +4145,14 @@ impl SecurityPolicy {
     }
 
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        // See `is_resolved_path_readable`: authorization compares the target,
+        // allow roots, and forbidden entries only after the same resolution
+        // step, and fails closed when no trustworthy target can be produced.
+        let Some(resolved_path) = resolve_symlinked_path(resolved) else {
+            return false;
+        };
+        let resolved = resolved_path.as_path();
+
         if is_null_device(resolved) {
             return true;
         }
@@ -1847,37 +4163,44 @@ impl SecurityPolicy {
             .workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
-        if resolved.starts_with(&workspace_root) {
+
+        // Extra allowed roots and write-only cross-agent grants authorize this
+        // write path. `is_resolved_path_readable` intentionally does not include
+        // write-only roots because `AccessMode::Write` is one-way by design.
+        let allow_depth = deepest_allow_depth(
+            &workspace_root,
+            &[&self.allowed_roots, &self.allowed_roots_write_only],
+            resolved,
+            PathMatchNamespace::Resolved,
+        );
+
+        if allow_depth.is_some() {
+            // Deny-before-allow: an explicit `forbidden_paths` entry at least as
+            // specific as the allowing root denies even inside the workspace or
+            // an allowed root, preventing symlink escapes and sensitive-directory
+            // access. A broad default forbidden root (e.g. `/home`) does not
+            // override a more specific operator allowlist entry.
+            let forbidden_depth = deepest_forbidden_depth(
+                &self.forbidden_paths,
+                resolved,
+                PathMatchNamespace::Resolved,
+            );
+            if forbidden_overrides_allow(forbidden_depth, allow_depth) {
+                return false;
+            }
             return true;
-        }
-
-        // Check extra allowed roots (e.g. shared skills directories) before
-        // forbidden checks so explicit allowlists can coexist with broad
-        // default forbidden roots such as `/home` and `/tmp`.
-        for root in &self.allowed_roots {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
-        }
-
-        // Write-only cross-agent grants land here. The bot can write
-        // under these paths but `is_resolved_path_readable` does not
-        // see them — `AccessMode::Write` is one-way by design.
-        for root in &self.allowed_roots_write_only {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
         }
 
         // For paths outside workspace/allowlist, block forbidden roots to
         // prevent symlink escapes and sensitive directory access.
-        for forbidden in &self.forbidden_paths {
-            let forbidden_path = expand_user_path(forbidden);
-            if resolved.starts_with(&forbidden_path) {
-                return false;
-            }
+        if deepest_forbidden_depth(
+            &self.forbidden_paths,
+            resolved,
+            PathMatchNamespace::Resolved,
+        )
+        .is_some()
+        {
+            return false;
         }
 
         // When workspace_only is disabled the user explicitly opted out of
@@ -1962,10 +4285,8 @@ impl SecurityPolicy {
     // no side effects. Act operations must pass both the autonomy gate
     // (not read-only) and the sliding-window rate limiter.
 
-    /// Enforce policy for a tool operation.
-    /// Read operations are always allowed by autonomy/rate gates.
-    /// Act operations require non-readonly autonomy and available action budget.
-    pub fn enforce_tool_operation(
+    /// Check whether autonomy permits a tool operation without recording it.
+    pub fn authorize_tool_operation(
         &self,
         operation: ToolOperation,
         operation_name: &str,
@@ -1978,14 +4299,27 @@ impl SecurityPolicy {
                         "Security policy: read-only mode, cannot perform '{operation_name}'"
                     ));
                 }
-
-                if !self.record_action() {
-                    return Err("Rate limit exceeded: action budget exhausted".to_string());
-                }
-
                 Ok(())
             }
         }
+    }
+
+    /// Enforce policy and record an action for callers without a rate-limit wrapper.
+    pub fn enforce_tool_operation(
+        &self,
+        operation: ToolOperation,
+        operation_name: &str,
+    ) -> Result<(), String> {
+        self.authorize_tool_operation(operation, operation_name)?;
+        if operation == ToolOperation::Act && !self.record_action() {
+            return Err("Rate limit exceeded: action budget exhausted".to_string());
+        }
+        Ok(())
+    }
+
+    /// Atomically reserve one action slot for a production-wrapped invocation.
+    pub fn reserve_action(&self) -> Option<ActionReservation> {
+        self.tracker.reserve_for_current(self.max_actions_per_hour)
     }
 
     /// Record an action for the current sender and check if rate-limited.
@@ -2091,7 +4425,11 @@ impl SecurityPolicy {
             }
         }
         for cmd in &self.allowed_commands {
-            if !parent.allowed_commands.iter().any(|p| p == cmd) {
+            if !parent
+                .allowed_commands
+                .iter()
+                .any(|p| command_allowlist_entries_equivalent(p, cmd))
+            {
                 return Err(EscalationViolation::CommandNotInParent {
                     command: cmd.clone(),
                 });
@@ -2226,6 +4564,7 @@ impl SecurityPolicy {
             always_ask: risk_profile.always_ask.clone(),
             sandbox_enabled: risk_profile.sandbox_enabled,
             sandbox_backend: risk_profile.sandbox_backend.clone(),
+            sandbox_image: risk_profile.sandbox_image.clone(),
             firejail_args: risk_profile.firejail_args.clone(),
             tracker: PerSenderTracker::new(),
         }
@@ -2591,6 +4930,7 @@ mod tests {
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
             firejail_args: vec!["--net=none".into()],
+            sandbox_image: None,
         };
 
         let policy = SecurityPolicy::from_profiles(&rp, None, Path::new("/ws"));
@@ -2806,6 +5146,25 @@ mod tests {
         assert!(err.contains("Rate limit exceeded"));
     }
 
+    #[test]
+    fn authorize_tool_operation_does_not_consume_rate_budget() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 1,
+            ..default_policy()
+        };
+
+        assert!(
+            p.authorize_tool_operation(ToolOperation::Act, "coding_agent")
+                .is_ok()
+        );
+        assert!(
+            p.authorize_tool_operation(ToolOperation::Act, "coding_agent")
+                .is_ok()
+        );
+        assert!(p.record_action(), "authorization must leave the slot free");
+        assert!(!p.record_action(), "the committed action must consume it");
+    }
+
     // ── is_command_allowed ───────────────────────────────────
 
     #[test]
@@ -2910,6 +5269,34 @@ mod tests {
     }
 
     #[test]
+    fn mixed_case_bare_allowlist_entry_matches_on_every_platform() {
+        // Callers lowercase the executable basename before the allowlist
+        // comparison, so an entry written with any uppercase could never match
+        // until both sides were folded.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["Git".into(), "DOCKER".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("git status"));
+        assert!(p.is_command_allowed("docker ps"));
+        // The invocation may also be capitalized; the basename is folded too.
+        assert!(p.is_command_allowed("GIT status"));
+        // Entries that are genuinely absent are still refused.
+        assert!(!p.is_command_allowed("kubectl get pods"));
+    }
+
+    #[test]
+    fn mixed_case_allowlist_entry_does_not_widen_path_matching() {
+        // Path-like entries stay exact rather than using command-name folding.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["/usr/bin/Antigravity".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("/usr/bin/Antigravity"));
+        assert!(!p.is_command_allowed("/usr/bin/antigravity"));
+    }
+
+    #[test]
     fn empty_allowlist_blocks_everything() {
         let p = SecurityPolicy {
             allowed_commands: vec![],
@@ -2955,6 +5342,281 @@ mod tests {
     }
 
     #[test]
+    fn command_risk_classifies_powershell_commands() {
+        let p = default_policy();
+        for command in [
+            "Remove-Item important.txt",
+            "Set-Content output.txt value",
+            "Start-Process calc.exe",
+            "Invoke-WebRequest https://example.com",
+            "ri important.txt",
+            "iwr https://example.com",
+            "ac output.txt value",
+            "clc output.txt",
+            "wsl.exe --exec rm important.txt",
+        ] {
+            assert_eq!(
+                p.command_risk_level_for_shell(command, ShellDialect::PowerShell),
+                CommandRiskLevel::High,
+                "PowerShell-native command should be high risk: {command}"
+            );
+        }
+
+        for command in [
+            "New-Item output.txt",
+            "Copy-Item from.txt to.txt",
+            "ni output.txt",
+        ] {
+            assert_eq!(
+                p.command_risk_level_for_shell(command, ShellDialect::PowerShell),
+                CommandRiskLevel::Medium,
+                "PowerShell-native mutation should be medium risk: {command}"
+            );
+        }
+
+        for command in ["Write-Output safe", "Get-Date", "Get-ChildItem"] {
+            assert_eq!(
+                p.command_risk_level_for_shell(command, ShellDialect::PowerShell),
+                CommandRiskLevel::Low,
+                "read-only PowerShell command should stay low risk: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_only_names_do_not_change_other_shell_dialects() {
+        let p = default_policy();
+
+        for command in [
+            "ri file.txt",
+            "iwr example.test",
+            "ni file.txt",
+            "md output",
+            "start app",
+        ] {
+            assert_eq!(
+                p.command_risk_level_for_shell(command, ShellDialect::Posix),
+                CommandRiskLevel::Low,
+                "PowerShell risk names must not leak into POSIX: {command}"
+            );
+            assert_eq!(
+                p.command_risk_level_for_shell(command, ShellDialect::WindowsCmd),
+                CommandRiskLevel::Low,
+                "PowerShell risk names must not leak into cmd.exe: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_command_blocks_powershell_native_command_via_wildcard() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        let error = p
+            .validate_command_execution_for_shell(
+                "Remove-Item important.txt",
+                true,
+                ShellDialect::PowerShell,
+            )
+            .expect_err("PowerShell-native high-risk commands must be blocked");
+        assert!(error.contains("high-risk"));
+    }
+
+    #[test]
+    fn validate_command_allows_low_risk_powershell_command_via_wildcard() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        let risk = p
+            .validate_command_execution_for_shell(
+                "Write-Output safe",
+                false,
+                ShellDialect::PowerShell,
+            )
+            .expect("low-risk PowerShell commands should not require approval");
+        assert_eq!(risk, CommandRiskLevel::Low);
+    }
+
+    #[test]
+    fn powershell_stop_parsing_token_is_rejected_by_grammar() {
+        // `--%` is PowerShell's stop-parsing token: it strips itself and passes
+        // the remaining arguments to a native command verbatim. Without special
+        // handling the policy would classify `git --% push` by its first token
+        // `--%` (low risk) while Git actually receives `push`. The bounded
+        // grammar must reject the unquoted operator so it never reaches the
+        // named risk classifier.
+        assert_eq!(
+            split_powershell_pipeline_syntax("git --% push origin main"),
+            None
+        );
+        assert_eq!(
+            split_powershell_pipeline_syntax("git --% reset --hard"),
+            None
+        );
+        assert_eq!(split_simple_powershell_pipeline("git --% push"), None);
+        // Also rejected when it is the trailing token or inside a pipeline stage.
+        assert_eq!(split_powershell_pipeline_syntax("echo hi | git --%"), None);
+
+        // A quoted `--%` is an ordinary literal argument, not the operator, so
+        // it must NOT trip the guard (avoid over-blocking legitimate strings).
+        assert!(split_powershell_pipeline_syntax("echo \"--%\"").is_some());
+        assert!(split_powershell_pipeline_syntax("echo '--%'").is_some());
+        // A token that merely contains `--%` as a substring is not the operator.
+        assert!(split_powershell_pipeline_syntax("echo --%tail").is_some());
+
+        // Mixed quoting must not launder the operator: PowerShell assembles
+        // adjacent quoted and unquoted fragments into one token, so `-"-"%`,
+        // `"-"-%`, and `--"%"` all reach the parser as the stop-parsing `--%`
+        // while a naive "any quote makes it a literal" check would let them
+        // through. The guard collapses quote delimiters and still rejects them
+        // because at least one character of the token is bare.
+        assert_eq!(
+            split_powershell_pipeline_syntax("git -\"-\"% push origin main"),
+            None
+        );
+        assert_eq!(
+            split_powershell_pipeline_syntax("git \"-\"-% reset --hard"),
+            None
+        );
+        assert_eq!(split_powershell_pipeline_syntax("git --\"%\" push"), None);
+        assert_eq!(split_powershell_pipeline_syntax("git -'-'% push"), None);
+        // A fully quoted `--%` stays a literal argument (no bare character).
+        assert!(split_powershell_pipeline_syntax("echo \"--%\"").is_some());
+        // But `x"--%"` is a mixed bare+quoted token (PowerShell binds it as
+        // `x--%`), so it is rejected by the mixed-quoting guard.
+        assert_eq!(split_powershell_pipeline_syntax("echo x\"--%\""), None);
+    }
+
+    #[test]
+    fn validate_command_blocks_powershell_stop_parsing_git_mutation() {
+        // Default Windows-style policy: `git` is on the default allowlist and
+        // the policy is supervised with medium-risk approval enabled. Before the
+        // fix, `git --% push` was classified Low and ran without approval.
+        let p = default_policy();
+
+        for command in [
+            "git --% push origin main",
+            "git --% reset --hard",
+            "git --% clean -fdx",
+        ] {
+            let error = p
+                .validate_command_execution_for_shell(command, false, ShellDialect::PowerShell)
+                .expect_err("stop-parsing native mutation must not be silently allowed");
+            assert!(
+                error.contains("not allowed by security policy"),
+                "unexpected acceptance for {command}: {error}"
+            );
+        }
+
+        // Approval must not launder the stop-parsing token either: the command
+        // is rejected outright rather than downgraded to an approved mutation.
+        let approved = p.validate_command_execution_for_shell(
+            "git --% push origin main",
+            true,
+            ShellDialect::PowerShell,
+        );
+        assert!(
+            approved.is_err(),
+            "approval must not bypass the grammar guard"
+        );
+
+        // The equivalent parsed command is still governed normally: an ordinary
+        // `git push` remains a recognized medium-risk mutation.
+        assert_eq!(
+            p.command_risk_level_for_shell("git push origin main", ShellDialect::PowerShell),
+            CommandRiskLevel::Medium,
+        );
+    }
+
+    #[test]
+    fn powershell_grammar_rejects_mixed_quoted_tokens() {
+        // PowerShell concatenates adjacent quoted and unquoted fragments before
+        // binding an argument, so a token that mixes bare and quoted characters
+        // reaches the native command as a different string than policy's later
+        // provider, path, allowlist, and risk checks inspect. The bounded
+        // grammar rejects such tokens so those checks never see a laundered
+        // provider path, drive prefix, or `..` traversal.
+        for command in [
+            // `Env:`/provider access hidden by an interior quote.
+            "cat E'nv:'PATH",
+            "cat \"env\":path",
+            // Drive prefix split by a quote: binds as `C:\Windows\win.ini`.
+            "cat C':'\\Windows\\win.ini",
+            // `..` traversal split across a quote boundary.
+            "cat .'.'\\secret.txt",
+            "cat \"..\"\\secret.txt",
+        ] {
+            assert_eq!(
+                split_powershell_pipeline_syntax(command),
+                None,
+                "mixed quoted/unquoted token must be rejected: {command}"
+            );
+        }
+
+        // Fully bare and fully quoted tokens remain valid — only the *mix* is
+        // rejected, so ordinary quoted arguments are not over-blocked.
+        assert!(split_powershell_pipeline_syntax("cat env:path").is_some());
+        assert!(split_powershell_pipeline_syntax("cat \"env:path\"").is_some());
+        assert!(split_powershell_pipeline_syntax("cat 'env:path'").is_some());
+        assert!(split_powershell_pipeline_syntax("cat \"my file.txt\"").is_some());
+    }
+
+    #[test]
+    fn validate_blocks_powershell_provider_hidden_by_mixed_quoting() {
+        // End-to-end through the dialect-aware validator: a default-allowlisted
+        // read command must not launder an `Env:` provider read past policy by
+        // splitting the provider prefix with a quote.
+        let p = default_policy();
+        let denied = p.validate_command_execution_for_shell(
+            "cat E'nv:'PATH",
+            true,
+            ShellDialect::PowerShell,
+        );
+        assert!(
+            denied.is_err(),
+            "quote-hidden provider path must be rejected, got {denied:?}"
+        );
+
+        // The unobscured provider form is still recognized and blocked too, so
+        // the guard is not the only thing standing between policy and `Env:`.
+        assert!(
+            p.command_risk_level_for_shell("cat env:path", ShellDialect::PowerShell)
+                == CommandRiskLevel::High
+        );
+    }
+
+    #[test]
+    fn powershell_stop_parsing_token_still_follows_trusted_optout() {
+        // The wildcard + disabled high-risk-blocking escape hatch intentionally
+        // skips the bounded grammar, exactly as it does for backticks and
+        // subexpressions. `--%` is not special-cased against that contract.
+        let trusted = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            trusted
+                .validate_command_execution_for_shell(
+                    "git --% push origin main",
+                    true,
+                    ShellDialect::PowerShell,
+                )
+                .is_ok(),
+            "trusted opt-out must keep bypassing the grammar for --% too"
+        );
+    }
+
+    #[test]
     fn validate_command_requires_approval_for_medium_risk() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -2969,6 +5631,644 @@ mod tests {
 
         let allowed = p.validate_command_execution("touch test.txt", true);
         assert_eq!(allowed.unwrap(), CommandRiskLevel::Medium);
+    }
+
+    #[test]
+    fn shell_policy_normalizes_non_git_executable_and_arguments() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into(), "find".into()],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_command_allowed_for_shell("c\\at ./src/main.rs", ShellDialect::Posix,));
+        assert!(!p.is_command_allowed_for_shell("c\\at ./src/main.rs", ShellDialect::WindowsCmd,));
+
+        assert!(!p.is_command_allowed("find . '-exec' echo"));
+        assert_eq!(p.forbidden_path_argument("cat './src/main.rs'"), None);
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            p.forbidden_path_argument("cat ..\\/secret.txt"),
+            Some("../secret.txt".into())
+        );
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            p.forbidden_path_argument("cat ..\\/secret.txt"),
+            Some("..\\/secret.txt".into())
+        );
+    }
+
+    #[test]
+    fn posix_policy_does_not_inherit_windows_executable_syntax() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Docker executes POSIX `sh` even on a Windows host. Backslashes escape
+        // the next character there, while cmd.exe treats them as path separators.
+        for command in [r"attacker\git status", "git.exe status"] {
+            assert!(
+                p.validate_command_execution_for_shell(command, false, ShellDialect::Posix)
+                    .is_err(),
+                "POSIX must not treat {command:?} as allowlisted git"
+            );
+            assert!(
+                p.validate_command_execution_for_shell(command, false, ShellDialect::WindowsCmd)
+                    .is_ok(),
+                "cmd.exe semantics must remain available for {command:?}"
+            );
+        }
+
+        assert_eq!(
+            p.command_risk_level_for_shell(r"attacker\git commit", ShellDialect::Posix),
+            CommandRiskLevel::Low
+        );
+        assert_eq!(
+            p.command_risk_level_for_shell(r"attacker\git commit", ShellDialect::WindowsCmd),
+            CommandRiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn git_archive_remote_and_output_writes_enforce_policy_boundary() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git archive --format --remote=ext::helper HEAD",
+            "git archive --prefix --remote=ext::helper HEAD",
+        ] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("archive helper remotes must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        for command in [
+            "git archive --format --remote=https://example.invalid/repo HEAD",
+            "git archive --prefix --remote=https://example.invalid/repo HEAD",
+            "git archive -- --remote=ext::helper",
+        ] {
+            let risk = p
+                .validate_command_execution(command, false)
+                .expect("safe remotes and operands must remain allowed");
+            assert_eq!(risk, CommandRiskLevel::Low, "{command}");
+        }
+
+        for command in [
+            "git archive --output=./archive.tar HEAD",
+            "git archive --output ./archive.tar HEAD",
+            "git archive --out=./archive.tar HEAD",
+            "git archive -o ./archive.tar HEAD",
+            "git archive -o./archive.tar HEAD",
+            "git bundle create ./repo.bundle HEAD",
+            "git diff --output=./review-output.patch",
+            "git diff --output ./review-output.patch",
+            "git format-patch -1 HEAD",
+            "git format-patch --output-directory=./patches -1 HEAD",
+            "git format-patch --output-directory ./patches -1 HEAD",
+            "git format-patch -o ./patches -1 HEAD",
+            "git log --output=./review-output.log -1",
+            "git show --output ./review-output.txt HEAD",
+        ] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("Git output-file options must require approval");
+            assert!(err.contains("medium-risk operation"), "{command}: {err}");
+
+            let risk = p
+                .validate_command_execution(command, true)
+                .expect("approved Git output-file options must remain available");
+            assert_eq!(risk, CommandRiskLevel::Medium, "{command}");
+        }
+
+        for command in [
+            "git archive HEAD",
+            "git archive -- --output=./archive.tar",
+            "git diff -- --output=./review-output.patch",
+            "git log -- --output=./review-output.log",
+            "git show -- --output=./review-output.txt",
+        ] {
+            let risk = p
+                .validate_command_execution(command, false)
+                .expect("output-looking operands after -- must remain allowed");
+            assert_eq!(risk, CommandRiskLevel::Low, "{command}");
+        }
+    }
+
+    #[test]
+    fn shell_environment_assignments_rejected_at_policy_boundary() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["git".into(), "env".into(), "ls".into(), "grep".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "ZC_ALIAS='!/usr/bin/true' git --config-env=alias.zcprobe=ZC_ALIAS zcprobe",
+            "ZC_ALIAS='!/usr/bin/true' git --config-env alias.zcprobe=ZC_ALIAS zcprobe",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.zcprobe GIT_CONFIG_VALUE_0='!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_PARAMETERS='alias.zcprobe=!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_COUNT+=1 git zcprobe",
+            "GIT_CONFIG_KEY_0+=alias.zcprobe git zcprobe",
+            "GIT_CONFIG_VALUE_0+='!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_PARAMETERS+='alias.zcprobe=!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_GLOBAL=./zc-config git zcprobe",
+            "GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
+            "GIT_CONFIG_NOGLOBAL=1 git zcprobe",
+            "GIT_CONFIG_NOSYSTEM=1 git zcprobe",
+            "GIT_CONFIG_GLOBAL=./zc-config >/dev/null git zcprobe",
+            ">/dev/null GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
+            "git -c alias.zcprobe='!/usr/bin/true' zcprobe",
+            "git -calias.zcprobe='!/usr/bin/true' zcprobe",
+            "git '-c' foo.bar=ENV status",
+            "git '-cfoo.bar=ENV' status",
+            "git '--config-env' foo.bar=ENV status",
+            "git '--config-env=foo.bar=ENV' status",
+            "git --config-env\\=foo.bar=ENV status",
+            "git --exec-path ./tools zcprobe",
+            "git --exec-path=./tools zcprobe",
+            "env GIT_CONFIG_GLOBAL=./zc-config git zcprobe",
+            "/usr/bin/env GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
+            "env git status",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("command-scope Git process controls must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+
+        for command in [
+            "GIT_EXEC_PATH=./tools git zcprobe",
+            "GIT_SSH_COMMAND=./tools/zcprobe git fetch ssh://example.invalid/repo",
+            "GIT_SSH_COMMAND+=./tools/zcprobe git fetch ssh://example.invalid/repo",
+            "PATH=./tools:/usr/bin git zcprobe",
+            "PATH+=:./tools git zcprobe",
+            "PATH=./tools:/usr/bin ls",
+            "PATH+=:./tools ls",
+            "LD_PRELOAD=./tools/zcprobe.so ls",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("leading environment assignments must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        assert!(p.is_command_allowed("env"));
+        let env_only = p
+            .validate_command_execution("env", false)
+            .expect("bare env has no nested command to bypass policy");
+        assert_eq!(env_only, CommandRiskLevel::Low);
+
+        for command in [
+            "git difftool --no-prompt --extcmd=./helper -- file",
+            "git difftool --no-prompt -x ./helper -- file",
+            "git difftool --tool=vimdiff -- file",
+            "git difftool--helper --extcmd=./helper -- file",
+            "git mergetool --tool=vimdiff file",
+            "git mergetool--helper --tool=vimdiff file",
+            "git diff --ext-diff -- file",
+            "git diff --ext-d -- file",
+            "git diff --ext -- file",
+            "git log --ext-diff -1",
+            "git show --ext-diff --stat HEAD",
+            "git -p status",
+            "git --paginate status",
+            "git grep -O pattern",
+            "git grep -O./pager pattern",
+            "git grep --open-files-in-pager pattern",
+            "git grep --open-files-in-pager=./pager pattern",
+            "git grep --open-files-in-pag pattern",
+            "git grep --open-files-in-pag=./pager pattern",
+            "git help -w status",
+            "git help --web status",
+            "git help --we status",
+            "git --no-pager bisect run ./helper",
+            "git -C . submodule --quiet foreach './helper'",
+            "git submodule--helper foreach -- './helper'",
+            "git zcprobe",
+            "git fetch --upload-pack=./helper origin main",
+            "git fetch --upload-pack ./helper origin main",
+            "git ls-remote --upload-pack=./helper origin",
+            "git pull --upload-pack=./helper origin main",
+            "git pull --upload-pack ./helper origin main",
+            "git push --receive-pack=./helper origin main",
+            "git push --exec ./helper origin main",
+            "git archive --exec=./helper HEAD",
+            "git archive --exec ./helper HEAD",
+            "git clone --config core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git clone --config=core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git clone --template=./hooks https://example.invalid/repo ./dst",
+            "git clone --template ./hooks https://example.invalid/repo ./dst",
+            "git init --template=./hooks ./dst",
+            "git init --template ./hooks ./dst",
+            "git rebase --exec=./helper main",
+            "git rebase --exec ./helper main",
+            "git rebase -x ./helper main",
+            "git rebase -x./helper main",
+            "git rebase -ix ./helper main",
+            "git clone -u ./helper ssh://example.invalid/repo ./dst",
+            "git clone -u./helper ssh://example.invalid/repo ./dst",
+            "git STATUS",
+            "git COMMIT -m test",
+            "git fetch --upl=./helper origin main",
+            "git pull --upl=./helper origin main",
+            "git push --rece=./helper origin main",
+            "git push --exe=./helper origin main",
+            "git archive --exe=./helper HEAD",
+            "git clone --conf=core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git clone --temp=./hooks https://example.invalid/repo ./dst",
+            "git init --temp=./hooks ./dst",
+            "git rebase --exe=./helper main",
+            "git ls-remote 'ext::sh -c true'",
+            "git fetch helper::payload",
+            "git clone ext::helper ./dst",
+            "git push ext::helper main",
+            "git remote add origin ext::helper",
+            "git ls-remote evil://host/repo",
+            "git fetch evil://host/repo",
+            "git clone evil://host/repo ./dst",
+            "git push evil://host/repo main",
+            "git clone -- ext::helper ./dst",
+            "git fetch -- ext::helper main",
+            "git ls-remote -- ext::helper",
+            "git push -- ext::helper main",
+            "git ls-remote 'evil://host/repo?x=y'",
+            "git clone 'ext::helper arg=value' ./dst",
+            "git ls-remote 1foo::payload",
+            "git ls-remote 1foo://host/repo",
+            "git clone --depth 1 ext::helper ./dst",
+            "git fetch --dep 1 ext::helper",
+            "git clone --bra main ext::helper ./dst",
+            "git remote add --mas main origin ext::helper",
+            "git submodule add --na origin ext::helper ./dst",
+            "git pull -s ours ext::helper",
+            "git pull --strategy ours ext::helper",
+            "git pull --jobs ext::helper",
+            "git pull -j ext::helper",
+            "git archive --format=tar --remote=ext::helper HEAD",
+            "git archive --for=tar --rem=ext::helper HEAD",
+            "git archive --remote=https://example.invalid/repo --remote=ext::helper HEAD",
+            "git archive --remote https://example.invalid/repo --remote ext::helper HEAD",
+            "git archive --remote -- --remote=ext::helper HEAD",
+            "git clone --server-option --remote=ext::helper https://example.invalid/repo dst",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("Git delegated-execution surfaces must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        for command in [
+            "git 2>&1> /dev/null commit -m test",
+            "git <&0> /dev/null commit -m test",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("ambiguous packed redirections must fail closed");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        let status = p
+            .validate_command_execution("git status", false)
+            .expect("read-only Git status should remain allowed");
+        assert_eq!(status, CommandRiskLevel::Low);
+
+        for command in [
+            "git diff --stat",
+            "git diff --no-ext-diff --stat",
+            "git log --oneline -1",
+            "git show --stat --no-patch HEAD",
+            "git submodule status",
+            "git diff -- --ext-diff",
+            "git diff -- --ext-d",
+            "git diff -- --ext",
+            "git log -- --ext-diff",
+            "git submodule status foreach",
+            "git submodule status -- foreach",
+            "git bisect log run",
+            "git --no-pager status",
+            "git log -p -1",
+            "git grep -o pattern",
+            "git fetch origin main",
+            "git worktree list",
+            "git -C . worktree list --porcelain",
+            "git ls-remote origin",
+            "git clone https://example.invalid/repo ./dst",
+            "git clone git+ssh://example.invalid/repo ./dst",
+            "git clone ssh+git://example.invalid/repo ./dst",
+            "git diff -- ext::helper",
+            "git diff ext::helper",
+            "git status ext::helper",
+            "git grep -- --open-files-in-pag",
+            "git grep -- --open-files-in-pag=./pager",
+            "git help -- --we",
+            "git log -- --upload-pack=./helper",
+            "git clone https://example.invalid/repo ./dst::name",
+            "git clone https://example.invalid/repo ./evil://dst",
+            "git clone https://example.invalid/repo evil://dst",
+            "git submodule status ./evil://path",
+            "git submodule add https://example.invalid/repo evil://path",
+            "git archive -- --remote=ext::helper",
+            "git archive --remote=https://example.invalid/repo --remote=ssh://example.invalid/repo HEAD",
+        ] {
+            let allowed = p
+                .validate_command_execution(command, false)
+                .expect("read-only Git commands should remain allowed");
+            assert_eq!(allowed, CommandRiskLevel::Low, "{command}");
+        }
+
+        let commit_denied = p
+            .validate_command_execution("git commit -m test", false)
+            .expect_err("Git write verbs still require approval");
+        assert!(
+            commit_denied.contains("medium-risk operation"),
+            "{commit_denied}"
+        );
+
+        for command in [
+            ">/dev/null git commit -m test",
+            "<<<payload git commit -m test",
+            "git -C . 2>&1 commit -m test",
+            "git -C . >/dev/null commit -m test",
+            "git -C . <<<payload commit -m test",
+            "git -C . <<< payload commit -m test",
+            r#"git -C . <<<" " commit -m test"#,
+            r#"git -C . <<<"" commit -m test"#,
+            r#"git -C . <<<'' commit -m test"#,
+            "git -C . <<<123 commit -m test",
+            r#"git -C . <<<"<" commit -m test"#,
+            r#"git -C . <<<">" commit -m test"#,
+            "git -C . <<<\\  commit -m test",
+            "git -C . commit -m test 2>&1",
+            "git -C . commit -m test >/dev/null",
+            "git -C . commit -m test <<<payload",
+        ] {
+            assert!(p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("redirections must not hide a Git write verb");
+            assert!(err.contains("medium-risk operation"), "{command}: {err}");
+        }
+
+        let commit_allowed = p
+            .validate_command_execution("git commit -m test", true)
+            .expect("runtime-approved Git write verb should remain allowed");
+        assert_eq!(commit_allowed, CommandRiskLevel::Medium);
+
+        let push_allowed = p
+            .validate_command_execution("git push origin main", true)
+            .expect("runtime-approved Git push to a configured remote should remain allowed");
+        assert_eq!(push_allowed, CommandRiskLevel::Medium);
+
+        let init_allowed = p
+            .validate_command_execution("git init ./dst", false)
+            .expect("plain Git init should remain allowed");
+        assert_eq!(init_allowed, CommandRiskLevel::Low);
+
+        let rebase_denied = p
+            .validate_command_execution("git rebase main", false)
+            .expect_err("Git rebase without an exec hook should still require approval");
+        assert!(rebase_denied.contains("medium-risk operation"));
+
+        let rebase_allowed = p
+            .validate_command_execution("git rebase main", true)
+            .expect("runtime-approved Git rebase without an exec hook should remain allowed");
+        assert_eq!(rebase_allowed, CommandRiskLevel::Medium);
+
+        for command in [
+            "git am ./change.mbox",
+            "git pull origin main",
+            "git -C . pull origin main",
+            "git worktree add ./dst HEAD",
+            "git -C . worktree add ./dst HEAD",
+        ] {
+            let denied = p
+                .validate_command_execution(command, false)
+                .expect_err("Git mutations and lifecycle hooks must require approval");
+            assert!(
+                denied.contains("medium-risk operation"),
+                "{command}: {denied}"
+            );
+
+            let allowed = p
+                .validate_command_execution(command, true)
+                .expect("runtime-approved Git mutations should remain available");
+            assert_eq!(allowed, CommandRiskLevel::Medium, "{command}");
+        }
+
+        let global_option_commit_denied = p
+            .validate_command_execution("git -C . commit -m test", false)
+            .expect_err("Git write verbs behind global options still require approval");
+        assert!(
+            global_option_commit_denied.contains("medium-risk operation"),
+            "{global_option_commit_denied}"
+        );
+
+        let global_option_commit_allowed = p
+            .validate_command_execution("git -C . commit -m test", true)
+            .expect("runtime-approved Git write verb behind global options should remain allowed");
+        assert_eq!(global_option_commit_allowed, CommandRiskLevel::Medium);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unix_literal_backslash_executable_is_not_allowlist_match() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            r#""g\it" status"#,
+            r#"'foo\git' status"#,
+            r#"'git>helper' status"#,
+            r#""git<helper" status"#,
+            r#""FOO=bar" git status"#,
+            r#"FOO\=bar git status"#,
+            r#"git\" status"#,
+            r#"\"git status"#,
+            r#""git\"" status"#,
+            r#"'git ' status"#,
+            r#"' git' status"#,
+            "git\\  status",
+            r#"'git '>/dev/null status"#,
+            r#"' git'>/dev/null status"#,
+            r#"'2'>/dev/null git status"#,
+            r#"\2>/dev/null git status"#,
+            "git\\ >/dev/null status",
+        ] {
+            let result = p.validate_command_execution(command, false);
+            assert!(result.is_err(), "{command}: {result:?}");
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_unmodeled_shell_expansions_rejected_at_policy_boundary() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            concat!("git -C . com\\", "\n", "mit -m test"),
+            "git -C {.,commit} -m test",
+            "git -C . $'commit' -m test",
+            "git -C . $\"commit\" -m test",
+            "git -C . $=verb -m test",
+            "git -C . $+verb -m test",
+            "git -C . $^verb -m test",
+            "git -C . $~verb -m test",
+            "git -C . \"$[2+3]\" -m test",
+            "git -C . \"$<\" -m test",
+            "git -C . com* -m test",
+            "git -C . @(commit) -m test",
+            "git -C . +(commit) -m test",
+            "git -C . !(status) -m test",
+            "git -C . ^status -m test",
+        ] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("unmodeled shell expansion must be rejected before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+
+        for command in ["git -C . com#mit -m test", "git -C . crates~status -m test"] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("zsh extended glob must be rejected before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+
+        for command in [
+            "git -C ~/repo status",
+            "FOO=~/repo git status",
+            "FOO=x:~/repo git status",
+        ] {
+            assert!(!contains_unmodeled_shell_word_expansion(
+                command,
+                ShellDialect::Posix,
+            ));
+        }
+
+        for command in ["echo C#", "echo file~backup"] {
+            assert!(contains_unmodeled_shell_word_expansion(
+                command,
+                ShellDialect::Posix,
+            ));
+            assert!(!contains_unmodeled_shell_word_expansion(
+                command,
+                ShellDialect::WindowsCmd,
+            ));
+        }
+        assert!(contains_unmodeled_shell_word_expansion(
+            "echo %USERPROFILE%",
+            ShellDialect::WindowsCmd,
+        ));
+        assert!(!contains_unmodeled_shell_word_expansion(
+            "echo %USERPROFILE%",
+            ShellDialect::Posix,
+        ));
+    }
+
+    #[test]
+    fn windows_backslash_executable_is_not_normalized_to_allowlisted_command() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution_for_shell(
+                "c\\at ./src/main.rs",
+                false,
+                ShellDialect::WindowsCmd,
+            )
+            .expect_err("Windows path separators must not become allowlisted command text");
+        assert!(
+            err.contains("Command not allowed by security policy"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_single_quotes_remain_literal_executable_text() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution("g'i't.exe status", false)
+            .expect_err("cmd.exe single quotes must not normalize to an allowlisted executable");
+        assert!(
+            err.contains("Command not allowed by security policy"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_cmd_expansions_cannot_hide_git_write_verbs() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git %ZC_GIT_VERB%",
+            "git !ZC_GIT_VERB!",
+            "git co^mmit -m test",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("cmd.exe transformations must fail closed before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -3180,6 +6480,217 @@ mod tests {
         assert!(!p.is_path_allowed("~/.gnupg/pubring.kbx"));
     }
 
+    // ── deny-before-allow with most-specific-match wins ─────────────────
+    //
+    // `forbidden_paths` must apply even when a path also falls under the
+    // workspace or an allowed root. Specificity (matched path-component
+    // depth) breaks ties so a narrow explicit forbidden entry beats a broad
+    // allowed root, while a narrow allowed root still beats a broad *default*
+    // forbidden root such as `/home`.
+
+    #[test]
+    fn forbidden_overrides_allow_specificity_rules() {
+        // Forbidden deeper than allow => deny.
+        assert!(forbidden_overrides_allow(Some(4), Some(3)));
+        // Equal depth => deny (explicit forbidden at the allow boundary wins).
+        assert!(forbidden_overrides_allow(Some(3), Some(3)));
+        // Broad forbidden shallower than a specific allow => allow.
+        assert!(!forbidden_overrides_allow(Some(1), Some(3)));
+        // Forbidden with no competing allow => deny.
+        assert!(forbidden_overrides_allow(Some(2), None));
+        // No forbidden match => allow.
+        assert!(!forbidden_overrides_allow(None, Some(3)));
+        assert!(!forbidden_overrides_allow(None, None));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn forbidden_path_nested_under_allowed_root_is_denied() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: vec!["/home/me/project/secrets".into()],
+            ..SecurityPolicy::default()
+        };
+        // The allowed root itself and non-forbidden children remain allowed.
+        assert!(p.is_path_allowed("/home/me/project/main.rs"));
+        // The explicit, more-specific forbidden subtree is denied even though
+        // it falls under an allowed_roots entry (the reported repro).
+        assert!(!p.is_path_allowed("/home/me/project/secrets/key.txt"));
+        assert!(!p.is_path_allowed("/home/me/project/secrets"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn allowed_root_more_specific_than_broad_default_forbidden_still_allows() {
+        // Default forbidden paths include broad roots like `/home`. An operator
+        // allowlist that is more specific than that broad root must still work.
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: default_forbidden_paths(),
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_path_allowed("/home/me/project/main.rs"));
+        // A sibling under the broad forbidden `/home` that is NOT under the
+        // allowlist is still denied.
+        assert!(!p.is_path_allowed("/home/me/other/file.txt"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn forbidden_path_nested_in_workspace_is_denied() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: true,
+            forbidden_paths: vec!["/srv/ws/secrets".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_path_allowed("/srv/ws/notes.md"));
+        assert!(!p.is_path_allowed("/srv/ws/secrets/token"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolved_path_allowed_honors_forbidden_under_allowed_root() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: vec!["/home/me/project/secrets".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_resolved_path_allowed(Path::new("/home/me/project/main.rs")));
+        assert!(!p.is_resolved_path_allowed(Path::new("/home/me/project/secrets/key.txt")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolved_path_allowed_narrow_allow_beats_broad_default_forbidden() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: default_forbidden_paths(),
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_resolved_path_allowed(Path::new("/home/me/project/main.rs")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolved_path_readable_honors_forbidden_under_allowed_root() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: vec!["/home/me/project/secrets".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_resolved_path_readable(Path::new("/home/me/project/main.rs")));
+        assert!(!p.is_resolved_path_readable(Path::new("/home/me/project/secrets/key.txt")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolved_path_readable_narrow_allow_beats_broad_default_forbidden() {
+        let p = SecurityPolicy {
+            workspace_dir: PathBuf::from("/srv/ws"),
+            workspace_only: false,
+            allowed_roots: vec![PathBuf::from("/home/me/project")],
+            forbidden_paths: default_forbidden_paths(),
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_resolved_path_readable(Path::new("/home/me/project/main.rs")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_write_denies_forbidden_symlink_alias_with_missing_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("real");
+        let project = real_root.join("project");
+        let secrets = project.join("secrets");
+        let public = project.join("public");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::create_dir_all(&public).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let alias = tmp.path().join("alias");
+        symlink(&real_root, &alias).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace,
+            workspace_only: true,
+            allowed_roots: vec![project.clone()],
+            forbidden_paths: vec![alias.join("project/secrets").display().to_string()],
+            ..SecurityPolicy::default()
+        };
+
+        let denied = secrets.join("new-key.txt");
+        assert!(
+            !denied.exists(),
+            "the create target must remain non-existent"
+        );
+        let resolved_denied = resolve_symlinked_path(&denied).unwrap();
+        assert!(
+            !policy.is_resolved_path_allowed(&resolved_denied),
+            "a forbidden alias must deny the equivalent canonical create target"
+        );
+
+        let allowed = resolve_symlinked_path(&public.join("new-note.txt")).unwrap();
+        assert!(
+            policy.is_resolved_path_allowed(&allowed),
+            "a sibling beneath the canonical allowed root must remain writable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_read_denies_forbidden_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("real");
+        let project = real_root.join("project");
+        let secrets = project.join("secrets");
+        let public = project.join("public");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::create_dir_all(&public).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(secrets.join("key.txt"), b"secret").unwrap();
+        std::fs::write(public.join("note.txt"), b"public").unwrap();
+
+        let alias = tmp.path().join("alias");
+        symlink(&real_root, &alias).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace,
+            workspace_only: true,
+            allowed_roots_read_only: vec![project],
+            forbidden_paths: vec![alias.join("project/secrets").display().to_string()],
+            ..SecurityPolicy::default()
+        };
+
+        let denied = secrets.join("key.txt").canonicalize().unwrap();
+        assert!(
+            !policy.is_resolved_path_readable(&denied),
+            "a forbidden alias must deny the equivalent canonical read target"
+        );
+
+        let allowed = public.join("note.txt").canonicalize().unwrap();
+        assert!(
+            policy.is_resolved_path_readable(&allowed),
+            "a sibling beneath the canonical read-only root must remain readable"
+        );
+    }
+
     #[test]
     fn empty_path_allowed() {
         let p = default_policy();
@@ -3375,6 +6886,16 @@ mod tests {
         tracker.record();
         assert_eq!(tracker.count(), 3);
         assert_eq!(cloned.count(), 2); // clone is independent
+    }
+
+    #[test]
+    fn action_tracker_clone_does_not_copy_in_flight_usage() {
+        let tracker = ActionTracker::new();
+        assert!(tracker.reserve(1));
+
+        let cloned = tracker.clone();
+
+        assert_eq!(cloned.used(), 0);
     }
 
     // ── Edge cases: command injection ────────────────────────
@@ -3583,6 +7104,111 @@ mod tests {
     }
 
     #[test]
+    fn windows_nul_redirect_allowed_only_under_cmd_exe() {
+        // The Windows null device is a safe discard-only redirect target — but
+        // ONLY under a native Windows `cmd.exe` shell. Under a POSIX shell (Unix
+        // native or Docker `sh -c`) `nul` is an ordinary relative
+        // filename, so `>nul` must stay blocked to prevent a workspace-file write.
+        use ShellDialect::{Posix, WindowsCmd};
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for cmd in [
+            "git -C E:/repo ls-tree -r --name-only HEAD path 2>nul",
+            "echo x >nul",
+            "echo x 1>NUL",
+            "echo x 2>Nul",
+            "echo x > nul",     // target as a separate token
+            r"echo x >\\.\nul", // full device form
+        ] {
+            // cmd.exe: nul resolves to the discard-only null device.
+            assert!(
+                p.is_command_allowed_for_shell(cmd, WindowsCmd),
+                "cmd.exe must allow the nul null device: {cmd}"
+            );
+            // POSIX shell: the SAME command must be blocked (nul is a real file).
+            assert!(
+                !p.is_command_allowed_for_shell(cmd, Posix),
+                "POSIX shell must block a redirect to `nul` (an ordinary file): {cmd}"
+            );
+        }
+
+        // The default (dialect-less) entry point is POSIX/fail-closed, so it
+        // blocks `nul`; configured runtime consumers pass their actual dialect.
+        assert!(!p.is_command_allowed("echo x >nul"));
+
+        // The redirect gate itself: nul is stripped as safe only under cmd.exe.
+        assert!(!contains_unsafe_output_redirect_for_shell(
+            "git status 2>nul",
+            WindowsCmd
+        ));
+        assert!(contains_unsafe_output_redirect_for_shell(
+            "git status 2>nul",
+            Posix
+        ));
+        assert!(!contains_unsafe_output_redirect_for_shell(
+            r"echo x >\\.\nul",
+            WindowsCmd
+        ));
+        assert!(contains_unsafe_output_redirect_for_shell(
+            r"echo x >\\.\nul",
+            Posix
+        ));
+
+        // POSIX device paths are safe only for the POSIX shell. A real file and
+        // a non-bare `nul`-prefixed name stay blocked under both dialects.
+        assert!(p.is_command_allowed_for_shell("git status 2>/dev/null", Posix));
+        assert!(!p.is_command_allowed_for_shell("git status 2>/dev/null", WindowsCmd));
+        assert!(!p.is_command_allowed_for_shell("echo secret 2>out.txt", WindowsCmd));
+        assert!(!p.is_command_allowed_for_shell("echo secret >nul.txt", WindowsCmd));
+        assert!(contains_unsafe_output_redirect_for_shell(
+            "echo secret >nul.txt",
+            WindowsCmd
+        ));
+    }
+
+    #[test]
+    fn windows_cmd_operator_and_device_redirects_are_fail_closed() {
+        use ShellDialect::{Posix, WindowsCmd};
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git status 'x & whoami'",
+            r"git status x\&whoami",
+            "git status 'x | whoami'",
+            "git status 'x > /dev/null'",
+            "git status >/dev/null",
+            "git status </dev/zero",
+        ] {
+            assert!(
+                p.validate_command_execution_for_shell(command, false, WindowsCmd)
+                    .is_err(),
+                "cmd.exe must reject policy-hidden operator or POSIX device redirect: {command}"
+            );
+        }
+
+        for command in [
+            "git status 'x & whoami'",
+            r"git status x\&whoami",
+            "git status 'x | whoami'",
+            "git status 'x > /dev/null'",
+            "git status >/dev/null",
+            "git status </dev/zero",
+        ] {
+            assert!(
+                p.validate_command_execution_for_shell(command, false, Posix)
+                    .is_ok(),
+                "POSIX must retain quoted, escaped, and safe-device behavior: {command}"
+            );
+        }
+    }
+
+    #[test]
     fn safe_redirect_to_dev_stdout_allowed() {
         let p = default_policy();
         assert!(p.is_command_allowed("echo hello > /dev/stdout"));
@@ -3647,15 +7273,34 @@ mod tests {
 
     #[test]
     fn redirect_helper_unit_tests() {
-        assert!(!contains_unquoted_input_redirect("cat << 'EOF'"));
-        assert!(!contains_unquoted_input_redirect("cat <<< 'hello'"));
-        assert!(contains_unquoted_input_redirect("cat < /etc/passwd"));
-        assert!(!contains_unquoted_input_redirect("echo 'a<b'"));
-        assert!(!contains_unquoted_input_redirect("cat</dev/null"));
-        // Input redirect word→non-word bypass (same fix as output redirects)
-        assert!(contains_unquoted_input_redirect("cat</dev/null.secret"));
+        assert!(!contains_unquoted_input_redirect(
+            "cat << 'EOF'",
+            ShellDialect::Posix
+        ));
+        assert!(!contains_unquoted_input_redirect(
+            "cat <<< 'hello'",
+            ShellDialect::Posix
+        ));
         assert!(contains_unquoted_input_redirect(
-            "cat </dev/zero/etc/passwd"
+            "cat < /etc/passwd",
+            ShellDialect::Posix
+        ));
+        assert!(!contains_unquoted_input_redirect(
+            "echo 'a<b'",
+            ShellDialect::Posix
+        ));
+        assert!(!contains_unquoted_input_redirect(
+            "cat</dev/null",
+            ShellDialect::Posix
+        ));
+        // Input redirect word→non-word bypass (same fix as output redirects)
+        assert!(contains_unquoted_input_redirect(
+            "cat</dev/null.secret",
+            ShellDialect::Posix
+        ));
+        assert!(contains_unquoted_input_redirect(
+            "cat </dev/zero/etc/passwd",
+            ShellDialect::Posix
         ));
         assert!(!contains_unsafe_output_redirect("cmd 2>/dev/null"));
         assert!(!contains_unsafe_output_redirect("cmd >/dev/null"));
@@ -3705,13 +7350,26 @@ mod tests {
     #[test]
     fn command_argument_injection_blocked() {
         let p = default_policy();
-        // find -exec is a common bypass
-        assert!(!p.is_command_allowed("find . -exec rm -rf {} +"));
-        assert!(!p.is_command_allowed("find / -ok cat {} \\;"));
+        for command in [
+            "find . -exec rm -rf '{}' +",
+            "find / -ok cat '{}' ';'",
+            "find . -execdir git commit '{}' +",
+            "find . -okdir env GIT_CONFIG_GLOBAL=./zc-config git zcprobe '{}' ';'",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("find command carriers must fail before child execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
         // git config/alias can execute commands
         assert!(!p.is_command_allowed("git config core.editor \"rm -rf /\""));
         assert!(!p.is_command_allowed("git alias.st status"));
         assert!(!p.is_command_allowed("git -c core.editor=calc.exe commit"));
+        assert!(!p.is_command_allowed("git --config-env=alias.st=ZC_ALIAS status"));
         // Legitimate commands should still work
         assert!(p.is_command_allowed("find . -name '*.txt'"));
         assert!(p.is_command_allowed("git status"));
@@ -3749,10 +7407,10 @@ mod tests {
     #[test]
     fn command_env_var_prefix_with_allowed_cmd() {
         let p = default_policy();
-        // env assignment + allowed command — OK
-        assert!(p.is_command_allowed("FOO=bar ls"));
-        assert!(p.is_command_allowed("LANG=C grep pattern file"));
-        // env assignment + disallowed command — blocked
+        // Per-invocation environment changes can alter executable resolution or
+        // command behavior before the allowlist and risk model see it.
+        assert!(!p.is_command_allowed("FOO=bar ls"));
+        assert!(!p.is_command_allowed("LANG=C grep pattern file"));
         assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
     }
 
@@ -3775,6 +7433,129 @@ mod tests {
         assert_eq!(
             p.forbidden_path_argument("find .. -name '*.rs'"),
             Some("..".into())
+        );
+    }
+
+    #[test]
+    fn powershell_path_guard_blocks_windows_relative_and_executable_paths() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tp_ws(),
+            allowed_commands: vec!["cat".into(), "git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for (command, blocked_path) in [
+            ("cat ..\\secret.txt", "..\\secret.txt"),
+            ("cat .\\..\\secret.txt", ".\\..\\secret.txt"),
+            ("cat ~\\.ssh\\id_rsa", "~\\.ssh\\id_rsa"),
+            ("cat C:secret.txt", "C:secret.txt"),
+            ("..\\git.exe status", "..\\git.exe"),
+        ] {
+            assert_eq!(
+                p.forbidden_path_argument_for_shell(command, ShellDialect::PowerShell),
+                Some(blocked_path.to_string()),
+                "PowerShell path should be blocked: {command}"
+            );
+
+            let error = p
+                .validate_command_execution_for_shell(command, true, ShellDialect::PowerShell)
+                .expect_err("named allowlists must not bypass PowerShell path confinement");
+            assert!(
+                error.contains("forbidden path argument"),
+                "unexpected rejection for {command}: {error}"
+            );
+        }
+
+        assert_eq!(
+            p.forbidden_path_argument_for_shell("cat .\\src\\main.rs", ShellDialect::PowerShell),
+            None
+        );
+        assert_eq!(
+            p.forbidden_path_argument_for_shell(".\\git.exe status", ShellDialect::PowerShell),
+            None
+        );
+
+        let explicit_path_policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tp_ws(),
+            allowed_commands: vec!["/usr/bin/antigravity".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            explicit_path_policy
+                .validate_command_execution_for_shell(
+                    "/usr/bin/antigravity",
+                    true,
+                    ShellDialect::PowerShell,
+                )
+                .is_ok(),
+            "an exact executable-path allowlist must retain its existing meaning"
+        );
+    }
+
+    #[test]
+    fn powershell_allowlist_accepts_case_insensitive_exe_suffix() {
+        assert!(is_powershell_allowlist_entry_match(
+            "git.EXE", "git.exe", "git"
+        ));
+    }
+
+    #[test]
+    fn powershell_allowlist_accepts_windows_relative_path_spelling() {
+        assert!(is_powershell_allowlist_entry_match(
+            r".\tools\git.exe",
+            "./tools/git.exe",
+            "git"
+        ));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn powershell_allowlist_path_is_case_sensitive_on_unix() {
+        // The explicit path is the trust anchor. On a case-sensitive host,
+        // `/tmp/Safe/tool` and `/tmp/safe/tool` can be different executables,
+        // so a differently cased request must not inherit the allowlist grant.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tp_ws(),
+            allowed_commands: vec!["/tmp/Safe/tool".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        // Exact case remains authorized.
+        assert!(
+            p.validate_command_execution_for_shell(
+                "/tmp/Safe/tool",
+                true,
+                ShellDialect::PowerShell,
+            )
+            .is_ok(),
+            "exact-case explicit path must stay authorized"
+        );
+
+        // Differently cased executable must NOT match the trusted entry.
+        assert!(
+            p.validate_command_execution_for_shell(
+                "/tmp/safe/tool",
+                true,
+                ShellDialect::PowerShell,
+            )
+            .is_err(),
+            "case-distinct executable must not inherit the allowlist grant on a case-sensitive host"
+        );
+
+        // The workspace-exemption path (forbidden_path_argument) must apply the
+        // same case rule: the differently cased executable is not exempted by
+        // the trusted entry, so it is subject to path confinement.
+        assert!(
+            !is_powershell_allowlist_entry_match("/tmp/Safe/tool", "/tmp/safe/tool", "tool"),
+            "path allowlist match must be case-sensitive on Unix"
+        );
+        assert!(
+            is_powershell_allowlist_entry_match("/tmp/Safe/tool", "/tmp/Safe/tool", "tool"),
+            "exact-case path allowlist match must still succeed"
         );
     }
 
@@ -3899,6 +7680,16 @@ mod tests {
         // Single-quoted variant of the same shape.
         assert_eq!(
             p.forbidden_path_argument("printf '<<EOF\nbody\nEOF' /etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_ignores_quoted_redirection_markers() {
+        let p = unix_forbidden_path_policy();
+
+        assert_eq!(
+            p.forbidden_path_argument("cat 'literal>' --file=/etc/passwd"),
             Some("/etc/passwd".into())
         );
     }
@@ -4055,6 +7846,98 @@ mod tests {
             ..SecurityPolicy::default()
         };
         assert!(!p.record_action());
+        assert!(p.reserve_action().is_none());
+    }
+
+    #[test]
+    fn action_reservation_drop_releases_exact_slot() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 2,
+            ..SecurityPolicy::default()
+        };
+
+        let first = p.reserve_action().expect("first reservation");
+        let second = p.reserve_action().expect("second reservation");
+        assert!(p.reserve_action().is_none(), "both slots are reserved");
+
+        drop(first);
+        let replacement = p.reserve_action().expect("only first slot was released");
+        second.commit();
+        assert!(
+            p.reserve_action().is_none(),
+            "second reservation committed while replacement remains in flight"
+        );
+
+        drop(replacement);
+        let final_slot = p.reserve_action().expect("replacement slot was released");
+        final_slot.commit();
+        assert!(p.reserve_action().is_none(), "both slots are now committed");
+    }
+
+    #[test]
+    fn action_reservations_are_isolated_by_sender() {
+        let tracker = PerSenderTracker::new();
+        let sender_a = tracker
+            .reserve_within("sender-a".to_string(), 1)
+            .expect("sender A reservation");
+
+        assert!(
+            tracker.reserve_within("sender-a".to_string(), 1).is_none(),
+            "sender A has no second slot"
+        );
+        let sender_b = tracker
+            .reserve_within("sender-b".to_string(), 1)
+            .expect("sender B has an independent slot");
+
+        sender_a.commit();
+        drop(sender_b);
+        assert!(
+            tracker.reserve_within("sender-b".to_string(), 1).is_some(),
+            "releasing sender B is independent from sender A's commit"
+        );
+    }
+
+    #[test]
+    fn released_reservation_removes_empty_sender_bucket() {
+        let tracker = PerSenderTracker::new();
+        let reservation = tracker
+            .reserve_within("ephemeral-sender".to_string(), 1)
+            .expect("reservation");
+        assert!(tracker.buckets.lock().contains_key("ephemeral-sender"));
+
+        drop(reservation);
+
+        assert!(!tracker.buckets.lock().contains_key("ephemeral-sender"));
+    }
+
+    #[test]
+    fn zero_budget_does_not_create_sender_bucket() {
+        let tracker = PerSenderTracker::new();
+
+        assert!(!tracker.record_within("zero-budget", 0));
+        assert!(
+            tracker
+                .reserve_within("zero-budget".to_string(), 0)
+                .is_none()
+        );
+        assert!(tracker.buckets.lock().is_empty());
+    }
+
+    #[test]
+    fn expired_success_is_evicted_when_budget_is_read() {
+        let tracker = PerSenderTracker::new();
+        assert!(tracker.record_within("expired-sender", 1));
+        let after_window = {
+            let buckets = tracker.buckets.lock();
+            let action_tracker = buckets.get("expired-sender").expect("sender bucket");
+            let state = action_tracker.state.lock();
+            state.committed[0]
+                .checked_add(ACTION_WINDOW + Duration::from_secs(1))
+                .expect("test timestamp")
+        };
+
+        assert!(!tracker.is_exhausted_at("expired-sender", 1, after_window));
+        assert!(!tracker.buckets.lock().contains_key("expired-sender"));
     }
 
     #[test]
@@ -4135,7 +8018,7 @@ mod tests {
             "forbidden paths must be blocked even when workspace_only=false"
         );
         assert!(
-            !p.is_resolved_path_allowed(Path::new("/var/run/docker.sock")),
+            !p.is_resolved_path_allowed(Path::new("/var/zeroclaw-forbidden-test/nonexistent.sock")),
             "forbidden /var must be blocked even when workspace_only=false"
         );
 
@@ -4178,6 +8061,7 @@ mod tests {
 
     // ── is_resolved_path_readable: read-only allowlist + POSIX devs ──
 
+    #[cfg(unix)]
     #[test]
     fn readable_includes_posix_device_files() {
         // /dev/null and friends are universally-readable system paths
@@ -4674,6 +8558,215 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Regression for the shell workspace-boundary bypass: a direct path-shaped
+    /// command argument that reaches outside the workspace through an
+    /// in-workspace symlink must be blocked. The leaf may not exist yet (the
+    /// command is about to create it), so resolution must follow the symlinked
+    /// ancestor.
+    #[cfg(unix)]
+    #[test]
+    fn forbidden_path_argument_blocks_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_test_shell_symlink_escape_{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside_target");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // `link` inside the workspace points at the outside directory.
+        symlink(&outside, workspace.join("link")).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+
+        // Writing a NEW file through the symlink (leaf does not exist yet).
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument("touch link/new.txt")
+                .as_deref(),
+            Some("link/new.txt"),
+            "creating a file through an in-workspace symlink to outside must be blocked"
+        );
+        // Redirect target through the symlink.
+        assert!(
+            policy
+                .forbidden_workspace_path_argument("echo hi > link/out.txt")
+                .is_some(),
+            "shell redirect through an escaping symlink must be blocked"
+        );
+        // Reading an existing file through the symlink.
+        std::fs::write(outside.join("secret.txt"), b"x").unwrap();
+        assert!(
+            policy
+                .forbidden_workspace_path_argument("cat link/secret.txt")
+                .is_some(),
+            "reading through an escaping symlink must be blocked"
+        );
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument_for_shell(
+                    r"cat link\secret.txt",
+                    ShellDialect::PowerShell,
+                )
+                .as_deref(),
+            Some(r"link\secret.txt"),
+            "PowerShell backslash paths must retain workspace symlink resolution"
+        );
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument_for_shell(
+                    r"cat link\secret.txt",
+                    ShellDialect::WindowsCmd,
+                )
+                .as_deref(),
+            Some(r"link\secret.txt"),
+            "cmd.exe backslash paths must retain workspace symlink resolution"
+        );
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument_for_shell(
+                    r"cat link\secret.txt",
+                    ShellDialect::Posix,
+                )
+                .as_deref(),
+            None,
+            "POSIX backslash escapes must retain their existing tokenization"
+        );
+
+        // PowerShell single quotes preserve a path with spaces as one argument.
+        // The path guard must inspect that complete path before the shell resolves
+        // the in-workspace symlink.
+        symlink(&outside, workspace.join("link dir")).unwrap();
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument_for_shell(
+                    r"cat 'link dir\secret.txt'",
+                    ShellDialect::PowerShell,
+                )
+                .as_deref(),
+            Some(r"link dir\secret.txt"),
+            "PowerShell quoted paths must retain symlink-boundary checks"
+        );
+
+        // A DANGLING symlink (its target directory does not exist yet) still
+        // escapes on write, so it must be blocked even though it cannot be
+        // `canonicalize`d.
+        symlink(outside.join("nonexistent_dir"), workspace.join("dangling")).unwrap();
+        assert!(
+            policy
+                .forbidden_workspace_path_argument("echo x > dangling/new.txt")
+                .is_some(),
+            "writing through a dangling symlink to outside must be blocked"
+        );
+
+        // A symlink CYCLE exhausts the resolver's hop budget. It must fail
+        // CLOSED (block), not fall back to the pristine in-workspace path.
+        symlink(workspace.join("cycle_b"), workspace.join("cycle_a")).unwrap();
+        symlink(workspace.join("cycle_a"), workspace.join("cycle_b")).unwrap();
+        assert!(
+            policy
+                .forbidden_workspace_path_argument("cat cycle_a/file")
+                .is_some(),
+            "an unresolvable symlink cycle must fail closed (be blocked)"
+        );
+
+        // Scoping check: the STRING-only guard (used by cron, whose cwd is NOT
+        // the workspace) must NOT resolve symlinks, so it does not over-block a
+        // workspace-relative path here. The resolve step is scoped to the
+        // workspace-cwd variant used above.
+        assert_eq!(
+            policy.forbidden_path_argument("cat link/secret.txt"),
+            None,
+            "string-only guard must not resolve symlinks (keeps cron unaffected)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Non-regression: a symlink that stays INSIDE the workspace, and ordinary
+    /// workspace-relative paths, must still be allowed after the resolve check.
+    #[cfg(unix)]
+    #[test]
+    fn forbidden_path_argument_allows_in_workspace_paths() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_test_shell_in_workspace_{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(workspace.join("real_dir")).unwrap();
+        std::fs::create_dir_all(workspace.join("sub")).unwrap();
+
+        // `inside` points at another directory WITHIN the workspace.
+        symlink(workspace.join("real_dir"), workspace.join("inside")).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+
+        assert_eq!(
+            policy.forbidden_workspace_path_argument("touch inside/new.txt"),
+            None,
+            "an in-workspace symlink target must remain allowed"
+        );
+        assert_eq!(
+            policy.forbidden_workspace_path_argument("touch sub/out.txt"),
+            None,
+            "an ordinary workspace-relative path must remain allowed"
+        );
+        assert_eq!(
+            policy.forbidden_workspace_path_argument("echo hi > sub/out.txt"),
+            None,
+            "an ordinary workspace-relative redirect target must remain allowed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Non-regression: a path under an `allowed_roots_read_only` grant (outside
+    /// the workspace) must stay READABLE - the command guard checks read OR
+    /// write, so the resolve step must not drop read-only roots.
+    #[cfg(unix)]
+    #[test]
+    fn forbidden_path_argument_allows_read_only_root() {
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_test_shell_read_only_root_{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let shared = root.join("shared_readonly");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("data.txt"), b"x").unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            allowed_roots_read_only: vec![shared.clone()],
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        let cmd = format!("cat {}/data.txt", shared.display());
+        assert_eq!(
+            policy.forbidden_workspace_path_argument(&cmd),
+            None,
+            "reading under an allowed read-only root must remain allowed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn allowed_roots_permits_paths_outside_workspace() {
@@ -4925,6 +9018,41 @@ mod tests {
             ..parent.clone()
         };
         assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_case_equivalent_command_names() {
+        let parent = SecurityPolicy {
+            allowed_commands: vec!["Git".into(), "DOCKER".into()],
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            allowed_commands: vec!["git".into(), "docker".into()],
+            ..parent.clone()
+        };
+
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_keeps_command_paths_case_sensitive() {
+        let parent = SecurityPolicy {
+            allowed_commands: vec!["/usr/bin/Git".into()],
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            allowed_commands: vec!["/usr/bin/git".into()],
+            ..parent.clone()
+        };
+
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("case-distinct paths must not be treated as equivalent");
+        assert!(matches!(
+            err,
+            EscalationViolation::CommandNotInParent { ref command }
+            if command == "/usr/bin/git"
+        ));
     }
 
     #[test]
@@ -5610,14 +9738,14 @@ mod tests {
     #[test]
     fn per_sender_tracker_isolates_counts() {
         let t = PerSenderTracker::new();
-        // sender A hits limit=2 on 3rd call
-        assert!(t.record_within("chat_a", 2)); // count=1 ≤ 2 → ok
-        assert!(t.record_within("chat_a", 2)); // count=2 ≤ 2 → ok
-        assert!(!t.record_within("chat_a", 2)); // count=3 > 2 → blocked
+        // sender A rejects its third call without recording it
+        assert!(t.record_within("chat_a", 2)); // count=1
+        assert!(t.record_within("chat_a", 2)); // count=2
+        assert!(!t.record_within("chat_a", 2)); // remains count=2
         // sender B is unaffected — its bucket is empty
-        assert!(t.record_within("chat_b", 2)); // count=1 ≤ 2 → ok
-        assert!(t.record_within("chat_b", 2)); // count=2 ≤ 2 → ok
-        assert!(!t.record_within("chat_b", 2)); // count=3 > 2 → blocked
+        assert!(t.record_within("chat_b", 2)); // count=1
+        assert!(t.record_within("chat_b", 2)); // count=2
+        assert!(!t.record_within("chat_b", 2)); // remains count=2
     }
 
     #[test]

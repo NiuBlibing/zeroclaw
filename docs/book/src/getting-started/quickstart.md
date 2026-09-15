@@ -10,8 +10,6 @@ where you are.
 
 {{#include ../_snippets/install.md}}
 
-Every installation includes `zeroclaw`. A release archive or selected source apps may also include the `zerocode` terminal interface. For a source install, pass `--apps zerocode` when it is not already selected. Without `zerocode`, use the CLI or web Quickstart paths below.
-
 ## The steps
 
 > **Important:** if any of these terms are unfamiliar, read
@@ -83,6 +81,10 @@ the tabs. Drive it with the keyboard:
 Switch to the **Quickstart** pane:
 
 {{#include ../_snippets/zerocode-pane-nav-keys.md}}
+
+You can also choose **» Quickstart** in the agent sidebar. Pressing **Esc**
+returns to the pane that opened Quickstart, whether you entered from the
+keyboard mode bar, a mode-bar click, or the sidebar launcher.
 
 Inside the pane:
 

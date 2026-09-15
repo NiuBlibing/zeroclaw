@@ -345,34 +345,30 @@ impl MattermostChannel {
         self
     }
 
-    pub fn with_transcription(
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
+    }
+
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
+    pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        if !config.enabled {
-            return self;
-        }
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                let names = m.available_providers();
-                let m = if names.len() == 1 {
-                    let only = names[0].to_string();
-                    m.with_agent_transcription_provider(only)
-                } else {
-                    m
-                };
-                self.transcription_manager = Some(Arc::new(m));
-                self.transcription = Some(config);
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                    "transcription manager init failed, voice transcription disabled"
-                );
-            }
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
+            self.transcription = Some(config);
         }
         self
     }
@@ -622,36 +618,24 @@ impl MattermostChannel {
             return None;
         }
 
-        if let Some(content_length) = response.content_length()
-            && content_length > MAX_MATTERMOST_AUDIO_BYTES
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(
-                        ::serde_json::json!({"content_length": content_length, "file_id": file_id})
-                    ),
-                "audio file too large ( bytes)"
-            );
-            return None;
-        }
-
-        let bytes = match response.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "file_id": file_id})
-                        ),
-                    "failed to read audio bytes for"
-                );
-                return None;
-            }
-        };
+        let bytes =
+            match crate::util::read_response_body_limited(response, MAX_MATTERMOST_AUDIO_BYTES)
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{}", e), "file_id": file_id})
+                            ),
+                        "failed to read audio bytes for"
+                    );
+                    return None;
+                }
+            };
 
         match manager.transcribe(&bytes, file_name).await {
             Ok(text) => {
@@ -727,8 +711,10 @@ impl Channel for MattermostChannel {
             "message": message.content
         });
 
-        if let Some(root) = root_id {
-            body_map.as_object_mut().unwrap().insert(
+        if let Some(root) = root_id
+            && let Some(body) = body_map.as_object_mut()
+        {
+            body.insert(
                 "root_id".to_string(),
                 serde_json::Value::String(root.to_string()),
             );
@@ -2630,6 +2616,77 @@ mod tests {
 
             let result = ch.try_transcribe_audio_attachment(&post).await;
             assert_eq!(result.as_deref(), Some("[Voice] test transcript"));
+        }
+
+        #[tokio::test]
+        async fn mattermost_audio_rejects_declared_oversize_before_transcription() {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_MATTERMOST_AUDIO_BYTES + 1
+            )
+            .into_bytes();
+            let (mattermost_url, server) =
+                crate::util::spawn_raw_http_response(response, true).await;
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/v1/audio/transcriptions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"text": "wrong"})))
+                .expect(0)
+                .mount(&mock_server)
+                .await;
+
+            let ch = MattermostChannel::new(
+                mattermost_url,
+                Some("test_token".to_string()),
+                None,
+                None,
+                Vec::new(),
+                "mattermost_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+                false,
+            )
+            .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
+                enabled: true,
+                api_key: None,
+                api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+                model: "whisper-large-v3".to_string(),
+                language: None,
+                initial_prompt: None,
+                max_audio_bytes: None,
+                max_duration_secs: 600,
+                openai: None,
+                deepgram: None,
+                assemblyai: None,
+                google: None,
+                local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                    url: format!("{}/v1/audio/transcriptions", mock_server.uri()),
+                    bearer_token: Some("test_token".to_string()),
+                    max_audio_bytes: 25_000_000,
+                    timeout_secs: 300,
+                }),
+                transcribe_non_ptt_audio: false,
+            });
+            let post = json!({
+                "metadata": {
+                    "files": [{
+                        "id": "file1",
+                        "mime_type": "audio/ogg",
+                        "name": "voice.ogg"
+                    }]
+                }
+            });
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                ch.try_transcribe_audio_attachment(&post),
+            )
+            .await
+            .expect("declared oversize must be rejected before reading the body");
+            server.abort();
+
+            assert!(result.is_none());
         }
 
         #[tokio::test]

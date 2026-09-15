@@ -1,7 +1,8 @@
 use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
-    build_responses_input, convert_tools, first_nonempty, process_sse_chunk,
+    build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
 };
+use crate::opencode_session::OPENCODE_SESSION_HEADER;
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -22,18 +23,14 @@ pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 /// Default endpoint for the OpenAI Responses API.
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
-/// Max wait for the next streaming body read before the connection is treated
-/// as stalled. Streaming clients omit reqwest's overall `.timeout()` (it kills
-/// long-running responses mid-stream), so without a per-read bound a connection
-/// that goes silent after the headers park `bytes_stream().next().await` forever
-/// and the turn hangs on "working". `read_timeout` caps the gap between reads and
-/// converts a silent stall into a retryable stream error.
+/// Maximum silence between body reads for OpenAI Responses SSE streams.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub struct OpenAiModelProvider {
     /// `[providers.models.openai.<alias>]` config-key alias.
     alias: String,
     base_url: String,
+    canonical_base_url: &'static str,
     credential: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: u64,
@@ -69,18 +66,24 @@ struct Choice {
 struct ResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    /// Reasoning/thinking models may return output in `reasoning_content`.
-    #[serde(default)]
-    reasoning_content: Option<String>,
 }
 
 impl ResponseMessage {
     fn effective_content(&self) -> String {
-        match &self.content {
-            Some(c) if !c.is_empty() => c.clone(),
-            _ => self.reasoning_content.clone().unwrap_or_default(),
-        }
+        self.content.clone().unwrap_or_default()
     }
+}
+
+/// String-only completions have no native tool-call escape hatch. An empty or
+/// reasoning-only result is therefore a typed terminal failure, not a valid
+/// string result for direct callers that do not use the structured chat API.
+fn require_terminal_text(content: String) -> anyhow::Result<String> {
+    if zeroclaw_api::model_provider::strip_think_tags(&content).is_empty() {
+        return Err(anyhow::Error::new(
+            zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+        ));
+    }
+    Ok(content)
 }
 
 #[derive(Debug, Serialize)]
@@ -112,23 +115,37 @@ struct NativeMessage {
     reasoning_content: Option<String>,
 }
 
+/// OpenAI chat-completions native tool entry. Shared with the
+/// OpenAI-compatible provider (`compatible.rs`), which emits the same wire
+/// shape.
 #[derive(Debug, Serialize, Deserialize)]
-struct NativeToolSpec {
+pub(crate) struct NativeToolSpec {
     #[serde(rename = "type")]
-    kind: String,
-    function: NativeToolFunctionSpec,
+    pub(crate) kind: String,
+    pub(crate) function: NativeToolFunctionSpec,
+    /// Unknown sibling fields from parsed caller-supplied specs, preserved
+    /// verbatim so the `chat_with_tools` round-trip validates without
+    /// silently altering the payload. Empty (serializes nothing) for
+    /// internally built specs.
+    #[serde(flatten)]
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct NativeToolFunctionSpec {
-    name: String,
-    description: String,
+pub(crate) struct NativeToolFunctionSpec {
+    pub(crate) name: String,
+    pub(crate) description: String,
     /// `Arc`-shared with the tool registry's stored schema — serialized
     /// transparently, never deep-cloned per request
-    parameters: std::sync::Arc<serde_json::Value>,
+    pub(crate) parameters: std::sync::Arc<serde_json::Value>,
+    /// Unknown sibling fields (e.g. OpenAI `strict`) from parsed
+    /// caller-supplied specs, preserved verbatim. Empty for internally
+    /// built specs.
+    #[serde(flatten)]
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
 
-fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<NativeToolSpec> {
+pub(crate) fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<NativeToolSpec> {
     let spec: NativeToolSpec = serde_json::from_value(value).map_err(|e| {
         ::zeroclaw_log::record!(
             WARN,
@@ -206,10 +223,10 @@ struct NativeResponseMessage {
 
 impl NativeResponseMessage {
     fn effective_content(&self) -> Option<String> {
-        match &self.content {
-            Some(c) if !c.is_empty() => Some(c.clone()),
-            _ => self.reasoning_content.clone(),
-        }
+        self.content
+            .as_ref()
+            .filter(|content| !content.is_empty())
+            .cloned()
     }
 }
 
@@ -223,6 +240,7 @@ pub struct OpenAiBuilder {
     alias: String,
     credential: Option<String>,
     base_url: Option<String>,
+    canonical_base_url: Option<&'static str>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
 }
@@ -241,6 +259,11 @@ impl OpenAiBuilder {
     /// Override the API endpoint. Trailing slashes are stripped.
     pub fn base_url(mut self, base_url: &str) -> Self {
         self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    pub(crate) fn canonical_base_url(mut self, base_url: &'static str) -> Self {
+        self.canonical_base_url = Some(base_url);
         self
     }
 
@@ -264,6 +287,7 @@ impl OpenAiBuilder {
         OpenAiModelProvider {
             alias: self.alias,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            canonical_base_url: self.canonical_base_url.unwrap_or(BASE_URL),
             credential: self.credential,
             max_tokens: self.max_tokens,
             timeout_secs: self.timeout_secs.unwrap_or(120),
@@ -279,6 +303,7 @@ impl OpenAiModelProvider {
             alias: alias.to_string(),
             credential: None,
             base_url: None,
+            canonical_base_url: None,
             max_tokens: None,
             timeout_secs: None,
         }
@@ -324,7 +349,9 @@ impl OpenAiModelProvider {
                 .iter()
                 .map(|tool| NativeToolSpec {
                     kind: "function".to_string(),
+                    extra: serde_json::Map::new(),
                     function: NativeToolFunctionSpec {
+                        extra: serde_json::Map::new(),
                         name: tool.name.clone(),
                         description: tool.description.clone(),
                         parameters: std::sync::Arc::clone(&tool.parameters),
@@ -442,7 +469,7 @@ impl OpenAiModelProvider {
 impl ModelProvider for OpenAiModelProvider {
     // ── ModelProvider-family defaults ──
     fn default_base_url(&self) -> Option<&str> {
-        Some(BASE_URL)
+        Some(self.canonical_base_url)
     }
 
     async fn chat_with_system(
@@ -505,7 +532,8 @@ impl ModelProvider for OpenAiModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.effective_content())
+            .map(|c| require_terminal_text(c.message.effective_content()))
+            .transpose()?
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -583,6 +611,7 @@ impl ModelProvider for OpenAiModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -669,6 +698,7 @@ impl ModelProvider for OpenAiModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -759,6 +789,8 @@ struct ResponsesApiBody {
     output: Vec<serde_json::Value>,
     #[serde(default)]
     output_text: Option<String>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 fn extract_responses_api_text(body: &ResponsesApiBody) -> Option<String> {
@@ -850,7 +882,7 @@ pub(crate) async fn run_responses_sse(
     let mut pending_utf8: Vec<u8> = Vec::new();
     let mut chunk_buf = String::new();
 
-    loop {
+    'stream: loop {
         match byte_stream.next().await {
             Some(Ok(bytes)) => {
                 if let Err(err) =
@@ -893,6 +925,9 @@ pub(crate) async fn run_responses_sse(
                             return;
                         }
                     }
+                    if state.saw_completion {
+                        break 'stream;
+                    }
                 }
                 Err(err) => {
                     if err.downcast_ref::<ResponsesStreamApiError>().is_some() {
@@ -906,7 +941,8 @@ pub(crate) async fn run_responses_sse(
         }
     }
 
-    if !chunk_buf.trim().is_empty()
+    if !state.saw_completion
+        && !chunk_buf.trim().is_empty()
         && let Ok(events) = process_sse_chunk(&chunk_buf, &mut state)
     {
         for event in events {
@@ -1123,6 +1159,37 @@ impl OpenAiResponsesModelProvider {
         headers
     }
 
+    /// OpenCode affinity header value for the calling conversation, or `None`
+    /// when this provider does not target OpenCode.
+    ///
+    /// `responses_url` is the full endpoint rather than a base URL; the target
+    /// test parses its host, so it matches either shape. Returns `None` when
+    /// the operator already pinned the header through `extra_headers`, which
+    /// `build_default_headers` puts on every request — a second value here
+    /// would send the header twice.
+    fn opencode_session_value(&self) -> Option<String> {
+        if self
+            .extra_headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case(OPENCODE_SESSION_HEADER))
+        {
+            return None;
+        }
+        crate::opencode_session::session_token(&self.responses_url)
+    }
+
+    /// Attach the OpenCode affinity header, for request paths that build in the
+    /// caller's task. The streaming path resolves the value before its spawn.
+    fn apply_opencode_session_header(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        match self.opencode_session_value() {
+            Some(session) => req.header(OPENCODE_SESSION_HEADER, session),
+            None => req,
+        }
+    }
+
     fn http_client(&self) -> Client {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder()
@@ -1131,6 +1198,10 @@ impl OpenAiResponsesModelProvider {
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
+            "model_provider.openai",
+        );
         builder.build().unwrap_or_else(|_| Client::new())
     }
 
@@ -1142,6 +1213,10 @@ impl OpenAiResponsesModelProvider {
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
+            "model_provider.openai",
+        );
         builder.build().unwrap_or_else(|_| Client::new())
     }
 }
@@ -1203,9 +1278,11 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         };
         let req = self.build_request(instructions, input, None, model, temperature, false);
         let response = self
-            .http_client()
-            .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {credential}"))
+            .apply_opencode_session_header(
+                self.http_client()
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {credential}")),
+            )
             .json(&req)
             .send()
             .await?;
@@ -1253,9 +1330,11 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             );
         }
         let response = self
-            .http_client()
-            .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {credential}"))
+            .apply_opencode_session_header(
+                self.http_client()
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {credential}")),
+            )
             .json(&req)
             .send()
             .await?;
@@ -1266,7 +1345,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         Ok(ProviderChatResponse {
             text: extract_responses_api_text(&body),
             tool_calls: extract_responses_api_tool_calls(&body),
-            usage: None,
+            usage: parse_responses_usage(body.usage.as_ref()),
             reasoning_content: None,
         })
     }
@@ -1294,6 +1373,9 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let tools_owned = request.tools.map(<[ToolSpec]>::to_vec);
         let model = model.to_string();
         let responses_url = self.responses_url.clone();
+        // Resolved before the spawn: `spawn!` propagates the tracing span but
+        // not task-locals, so the conversation scope is unreadable inside.
+        let opencode_session = self.opencode_session_value();
         let count_tokens = options.count_tokens;
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
@@ -1346,11 +1428,14 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 );
             }
 
-            let request_builder = client
+            let mut request_builder = client
                 .post(&responses_url)
                 .header("Authorization", format!("Bearer {credential}"))
-                .header("Accept", "text/event-stream")
-                .json(&req);
+                .header("Accept", "text/event-stream");
+            if let Some(session) = opencode_session.as_deref() {
+                request_builder = request_builder.header(OPENCODE_SESSION_HEADER, session);
+            }
+            let request_builder = request_builder.json(&req);
 
             run_responses_sse(request_builder, &tx, count_tokens).await;
         });
@@ -1379,6 +1464,223 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiResponsesModelProvider 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn responses_completed_ignores_trailing_events_without_eof() {
+        use axum::{Router, response::IntoResponse, routing::post};
+
+        let app = Router::new().route(
+            "/responses",
+            post(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"output_text\":\"fallback\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"after-terminal\"}\n\n",
+                    ))
+                });
+                let open = futures_util::stream::pending::<
+                    Result<axum::body::Bytes, std::convert::Infallible>,
+                >();
+                axum::body::Body::from_stream(first.chain(open)).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses SSE test server");
+        let addr = listener.local_addr().expect("Responses SSE test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Responses SSE test");
+        });
+        let request = reqwest::Client::new().post(format!("http://{addr}/responses"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_responses_sse(request, &tx, false),
+        )
+        .await
+        .expect("response.completed must finish without waiting for EOF");
+        drop(tx);
+        server.abort();
+
+        let mut text = None;
+        let mut saw_final = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                Ok(StreamEvent::TextDelta(chunk)) => text = Some(chunk.delta),
+                Ok(StreamEvent::Final) => saw_final = true,
+                _ => {}
+            }
+        }
+        assert_eq!(text.as_deref(), Some("fallback"));
+        assert!(saw_final, "response.completed must emit Final");
+    }
+
+    #[tokio::test]
+    async fn responses_chat_propagates_usage() {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let app = Router::new().route(
+            "/responses",
+            post(|| async {
+                Json(serde_json::json!({
+                    "output_text": "ok",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 120,
+                        "input_tokens_details": {"cached_tokens": 45},
+                        "output_tokens": 30
+                    }
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{addr}"))
+            .credential(Some("test-key"))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-4o-mini",
+                None,
+            )
+            .await
+            .expect("chat should succeed");
+
+        let usage = response
+            .usage
+            .expect("provider-reported usage should propagate");
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.cached_input_tokens, Some(45));
+        assert_eq!(usage.output_tokens, Some(30));
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_provider_honors_runtime_proxy_config() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{ProxyConfig, ProxyScope, set_runtime_proxy_config};
+
+        async fn proxy_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "proxied",
+                "output": []
+            }))
+        }
+
+        async fn direct_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "direct",
+                "output": []
+            }))
+        }
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_app = Router::new()
+            .fallback(proxy_response)
+            .with_state(Arc::clone(&proxy_hits));
+        let proxy_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(proxy_listener, proxy_app).await.unwrap();
+        });
+
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let direct_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = direct_listener.local_addr().unwrap();
+        let direct_app = Router::new()
+            .route("/responses", post(direct_response))
+            .with_state(Arc::clone(&direct_hits));
+        let direct_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(direct_listener, direct_app).await.unwrap();
+        });
+
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some(format!("http://{proxy_addr}")),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.openai".to_string()],
+            ..Default::default()
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{direct_addr}"))
+            .credential(Some("test-key"))
+            .build();
+        let client = provider.http_client();
+        let streaming_client = provider.streaming_client();
+        set_runtime_proxy_config(ProxyConfig::default());
+
+        let response = client
+            .post(&provider.responses_url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("responses request should succeed through runtime proxy");
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .expect("proxy should return a Responses-shaped JSON body");
+        let streaming_response = streaming_client
+            .post(&provider.responses_url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("streaming responses request should succeed through runtime proxy");
+        let streaming_body: serde_json::Value = streaming_response
+            .json()
+            .await
+            .expect("proxy should return a Responses-shaped JSON body");
+
+        proxy_server.abort();
+        direct_server.abort();
+
+        assert_eq!(
+            body.get("output_text").and_then(serde_json::Value::as_str),
+            Some("proxied"),
+            "Responses requests must use the runtime proxy client path for model_provider.openai"
+        );
+        assert_eq!(
+            streaming_body
+                .get("output_text")
+                .and_then(serde_json::Value::as_str),
+            Some("proxied"),
+            "streaming Responses requests must use the runtime proxy client path for model_provider.openai"
+        );
+        assert_eq!(
+            proxy_hits.load(Ordering::SeqCst),
+            2,
+            "runtime proxy server should receive the Responses request"
+        );
+        assert_eq!(
+            direct_hits.load(Ordering::SeqCst),
+            0,
+            "direct Responses endpoint must not be contacted when the runtime proxy applies"
+        );
+    }
 
     #[test]
     fn creates_with_key() {
@@ -1411,6 +1713,37 @@ mod tests {
             .credential(None)
             .build();
         assert_eq!(p.responses_url, RESPONSES_URL);
+    }
+
+    #[test]
+    fn opencode_session_header_follows_the_built_request_destination() {
+        // Header selection must agree with the parser that addresses the
+        // request, not with a textual reading of the configured URI.
+        for (api_url, expected_host) in [
+            // `\` ends the authority; `@opencode.ai/zen/v1` is only path.
+            (
+                "https://relay.example\\@opencode.ai/zen/v1",
+                "relay.example",
+            ),
+            // A percent-encoded host decodes to the relay.
+            ("https://%6fpencode.ai/zen/v1", "opencode.ai"),
+        ] {
+            let provider = OpenAiResponsesModelProvider::builder("opencode")
+                .api_url(api_url)
+                .credential(Some("test-key"))
+                .build();
+            let request = provider
+                .apply_opencode_session_header(reqwest::Client::new().post(&provider.responses_url))
+                .build()
+                .expect("request must build");
+            let host = request.url().host_str().expect("request must have a host");
+            assert_eq!(host, expected_host, "{api_url}");
+            assert_eq!(
+                request.headers().contains_key(OPENCODE_SESSION_HEADER),
+                host == "opencode.ai",
+                "{api_url}: header selection must match the request host {host}"
+            );
+        }
     }
 
     #[test]
@@ -1697,6 +2030,25 @@ mod tests {
     }
 
     #[test]
+    fn string_completion_rejects_empty_and_think_only_text() {
+        for text in ["", "  \n", "<think>internal reasoning</think>"] {
+            let error = require_terminal_text(text.to_string())
+                .expect_err("a string-only semantic-empty completion must fail");
+            assert!(error.chain().any(|cause| {
+                cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+            }));
+        }
+    }
+
+    #[test]
+    fn string_completion_keeps_visible_text() {
+        assert_eq!(
+            require_terminal_text("final answer".to_string()).unwrap(),
+            "final answer"
+        );
+    }
+
+    #[test]
     fn request_serializes_with_system_message() {
         let req = ChatRequest {
             model: "gpt-4o".to_string(),
@@ -1793,18 +2145,18 @@ mod tests {
     // ----------------------------------------------------------
 
     #[test]
-    fn reasoning_content_fallback_empty_content() {
+    fn reasoning_content_does_not_become_empty_final_content() {
         let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Thinking..."}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.effective_content(), "Thinking...");
+        assert_eq!(resp.choices[0].message.effective_content(), "");
     }
 
     #[test]
-    fn reasoning_content_fallback_null_content() {
+    fn reasoning_content_does_not_become_missing_final_content() {
         let json =
             r#"{"choices":[{"message":{"content":null,"reasoning_content":"Thinking..."}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.effective_content(), "Thinking...");
+        assert_eq!(resp.choices[0].message.effective_content(), "");
     }
 
     #[test]
@@ -1815,12 +2167,12 @@ mod tests {
     }
 
     #[test]
-    fn native_response_reasoning_content_fallback() {
+    fn native_response_reasoning_content_does_not_become_final_text() {
         let json =
             r#"{"choices":[{"message":{"content":"","reasoning_content":"Native thinking"}}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), Some("Native thinking".to_string()));
+        assert_eq!(msg.effective_content(), None);
     }
 
     #[test]
@@ -1946,7 +2298,19 @@ mod tests {
         let message = resp.choices.into_iter().next().unwrap().message;
         let parsed = OpenAiModelProvider::parse_native_response(message);
         assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
+        assert_eq!(parsed.text.as_deref(), Some("answer"));
         assert_eq!(parsed.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_native_response_rejects_reasoning_only_terminal_text() {
+        let json =
+            r#"{"choices":[{"message":{"content":"","reasoning_content":"thinking step"}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let message = resp.choices.into_iter().next().unwrap().message;
+        let parsed = OpenAiModelProvider::parse_native_response(message);
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
+        assert!(parsed.is_semantically_empty_terminal());
     }
 
     #[test]

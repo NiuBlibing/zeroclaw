@@ -40,6 +40,7 @@ pub mod retrieval;
 pub mod scanned;
 pub mod snapshot;
 pub mod sqlite;
+mod sqlite_permissions;
 pub mod threat;
 pub mod traits;
 pub mod vector;
@@ -175,7 +176,13 @@ where
                  call create_memory_with_storage_and_routes instead of create_memory_with_builders"
             )
         }
-        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => wrap_scanned_and_audit(
+        MemoryBackendKind::Qdrant => {
+            anyhow::bail!(
+                "memory backend 'qdrant' is not supported by this operation; choose sqlite, lucid, \
+                 or markdown"
+            )
+        }
+        MemoryBackendKind::Markdown => wrap_scanned_and_audit(
             MarkdownMemory::new("markdown", workspace_dir),
             policy,
             workspace_dir,
@@ -219,6 +226,33 @@ pub fn is_assistant_autosave_key(key: &str) -> bool {
 pub fn is_user_autosave_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
     normalized == "user_msg" || normalized.starts_with("user_msg_")
+}
+
+/// Whether a turn's origin permits autosaving its user-side text as a
+/// Conversation memory.
+///
+/// Turn origin is trusted caller provenance, not proof that a person authored
+/// the text. `Interactive`, `Channel`, and `AgentDirect` remain autosave-
+/// eligible because each can carry user-facing or externally supplied text.
+/// On a scheduled turn (cron, heartbeat), however, the "user message" is an
+/// operator-configured task prompt, and on a sub-turn it is text the parent
+/// turn composed. Storing either as a `user_msg` row feeds known internal
+/// synthetic text back into recall.
+///
+/// This is the load-bearing gate; [`should_skip_autosave_content`] is a
+/// content-shape backstop for stored histories and origin-less surfaces. The
+/// content filter alone is defeatable — a heartbeat prompt with session
+/// context prepended no longer starts with `[Heartbeat Task`, and leaked
+/// that way in production — which is why suppression keys on origin first.
+///
+/// Exhaustive match on purpose: a new origin variant must decide its
+/// autosave posture here explicitly.
+pub fn should_autosave_origin(origin: zeroclaw_api::ingress::TurnOrigin) -> bool {
+    use zeroclaw_api::ingress::TurnOrigin;
+    match origin {
+        TurnOrigin::Interactive | TurnOrigin::Channel | TurnOrigin::AgentDirect => true,
+        TurnOrigin::Cron | TurnOrigin::Daemon | TurnOrigin::SubTurn => false,
+    }
 }
 
 /// Filter known synthetic autosave noise patterns that should not be
@@ -1721,6 +1755,49 @@ mod tests {
         ));
     }
 
+    /// The full truth table. User-facing or external-capable origins preserve
+    /// their existing autosave behavior; known scheduled and parent-composed
+    /// origins do not qualify.
+    #[test]
+    fn autosave_origin_allows_user_facing_and_external_capable_turns() {
+        use zeroclaw_api::ingress::TurnOrigin;
+
+        assert!(should_autosave_origin(TurnOrigin::Interactive));
+        assert!(should_autosave_origin(TurnOrigin::Channel));
+        assert!(should_autosave_origin(TurnOrigin::AgentDirect));
+
+        assert!(!should_autosave_origin(TurnOrigin::Cron));
+        assert!(!should_autosave_origin(TurnOrigin::Daemon));
+        assert!(!should_autosave_origin(TurnOrigin::SubTurn));
+    }
+
+    /// The production leak this gate exists for: a heartbeat prompt with
+    /// session context prepended starts with the context header, not
+    /// `[Heartbeat Task`, so the content filter misses it — every tick
+    /// stored the full synthetic prompt (quoted prior conversation
+    /// included) as a fresh user message. The content filter's miss is
+    /// pinned deliberately: it documents that the prefix check is a
+    /// backstop, and the origin gate is what actually stops this shape.
+    #[test]
+    fn heartbeat_session_context_shape_defeats_the_content_filter_but_not_the_origin_gate() {
+        use zeroclaw_api::ingress::TurnOrigin;
+
+        let leaked = "[Recent conversation history — use this for context when composing                       your message] (last message ~5 minutes ago)
+User: how was the deploy?
+                      You: all green.
+
+[Heartbeat Task | high] check the build";
+
+        assert!(
+            !should_skip_autosave_content(leaked),
+            "the content filter does not catch the prepended-context shape;              if this starts passing, the origin gate has a redundant partner — update this test"
+        );
+        assert!(
+            !should_autosave_origin(TurnOrigin::Daemon),
+            "the origin gate is what stops the heartbeat leak"
+        );
+    }
+
     #[test]
     fn factory_markdown() {
         let tmp = TempDir::new().unwrap();
@@ -1757,11 +1834,9 @@ if [ "${{1:-}}" = "store" ]; then
   printf 'store-start:%s\n' "${{2:-}}" >> "{}"
   case "${{2:-}}" in
     fast_store:*)
-      sleep 0.1
       printf 'fast-store-complete\n' >> "{}"
       ;;
     slow_store:*)
-      sleep 1.2
       printf 'slow-store-complete\n' >> "{}"
       ;;
   esac
@@ -1769,7 +1844,6 @@ if [ "${{1:-}}" = "store" ]; then
 fi
 if [ "${{1:-}}" = "context" ]; then
   printf 'context-start\n' >> "{}"
-  sleep 1.0
   printf 'context-complete\n' >> "{}"
   cat <<'EOF'
 <lucid-context>
@@ -1824,18 +1898,25 @@ backend = "lucid.selected"
 
 [storage.lucid.selected]
 binary_path = "{selected_cmd}"
-recall_timeout_ms = 200
-store_timeout_ms = 500
+recall_timeout_ms = 10000
+store_timeout_ms = 20000
 
 [storage.lucid.decoy]
 binary_path = "{decoy_cmd}"
-recall_timeout_ms = 900
-store_timeout_ms = 900
+recall_timeout_ms = 30000
+store_timeout_ms = 40000
 "#
         );
         let mut config: Config = toml::from_str(&raw).expect("parse Lucid aliases");
         config.data_dir = tmp.path().to_path_buf();
         config.validate().expect("Lucid aliases must validate");
+
+        let local = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let configured = build_lucid_memory(tmp.path(), local, config.resolve_active_storage());
+        let (lucid_cmd, recall_timeout, store_timeout) = configured.test_process_config();
+        assert_eq!(lucid_cmd, selected_cmd);
+        assert_eq!(recall_timeout, std::time::Duration::from_secs(10));
+        assert_eq!(store_timeout, std::time::Duration::from_secs(20));
 
         let memory =
             create_memory_from_config(&config, None).expect("build Lucid memory from parsed alias");
@@ -1860,14 +1941,13 @@ store_timeout_ms = 900
             .unwrap();
         let entries = memory.recall("factory", 5, None, None, None).await.unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
         let selected_calls = fs::read_to_string(&selected_log).unwrap_or_default();
         assert!(selected_calls.contains("store-start:fast_store:"));
         assert!(selected_calls.contains("fast-store-complete"));
         assert!(selected_calls.contains("store-start:slow_store:"));
-        assert!(!selected_calls.contains("slow-store-complete"));
+        assert!(selected_calls.contains("slow-store-complete"));
         assert!(selected_calls.contains("context-start"));
-        assert!(!selected_calls.contains("context-complete"));
+        assert!(selected_calls.contains("context-complete"));
         assert!(!decoy_log.exists(), "unselected Lucid alias was invoked");
         assert!(
             entries
@@ -1877,7 +1957,7 @@ store_timeout_ms = 900
         assert!(
             entries
                 .iter()
-                .all(|entry| !entry.content.contains("Factory-selected remote result"))
+                .any(|entry| entry.content.contains("Factory-selected remote result"))
         );
     }
 
@@ -1898,13 +1978,13 @@ backend = "lucid.selected"
 
 [storage.lucid.selected]
 binary_path = "{selected_cmd}"
-recall_timeout_ms = 200
-store_timeout_ms = 500
+recall_timeout_ms = 10000
+store_timeout_ms = 20000
 
 [storage.lucid.decoy]
 binary_path = "{decoy_cmd}"
-recall_timeout_ms = 900
-store_timeout_ms = 900
+recall_timeout_ms = 30000
+store_timeout_ms = 40000
 "#
         );
         let mut config: Config = toml::from_str(&raw).expect("parse Lucid aliases");
@@ -2014,6 +2094,57 @@ store_timeout_ms = 900
             error.to_string().contains("full Config"),
             "error should require config-aware construction: {error}"
         );
+    }
+
+    /// Regression for the builder-only factory: `qdrant` must never silently
+    /// degrade to the Markdown fallback. On the pre-fix code this returned a
+    /// working handle named "markdown"; now it is an explicit error naming
+    /// supported targets without exposing an internal factory function.
+    #[test]
+    fn builder_only_factory_rejects_qdrant_instead_of_markdown_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.memory.backend = "qdrant".into();
+        config.data_dir = tmp.path().to_path_buf();
+        let error = create_memory_for_migration(&config)
+            .err()
+            .expect("backend=qdrant must be rejected by the builder-only factory");
+        let message = error.to_string();
+        assert!(
+            message.contains("not supported")
+                && message.contains("sqlite")
+                && message.contains("lucid")
+                && message.contains("markdown"),
+            "error should direct operators to supported targets: {message}"
+        );
+        assert!(!message.contains("create_memory_"));
+    }
+
+    /// The storage-aware factory still accepts Qdrant when a
+    /// `[storage.qdrant.<alias>]` entry with a URL resolves (construction is
+    /// lazy; no server contact happens here).
+    #[test]
+    fn storage_aware_factory_still_builds_qdrant_with_storage_config() {
+        use zeroclaw_config::schema::QdrantStorageConfig;
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "qdrant.default".into(),
+            ..MemoryConfig::default()
+        };
+        let storage = QdrantStorageConfig {
+            url: Some("http://localhost:6333".into()),
+            ..QdrantStorageConfig::default()
+        };
+        let mem = create_memory_with_storage_and_routes(
+            &cfg,
+            &[],
+            ActiveStorage::Qdrant(&storage),
+            tmp.path(),
+            None,
+            None,
+        )
+        .expect("qdrant with resolved storage config must still construct");
+        assert_eq!(mem.name(), "qdrant");
     }
 
     #[test]

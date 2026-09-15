@@ -129,6 +129,11 @@ rc-update add zeroclaw default    # start on boot
 
 </div>
 
+OpenRC keeps daemon output in `/var/log/zeroclaw/access.log` and
+`/var/log/zeroclaw/error.log`. Each file retains recent output within an 8 MiB
+bound. Reinstall and restart the service after upgrading so the generated init
+script uses bounded logger processes.
+
 ## macOS: LaunchAgent
 
 `zeroclaw service install` writes `~/Library/LaunchAgents/com.zeroclaw.daemon.plist` and loads it.
@@ -145,7 +150,7 @@ launchctl load ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 
 </div>
 
-Logs go to `<config-dir>/logs/` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `~/.zeroclaw/logs/`). Homebrew installs write to `$HOMEBREW_PREFIX/var/zeroclaw/logs/` instead.
+Logs go to `<config-dir>/logs/` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `~/.zeroclaw/logs/`). Homebrew installs write to `$HOMEBREW_PREFIX/var/zeroclaw/logs/` instead. Each launchd capture file retains recent output within an 8 MiB bound. Reinstall and restart the service after upgrading so the generated LaunchAgent uses bounded capture. `zeroclaw service logs` tails whichever of the two files hold output, so a daemon that only writes to stdout still shows up; `--follow` watches both, so a failure written to `daemon.stderr.log` after startup still reaches a running viewer. When more than one file is shown, `tail` labels each block with a `==> path <==` header.
 
 ### Homebrew-managed
 
@@ -175,7 +180,7 @@ Don't mix `zeroclaw service` CLI commands with `brew services`, pick one. Both e
 
 Verify in Task Scheduler GUI (`taskschd.msc`) under Task Scheduler Library → ZeroClaw Daemon.
 
-Logs go to `<config-dir>\logs\` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `%USERPROFILE%\.zeroclaw\logs\`):
+Logs go to `<config-dir>\logs\` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `%USERPROFILE%\.zeroclaw\logs\`). `zeroclaw service logs` prints whichever of the two files hold output, and `--follow` shows the others first and then streams `daemon.stdout.log`, or `daemon.stderr.log` when only that file holds output, because `Get-Content -Wait` tracks a single path. To read one directly:
 
 <div class="os-tabs-src">
 

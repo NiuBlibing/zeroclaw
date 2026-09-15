@@ -273,7 +273,7 @@ zeroclaw channel doctor
 `zeroclaw channel doctor` constructs transport adapters without the daemon's live SOP engine and
 audit handles. It can check ordinary channel transports, but it does not prove that MQTT,
 filesystem, or AMQP SOP dispatch can start a run. For those sources, start `zeroclaw daemon` with
-`sop.sops_dir` configured, then inspect the source connection and `SOP ingress` log events. An AMQP
+the SOP runtime enabled (`sop.sops_dir` set to a non-empty value; unset by default, which disables it; the documented value is `shared/sops`), then inspect the source connection and `SOP ingress` log events. An AMQP
 channel using `dispatch = "sop"` or `"sop_and_agent_loop"` fails closed at daemon startup when the
 SOP handles are unavailable; it is intentionally omitted from the doctor work list in that state.
 
@@ -338,7 +338,7 @@ See [Security → Autonomy levels](../security/autonomy.md).
 
 ### Tool invocations fail inside Docker sandbox
 
-- Container image isn't pulled, run `docker pull <image>` for whatever you have configured under `[security.sandbox].image` (default: `alpine:latest`)
+- Container image isn't pulled, run `docker pull <image>` for the image the sandbox uses. That is `sandbox_image` on the active risk profile (`[risk_profiles.<name>].sandbox_image`), or `alpine:latest` when it is unset
 - Docker daemon not reachable from the ZeroClaw user, check `docker info`
 - Tool needs a device that's not passed through, extend `allow_devices`
 

@@ -267,20 +267,28 @@ impl<'a> InfoBar<'a> {
 }
 
 /// Truncate `s` to at most `width` display columns, appending an ellipsis when
-/// it overflows. Approximates width by `char` count — adequate for the
-/// single-line status text the info bar carries.
-fn truncate_to_width(s: &str, width: usize) -> String {
+/// it overflows. Grapheme boundaries and terminal display width stay aligned
+/// with the renderer and hit geometry.
+pub(crate) fn truncate_to_width(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    if s.chars().count() <= width {
+    if crate::display_width::display_width(s) <= width {
         return s.to_string();
     }
     if width == 1 {
         return "\u{2026}".to_string();
     }
     let keep = width - 1;
-    let mut out: String = s.chars().take(keep).collect();
+    let mut used = 0usize;
+    let mut out = String::new();
+    for (_, grapheme, grapheme_width) in crate::display_width::grapheme_widths(s) {
+        if used + grapheme_width > keep {
+            break;
+        }
+        out.push_str(grapheme);
+        used += grapheme_width;
+    }
     out.push('\u{2026}');
     out
 }
@@ -292,6 +300,7 @@ use ratatui::{
     layout::Rect,
     widgets::{Block, Borders, Clear, List, ListItem, ListState},
 };
+use unicode_width::UnicodeWidthStr;
 
 pub struct PickerModal<'a> {
     title: &'a str,
@@ -317,10 +326,10 @@ impl<'a> PickerModal<'a> {
         // on the same rows the user sees.
         let longest = items
             .iter()
-            .map(|s| s.chars().count())
+            .map(|s| UnicodeWidthStr::width(s.as_str()))
             .max()
             .unwrap_or(0)
-            .max(title.chars().count());
+            .max(UnicodeWidthStr::width(title));
         let inner_w = longest + 2; // 1 col padding each side
         let box_w = (inner_w + 2).clamp(12, area.width as usize) as u16;
         let box_h = (items.len() + 2).clamp(3, area.height as usize) as u16;
@@ -441,6 +450,13 @@ mod info_bar_tests {
     }
 
     #[test]
+    fn truncate_respects_wide_grapheme_columns() {
+        let truncated = truncate_to_width("agent界界", 7);
+        assert_eq!(truncated, "agent\u{2026}");
+        assert_eq!(crate::display_width::display_width(&truncated), 6);
+    }
+
+    #[test]
     fn fresh_message_is_not_expired() {
         let m = InfoMessage::info("hi");
         assert!(!m.is_expired());
@@ -472,6 +488,25 @@ mod info_bar_tests {
 #[cfg(test)]
 mod picker_tests {
     use super::*;
+
+    #[test]
+    fn area_for_uses_display_width_for_wide_items() {
+        let items = vec!["界界界界界界".to_string()];
+
+        let area = PickerModal::area_for("Pick", &items, Rect::new(0, 0, 80, 24)).unwrap();
+
+        assert_eq!(area.width, 16);
+    }
+
+    #[test]
+    fn area_for_uses_display_width_for_wide_title() {
+        let items = vec!["one".to_string()];
+
+        let area =
+            PickerModal::area_for("界界界界界界界", &items, Rect::new(0, 0, 80, 24)).unwrap();
+
+        assert_eq!(area.width, 18);
+    }
 
     #[test]
     fn new_defaults_to_first_when_no_default() {

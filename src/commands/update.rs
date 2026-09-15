@@ -297,7 +297,7 @@ pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
             // companion, the `web/dist` dashboard bundle, …). Best-effort:
             // the validated main binary is already in place and must not be
             // rolled back if these fail.
-            install_companion_artifacts(&staging, &current_exe).await;
+            install_companion_artifacts(&staging, &current_exe, &host_dashboard_candidates()).await;
             println!("{}", update_success_message(&update_info.latest_version));
             println!("{}", prebuilt_channel_note_message());
             Ok(())
@@ -603,9 +603,11 @@ fn main_binary_name() -> &'static str {
 /// mirrors (currently: `zerocode` next to `zeroclaw`, plus the `web/dist`
 /// directory that's handled by the whole-directory swap above).
 #[cfg(windows)]
-const KNOWN_COMPANION_FILES: &[&str] = &["zerocode.exe"];
+const ZEROCODE_BINARY_NAME: &str = "zerocode.exe";
 #[cfg(not(windows))]
-const KNOWN_COMPANION_FILES: &[&str] = &["zerocode"];
+const ZEROCODE_BINARY_NAME: &str = "zerocode";
+
+const KNOWN_COMPANION_FILES: &[&str] = &[ZEROCODE_BINARY_NAME];
 
 fn is_known_companion(name: &str) -> bool {
     KNOWN_COMPANION_FILES.contains(&name)
@@ -992,12 +994,16 @@ async fn smoke_test(binary: &Path) -> Result<()> {
 /// Best-effort by design — the `zeroclaw` binary has already been swapped and
 /// smoke-tested. A failure here (e.g. an unwritable data directory) is logged
 /// and swallowed rather than failing or rolling back an otherwise-good update.
-async fn install_companion_artifacts(staging: &Path, current_exe: &Path) {
+async fn install_companion_artifacts(
+    staging: &Path,
+    current_exe: &Path,
+    host_candidates: &[PathBuf],
+) {
     // 1. Dashboard bundle, if present: swap the whole `web/dist` directory so a
     //    stale file removed in a release is *gone*, not orphaned in place.
     let staged_web_dist = staging.join("web").join("dist");
     if staged_web_dist.is_dir() {
-        match install_web_dist(&staged_web_dist, current_exe).await {
+        match install_web_dist(&staged_web_dist, current_exe, host_candidates).await {
             Ok(target) => ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1213,8 +1219,12 @@ async fn swap_file(new: &Path, target: &Path) -> Result<()> {
 ///   have open handles), but `remove_dir_all` of the sidelined tree fails as
 ///   long as any file inside is held open. The leftover `.<name>.update-old-*`
 ///   directory is cleaned up by `sweep_update_residue` on the next update.
-async fn install_web_dist(staged_dist: &Path, current_exe: &Path) -> Result<PathBuf> {
-    let target = resolve_web_dist_target(current_exe);
+async fn install_web_dist(
+    staged_dist: &Path,
+    current_exe: &Path,
+    host_candidates: &[PathBuf],
+) -> Result<PathBuf> {
+    let target = resolve_web_dist_target(current_exe, host_candidates);
     let parent = target
         .parent()
         .context("web dashboard target has no parent")?;
@@ -1282,32 +1292,27 @@ async fn install_web_dist(staged_dist: &Path, current_exe: &Path) -> Result<Path
 /// gateway's dashboard auto-detection ([`crates/zeroclaw-gateway/src/lib.rs`])
 /// and `install.sh`:
 ///   1. existing `web/dist` next to the running binary (dev / packaged), or
-///   2. Docker layout `/zeroclaw-data/web/dist`, or
-///   3. system package layout `/usr/share/zeroclawlabs/web/dist`, or
-///   4. platform data dir `…/zeroclaw/web/dist` (prebuilt installer), or
-///   5. **fallback**: `web/dist` next to the running binary, even if it does
+///   2. one of `host_candidates` (Docker / system-package / platform data-dir
+///      layouts — see [`host_dashboard_candidates`]), or
+///   3. **fallback**: `web/dist` next to the running binary, even if it does
 ///      not yet exist — write *somewhere* so a fresh install gets a dashboard.
+///
+/// `host_candidates` is a parameter so unit tests can scope it to `&[]` and
+/// run hermetically against a tempdir binary, regardless of whether the host
+/// already has a dashboard installed (which would otherwise divert the target).
+/// Production callers pass [`host_dashboard_candidates`].
 ///
 /// The custom-config path (`gateway.web_dist_dir`) is intentionally ignored;
 /// reading the config here would couple this command to gateway internals and
 /// the operator can always re-run with `--force` after fixing the layout.
-fn resolve_web_dist_target(current_exe: &Path) -> PathBuf {
+fn resolve_web_dist_target(current_exe: &Path, host_candidates: &[PathBuf]) -> PathBuf {
     let binary_adjacent = current_exe.parent().map(|p| p.join("web").join("dist"));
 
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(ref p) = binary_adjacent {
         candidates.push(p.clone());
     }
-    candidates.push(PathBuf::from("/zeroclaw-data/web/dist"));
-    candidates.push(PathBuf::from("/usr/share/zeroclawlabs/web/dist"));
-    if let Some(base) = directories::BaseDirs::new() {
-        candidates.push(
-            base.data_local_dir()
-                .join("zeroclaw")
-                .join("web")
-                .join("dist"),
-        );
-    }
+    candidates.extend_from_slice(host_candidates);
     for c in &candidates {
         if c.join("index.html").is_file() {
             return c.clone();
@@ -1315,6 +1320,28 @@ fn resolve_web_dist_target(current_exe: &Path) -> PathBuf {
     }
     // Fallback: write next to the binary even if nothing existed yet.
     binary_adjacent.unwrap_or_else(|| PathBuf::from("web/dist"))
+}
+
+/// Absolute dashboard install locations outside the binary's own tree, in
+/// precedence order: the Docker layout, the system package layout, and the
+/// prebuilt-installer platform data dir. Extracted from
+/// [`resolve_web_dist_target`] so unit tests can run the resolver hermetically
+/// against a tempdir binary without consulting the real host layout — which
+/// may already hold a ZeroClaw dashboard and so divert the install target.
+fn host_dashboard_candidates() -> Vec<PathBuf> {
+    let mut c = vec![
+        PathBuf::from("/zeroclaw-data/web/dist"),
+        PathBuf::from("/usr/share/zeroclawlabs/web/dist"),
+    ];
+    if let Some(base) = directories::BaseDirs::new() {
+        c.push(
+            base.data_local_dir()
+                .join("zeroclaw")
+                .join("web")
+                .join("dist"),
+        );
+    }
+    c
 }
 
 /// Recursively copy `src` into `dst`. Used as the cross-filesystem fallback
@@ -1893,7 +1920,7 @@ mod tests {
     #[test]
     fn unpack_tar_gz_writes_main_binary() {
         let fake_binary = b"#!/bin/sh\necho zeroclaw";
-        let gz_buf = make_tar_gz(&[("zeroclaw", fake_binary)]);
+        let gz_buf = make_tar_gz(&[(main_binary_name(), fake_binary)]);
 
         let tmp = tempfile::tempdir().unwrap();
         let staging = tmp.path().join("staging");
@@ -1912,9 +1939,10 @@ mod tests {
         let zerocode = b"#!/bin/sh\necho zerocode";
         let index = b"<!doctype html><title>dash</title>";
         let asset = b"console.log('app')";
+        let companion_name = ZEROCODE_BINARY_NAME;
         let gz_buf = make_tar_gz(&[
-            ("zeroclaw", zeroclaw),
-            ("zerocode", zerocode),
+            (main_binary_name(), zeroclaw),
+            (companion_name, zerocode),
             ("web/dist/index.html", index),
             ("web/dist/assets/app.js", asset),
         ]);
@@ -1926,7 +1954,10 @@ mod tests {
 
         let binary = locate_main_binary(&staging).unwrap();
         assert_eq!(std::fs::read(&binary).unwrap(), zeroclaw);
-        assert_eq!(std::fs::read(staging.join("zerocode")).unwrap(), zerocode);
+        assert_eq!(
+            std::fs::read(staging.join(companion_name)).unwrap(),
+            zerocode
+        );
         assert_eq!(
             std::fs::read(staging.join("web").join("dist").join("index.html")).unwrap(),
             index
@@ -2143,7 +2174,7 @@ mod tests {
         std::fs::write(bin_dir.join("web/dist/index.html"), b"<html>").unwrap();
         let exe = bin_dir.join("zeroclaw");
 
-        let target = resolve_web_dist_target(&exe);
+        let target = resolve_web_dist_target(&exe, &[]);
         assert_eq!(target, bin_dir.join("web").join("dist"));
     }
 
@@ -2155,12 +2186,37 @@ mod tests {
         let exe = tmp.path().join("bin").join("zeroclaw");
         std::fs::create_dir_all(tmp.path().join("bin")).unwrap();
 
-        let target = resolve_web_dist_target(&exe);
+        let target = resolve_web_dist_target(&exe, &[]);
         // Fallback either lands on the binary-adjacent dir or on the platform
         // data dir, depending on whether `/usr/share/zeroclawlabs/web/dist`
         // happens to exist on the runner. Both are acceptable; what matters is
         // it does not error.
         assert!(target.ends_with("web/dist"));
+    }
+
+    #[test]
+    fn resolve_web_dist_target_ignores_host_dashboard_when_candidates_empty() {
+        // A host that already has a dashboard installed must not divert the
+        // resolver off the binary-adjacent target when the caller scopes host
+        // candidates to none — the hermetic surface the unit tests rely on.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe = bin_dir.join("zeroclaw");
+
+        // Stands in for the platform data dir on a host with an install.
+        let host_dashboard = tmp.path().join("host-install").join("web").join("dist");
+        std::fs::create_dir_all(&host_dashboard).unwrap();
+        std::fs::write(host_dashboard.join("index.html"), b"host").unwrap();
+
+        // With the host candidate injected, the scan still honors it.
+        let diverted = resolve_web_dist_target(&exe, std::slice::from_ref(&host_dashboard));
+        assert_eq!(diverted, host_dashboard);
+
+        // With no host candidates, the host dashboard is ignored and the
+        // resolver falls back to the binary-adjacent path.
+        let hermetic = resolve_web_dist_target(&exe, &[]);
+        assert_eq!(hermetic, bin_dir.join("web").join("dist"));
     }
 
     #[tokio::test]
@@ -2185,7 +2241,7 @@ mod tests {
         std::fs::write(staged_dist.join("index.html"), b"NEW INDEX").unwrap();
         std::fs::write(staged_dist.join("brand-new.txt"), b"fresh").unwrap();
 
-        let installed = install_web_dist(&staged_dist, &exe).await.unwrap();
+        let installed = install_web_dist(&staged_dist, &exe, &[]).await.unwrap();
         // Installs adjacent because old_dist already contains index.html.
         assert_eq!(installed, old_dist);
         assert_eq!(
@@ -2225,22 +2281,23 @@ mod tests {
         // top-level files are covered by the sibling test below.
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
+        let companion_name = ZEROCODE_BINARY_NAME;
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let exe = bin_dir.join("zeroclaw");
+        let exe = bin_dir.join(main_binary_name());
         std::fs::write(&exe, b"zeroclaw").unwrap();
-        std::fs::write(bin_dir.join("zerocode"), b"old zerocode").unwrap();
+        std::fs::write(bin_dir.join(companion_name), b"old zerocode").unwrap();
 
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         // Main binary lives in the staged tree but must NOT be re-swapped here
         // (it was already handled by the transactional `swap_binary` path).
-        std::fs::write(staging.join("zeroclaw"), b"new zeroclaw").unwrap();
-        std::fs::write(staging.join("zerocode"), b"new zerocode").unwrap();
+        std::fs::write(staging.join(main_binary_name()), b"new zeroclaw").unwrap();
+        std::fs::write(staging.join(companion_name), b"new zerocode").unwrap();
 
-        install_companion_artifacts(&staging, &exe).await;
+        install_companion_artifacts(&staging, &exe, &[]).await;
 
         // zerocode swapped in.
-        let expected_zerocode = bin_dir.join("zerocode");
+        let expected_zerocode = bin_dir.join(companion_name);
         assert_eq!(std::fs::read(&expected_zerocode).unwrap(), b"new zerocode");
         // Main binary must be unchanged by the companion pass.
         assert_eq!(std::fs::read(&exe).unwrap(), b"zeroclaw");
@@ -2256,25 +2313,26 @@ mod tests {
     async fn install_companion_artifacts_skips_unknown_top_level_files() {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
+        let companion_name = ZEROCODE_BINARY_NAME;
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let exe = bin_dir.join("zeroclaw");
+        let exe = bin_dir.join(main_binary_name());
         std::fs::write(&exe, b"zeroclaw").unwrap();
 
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         // Known companion — must be installed.
-        std::fs::write(staging.join("zerocode"), b"new zerocode").unwrap();
+        std::fs::write(staging.join(companion_name), b"new zerocode").unwrap();
         // Unknown top-level file — must NOT be installed. This is the
         // defense-in-depth surface: a forged release cannot smuggle a
         // `zerodash`, `.bashrc`, `evil.so`, etc. next to `zeroclaw` just by
         // naming it in its own archive.
         std::fs::write(staging.join("zerodash"), b"unknown artifact").unwrap();
 
-        install_companion_artifacts(&staging, &exe).await;
+        install_companion_artifacts(&staging, &exe, &[]).await;
 
         // Known companion installed.
         assert_eq!(
-            std::fs::read(bin_dir.join("zerocode")).unwrap(),
+            std::fs::read(bin_dir.join(companion_name)).unwrap(),
             b"new zerocode"
         );
         // Unknown sibling NOT installed.
@@ -2293,13 +2351,14 @@ mod tests {
     async fn install_companion_artifacts_skips_unknown_top_level_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
+        let companion_name = ZEROCODE_BINARY_NAME;
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let exe = bin_dir.join("zeroclaw");
+        let exe = bin_dir.join(main_binary_name());
         std::fs::write(&exe, b"zeroclaw").unwrap();
 
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join("zerocode"), b"new zerocode").unwrap();
+        std::fs::write(staging.join(companion_name), b"new zerocode").unwrap();
         // An unknown directory (a future layout, a mispackaged release, …).
         std::fs::create_dir_all(staging.join("themes").join("dark")).unwrap();
         std::fs::write(staging.join("themes/dark/index.css"), b"body{}").unwrap();
@@ -2308,11 +2367,11 @@ mod tests {
         std::fs::create_dir_all(staging.join("web").join("dist")).unwrap();
         std::fs::write(staging.join("web/dist/index.html"), b"NEW INDEX").unwrap();
 
-        install_companion_artifacts(&staging, &exe).await;
+        install_companion_artifacts(&staging, &exe, &[]).await;
 
         // Known artifacts installed.
         assert_eq!(
-            std::fs::read(bin_dir.join("zerocode")).unwrap(),
+            std::fs::read(bin_dir.join(companion_name)).unwrap(),
             b"new zerocode"
         );
         assert_eq!(
@@ -2395,7 +2454,7 @@ mod tests {
         std::fs::create_dir_all(&staged_dist).unwrap();
         std::fs::write(staged_dist.join("index.html"), b"NEW").unwrap();
 
-        let installed = install_web_dist(&staged_dist, &exe).await.unwrap();
+        let installed = install_web_dist(&staged_dist, &exe, &[]).await.unwrap();
 
         assert_eq!(std::fs::read(installed.join("index.html")).unwrap(), b"NEW");
         // Previous-run sidelined directory must be swept.
@@ -2403,5 +2462,277 @@ mod tests {
             !stale.exists(),
             "install_web_dist must sweep residue from previous runs"
         );
+    }
+
+    #[cfg(windows)]
+    mod windows_runtime_tests {
+        use super::*;
+        use std::path::{Path, PathBuf};
+        use std::process::{Child, Command, Output, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CHILD_ENV: &str = "ZEROCLAW_WINDOWS_UPDATE_RUNTIME_TEST_CHILD";
+        const READY_ENV: &str = "ZEROCLAW_WINDOWS_UPDATE_RUNTIME_TEST_READY";
+        const RELEASE_ENV: &str = "ZEROCLAW_WINDOWS_UPDATE_RUNTIME_TEST_RELEASE";
+        const CHILD_TEST: &str =
+            "commands::update::tests::windows_runtime_tests::windows_update_runtime_child";
+        const POLL_INTERVAL: Duration = Duration::from_millis(10);
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+        struct LockedTestExecutable {
+            child: Option<Child>,
+            ready: PathBuf,
+            release: PathBuf,
+        }
+
+        impl LockedTestExecutable {
+            fn spawn(executable: &Path, marker_dir: &Path, label: &str) -> Self {
+                let ready = marker_dir.join(format!("{label}.ready"));
+                let release = marker_dir.join(format!("{label}.release"));
+                let child = Command::new(executable)
+                    .arg(CHILD_TEST)
+                    .arg("--exact")
+                    .arg("--test-threads=1")
+                    .env(CHILD_ENV, "1")
+                    .env(READY_ENV, &ready)
+                    .env(RELEASE_ENV, &release)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap_or_else(|error| {
+                        panic!("failed to spawn locked test executable {executable:?}: {error}")
+                    });
+                Self {
+                    child: Some(child),
+                    ready,
+                    release,
+                }
+            }
+
+            fn pid(&self) -> u32 {
+                self.child
+                    .as_ref()
+                    .expect("locked test executable must be running")
+                    .id()
+            }
+
+            fn wait_ready(&mut self) {
+                let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+                loop {
+                    if self.ready.is_file() {
+                        return;
+                    }
+                    let child_status = self
+                        .child
+                        .as_mut()
+                        .expect("locked test executable child is still present")
+                        .try_wait();
+                    match child_status {
+                        Ok(Some(status)) => {
+                            self.fail(format!(
+                                "locked test executable exited before ready: {status}"
+                            ));
+                        }
+                        Err(error) => {
+                            self.fail(format!(
+                                "failed to poll locked test executable before ready: {error}"
+                            ));
+                        }
+                        Ok(None) => {}
+                    }
+                    if Instant::now() >= deadline {
+                        self.fail("timed out waiting for locked test executable readiness".into());
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            }
+
+            fn release_and_wait(mut self) {
+                std::fs::write(&self.release, b"release").unwrap_or_else(|error| {
+                    panic!(
+                        "failed to write child release marker {:?}: {error}",
+                        self.release
+                    )
+                });
+                let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+                loop {
+                    let child_status = self
+                        .child
+                        .as_mut()
+                        .expect("locked test executable child is still present")
+                        .try_wait();
+                    match child_status {
+                        Ok(Some(status)) => {
+                            let child = self.child.take().unwrap();
+                            let output = child
+                                .wait_with_output()
+                                .expect("failed to collect locked test executable output");
+                            assert!(
+                                output.status.success(),
+                                "locked test executable exited unsuccessfully ({status}): {}",
+                                child_output(&output)
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            self.fail(format!("failed to poll released test executable: {error}"));
+                        }
+                        Ok(None) => {}
+                    }
+                    if Instant::now() >= deadline {
+                        self.fail("timed out waiting for released test executable".into());
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            }
+
+            fn fail(&mut self, reason: String) -> ! {
+                let mut child = self
+                    .child
+                    .take()
+                    .expect("locked test executable child exists");
+                let _ = child.kill();
+                let details = match child.wait_with_output() {
+                    Ok(output) => child_output(&output),
+                    Err(error) => format!("failed to collect child output: {error}"),
+                };
+                panic!("{reason}; {details}");
+            }
+        }
+
+        impl Drop for LockedTestExecutable {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        fn child_output(output: &Output) -> String {
+            format!(
+                "stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+
+        fn copy_current_test_executable(destination: &Path) {
+            let source = std::env::current_exe().expect("resolve current test executable");
+            std::fs::copy(&source, destination).unwrap_or_else(|error| {
+                panic!("copy current test executable to {destination:?}: {error}")
+            });
+        }
+
+        fn sidecar_path_for_pid(target: &Path, pid: u32, suffix: &str) -> PathBuf {
+            let mut name = target.file_name().unwrap_or_default().to_os_string();
+            name.push(format!(".{pid}.{suffix}"));
+            target.with_file_name(name)
+        }
+
+        #[test]
+        fn windows_update_runtime_child() {
+            if std::env::var(CHILD_ENV).ok().as_deref() != Some("1") {
+                return;
+            }
+            let ready = PathBuf::from(
+                std::env::var_os(READY_ENV).expect("child ready marker path must be configured"),
+            );
+            let release = PathBuf::from(
+                std::env::var_os(RELEASE_ENV)
+                    .expect("child release marker path must be configured"),
+            );
+            std::fs::write(&ready, b"ready").expect("write child ready marker");
+
+            let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+            while !release.is_file() {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for child release marker {:?}",
+                    release
+                );
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+
+        #[tokio::test]
+        async fn windows_swap_binary_handles_locked_sidecars() {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = tmp.path().join("zeroclaw.exe");
+            let preexisting_seed = tmp.path().join("preexisting.exe");
+            copy_current_test_executable(&target);
+            copy_current_test_executable(&preexisting_seed);
+
+            let mut target_child = LockedTestExecutable::spawn(&target, tmp.path(), "target");
+            target_child.wait_ready();
+            let mut preexisting_child =
+                LockedTestExecutable::spawn(&preexisting_seed, tmp.path(), "preexisting");
+            preexisting_child.wait_ready();
+
+            let parent_sidecar = sidecar_path(&target, "old");
+            assert_eq!(
+                parent_sidecar,
+                sidecar_path_for_pid(&target, std::process::id(), "old"),
+                "production sidecar must include the current process ID"
+            );
+            let preexisting_sidecar = sidecar_path_for_pid(&target, preexisting_child.pid(), "old");
+            assert_ne!(
+                parent_sidecar, preexisting_sidecar,
+                "parent sidecar must not collide with a sidecar from another process"
+            );
+            std::fs::rename(&preexisting_seed, &preexisting_sidecar).unwrap();
+
+            let new = tmp.path().join("replacement.bin");
+            std::fs::write(&new, b"replacement bytes").unwrap();
+            swap_binary(&new, &target).await.unwrap();
+
+            assert_eq!(std::fs::read(&target).unwrap(), b"replacement bytes");
+            assert!(
+                parent_sidecar.is_file(),
+                "running target must leave its parent sidecar in place"
+            );
+            assert!(
+                preexisting_sidecar.is_file(),
+                "running pre-existing sidecar must survive the sweep"
+            );
+
+            target_child.release_and_wait();
+            preexisting_child.release_and_wait();
+            sweep_stale_sidecars(&target).await;
+
+            assert!(!parent_sidecar.exists());
+            assert!(!preexisting_sidecar.exists());
+        }
+
+        #[tokio::test]
+        async fn windows_swap_failure_restores_then_rolls_back_locked_target() {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = tmp.path().join("zeroclaw.exe");
+            copy_current_test_executable(&target);
+            let original = std::fs::read(&target).unwrap();
+            let backup = tmp.path().join("zeroclaw.bak");
+            std::fs::write(&backup, b"backup bytes").unwrap();
+            let missing = tmp.path().join("missing.exe");
+
+            let mut target_child = LockedTestExecutable::spawn(&target, tmp.path(), "rollback");
+            target_child.wait_ready();
+
+            assert!(swap_binary(&missing, &target).await.is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), original);
+            assert!(!sidecar_path(&target, "old").exists());
+
+            let rollback_sidecar = sidecar_path(&target, "rollback-old");
+            rollback_binary(&backup, &target).await.unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"backup bytes");
+            assert!(
+                rollback_sidecar.is_file(),
+                "rollback residue must remain while the original image is mapped"
+            );
+
+            target_child.release_and_wait();
+            sweep_stale_sidecars(&target).await;
+            assert!(!rollback_sidecar.exists());
+        }
     }
 }

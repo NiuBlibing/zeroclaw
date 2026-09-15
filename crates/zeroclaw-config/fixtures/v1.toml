@@ -159,6 +159,7 @@ loop_ignore_tools = []
 loop_detection_enabled = true
 loop_detection_window_size = 20
 loop_detection_max_repeats = 3
+loop_detection_no_progress_min_calls = 5
 
 [skills]
 open_skills_enabled = false
@@ -323,12 +324,6 @@ enabled = false
 api_token = "linq-api-token"
 from_phone = "+15555550103"
 allowed_senders = ["+15555550104"]
-
-[channels_config.wati]
-enabled = false
-api_token = "wati-api-token"
-api_url = "https://live-mt-server.wati.io"
-allowed_numbers = ["+15555550105"]
 
 [channels_config.nextcloud_talk]
 enabled = false

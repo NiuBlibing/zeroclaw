@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
 
@@ -22,6 +23,9 @@ fn integration_entry_json(
         "category": entry.category,
         "category_label": entry.category.label(),
         "status": entry.status,
+        // Canonical config map key (provider family key / ChannelsConfig map
+        // key) for deep links; null when the entry has no config section.
+        "key": &entry.key,
     })
 }
 
@@ -121,12 +125,21 @@ pub struct CronAddBody {
     pub job_type: Option<String>,
     pub prompt: Option<String>,
     pub delivery: Option<zeroclaw_runtime::cron::DeliveryConfig>,
+    /// Agent session context: `"isolated"` (default) or `"main"`. For agent jobs,
+    /// a present value that is not one of those two names is rejected; omitted
+    /// keeps the isolated default. Same contract as the `cron_add` tool. Shell
+    /// jobs ignore this field.
     pub session_target: Option<String>,
     pub model: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
     pub delete_after_run: Option<bool>,
     /// If false, disable memory recall for this agent cron job (default: true).
     pub uses_memory: Option<bool>,
+    /// Shell output format for shell-type cron jobs. `"wrapped"` (default) or
+    /// `"raw"`. Only meaningful when `job_type` is `"shell"` (or inferred as
+    /// shell when no prompt is given). Rejected for agent jobs.
+    #[serde(default)]
+    pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +161,10 @@ pub struct CronPatchBody {
     pub enabled: Option<bool>,
     /// If false, disable memory recall for this agent cron job (default: true).
     pub uses_memory: Option<bool>,
+    /// Shell output format override. `"wrapped"` (default) or `"raw"`.
+    /// Only applied to shell-type jobs.
+    #[serde(default)]
+    pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
 }
 
 enum CronTimezonePatch {
@@ -218,6 +235,47 @@ pub struct SessionMessagePostBody {
 
 // ── Handlers ────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct StatusNodes {
+    pub connected: Vec<String>,
+    pub mdns_peers: Vec<crate::nodes::mdns::MdnsPeerSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct StatusResponse {
+    pub version: String,
+    /// Dotted `<type>.<alias>` of the resolved model provider, or `null` when none is configured.
+    /// The unqualified provider name is reserved; this field is always qualified.
+    pub model_provider: Option<String>,
+    pub model: String,
+    /// Resolved model temperature, or `null` when no temperature is configured.
+    pub temperature: Option<f64>,
+    pub uptime_seconds: u64,
+    /// RFC 3339 UTC wall-clock time when the daemon started.
+    pub daemon_started_at: String,
+    pub gateway_port: u16,
+    pub locale: String,
+    pub memory_backend: String,
+    pub paired: bool,
+    pub channels: BTreeMap<String, bool>,
+    pub nodes: StatusNodes,
+    pub health: zeroclaw_runtime::health::HealthSnapshot,
+    /// Configured agent alias used for per-agent resolution, or `null` for the install-wide view.
+    pub agent_alias: Option<String>,
+    /// Self-process resource snapshot; unsupported hosts report zero memory and a null CPU value.
+    pub process: zeroclaw_runtime::process_stats::ProcessStats,
+    /// Whether the gateway polls for newer releases and shows an update indicator.
+    pub check_updates: bool,
+    /// Whether browser-triggered self-upgrade is enabled.
+    pub allow_self_upgrade: bool,
+    /// How the daemon is restarted after an upgrade: supervised, self-respawn, or manual.
+    pub restart_mode: crate::version::RestartMode,
+    /// Operator-facing command or instruction for completing an upgrade restart.
+    pub restart_hint: String,
+}
+
 /// Query parameters for `GET /api/status`. Pass `?agent=<alias>` to
 /// have `model_provider`, `model`, `temperature`, and `memory_backend`
 /// reflect that specific agent's resolved config; omit it for the
@@ -243,10 +301,10 @@ pub async fn handle_api_status(
 
     // Per-alias map keyed by composite `<type>.<alias>`. Every
     // populated `[channels.<type>.<alias>]` is a separate dashboard row.
-    let mut channels = serde_json::Map::new();
+    let mut channels = BTreeMap::new();
     for info in config.channels_by_alias() {
         let composite = format!("{}.{}", info.channel_type, info.alias);
-        channels.insert(composite, serde_json::Value::Bool(true));
+        channels.insert(composite, true);
     }
 
     let locale = config
@@ -302,30 +360,30 @@ pub async fn handle_api_status(
     // the upgrade button, and which restart command to show afterwards.
     let restart = crate::version::detect_restart();
 
-    let body = serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "model_provider": model_provider,
-        "model": model,
-        "temperature": temperature,
-        "uptime_seconds": health.uptime_seconds,
-        "daemon_started_at": zeroclaw_runtime::health::daemon_started_at(),
-        "gateway_port": config.gateway.port,
-        "locale": locale,
-        "memory_backend": memory_backend,
-        "paired": state.pairing.is_paired(),
-        "channels": channels,
-        "nodes": {
-            "connected": state.node_registry.node_ids(),
-            "mdns_peers": state.mdns_peer_registry.snapshots(),
+    let body = StatusResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        model_provider,
+        model,
+        temperature,
+        uptime_seconds: health.uptime_seconds,
+        daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
+        gateway_port: config.gateway.port,
+        locale,
+        memory_backend,
+        paired: state.pairing.is_paired(),
+        channels,
+        nodes: StatusNodes {
+            connected: state.node_registry.node_ids(),
+            mdns_peers: state.mdns_peer_registry.snapshots(),
         },
-        "health": health,
-        "agent_alias": agent_alias,
-        "process": process,
-        "check_updates": config.gateway.check_updates,
-        "allow_self_upgrade": config.gateway.allow_self_upgrade,
-        "restart_mode": restart.mode.as_str(),
-        "restart_hint": restart.hint,
-    });
+        health,
+        agent_alias: agent_alias.map(String::from),
+        process,
+        check_updates: config.gateway.check_updates,
+        allow_self_upgrade: config.gateway.allow_self_upgrade,
+        restart_mode: restart.mode,
+        restart_hint: restart.hint,
+    };
 
     Json(body).into_response()
 }
@@ -419,6 +477,7 @@ pub async fn handle_api_cron_add(
         allowed_tools,
         delete_after_run,
         uses_memory,
+        shell_output_format,
     } = body;
 
     let config = state.config.read().clone();
@@ -452,6 +511,12 @@ pub async fn handle_api_cron_add(
         matches!(job_type.as_deref(), Some("agent")) || (job_type.is_none() && prompt.is_some());
 
     let result = if is_agent {
+        if shell_output_format.is_some() {
+            return bad_request(
+                "shell_output_format is not applicable to agent jobs; agent execution ignores it",
+            )
+            .into_response();
+        }
         let prompt = match prompt.as_deref() {
             Some(p) if !p.trim().is_empty() => p,
             _ => {
@@ -463,10 +528,13 @@ pub async fn handle_api_cron_add(
             }
         };
 
-        let session_target = session_target
-            .as_deref()
-            .map(zeroclaw_runtime::cron::SessionTarget::parse)
-            .unwrap_or_default();
+        let session_target = match session_target {
+            Some(raw) => match zeroclaw_runtime::cron::SessionTarget::try_parse(&raw) {
+                Ok(target) => target,
+                Err(e) => return bad_request(e).into_response(),
+            },
+            None => zeroclaw_runtime::cron::SessionTarget::Isolated,
+        };
 
         let default_delete = matches!(schedule, zeroclaw_runtime::cron::Schedule::At { .. });
         let delete_after_run = delete_after_run.unwrap_or(default_delete);
@@ -496,7 +564,8 @@ pub async fn handle_api_cron_add(
             }
         };
 
-        zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let fmt = shell_output_format.unwrap_or_default();
+        zeroclaw_runtime::cron::add_shell_job_with_approval_and_format(
             &config,
             &agent_alias,
             name,
@@ -504,6 +573,7 @@ pub async fn handle_api_cron_add(
             command,
             delivery,
             false,
+            fmt,
         )
     };
 
@@ -633,6 +703,7 @@ pub async fn handle_api_cron_patch(
         prompt,
         enabled,
         uses_memory,
+        shell_output_format,
     } = body;
     let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
         Ok(patch) => patch,
@@ -650,6 +721,22 @@ pub async fn handle_api_cron_patch(
         }
     };
     let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
+    if shell_output_format.is_some() {
+        if is_agent {
+            return bad_request(
+                "shell_output_format is not applicable to agent jobs; agent execution ignores it",
+            )
+            .into_response();
+        }
+        if existing.source == "declarative" {
+            return bad_request(format!(
+                "shell_output_format for declarative job '{id}' is set via \
+                 cron.{id}.shell_output_format in config.toml, not the API; \
+                 the DB column is not read for declarative jobs and this PATCH would have no effect"
+            ))
+            .into_response();
+        }
+    }
     let setting_shell_command = !is_agent && (command.is_some() || prompt.is_some());
     if setting_shell_command && config.agent(&agent_alias).is_none() {
         return (
@@ -708,6 +795,7 @@ pub async fn handle_api_cron_patch(
         prompt: patch_prompt,
         enabled,
         uses_memory,
+        shell_output_format,
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 
@@ -776,6 +864,11 @@ pub async fn handle_api_cron_settings_patch(
         return e.into_response();
     }
 
+    // Held through the swap below so a concurrent config writer can't land
+    // between this read and the save.
+    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
+        .lock_owned()
+        .await;
     let mut config = state.config.read().clone();
 
     if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) {
@@ -1657,6 +1750,38 @@ pub async fn handle_api_sessions_list(
     Json(serde_json::json!({ "sessions": sessions })).into_response()
 }
 
+/// Resolve a path `{id}` to the persisted session key.
+///
+/// `GET /api/sessions` advertises both a display `session_id` (`gw_` stripped
+/// for gateway sessions) and the full DB `session_key` for API operations.
+/// Accept either form so callers that reuse `session_key` do not get a doubled
+/// `gw_` prefix (`gw_gw_<id>`).
+///
+/// Resolution prefers **key existence** over punctuation heuristics (WebSocket
+/// clients may pick display ids that contain `_`, e.g. `team_alpha` →
+/// `gw_team_alpha`):
+/// 1. exact `id` if it already exists as a session/cancel key
+/// 2. `gw_{id}` if that exists
+/// 3. namespace fallback: keep a `gw_`-prefixed id as-is; otherwise prefix `gw_`
+fn resolve_gateway_session_key(id: &str, exists: impl Fn(&str) -> bool) -> String {
+    if exists(id) {
+        return id.to_string();
+    }
+    if !id.starts_with("gw_") {
+        let prefixed = format!("gw_{id}");
+        if exists(&prefixed) {
+            return prefixed;
+        }
+        return prefixed;
+    }
+    id.to_string()
+}
+
+/// Display session id used by WebSocket `?session_id=` / event filters.
+fn gateway_display_session_id(session_key: &str) -> &str {
+    session_key.strip_prefix("gw_").unwrap_or(session_key)
+}
+
 /// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
 pub async fn handle_api_session_messages(
     State(state): State<AppState>,
@@ -1676,14 +1801,7 @@ pub async fn handle_api_session_messages(
         .into_response();
     };
 
-    // Accept either the full DB key (channel-driven sessions like
-    // `discord.clamps_…`) or the stripped form (legacy callers that pass
-    // just the UUID for gateway sessions).
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
-    };
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
     let msgs = backend.load_with_timestamps(&session_key);
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
@@ -1731,12 +1849,8 @@ pub async fn handle_api_session_message_post(
             .into_response();
     };
 
-    let session_key = format!("gw_{id}");
-    if !backend
-        .list_sessions()
-        .iter()
-        .any(|key| key == &session_key)
-    {
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+    if !backend.session_exists(&session_key) {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -1771,11 +1885,13 @@ pub async fn handle_api_session_message_post(
             .into_response();
     }
 
-    // Use the raw dashboard session ID here to match the WS `?session_id=`
-    // query parameter; the `gw_` storage key is only for persistence.
+    // Match WS `?session_id=` / `event_matches_session` (display id), not the
+    // path string — callers that pass the full `session_key` must still notify
+    // the connected WebSocket.
+    let display_session_id = gateway_display_session_id(&session_key);
     let event = serde_json::json!({
         "type": "message",
-        "session_id": id.clone(),
+        "session_id": display_session_id,
         "role": "assistant",
         "content": body.content.clone(),
         "source": "api",
@@ -1785,7 +1901,7 @@ pub async fn handle_api_session_message_post(
 
     Json(serde_json::json!({
         "status": "ok",
-        "session_id": id,
+        "session_id": display_session_id,
         "message": {
             "role": "assistant",
             "content": message.content,
@@ -1813,11 +1929,7 @@ pub async fn handle_api_session_delete(
             .into_response();
     };
 
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
-    };
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
 
     let token = state
         .cancel_tokens
@@ -1877,11 +1989,10 @@ pub async fn handle_api_session_rename(
             .into_response();
     }
 
-    let session_key = format!("gw_{id}");
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
 
     // Verify the session exists before renaming
-    let sessions = backend.list_sessions();
-    if !sessions.contains(&session_key) {
+    if !backend.session_exists(&session_key) {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -1951,7 +2062,7 @@ pub async fn handle_api_session_state(
             .into_response();
     };
 
-    let session_key = format!("gw_{id}");
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
             let mut resp = serde_json::json!({
@@ -1990,16 +2101,17 @@ pub async fn handle_api_session_abort(
         return e.into_response();
     }
 
-    let session_key = format!("gw_{id}");
-
-    // Look up and cancel the token. Hold the lock only long enough to
-    // clone the token — cancellation itself does not need the lock.
-    let token = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .get(&session_key)
-        .cloned();
+    // Resolve + look up under one lock so underscore-bearing display ids
+    // (e.g. `team_alpha`) match the live `gw_{id}` cancel-token key.
+    let (session_key, token) = {
+        let tokens = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned");
+        let session_key = resolve_gateway_session_key(&id, |key| tokens.contains_key(key));
+        let token = tokens.get(&session_key).cloned();
+        (session_key, token)
+    };
 
     if let Some(token) = token {
         token.cancel();
@@ -2053,13 +2165,13 @@ pub(crate) mod tests {
     #[cfg(any(
         feature = "channel-linq",
         feature = "channel-nextcloud",
-        feature = "channel-wati",
         feature = "channel-whatsapp-cloud"
     ))]
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
     use zeroclaw_infra::session_store::SessionStore;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
@@ -2219,6 +2331,7 @@ pub(crate) mod tests {
     pub(crate) fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
         AppState {
             config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
@@ -2231,8 +2344,11 @@ pub(crate) mod tests {
                 ),
             ),
             auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
@@ -2249,8 +2365,6 @@ pub(crate) mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -2301,7 +2415,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn api_status_includes_connected_nodes_and_mdns_peers() {
+    async fn api_status_contract_includes_connected_nodes_and_mdns_peers() {
         let state = test_state(zeroclaw_config::schema::Config::default());
         let (invoke_tx, _invoke_rx) = tokio::sync::mpsc::channel(1);
         assert!(state.node_registry.register(nodes::NodeInfo {
@@ -2349,6 +2463,72 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn api_status_contract_preserves_nullable_and_nested_fields() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery { agent: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let json = response_json(response).await;
+        let actual_fields: std::collections::BTreeSet<_> = json
+            .as_object()
+            .expect("status response object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected_fields = [
+            "agent_alias",
+            "allow_self_upgrade",
+            "channels",
+            "check_updates",
+            "daemon_started_at",
+            "gateway_port",
+            "health",
+            "locale",
+            "memory_backend",
+            "model",
+            "model_provider",
+            "nodes",
+            "paired",
+            "process",
+            "restart_hint",
+            "restart_mode",
+            "temperature",
+            "uptime_seconds",
+            "version",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(actual_fields, expected_fields);
+        assert!(json["version"].as_str().is_some());
+        assert!(json["temperature"].is_null());
+        assert!(json["agent_alias"].is_null());
+        assert!(json["uptime_seconds"].is_u64());
+        assert!(json["daemon_started_at"].as_str().is_some());
+        assert!(json["channels"].is_object());
+        assert!(json["nodes"]["connected"].is_array());
+        assert!(json["nodes"]["mdns_peers"].is_array());
+        assert!(json["health"]["pid"].is_u64());
+        assert!(json["health"]["components"].is_object());
+        assert!(json["process"]["rss_bytes"].is_u64());
+        assert!(
+            json["process"]["cpu_percent"].is_null() || json["process"]["cpu_percent"].is_number()
+        );
+        assert!(json["check_updates"].is_boolean());
+        assert!(json["allow_self_upgrade"].is_boolean());
+        assert_eq!(
+            json["restart_mode"],
+            crate::version::detect_restart().mode.as_str()
+        );
+        assert!(json["restart_hint"].as_str().is_some());
+    }
+
     #[test]
     fn integration_entry_json_derives_category_label_from_category() {
         let entry = zeroclaw_runtime::integrations::IntegrationEntry {
@@ -2356,6 +2536,7 @@ pub(crate) mod tests {
             description: "Run browser automation".into(),
             category: zeroclaw_runtime::integrations::IntegrationCategory::ToolsAutomation,
             status: zeroclaw_runtime::integrations::IntegrationStatus::Active,
+            key: None,
         };
 
         let json = integration_entry_json(&entry);
@@ -2363,6 +2544,22 @@ pub(crate) mod tests {
         assert_eq!(json["category"], "ToolsAutomation");
         assert_eq!(json["category_label"], "Tools & Automation");
         assert_eq!(json["status"], "Active");
+        assert!(json["key"].is_null());
+    }
+
+    #[test]
+    fn integration_entry_json_exposes_config_key() {
+        let entry = zeroclaw_runtime::integrations::IntegrationEntry {
+            name: "Z.AI".into(),
+            description: String::new(),
+            category: zeroclaw_runtime::integrations::IntegrationCategory::AiModel,
+            status: zeroclaw_runtime::integrations::IntegrationStatus::Available,
+            key: Some("zai".into()),
+        };
+
+        let json = integration_entry_json(&entry);
+
+        assert_eq!(json["key"], "zai");
     }
 
     fn memory_entry_with_content(content: String) -> MemoryEntry {
@@ -2906,7 +3103,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn api_channel_relink_requires_bearer_auth_when_pairing_enabled() {
         let state = AppState {
-            pairing: Arc::new(PairingGuard::new(true, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                true,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             ..test_state(config_with_telegram("default"))
         };
 
@@ -3082,7 +3283,11 @@ pub(crate) mod tests {
         let config = config_with_webhook("paired", true, true, 42632, Some("/eyrie"));
         zeroclaw_runtime::health::mark_component_ok("channel:webhook.paired");
         let mut state = test_state(config.clone());
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         let health = zeroclaw_runtime::health::snapshot();
         let info = first_channel_info(&config);
         let readiness = channel_readiness(&config, &info, &health, &state);
@@ -3143,7 +3348,11 @@ pub(crate) mod tests {
     fn require_auth_rejects_empty_bearer_token() {
         let config = zeroclaw_config::schema::Config::default();
         let mut state = test_state(config);
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -3373,6 +3582,357 @@ pub(crate) mod tests {
         assert_eq!(messages[1].content, "queued notification");
     }
 
+    #[test]
+    fn resolve_gateway_session_key_accepts_full_key_and_display_id() {
+        let none = |_key: &str| false;
+        assert_eq!(
+            resolve_gateway_session_key("operator-1", none),
+            "gw_operator-1"
+        );
+        assert_eq!(
+            resolve_gateway_session_key("gw_operator-1", none),
+            "gw_operator-1"
+        );
+        // Underscore-bearing display ids must still map into the gw_ namespace
+        // when no exact key exists (punctuation is not a session namespace).
+        assert_eq!(
+            resolve_gateway_session_key("team_alpha", none),
+            "gw_team_alpha"
+        );
+
+        let gateway_only = |key: &str| key == "gw_team_alpha";
+        assert_eq!(
+            resolve_gateway_session_key("team_alpha", gateway_only),
+            "gw_team_alpha"
+        );
+        assert_eq!(
+            resolve_gateway_session_key("gw_team_alpha", gateway_only),
+            "gw_team_alpha"
+        );
+
+        let channel_only = |key: &str| key == "discord.clamps_room";
+        assert_eq!(
+            resolve_gateway_session_key("discord.clamps_room", channel_only),
+            "discord.clamps_room"
+        );
+
+        // Exact match wins when both the bare id and gw_ form exist.
+        let both = |key: &str| key == "team_alpha" || key == "gw_team_alpha";
+        assert_eq!(
+            resolve_gateway_session_key("team_alpha", both),
+            "team_alpha"
+        );
+    }
+
+    #[test]
+    fn gateway_display_session_id_strips_gw_prefix() {
+        assert_eq!(gateway_display_session_id("gw_operator-1"), "operator-1");
+        assert_eq!(gateway_display_session_id("gw_team_alpha"), "team_alpha");
+        assert_eq!(
+            gateway_display_session_id("discord.clamps_room"),
+            "discord.clamps_room"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_abort_accepts_full_session_key_from_sessions_list() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let session_key = "gw_operator-1".to_string();
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(session_key.clone(), token.clone());
+
+        // Same id GET /api/sessions advertises as session_key for abort.
+        let response = handle_api_session_abort(State(state), HeaderMap::new(), Path(session_key))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["status"], "aborted",
+            "full session_key must abort; doubled gw_ prefix yields no_active_response"
+        );
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_still_accepts_display_session_id() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert("gw_operator-1".to_string(), token.clone());
+
+        let response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "aborted");
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_accepts_underscore_display_session_id() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert("gw_team_alpha".to_string(), token.clone());
+
+        // List contract: session_id=team_alpha, session_key=gw_team_alpha.
+        // Treating "_" as "already a full key" would miss this cancel token.
+        let response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["status"], "aborted",
+            "underscore display ids must resolve to gw_ + id, not the bare id"
+        );
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_message_post_accepts_full_session_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let mut rx = state.event_tx.subscribe();
+
+        let response = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_operator-1".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "via session_key"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "ok");
+        assert_eq!(
+            json["session_id"], "operator-1",
+            "API response should use the display session id"
+        );
+        let messages = backend.load("gw_operator-1");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "via session_key");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("broadcast event")
+            .expect("broadcast value");
+        assert_eq!(event["type"], "message");
+        assert_eq!(
+            event["session_id"], "operator-1",
+            "broadcast must use display id so the WS filter accepts it"
+        );
+        assert_eq!(event["content"], "via session_key");
+    }
+
+    #[tokio::test]
+    async fn session_message_post_accepts_underscore_display_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_team_alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let mut rx = state.event_tx.subscribe();
+
+        let response = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "underscore display id"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let messages = backend.load("gw_team_alpha");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "underscore display id");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("broadcast event")
+            .expect("broadcast value");
+        assert_eq!(event["session_id"], "team_alpha");
+    }
+
+    #[tokio::test]
+    async fn session_rename_accepts_full_session_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        let response = handle_api_session_rename(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_operator-1".to_string()),
+            Json(serde_json::json!({ "name": "ops" })),
+        )
+        .await
+        .into_response();
+
+        // Master doubles the prefix (`gw_gw_operator-1`) and returns 404.
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["name"], "ops");
+        assert!(
+            backend.list_sessions().iter().any(|k| k == "gw_operator-1"),
+            "rename must target the real session key, not a doubled gw_ prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_rename_accepts_underscore_display_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_team_alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend);
+
+        let response = handle_api_session_rename(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+            Json(serde_json::json!({ "name": "alpha desk" })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["name"], "alpha desk");
+    }
+
+    #[tokio::test]
+    async fn session_state_accepts_full_session_key_and_underscore_display_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        // File SessionStore does not persist turn state; SQLite does.
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_team_alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        backend
+            .set_session_state("gw_team_alpha", "running", Some("turn-1"))
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend);
+
+        let full_key_response = handle_api_session_state(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("gw_team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(full_key_response.status(), StatusCode::OK);
+        let full_key_json = response_json(full_key_response).await;
+        assert_eq!(full_key_json["state"], "running");
+        assert_eq!(full_key_json["turn_id"], "turn-1");
+
+        let display_response = handle_api_session_state(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(display_response.status(), StatusCode::OK);
+        let display_json = response_json(display_response).await;
+        assert_eq!(
+            display_json["state"], "running",
+            "state handler must accept underscore display ids from the sessions list"
+        );
+        assert_eq!(display_json["turn_id"], "turn-1");
+    }
+
     #[tokio::test]
     async fn cron_api_shell_roundtrip_includes_delivery() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3460,6 +4020,174 @@ pub(crate) mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_type, zeroclaw_runtime::cron::JobType::Agent);
         assert_eq!(jobs[0].prompt.as_deref(), Some("summarize the latest logs"));
+        assert_eq!(
+            jobs[0].session_target,
+            zeroclaw_runtime::cron::SessionTarget::Isolated
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_persists_session_target_main() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "main-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "continue in the primary session",
+                    "session_target": "main"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let config = state.config.read().clone();
+        let jobs = zeroclaw_runtime::cron::list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].session_target,
+            zeroclaw_runtime::cron::SessionTarget::Main
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_accepts_session_target_case_and_whitespace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "main-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "continue in the primary session",
+                    "session_target": "  MAIN  "
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let jobs = zeroclaw_runtime::cron::list_jobs(&state.config.read().clone()).unwrap();
+        assert_eq!(
+            jobs[0].session_target,
+            zeroclaw_runtime::cron::SessionTarget::Main
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_rejects_invalid_session_target_as_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "typo-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "should not be created",
+                    "session_target": "shared"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("session_target"),
+            "error should name the field, got {error}"
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+                .unwrap()
+                .is_empty(),
+            "invalid session_target must not persist a job"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_rejects_empty_session_target_as_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "empty-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "should not be created",
+                    "session_target": "   "
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("session_target")
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4062,6 +4790,275 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn cron_api_patch_updates_imperative_shell_output_format() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("format-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello-raw-patch-run",
+            None,
+            true,
+        )
+        .expect("job added");
+        assert_eq!(
+            job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            "imperative jobs default to wrapped"
+        );
+        // Imperative jobs get UUID ids; the scheduler resolves owning agent
+        // by reverse-lookup against `agent.cron_jobs`, same as
+        // `cron_api_run_executes_shell_job_and_records_run`.
+        link_job_to_test_agent(&state, &job.id);
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "shell_output_format": "raw" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an imperative job's shell_output_format is a real, storable mutation"
+        );
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(
+            updated.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            "get_job must reflect the patched format for an imperative job"
+        );
+
+        // The regression this PATCH must actually prove: the persisted
+        // value is what execution reads, not just what get_job() reports.
+        // A job created wrapped, then PATCHed to raw, must run raw.
+        let run_response =
+            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
+                .await
+                .into_response();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_json = response_json(run_response).await;
+        assert_eq!(run_json["success"], true);
+        let output = run_json["output"].as_str().unwrap_or_default();
+        assert!(
+            output.contains("hello-raw-patch-run"),
+            "expected bare stdout in output, got: {output}"
+        );
+        assert!(
+            !output.contains("status="),
+            "a PATCH-to-raw job must run raw (bare stdout), not the wrapped status envelope; got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_rejects_shell_output_format_for_declarative_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config = with_test_agent(config);
+        // `sync_declarative_jobs` only materializes a job for an agent that
+        // claims it via `cron_jobs`, exactly like `seed_claiming_agent` in
+        // cron::store's own tests.
+        config.agents.get_mut("test-agent").unwrap().cron_jobs = vec!["decl-job".to_string()];
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("decl-job".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo decl-output".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+        };
+        let mut decls = std::collections::HashMap::new();
+        decls.insert("decl-job".to_string(), decl.clone());
+        config.cron.insert("decl-job".to_string(), decl);
+        zeroclaw_runtime::cron::sync_declarative_jobs(&config, &decls).unwrap();
+        let state = test_state(config);
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("decl-job".to_string()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "shell_output_format": "raw" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a declarative job's shell_output_format is owned by config.toml, not the API"
+        );
+        let json = response_json(response).await;
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("declarative"),
+            "error should explain the field is config-owned for declarative jobs"
+        );
+        assert!(
+            error.contains("cron.decl-job.shell_output_format"),
+            "error should name the exact config key to edit instead: {error}"
+        );
+        let unchanged =
+            zeroclaw_runtime::cron::get_job(&state.config.read().clone(), "decl-job").unwrap();
+        assert_eq!(
+            unchanged.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            "the rejected PATCH must not have changed the resolved format"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_rejects_shell_output_format_for_agent_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let add_response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "agent-format-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "do something"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(add_response.status(), StatusCode::OK);
+        let id = zeroclaw_runtime::cron::list_jobs(&state.config.read().clone()).unwrap()[0]
+            .id
+            .clone();
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "shell_output_format": "raw" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "shell_output_format is shell-only and must not be persisted for agent jobs"
+        );
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("agent job"),
+            "error should explain the field does not apply to agent jobs"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_add_rejects_shell_output_format_for_agent_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "agent-format-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "do something",
+                    "shell_output_format": "raw"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "shell_output_format must be rejected at creation for agent jobs, matching the PATCH contract, \
+             instead of silently discarded"
+        );
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("agent job"),
+            "error should explain the field does not apply to agent jobs"
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+                .unwrap()
+                .is_empty(),
+            "a rejected create must not persist a job"
+        );
+    }
+
+    #[tokio::test]
     async fn cron_api_rejects_announce_delivery_without_target() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
@@ -4280,7 +5277,11 @@ pub(crate) mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
 
-        let pairing = Arc::new(PairingGuard::new(true, &[]));
+        let pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         let code = pairing.pairing_code().unwrap();
         let token = pairing.try_pair(&code, "test").await.unwrap().unwrap();
         let token_hash = PairingGuard::token_hash(&token);
@@ -4370,7 +5371,11 @@ pub(crate) mod tests {
         let data_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        );
         let code = pairing.pairing_code().unwrap();
         let token = pairing
             .try_pair(&code, "legacy-client")
@@ -4462,11 +5467,12 @@ pub(crate) mod tests {
 
         let code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
             .expect("require_pairing was enabled");
 
         let response = submit_pairing_enhanced(
             State(state.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:40002".parse().unwrap()),
             HeaderMap::new(),
             Json(serde_json::json!({ "code": code, "device_name": "repaired" })),
         )
@@ -4545,7 +5551,7 @@ pub(crate) mod tests {
 
         let pending_code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
             .expect("require_pairing was enabled");
 
         let response = rotate_device_token(
@@ -4583,7 +5589,11 @@ pub(crate) mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
 
-        let pairing = Arc::new(PairingGuard::new(true, &[]));
+        let pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         let code = pairing.pairing_code().unwrap();
         let admin_token = pairing.try_pair(&code, "admin").await.unwrap().unwrap();
 
@@ -4591,7 +5601,7 @@ pub(crate) mod tests {
         for id in ["dev-a", "dev-b"] {
             // Each device needs its own paired token so revoke has a hash.
             let code = pairing
-                .generate_new_pairing_code()
+                .generate_new_pairing_code(zeroclaw_config::pairing::PairingCodePolicy::default())
                 .expect("pairing enabled");
             let tok = pairing.try_pair(&code, id).await.unwrap().unwrap();
             registry
@@ -4644,6 +5654,86 @@ pub(crate) mod tests {
         );
     }
 
+    /// Regression: a shell cron job created via the gateway API with
+    /// `shell_output_format = raw` must persist the format, return raw
+    /// stdout when triggered, and not wrap output in the status envelope.
+    #[tokio::test]
+    async fn cron_api_shell_raw_output_roundtrip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        // 1. Create a shell job with shell_output_format = raw via the API.
+        let add_response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "raw-echo",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "command": "echo hello-raw",
+                    "shell_output_format": "raw"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(add_response.status(), StatusCode::OK);
+        let add_json = response_json(add_response).await;
+        assert_eq!(add_json["status"], "ok");
+        let job_id = add_json["job"]["id"].as_str().expect("job id").to_string();
+
+        // 2. Read the job back via list and verify shell_output_format persisted.
+        let list_response = handle_api_cron_list(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        let list_json = response_json(list_response).await;
+        let jobs = list_json["jobs"].as_array().expect("jobs array");
+        let listed = jobs
+            .iter()
+            .find(|j| j["id"].as_str() == Some(&job_id))
+            .expect("job in list");
+        assert_eq!(
+            listed["shell_output_format"].as_str(),
+            Some("raw"),
+            "shell_output_format must persist through the API store path"
+        );
+
+        // 3. Link to test-agent so the scheduler can resolve the owner.
+        link_job_to_test_agent(&state, &job_id);
+
+        // 4. Trigger the job manually and verify raw output.
+        let run_response =
+            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job_id.clone()))
+                .await
+                .into_response();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_json = response_json(run_response).await;
+        assert_eq!(run_json["status"], "ok", "job should succeed: {run_json}");
+        assert_eq!(run_json["success"], true);
+
+        let output = run_json["output"].as_str().expect("output string");
+        assert_eq!(
+            output, "hello-raw",
+            "raw mode must return trimmed stdout, not the wrapped envelope: {output}"
+        );
+        assert!(
+            !output.contains("status="),
+            "raw output must not contain the status envelope: {output}"
+        );
+        assert!(
+            !output.contains("stdout:"),
+            "raw output must not contain the stdout header: {output}"
+        );
+    }
+
     #[cfg(feature = "a2a")]
     mod a2a_auth {
         use super::*;
@@ -4663,7 +5753,11 @@ pub(crate) mod tests {
             };
             config.agents.insert("maker".to_string(), agent);
             let mut state = test_state(config);
-            state.pairing = Arc::new(PairingGuard::new(true, &[TOKEN.to_string()]));
+            state.pairing = Arc::new(PairingGuard::new(
+                true,
+                &[TOKEN.to_string()],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            ));
             state
         }
 
