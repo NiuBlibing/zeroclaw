@@ -3049,6 +3049,7 @@ impl Agent {
             response: raw_response,
             new_messages,
             safeguard_fallback,
+            ..
         } = self
             .turn_streamed_with_steering_state(user_message, event_tx, cancel_token, None)
             .await

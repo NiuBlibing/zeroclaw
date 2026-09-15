@@ -1534,6 +1534,7 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "requested-provider",
             model: "requested-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",

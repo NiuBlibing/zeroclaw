@@ -449,6 +449,9 @@ mod tests {
             Ok(StreamedTurnSuccess {
                 response: "accepted response".into(),
                 new_messages: messages.clone(),
+                provider_name: "requested-provider".into(),
+                model: "requested-model".into(),
+                final_context_limits: None,
                 safeguard_fallback: Some(safeguard),
             }),
             "accepted response".into(),
