@@ -4221,6 +4221,7 @@ mod tests {
             tool_policy: crate::tool_policy::ToolPolicyConfig::default(),
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
+            sandbox_image: None,
             firejail_args: vec!["--net=none".into()],
         };
 
