@@ -4702,8 +4702,15 @@ impl Config {
         let mut entries = Vec::new();
         for (ty, alias, entry) in self.providers.models.iter_entries() {
             let profile_ref = format!("{ty}.{alias}");
+            let selected_model_alias = filter
+                .and_then(|f| f.strip_prefix(&format!("{profile_ref}.")))
+                .filter(|model_alias| entry.models.contains_key(*model_alias));
             let passes = match filter {
-                Some(f) => profile_ref == f || profile_ref.split('.').next() == Some(f),
+                Some(f) => {
+                    profile_ref == f
+                        || profile_ref.split('.').next() == Some(f)
+                        || selected_model_alias.is_some()
+                }
                 None => true,
             };
             if !passes {
@@ -4717,6 +4724,9 @@ impl Config {
                     entry.models.keys().map(String::as_str).collect();
                 model_aliases.sort_unstable();
                 for model_alias in model_aliases {
+                    if selected_model_alias.is_some_and(|selected| selected != model_alias) {
+                        continue;
+                    }
                     let three_seg = format!("{profile_ref}.{model_alias}");
                     let model_id = self
                         .resolve_model_selection(&three_seg)
@@ -44809,6 +44819,9 @@ temperature = 0.3
         // commands.
         let config: Config = toml::from_str(raw).unwrap();
         assert_eq!(config.configured_model_entries(Some("openai.gw")).len(), 2);
+        let selected = config.configured_model_entries(Some("openai.gw.cheap"));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].provider_ref, "openai.gw.cheap");
         assert_eq!(config.configured_model_entries(Some("groq")).len(), 1);
         assert!(
             config

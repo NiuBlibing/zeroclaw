@@ -753,9 +753,13 @@ pub async fn update_context_windows(
         ty: &str,
         alias: &str,
         entry: &zeroclaw_config::schema::ModelProviderConfig,
+        selected_model_alias: Option<&str>,
     ) -> Vec<ProviderTarget> {
         let profile_ref = format!("{ty}.{alias}");
         if entry.models.is_empty() {
+            if selected_model_alias.is_some() {
+                return Vec::new();
+            }
             return vec![(
                 profile_ref,
                 ty.to_string(),
@@ -771,6 +775,9 @@ pub async fn update_context_windows(
         model_aliases.sort_unstable();
         model_aliases
             .into_iter()
+            .filter(|model_alias| {
+                selected_model_alias.is_none_or(|selected| selected == *model_alias)
+            })
             .map(|model_alias| {
                 let nested = &entry.models[model_alias];
                 (
@@ -793,9 +800,19 @@ pub async fn update_context_windows(
 
     // Collect all the data we need first to avoid borrow conflicts
     let targets: Vec<ProviderTarget> = if let Some(model_provider) = provider_override {
-        // Single provider - use find_by_name to look up by "type.alias" format
+        // A three-segment ref selects one nested model; a two-segment ref
+        // keeps the historical behavior of expanding the whole profile.
         if let Some((t, a, entry)) = config.providers.models.find_by_name(model_provider) {
-            expand_profile_targets(t, &a, entry)
+            let model_alias = model_provider
+                .trim()
+                .splitn(3, '.')
+                .nth(2)
+                .filter(|segment| !segment.is_empty());
+            let targets = expand_profile_targets(t, &a, entry, model_alias);
+            if targets.is_empty() {
+                anyhow::bail!("Model provider '{model_provider}' not found in config");
+            }
+            targets
         } else {
             anyhow::bail!("Model provider '{model_provider}' not found in config");
         }
@@ -805,7 +822,7 @@ pub async fn update_context_windows(
             .providers
             .models
             .iter_entries()
-            .flat_map(|(t, a, e)| expand_profile_targets(t, a, e))
+            .flat_map(|(t, a, e)| expand_profile_targets(t, a, e, None))
             .collect()
     };
 
@@ -3673,6 +3690,58 @@ mod tests {
             entry.context_window, None,
             "the profile-level window must not be touched when all models are nested"
         );
+    }
+
+    #[tokio::test]
+    async fn update_context_windows_targets_only_selected_nested_model() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let mut config = Config {
+            config_path: temp_dir.path().join("config.toml"),
+            ..Default::default()
+        };
+        let entry = config
+            .providers
+            .models
+            .ensure("openai", "gw")
+            .expect("openai provider type exists");
+        entry.models.insert(
+            "cheap".to_string(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("gpt-4o-mini".into()),
+                ..Default::default()
+            },
+        );
+        entry.models.insert(
+            "big".to_string(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("gpt-4o".into()),
+                ..Default::default()
+            },
+        );
+
+        let mock_fetch: FetchContextWindowFn = Box::new(
+            |_type: &str, cfg: &zeroclaw_config::schema::ModelProviderConfig| {
+                Box::pin(async move { cfg.model.as_deref().map(|m| m.len() * 1000) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send>>
+            },
+        );
+        let updated = update_context_windows(
+            &mut config,
+            Some("openai.gw.cheap"),
+            false,
+            Some(mock_fetch),
+        )
+        .await
+        .expect("update_context_windows should succeed");
+
+        assert_eq!(updated, 1);
+        let entry = config
+            .providers
+            .models
+            .find("openai", "gw")
+            .expect("profile exists");
+        assert_eq!(entry.models["cheap"].context_window, Some(11_000));
+        assert_eq!(entry.models["big"].context_window, None);
     }
 
     #[test]
