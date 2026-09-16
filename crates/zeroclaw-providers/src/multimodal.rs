@@ -2179,13 +2179,10 @@ fn jpeg_frame_header(bytes: &[u8]) -> Option<JpegFrameHeader> {
         let payload_end = payload_start.checked_add(segment_len - 2)?;
         let payload = bytes.get(payload_start..payload_end)?;
 
-        // SOF0..SOF3, SOF5..SOF7, SOF9..SOFB and SOFCD..SOFC are the DCT
-        // frame markers accepted by zune-jpeg. Lossless SOFs are retained in
-        // the set and receive the same conservative coefficient bound.
-        let is_sof = matches!(
-            marker,
-            0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
-        );
+        // Keep this set aligned with zune-jpeg's Marker::from_u8 mapping.
+        // Other SOF-shaped, length-bearing markers are skipped by that decoder
+        // and must not hide the later frame header used for allocation.
+        let is_sof = matches!(marker, 0xc0..=0xc2);
         if is_sof {
             if payload.len() < 6 {
                 return None;
@@ -3980,6 +3977,49 @@ mod tests {
         })
         .await;
         assert_eq!(multimodal_error_kind(&error), "corrupt_image");
+        assert_eq!(decodes, 0, "refusal must happen before pixel decoding");
+        assert_eq!(budget, initial_budget, "refusal preserves sibling budget");
+
+        validate_within_budget("sibling.png", "image/png", &valid_png(), &mut budget)
+            .await
+            .expect("a valid sibling must remain admissible");
+    }
+
+    #[tokio::test]
+    async fn unsupported_jpeg_sof_marker_cannot_undercharge_admission() {
+        let mut bytes = jpeg_with_declared_dimensions(3000, 3000);
+        // zune-jpeg 0.5.15 treats C3 as an unknown length-bearing marker and
+        // continues to the real three-component frame header. The projection
+        // must do the same instead of trusting this smaller fake header.
+        bytes.splice(
+            2..2,
+            [
+                0xff, 0xc3, 0x00, 0x0b, 0x08, 0x0b, 0xb8, 0x0b, 0xb8, 0x01, 0x01, 0x11, 0x00,
+            ],
+        );
+
+        let header = jpeg_frame_header(&bytes).expect("the real frame header must be found");
+        assert_eq!(header.components.len(), 3);
+        let projected = 3000u64 * 3000 * 3
+            + jpeg_auxiliary_allocation(&bytes, 3000, 3000)
+                .expect("the real frame must have a conservative projection");
+        assert!(projected > MAX_DECODED_IMAGE_ALLOC_BYTES);
+
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        let initial_budget = budget;
+        let (error, decodes) = counting_decodes(async {
+            validate_within_budget("unsupported-sof.jpg", "image/jpeg", &bytes, &mut budget)
+                .await
+                .expect_err("the real frame allocation must exceed the per-image cap")
+        })
+        .await;
+        assert!(
+            matches!(
+                multimodal_error_kind(&error),
+                "image_too_large" | "corrupt_image"
+            ),
+            "admission must refuse the unsupported-marker payload"
+        );
         assert_eq!(decodes, 0, "refusal must happen before pixel decoding");
         assert_eq!(budget, initial_budget, "refusal preserves sibling budget");
 
