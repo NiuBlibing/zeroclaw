@@ -5754,6 +5754,23 @@ mod tests {
         system_suffix: Option<String>,
     }
 
+    struct UnchangedBeforeLlmHook;
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for UnchangedBeforeLlmHook {
+        fn name(&self) -> &str {
+            "unchanged-before-llm"
+        }
+
+        async fn before_llm_call(
+            &self,
+            _messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> crate::hooks::HookResult<()> {
+            crate::hooks::HookResult::Continue(())
+        }
+    }
+
     #[async_trait]
     impl crate::hooks::HookHandler for SelectingBeforeLlmHook {
         fn name(&self) -> &str {
@@ -7263,6 +7280,117 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn classified_route_keeps_selector_for_tool_protocol_and_unchanged_hook() {
+        let default_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
+        let text_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
+        let router = zeroclaw_providers::router::RouterModelProvider::new(
+            "classifier-router",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(HookProtocolCaptureProvider {
+                        supports_native: true,
+                        requests: Arc::clone(&default_requests),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text".into(),
+                    Box::new(HookProtocolCaptureProvider {
+                        supports_native: false,
+                        requests: Arc::clone(&text_requests),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            vec![(
+                "text".into(),
+                zeroclaw_providers::router::Route {
+                    provider_name: "text".into(),
+                    model: "text-model".into(),
+                },
+            )],
+            "native-model".into(),
+        );
+        let route_resolver = Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+            vec![(
+                "text".into(),
+                zeroclaw_providers::router::Route {
+                    provider_name: "text".into(),
+                    model: "text-model".into(),
+                },
+            )],
+            "default".into(),
+            "native-model".into(),
+        ));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                .expect("memory creation should succeed"),
+        );
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(UnchangedBeforeLlmHook));
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(router))
+            .model_provider_name("classifier-router".into())
+            .model_name("native-model".into())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(memory)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .classification_config(zeroclaw_config::schema::QueryClassificationConfig {
+                enabled: true,
+                rules: vec![zeroclaw_config::schema::ClassificationRule {
+                    hint: "text".into(),
+                    keywords: vec!["quick".into()],
+                    patterns: vec![],
+                    min_length: None,
+                    max_length: None,
+                    priority: 10,
+                }],
+            })
+            .model_route_resolver(route_resolver)
+            .hook_runner(Some(Arc::new(hooks)))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .build()
+            .expect("agent should build");
+
+        assert_eq!(
+            agent.turn("quick routed request").await.unwrap(),
+            "routed response"
+        );
+        assert!(
+            default_requests.lock().is_empty(),
+            "an unchanged hook must not replace the classifier's route selector"
+        );
+        let requests = text_requests.lock();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the classified route must receive the request"
+        );
+        let (model, sent_native_tools, messages) = &requests[0];
+        assert_eq!(model, "text-model");
+        assert!(
+            !sent_native_tools,
+            "tool capability must come from the routed text provider"
+        );
+        let system_prompt = messages
+            .iter()
+            .find(|message| message.role == "system")
+            .expect("provider request must include a system prompt")
+            .content
+            .as_str();
+        assert!(system_prompt.contains("## Tools"));
+        assert!(system_prompt.contains("## Tool Use Protocol"));
+        assert!(system_prompt.contains("<tool_call>"));
     }
 
     #[tokio::test]

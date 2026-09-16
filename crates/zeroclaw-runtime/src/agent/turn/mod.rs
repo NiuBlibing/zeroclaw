@@ -855,8 +855,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
 
         let mut iteration_tool_specs = build_iteration_tool_specs(
-            model_provider,
-            model,
+            active_model_provider,
+            active_dispatch_model,
             tools_registry,
             excluded_tools,
             activated_tools,
@@ -879,7 +879,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 .await
             {
                 crate::hooks::HookResult::Continue(()) => {
-                    hook_selected_model = Some(candidate_model);
+                    // A hook that leaves the resolved model unchanged has not
+                    // replaced the provider-facing selector. Preserve a route
+                    // hint such as `hint:fast` for dispatch and capability
+                    // checks; only an actual model change overrides it.
+                    if candidate_model != active_model {
+                        hook_selected_model = Some(candidate_model);
+                    }
                 }
                 crate::hooks::HookResult::Cancel(reason) => {
                     anyhow::bail!("LLM call cancelled by hook: {reason}");
@@ -893,16 +899,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let provider_dispatch_model = hook_selected_model
             .as_deref()
             .unwrap_or(active_dispatch_model);
-        // Only direct Agent turns scope the complete prompt variants. Preserve
-        // the channel loop's existing hook/protocol behavior rather than
-        // silently widening this delegation-focused repair into channel prompt
-        // reconciliation.
-        let uses_scoped_tool_protocol = TOOL_PROTOCOL_PROMPTS.try_with(|_| ()).is_ok();
-        let protocol_model = if uses_scoped_tool_protocol {
-            provider_request_model
-        } else {
-            active_model
-        };
+        let protocol_model = provider_dispatch_model;
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
         let IterationToolSpecs {
             ref tool_specs,
@@ -910,10 +907,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             ..
         } = iteration_tool_specs;
 
-        // For scoped direct Agent turns, the hook can choose a different routed
-        // model. Every protocol-bearing surface follows that dispatched model.
-        // Unscoped channel turns intentionally retain their pre-existing
-        // protocol behavior; channel prompt reconciliation is separate work.
+        // Tool protocol selection follows the provider-facing selector. Direct
+        // Agent turns also refresh their scoped complete prompt after a hook
+        // chooses a different model; unscoped callers retain their own prompt.
         refresh_prompt_anchor(turn_state.history, use_native_tools);
         refresh_prompt_anchor(&mut provider_request_messages, use_native_tools);
         refresh_scoped_tool_protocol_prompt(
@@ -962,10 +958,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         };
         let request_tool_count = request_tools.map_or(0, <[crate::tools::ToolSpec]>::len);
         let base_provider_supports_native_tools = model_provider
-            .capabilities_for_model(model)
+            .capabilities_for_model(dispatch_model)
             .native_tool_calling;
         let active_provider_supports_native_tools = active_model_provider
-            .capabilities_for_model(provider_request_model)
+            .capabilities_for_model(provider_dispatch_model)
             .native_tool_calling;
         let active_provider_supports_streaming = active_model_provider.supports_streaming();
         let active_provider_supports_streaming_tool_events =
