@@ -4591,6 +4591,7 @@ permissions = ["http_client"]
                 false,
                 None,
             )
+            .expect("tool registry builds")
             .tools
             .iter()
             .map(|t| t.name().to_string())
