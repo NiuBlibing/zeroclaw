@@ -34,7 +34,10 @@ Archives sit next to the active file and keep its extension, with a sortable
 UTC stamp inserted before that extension. For example, `runtime-trace.jsonl`
 rotates to `runtime-trace.0000000001-20260624-031500.jsonl`. The sequence
 prefix (`0000000001`) is written at rotation time and determines reader-side
-ordering; it never repeats across restarts. Archives written before sequence
+ordering. A best-effort sidecar preserves the high-water mark across restarts.
+If that sidecar cannot be written, retention removes every numbered archive,
+and the daemon then restarts, a sequence can be reused; an outstanding cursor
+can consequently bind to newer history. Archives written before sequence
 numbering existed keep their old shape (`runtime-trace.20260624-031500.jsonl`)
 and sort before every numbered archive.
 

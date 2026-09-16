@@ -257,8 +257,10 @@ it. Its internal shape depends on which segment the page ended in, because the
 three segment kinds have different stability properties:
 
 - A **numbered archive** is addressed by the sequence number written into its
-  name at rotation. That number is never reused, so later rotations cannot
-  invalidate the cursor.
+  name at rotation. A best-effort sidecar keeps numbers monotonic across normal
+  restarts. If its write fails, retention removes all numbered archives, and
+  the daemon restarts, a number can be reused and an outstanding cursor can
+  bind to newer history.
 - A **legacy archive**, written before sequence numbering existed, is addressed
   by filename. An archive name is never reassigned to different content, so this
   is stable in the same way.
@@ -289,7 +291,7 @@ Enumeration and reading are not atomic, so a rotation can land between them: the
 
 A segment that cannot be read is logged, left out of the merged view, and marked in the response with `incomplete: true` rather than failing the whole query, since one bad file should not cost the caller every other segment. `at_end` is then scoped to what could be read, and the flag is what tells the caller so; the daemon's own log reaches the operator, not the client that has to decide whether to keep paging. Single-event lookup carries the same distinction: a hit is authoritative however many segments were skipped, but a miss over a skipped segment is reported as unreadable-history rather than `not found`.
 
-Archive discovery rejects symlinks. Matching the writer's filename shape is not path confinement, and following a link would let anyone who can write into the log directory point an archive-shaped name at any file the daemon can read.
+Archive discovery rejects symlinks. Matching the writer's filename shape is not path confinement, and following a link would let anyone who can write into the log directory point an archive-shaped name at any file the daemon can read. Validation and open are separate operations, so an actor who can replace entries in the log directory can still race a validated archive into a symlink before it is opened; deployments must keep the log directory trusted until the reader uses no-follow or descriptor-stable opens.
 
 ## Persistence policy owns rewrites and retention
 
