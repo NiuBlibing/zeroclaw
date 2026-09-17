@@ -14140,6 +14140,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-dist"
+version = "0.8.5"
+
+[[package]]
 name = "zeroclaw-egress-plugin-fixture"
 version = "0.0.0"
 dependencies = [
@@ -14620,10 +14624,12 @@ dependencies = [
  "async-imap",
  "async-trait",
  "base64 0.22.1",
+ "brotli",
  "cap-std",
  "chrono",
  "directories",
  "fantoccini",
+ "flate2",
  "fluent",
  "futures-util",
  "glob",

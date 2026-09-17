@@ -3205,10 +3205,7 @@ pub struct ConfigDeleteResult {}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ConfigReloadResult {
-    #[allow(dead_code)]
-    pub reloading: bool,
-}
+pub struct ConfigReloadResult {}
 
 /// One selectable locale (`locales/list`).
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -3232,8 +3229,6 @@ pub struct FetchedCatalog {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct LocalesFetchResult {
-    #[allow(dead_code)]
-    pub locale: String,
     pub catalogs: Vec<FetchedCatalog>,
     pub skipped: Vec<String>,
 }
@@ -4304,10 +4299,6 @@ pub struct SessionOverrides {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionConfigureResult {
-    /// Echoed by the daemon; retained to lock the wire shape even though the
-    /// TUI keys off the caller's own session id.
-    #[allow(dead_code)]
-    pub session_id: String,
     #[serde(default)]
     pub overrides: SessionOverrides,
 }

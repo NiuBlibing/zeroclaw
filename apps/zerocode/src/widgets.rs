@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 #[derive(Debug, Clone, Default)]
 pub struct HelpEntry {
     /// Keys that trigger this action, e.g. ["↑", "k"]. Rendered labels,
@@ -72,6 +70,7 @@ impl HelpNode {
         }
     }
 
+    #[cfg(test)]
     pub fn titled(title: impl Into<String>, entries: Vec<HelpEntry>) -> Self {
         Self {
             title: Some(title.into()),
@@ -124,11 +123,6 @@ impl CtxBar {
             max_tokens,
             model_window,
         }
-    }
-
-    /// `true` when there is something worth rendering.
-    pub fn has_content(&self) -> bool {
-        self.input_tokens.is_some() || self.max_tokens.is_some()
     }
 
     /// Build a `Paragraph` widget, or `None` if there is nothing to show.
@@ -303,6 +297,7 @@ impl<'a> InfoBar<'a> {
         Self { message }
     }
 
+    #[cfg(test)]
     pub fn has_content(&self) -> bool {
         self.message.is_some()
     }
@@ -459,6 +454,7 @@ impl PickerState {
         Self { items, cursor }
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
