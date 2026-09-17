@@ -1065,6 +1065,22 @@ fn done_frame_context_limits(
     }
 }
 
+fn update_ws_usage_tokens(
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_input_tokens: &mut Option<u64>,
+    total_output_tokens: &mut Option<u64>,
+    last_input_tokens: &mut Option<u64>,
+) {
+    *last_input_tokens = input_tokens;
+    if let Some(input_tokens) = input_tokens {
+        *total_input_tokens = Some(total_input_tokens.unwrap_or(0) + input_tokens);
+    }
+    if let Some(output_tokens) = output_tokens {
+        *total_output_tokens = Some(total_output_tokens.unwrap_or(0) + output_tokens);
+    }
+}
+
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
@@ -1336,13 +1352,13 @@ async fn process_chat_message(
                         } => {
                             max_context_tokens = context_token_budget;
                             model_context_window = usage_model_context_window;
-                            if let Some(it) = input_tokens {
-                                total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
-                                last_input_tokens = Some(it);
-                            }
-                            if let Some(ot) = output_tokens {
-                                total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
-                            }
+                            update_ws_usage_tokens(
+                                input_tokens,
+                                output_tokens,
+                                &mut total_input_tokens,
+                                &mut total_output_tokens,
+                                &mut last_input_tokens,
+                            );
                             continue;
                         }
                         TurnEvent::Chunk { ref delta } => {
@@ -1829,6 +1845,32 @@ mod tests {
             done_frame_context_limits(None, Some(7_200), Some(8_000), Some(fallback)),
             (7_200, Some(8_000)),
         );
+    }
+
+    #[test]
+    fn usage_less_final_route_clears_the_previous_context_fill() {
+        let mut total_input_tokens = None;
+        let mut total_output_tokens = None;
+        let mut last_input_tokens = None;
+
+        update_ws_usage_tokens(
+            Some(1_024),
+            Some(64),
+            &mut total_input_tokens,
+            &mut total_output_tokens,
+            &mut last_input_tokens,
+        );
+        update_ws_usage_tokens(
+            None,
+            Some(32),
+            &mut total_input_tokens,
+            &mut total_output_tokens,
+            &mut last_input_tokens,
+        );
+
+        assert_eq!(total_input_tokens, Some(1_024));
+        assert_eq!(total_output_tokens, Some(96));
+        assert_eq!(last_input_tokens, None);
     }
 
     #[test]
