@@ -177,7 +177,10 @@ impl Tool for ModelSwitchTool {
 impl ModelSwitchTool {
     fn handle_get(&self) -> anyhow::Result<ToolResult> {
         let switch_state = current_model_switch_state()?;
-        let pending = switch_state.lock().unwrap().clone();
+        let pending = match switch_state.lock() {
+            Ok(state) => state.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
 
         Ok(ToolResult {
             success: true,
@@ -256,7 +259,12 @@ impl ModelSwitchTool {
         }
 
         let switch_state = current_model_switch_state()?;
-        *switch_state.lock().unwrap() = Some((model_provider.clone(), model.clone()));
+        match switch_state.lock() {
+            Ok(mut state) => *state = Some((model_provider.clone(), model.clone())),
+            Err(poisoned) => {
+                *poisoned.into_inner() = Some((model_provider.clone(), model.clone()));
+            }
+        }
 
         Ok(ToolResult {
             success: true,
