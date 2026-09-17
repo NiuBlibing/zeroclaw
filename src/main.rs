@@ -1206,8 +1206,13 @@ Methods: initialize, session/new, session/prompt, session/stop.
 
 Examples:
   zeroclaw acp                        # start ACP server
+  zeroclaw acp --agent fable         # default new sessions to agent fable
   zeroclaw acp --max-sessions 5       # limit concurrent sessions")]
     Acp {
+        /// Process-scoped default agent for alias-less session/new requests
+        #[arg(long)]
+        agent: Option<String>,
+
         /// Maximum concurrent sessions (default: 10)
         #[arg(long)]
         max_sessions: Option<usize>,
@@ -5255,6 +5260,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     if let Commands::Service {
+        service_command: ServiceCommands::RunDesktopDaemon { port },
+        ..
+    } = &cli.command
+    {
+        return service::run_desktop_daemon(*port).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
         service_command: ServiceCommands::RunOpenrcLogWriter { stream },
         ..
     } = &cli.command
@@ -5568,6 +5582,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         }
 
         Commands::Acp {
+            agent,
             max_sessions,
             session_timeout,
         } => {
@@ -5600,17 +5615,16 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         })
                         .ok();
                 let server = if let Some(store) = store {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
-                        config, acp_config, store,
-                    ))
+                    channels::acp_server::AcpServer::new_with_store(config, acp_config, store)
                 } else {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
-                };
-                server.run().await
+                    channels::acp_server::AcpServer::new(config, acp_config)
+                }
+                .with_connection_default_agent(agent);
+                std::sync::Arc::new(server).run().await
             }
             #[cfg(not(feature = "channel-acp-server"))]
             {
-                let _ = (max_sessions, session_timeout);
+                let _ = (agent, max_sessions, session_timeout);
                 anyhow::bail!("ACP server requires the `channel-acp-server` feature")
             }
         }
@@ -6602,6 +6616,9 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             }
             if let Some(handle) = degraded_nag.take() {
                 handle.abort();
+            }
+            if zeroclaw_runtime::restart::desktop_restart_requested() {
+                std::process::exit(zeroclaw_runtime::restart::DESKTOP_RESTART_EXIT_CODE);
             }
             // Bare-process auto-restart: the daemon has now torn down (the
             // gateway listener is released), so launch the upgraded binary as a
@@ -12113,6 +12130,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn desktop_daemon_cli_parses_hidden_command() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "service",
+            "run-desktop-daemon",
+            "--port",
+            "42617",
+        ])
+        .expect("internal desktop daemon should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Service {
+                service_command: ServiceCommands::RunDesktopDaemon { port },
+                ..
+            } if port == 42617
+        ));
+
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("run-desktop-daemon"));
+    }
+
+    #[test]
     fn probe_config_dir_extracts_global_flag_in_all_forms() {
         fn argv(parts: &[&str]) -> std::vec::IntoIter<std::ffi::OsString> {
             parts
@@ -12206,6 +12246,19 @@ mod tests {
             probe_config_dir(&command, argv(&["zeroclaw", "--config-dir", "--"])),
             None
         );
+    }
+
+    #[test]
+    fn acp_cli_accepts_process_default_agent() {
+        let cli = Cli::try_parse_from(["zeroclaw", "acp", "--agent", "fable"])
+            .expect("standalone ACP should accept a process default agent");
+
+        match cli.command {
+            Commands::Acp { agent, .. } => {
+                assert_eq!(agent.as_deref(), Some("fable"));
+            }
+            other => panic!("expected ACP command, got {other:?}"),
+        }
     }
 
     #[test]
@@ -14131,6 +14184,7 @@ mod tests {
                     model: Some("claude-opus-4-7".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 

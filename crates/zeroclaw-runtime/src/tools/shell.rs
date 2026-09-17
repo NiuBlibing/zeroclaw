@@ -234,9 +234,9 @@ impl ShellExecutionFactsResolver {
         Self::finalize_command(&mut command, &child_environment);
 
         let std_command = command.as_std();
-        let cwd = std_command
-            .get_current_dir()
-            .ok_or_else(|| anyhow::anyhow!("shell launch did not provide a working directory"))?;
+        let cwd = std_command.get_current_dir().ok_or_else(|| {
+            anyhow::Error::msg("shell launch did not provide a working directory")
+        })?;
         let resolved_cwd = cwd.canonicalize()?;
         let effective_path = environment_variable(std_command, "PATH");
         let host_interpreter = process_identity(
@@ -266,7 +266,9 @@ impl ShellExecutionFactsResolver {
             }),
             (SandboxShellProgram::Host, ShellExecutionDomain::Isolated { name: domain, .. }) => {
                 let profile = self.runtime.shell_profile().ok_or_else(|| {
-                    anyhow::anyhow!("isolated shell runtime did not declare its inner interpreter")
+                    anyhow::Error::msg(
+                        "isolated shell runtime did not declare its inner interpreter",
+                    )
                 })?;
                 json!({
                     "program": os_identity(OsStr::new(&profile.name)),
@@ -300,12 +302,12 @@ impl ShellExecutionFactsResolver {
                 })
             })
             .collect();
-        environment.sort_by(|left, right| left.to_string().cmp(&right.to_string()));
+        environment.sort_by_key(|entry| entry.to_string());
 
         let mut facts = shell_action.fingerprint_facts();
         let object = facts
             .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("shell fingerprint facts must be a JSON object"))?;
+            .ok_or_else(|| anyhow::Error::msg("shell fingerprint facts must be a JSON object"))?;
         if !matches!(
             shell_action.parse_status,
             zeroclaw_config::tool_policy::ParseStatus::Clean
@@ -338,11 +340,11 @@ impl ShellExecutionFactsResolver {
         let fact_segments = object
             .get_mut("segments")
             .and_then(serde_json::Value::as_array_mut)
-            .ok_or_else(|| anyhow::anyhow!("shell fingerprint segments must be an array"))?;
+            .ok_or_else(|| anyhow::Error::msg("shell fingerprint segments must be an array"))?;
         for (segment, identity) in fact_segments.iter_mut().zip(segment_identities) {
             let segment = segment
                 .as_object_mut()
-                .ok_or_else(|| anyhow::anyhow!("shell fingerprint segment must be an object"))?;
+                .ok_or_else(|| anyhow::Error::msg("shell fingerprint segment must be an object"))?;
             segment.insert("resolved_executable".to_string(), identity);
         }
         // The source is not an authority or display match. It closes the gap
@@ -496,9 +498,9 @@ fn ensure_isolated_shell_startup(
     dialect: crate::platform::ShellDialect,
     command: &std::process::Command,
 ) -> anyhow::Result<()> {
-    let profile = runtime
-        .shell_profile()
-        .ok_or_else(|| anyhow::anyhow!("isolated shell runtime did not declare an interpreter"))?;
+    let profile = runtime.shell_profile().ok_or_else(|| {
+        anyhow::Error::msg("isolated shell runtime did not declare an interpreter")
+    })?;
     if profile.dialect != dialect {
         anyhow::bail!("isolated shell runtime profile does not match its declared shell dialect");
     }
@@ -720,10 +722,10 @@ fn segment_executable_identities(
                 cwd.join(target)
             };
             cwd = target.canonicalize().map_err(|error| {
-                anyhow::anyhow!(
+                anyhow::Error::msg(format!(
                     "shell directory change target '{}' cannot be resolved: {error}",
                     target.display()
-                )
+                ))
             })?;
             if !cwd.is_dir() {
                 anyhow::bail!(
@@ -1057,20 +1059,20 @@ fn process_identity(
 
 fn executable_content_sha256(path: &Path) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(path).map_err(|error| {
-        anyhow::anyhow!(
+        anyhow::Error::msg(format!(
             "shell execution program '{}' cannot be opened for fingerprinting: {error}",
             path.display()
-        )
+        ))
     })?;
     let mut hasher = Sha256::new();
     let mut prefix = [0_u8; 2];
     let mut prefix_len = 0;
     while prefix_len < prefix.len() {
         let read = file.read(&mut prefix[prefix_len..]).map_err(|error| {
-            anyhow::anyhow!(
+            anyhow::Error::msg(format!(
                 "shell execution program '{}' cannot be read for fingerprinting: {error}",
                 path.display()
-            )
+            ))
         })?;
         if read == 0 {
             break;
@@ -1087,10 +1089,10 @@ fn executable_content_sha256(path: &Path) -> anyhow::Result<String> {
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer).map_err(|error| {
-            anyhow::anyhow!(
+            anyhow::Error::msg(format!(
                 "shell execution program '{}' cannot be read for fingerprinting: {error}",
                 path.display()
-            )
+            ))
         })?;
         if read == 0 {
             break;
@@ -1135,10 +1137,10 @@ fn resolve_program(
             cwd.join(requested)
         };
         return executable_candidate(&candidate).ok_or_else(|| {
-            anyhow::anyhow!(
+            anyhow::Error::msg(format!(
                 "shell execution program '{}' cannot be resolved as an executable",
                 candidate.display()
-            )
+            ))
         });
     }
 
@@ -1153,10 +1155,10 @@ fn resolve_program(
     }
 
     let path = path.ok_or_else(|| {
-        anyhow::anyhow!(
+        anyhow::Error::msg(format!(
             "shell execution program '{}' is relative but the final environment has no PATH",
             requested.display()
-        )
+        ))
     })?;
     #[cfg(not(windows))]
     let directories: Vec<PathBuf> = std::env::split_paths(path).collect();
@@ -1187,10 +1189,10 @@ fn resolve_program(
             }
         }
     }
-    Err(anyhow::anyhow!(
+    Err(anyhow::Error::msg(format!(
         "shell execution program '{}' cannot be resolved through the final PATH",
         requested.display()
-    ))
+    )))
 }
 
 #[cfg(windows)]

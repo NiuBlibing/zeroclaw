@@ -26,6 +26,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 uuid = { version = "1.22", default-features = false, features = ["std", "serde"] }
 
 [features]
+default = ["schema-export"]
 schema-export = ["dep:schemars"]
 
 [dev-dependencies]

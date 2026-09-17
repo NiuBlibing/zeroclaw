@@ -173,6 +173,15 @@ pub struct PolicyContextHolder {
     pub shell_dialect: ShellDialect,
 }
 
+fn canonical_tool_set(values: &[String]) -> HashSet<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 impl ApprovalManager {
     /// Attach the security policy and shell dialect this manager's agent
     /// runs under (RFC 7155: the approval gate resolves the actual shell
@@ -207,7 +216,7 @@ impl ApprovalManager {
     ) -> anyhow::Result<serde_json::Value> {
         self.shell_execution
             .get()
-            .ok_or_else(|| anyhow::anyhow!("shell execution context is not attached"))?
+            .ok_or_else(|| anyhow::Error::msg("shell execution context is not attached"))?
             .prepare(command)
             .map(|prepared| prepared.facts)
     }
@@ -231,8 +240,8 @@ impl ApprovalManager {
     /// Create an interactive (CLI) approval manager from a risk profile.
     pub fn from_risk_profile(risk_profile: &RiskProfileConfig) -> Self {
         Self {
-            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
-            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            auto_approve: canonical_tool_set(&risk_profile.auto_approve),
+            always_ask: canonical_tool_set(&risk_profile.always_ask),
             autonomy_level: risk_profile.level,
             non_interactive: false,
             non_interactive_shell_requires_approval: false,
@@ -246,8 +255,8 @@ impl ApprovalManager {
 
     pub fn for_non_interactive(risk_profile: &RiskProfileConfig) -> Self {
         Self {
-            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
-            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            auto_approve: canonical_tool_set(&risk_profile.auto_approve),
+            always_ask: canonical_tool_set(&risk_profile.always_ask),
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: false,
@@ -261,8 +270,8 @@ impl ApprovalManager {
 
     pub fn for_non_interactive_backchannel(risk_profile: &RiskProfileConfig) -> Self {
         Self {
-            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
-            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            auto_approve: canonical_tool_set(&risk_profile.auto_approve),
+            always_ask: canonical_tool_set(&risk_profile.always_ask),
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: true,
@@ -286,8 +295,8 @@ impl ApprovalManager {
     /// fresh — "Always" grants to one agent never transfer to another.
     pub fn derive_for_risk_profile(&self, risk_profile: &RiskProfileConfig) -> Self {
         let derived = Self {
-            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
-            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            auto_approve: canonical_tool_set(&risk_profile.auto_approve),
+            always_ask: canonical_tool_set(&risk_profile.always_ask),
             autonomy_level: risk_profile.level,
             non_interactive: self.non_interactive,
             non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,

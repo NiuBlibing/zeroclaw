@@ -93,7 +93,7 @@ pub(crate) async fn gate_tool_approval(
                 };
             }
             Decision::Allow | Decision::Ask => {
-                if resolution.decision == Decision::Ask
+                if (resolution.decision == Decision::Ask || mgr.hard_asks(tool_name))
                     && approval_requirement != ApprovalRequirement::Prompt
                 {
                     if mgr.can_request_shell_approval() {
@@ -530,6 +530,8 @@ mod tests {
         let mut profile = RiskProfileConfig {
             level: crate::security::AutonomyLevel::Full,
             auto_approve: vec!["shell".to_string()],
+            always_ask: vec![" shell ".to_string()],
+            allowed_commands: vec!["echo".to_string(), "true".to_string()],
             ..RiskProfileConfig::default()
         };
         profile.tool_policy.rules.push(PolicyRuleConfig {
@@ -543,20 +545,32 @@ mod tests {
     async fn full_auto_approve_does_not_bypass_shell_ask_with_or_without_route() {
         let workspace = tempfile::TempDir::new().unwrap();
         let profile = full_auto_approve_profile_with_shell_ask();
+        // Build the resolver without the manager's hard ask so this also
+        // exercises the defensive Allow + hard-ask branch. Production
+        // construction supplies the same canonicalized profile to both.
+        let mut policy_profile = profile.clone();
+        policy_profile.always_ask.clear();
         let security = Arc::new(crate::security::SecurityPolicy::from_risk_profile(
-            &profile,
+            &policy_profile,
             workspace.path(),
         ));
         let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
         let shell =
             crate::tools::shell::ShellTool::new(Arc::clone(&security), Arc::clone(&runtime));
-        let commands = ["echo ask", "printf unmatched"];
+        let commands = ["echo ask", "printf unmatched", "true"];
         assert!(matches!(
             security
                 .resolve_shell_decision(commands[1], ShellDialect::Posix, &[])
                 .reason,
             zeroclaw_config::tool_policy::ResolutionReason::Unmatched
         ));
+        assert_eq!(
+            security
+                .resolve_shell_decision(commands[2], ShellDialect::Posix, &[])
+                .decision,
+            Decision::Allow,
+            "the hard always-ask case must cover an otherwise allowed command"
+        );
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
 
