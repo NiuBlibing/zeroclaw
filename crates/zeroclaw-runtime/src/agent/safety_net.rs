@@ -2192,6 +2192,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
                 model_provider: &provider,
                 provider_name: "mock",
                 model: "mock-model",
+                dispatch_model: "mock-model",
                 temperature: None,
             },
             ResolvedIo {
@@ -2214,7 +2215,10 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
-                context_token_budget: 100_000,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
+                    100_000,
+                ),
+                context_limits_resolver: None,
                 knobs: &LoopKnobs::default(),
             },
         ),
@@ -2234,6 +2238,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
         memory: None,
         agent_alias: None,
         turn_id: &turn_id,
+        served_route_sink: None,
     })
     .await;
 
