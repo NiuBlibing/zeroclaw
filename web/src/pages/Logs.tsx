@@ -268,6 +268,7 @@ export default function Logs() {
         );
         if (isStale()) return;
         if (response.events.length > 0) mergeNewer(response.events);
+        setHistoryIncomplete((prev) => prev || (response.incomplete ?? false));
         if (response.daemon_started_at) setDaemonStartedAt(response.daemon_started_at);
         if (response.attribution_keys?.length) setAttributionKeys(response.attribution_keys);
       } catch {

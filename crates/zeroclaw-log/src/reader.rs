@@ -45,10 +45,12 @@ pub struct LogFilter {
 ///
 /// - **Archive cursor** (`archive:<seq>:<off>`): identifies a position in a
 ///   numbered archive. The sequence number is written into the archive name at
-///   rotation time and is never reused, so this form survives any number of
-///   subsequent rotations. If the segment has been deleted by retention, the
-///   reader returns an empty page with `at_end = true` rather than silently
-///   jumping to a different position.
+///   rotation time, and a best-effort sidecar preserves the high-water mark
+///   across normal restarts. If that sidecar cannot be written, retention
+///   removes every numbered archive, and the daemon then restarts, a sequence
+///   can be reused and an outstanding cursor can bind to newer history. If the
+///   segment has been deleted without sequence reuse, the reader returns an
+///   empty page with `at_end = true` rather than silently jumping elsewhere.
 ///
 /// - **Active cursor** (`active:<off>:<anchor_id>`): identifies a position in
 ///   the current active file. Because the active file's path is stable but its
@@ -71,8 +73,8 @@ pub struct SegmentCursor {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CursorKind {
-    /// Position inside a numbered archive, addressed by its never-reused
-    /// sequence number.
+    /// Position inside a numbered archive, addressed by its sequence number.
+    /// Persistence across restarts is best effort; see [`SegmentCursor`].
     Archive { seq: u64, off: u64 },
     /// Position inside a legacy archive written before sequence numbering.
     /// Addressed by filename, which is stable for an archive: unlike the
@@ -857,7 +859,7 @@ fn scan_segment(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SegmentRef {
     Active,
-    /// A numbered archive, addressed by its never-reused sequence number.
+    /// A numbered archive, addressed by its sequence number.
     Archive(u64),
     /// A legacy archive written before sequence numbering existed. It has no
     /// number, but its filename is stable, so a cursor addresses it by name.
@@ -875,11 +877,13 @@ fn resolve_cursor(
     unreadable: &mut bool,
 ) -> Option<(usize, u64)> {
     match &cursor.kind {
-        // An archive sequence is permanent: the number is written into the name
-        // at rotation and never reused. Not finding it means retention removed
-        // that segment, so there is genuinely nothing older to return. The
-        // explicit `archive:` wire prefix keeps this identity distinct from a
-        // legacy cursor naming an all-numeric active file.
+        // The number is written into the archive name and normally remains
+        // unique across restarts through the writer's high-water sidecar. Not
+        // finding it usually means retention removed that segment. Sequence
+        // reuse is possible only after the documented sidecar-write plus
+        // retention plus restart failure chain. The explicit `archive:` wire
+        // prefix keeps this identity distinct from a legacy cursor naming an
+        // all-numeric active file.
         CursorKind::Archive { seq, off } => segs
             .iter()
             .position(|s| s.seq == Some(*seq))

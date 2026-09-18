@@ -120,8 +120,9 @@ struct WorkerState {
     ///
     /// Stamped into the archive name so segment order is fixed at write time
     /// rather than inferred by a reader from mtimes. Seeded at startup from
-    /// the highest number already on disk, so the series keeps increasing
-    /// across restarts and reloads even though nothing persists it directly.
+    /// the highest number already on disk and the best-effort high-water
+    /// sidecar, so the series normally keeps increasing across restarts and
+    /// reloads even after retention removes older archives.
     next_archive_seq: AtomicU64,
 }
 
