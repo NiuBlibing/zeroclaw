@@ -677,6 +677,90 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn posix_escape_cannot_bypass_shell_deny_at_gate_or_execution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let fake_git = workspace.path().join("git");
+        let marker = workspace.path().join("escaped-deny-executed");
+        std::fs::write(&fake_git, "#!/bin/sh\n: > \"$2\"\n").unwrap();
+        std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut profile = RiskProfileConfig {
+            level: crate::security::AutonomyLevel::Full,
+            allowed_commands: vec!["git".to_string()],
+            ..RiskProfileConfig::default()
+        };
+        profile.tool_policy.rules.push(PolicyRuleConfig {
+            pattern: "Shell(git push:*)".to_string(),
+            decision: Decision::Deny,
+        });
+        let security = Arc::new(crate::security::SecurityPolicy::from_risk_profile(
+            &profile,
+            workspace.path(),
+        ));
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let shell =
+            crate::tools::shell::ShellTool::new(Arc::clone(&security), Arc::clone(&runtime));
+        let approval = ApprovalManager::for_non_interactive(&profile);
+        approval.set_policy_context(Arc::clone(&security), ShellDialect::Posix);
+        approval.set_shell_execution_context(shell.execution_facts_resolver());
+
+        let command = format!(
+            "PATH={} git pu\\sh {}",
+            workspace.path().display(),
+            marker.display()
+        );
+        let arguments = serde_json::json!({"command": command});
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test",
+            model: "test-model",
+            temperature: None,
+            approval: Some(&approval),
+            channel_name: "background",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "turn-posix-escape-deny",
+            agent_alias: Some("default"),
+            parent_agent_alias: None,
+        };
+
+        assert!(matches!(
+            gate_tool_approval(
+                &ctx,
+                "shell",
+                &arguments,
+                0,
+                zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+            )
+            .await,
+            ApprovalGateOutcome::Deny { .. }
+        ));
+
+        let result = shell.execute(arguments).await.unwrap();
+        assert!(
+            !result.success,
+            "escaped deny unexpectedly executed: {result:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "escaped command reached the fake git executable"
+        );
+    }
+
     #[tokio::test]
     async fn session_always_revalidates_policy_fingerprint_at_shell_boundary() {
         let workspace = tempfile::TempDir::new().unwrap();

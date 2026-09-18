@@ -1569,6 +1569,46 @@ pub(crate) fn contains_mixed_quoted_token(command: &str) -> bool {
     finish_token(&mut has_bare, &mut has_quoted)
 }
 
+/// Detect POSIX backslash escapes that the bounded whitespace tokenizer does
+/// not normalize to the argv the shell will execute.
+///
+/// Outside quotes a backslash always changes token interpretation. Inside
+/// double quotes it does so only for the characters POSIX shells treat as
+/// escapable there. Backslashes inside single quotes are literal.
+pub(crate) fn contains_posix_token_escape(command: &str) -> bool {
+    let mut quote = QuoteState::None;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                if ch == '"' {
+                    quote = QuoteState::None;
+                } else if ch == '\\'
+                    && chars
+                        .peek()
+                        .is_some_and(|next| matches!(next, '$' | '`' | '"' | '\\' | '\n'))
+                {
+                    return true;
+                }
+            }
+            QuoteState::None => match ch {
+                '\'' => quote = QuoteState::Single,
+                '"' => quote = QuoteState::Double,
+                '\\' => return true,
+                _ => {}
+            },
+        }
+    }
+
+    false
+}
+
 fn looks_like_path(candidate: &str) -> bool {
     candidate.starts_with('/')
         || candidate.starts_with("./")
@@ -2807,6 +2847,7 @@ impl SecurityPolicy {
             || command.contains("<(")
             || command.contains(">(")
             || contains_mixed_quoted_token(command)
+            || (dialect == ShellDialect::Posix && contains_posix_token_escape(command))
             || (dialect == ShellDialect::Posix && contains_unquoted_posix_grouping(command))
         {
             return false;

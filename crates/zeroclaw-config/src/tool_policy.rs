@@ -205,6 +205,9 @@ pub enum DegradationReason {
     /// shell concatenates these fragments before execution, but the bounded
     /// extractor does not normalize them safely.
     MixedQuotedToken,
+    /// A POSIX backslash escape changes the argv the shell executes, but the
+    /// bounded extractor preserves the raw backslash.
+    EscapedToken,
     /// Injection-capable arguments of a known executable (`find -exec`,
     /// `git -c`, `python -c`, `node -e`, `pip install`, `npm exec`,
     /// `cargo install`) — the executed code is not visible in the segment.
@@ -612,6 +615,12 @@ fn extract_posix_like_segments(
     }
     if degradation.is_none() && crate::policy::contains_mixed_quoted_token(command) {
         degradation = Some(DegradationReason::MixedQuotedToken);
+    }
+    if degradation.is_none()
+        && dialect == ShellDialect::Posix
+        && crate::policy::contains_posix_token_escape(command)
+    {
+        degradation = Some(DegradationReason::EscapedToken);
     }
     if degradation.is_none() && contains_unsafe_output_redirect_for_shell(command, dialect) {
         degradation = Some(DegradationReason::UnsafeOutputRedirect);
@@ -2226,6 +2235,30 @@ mod tests {
         let ToolAction::Shell(shell) = &action;
         assert_eq!(shell.parse_status, ParseStatus::Clean);
         assert_eq!(shell.segments[0].arguments, vec!["push"]);
+    }
+
+    #[test]
+    fn extraction_rejects_posix_escaped_tokens() {
+        for command in [r"git pu\sh", r#"git "pu\"sh""#] {
+            let action = extract_shell_action(command, ShellDialect::Posix, None);
+            let ToolAction::Shell(shell) = &action;
+            assert_eq!(
+                shell.parse_status,
+                ParseStatus::Degraded(DegradationReason::EscapedToken),
+                "the shell-normalized argv must not be matched as raw text: {command}"
+            );
+
+            let cfg = profile(AutonomyLevel::Supervised, &["git"]);
+            let resolution = resolve_with(&cfg, command, ShellDialect::Posix);
+            assert_eq!(resolution.decision, Decision::Deny, "{command}");
+            assert!(matches!(
+                resolution.reason,
+                ResolutionReason::DegradedSyntax {
+                    reason: DegradationReason::EscapedToken,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
