@@ -3,6 +3,140 @@ use std::path::{Path, PathBuf};
 use zeroclaw_api::platform::is_android;
 use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect, ShellProfile};
 
+/// Resolve the platform default shell when `runtime.shell` is omitted.
+/// Candidates are only inspected, never executed.
+pub fn default_shell() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        return first_available(["pwsh", "powershell"], shell_is_available)
+            .unwrap_or_else(|| "cmd.exe".to_string());
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        return "/system/bin/sh".to_string();
+    }
+
+    #[cfg(target_os = "macos")]
+    let fallback = ["zsh", "bash", "/bin/sh"];
+
+    #[cfg(target_os = "linux")]
+    let fallback = ["bash", "zsh", "/bin/sh"];
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "android", target_os = "macos", target_os = "linux"))
+    ))]
+    let fallback = ["sh"];
+
+    #[cfg(not(any(unix, target_os = "windows")))]
+    let fallback = ["sh"];
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(login_shell) = login_shell() {
+        if shell_is_available(&login_shell) {
+            return login_shell;
+        }
+    }
+
+    first_available(fallback, shell_is_available)
+        .unwrap_or_else(|| fallback[fallback.len() - 1].to_string())
+}
+
+fn first_available<'a>(
+    candidates: impl IntoIterator<Item = &'a str>,
+    mut available: impl FnMut(&str) -> bool,
+) -> Option<String> {
+    candidates
+        .into_iter()
+        .find(|candidate| available(candidate))
+        .map(str::to_owned)
+}
+
+#[cfg(unix)]
+fn shell_is_available(shell: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = Path::new(shell);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else if path.components().count() == 1 {
+        match std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join(shell))
+            .find(|candidate| candidate.is_file())
+        {
+            Some(found) => found,
+            None => return false,
+        }
+    } else {
+        return false;
+    };
+
+    resolved.is_file()
+        && resolved
+            .metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn shell_is_available(shell: &str) -> bool {
+    let path = Path::new(shell);
+    if path.is_absolute() {
+        return path.is_file();
+    }
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path_var).any(|dir| {
+        [shell.to_string(), format!("{shell}.exe")]
+            .iter()
+            .map(|name| dir.join(name))
+            .any(|candidate| candidate.is_file())
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn shell_is_available(_shell: &str) -> bool {
+    false
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn login_shell() -> Option<String> {
+    use std::ffi::CStr;
+    use std::os::raw::c_char;
+    use std::ptr;
+
+    let mut capacity = 1024usize;
+    loop {
+        let mut buffer = vec![0u8; capacity];
+        let mut passwd = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result = ptr::null_mut();
+        let status = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &mut passwd,
+                buffer.as_mut_ptr().cast::<c_char>(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+
+        if status == 0 {
+            if result.is_null() || passwd.pw_shell.is_null() {
+                return None;
+            }
+            let shell = unsafe { CStr::from_ptr(passwd.pw_shell) }
+                .to_str()
+                .ok()?
+                .trim();
+            return (!shell.is_empty()).then(|| shell.to_string());
+        }
+        if status != libc::ERANGE || capacity >= 1024 * 1024 {
+            return None;
+        }
+        capacity *= 2;
+    }
+}
+
 pub fn windows_cmd_shell_raw_arg(command: &str) -> String {
     format!("\"{command}\"")
 }
@@ -114,8 +248,7 @@ pub struct NativeRuntime {
     /// `-NoProfile -NonInteractive -Command` on every supported desktop host.
     ///
     /// Windows: [`RuntimeAdapter::shell_dialect`] selects the invocation
-    /// convention — `cmd.exe /C` (default, and for the cross-platform default
-    /// `sh`) or PowerShell (`powershell`/`pwsh`).
+    /// convention — `cmd.exe /C` or PowerShell (`powershell`/`pwsh`).
     shell: String,
 }
 
@@ -126,9 +259,9 @@ impl Default for NativeRuntime {
 }
 
 impl NativeRuntime {
-    /// Create a native runtime that uses the system default shell (`sh`).
+    /// Create a native runtime using the platform's resolved default shell.
     pub fn new() -> Self {
-        Self::with_shell("sh".into())
+        Self::with_shell(default_shell())
     }
 
     /// Create a native runtime that uses a specific shell binary.
@@ -260,6 +393,22 @@ impl RuntimeAdapter for NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_candidates_skip_unavailable_login_shell() {
+        let selected = first_available(["/missing/login-shell", "bash", "/bin/sh"], |candidate| {
+            candidate == "bash"
+        });
+        assert_eq!(selected.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn default_candidates_preserve_probe_order() {
+        let selected = first_available(["pwsh", "powershell", "cmd.exe"], |candidate| {
+            candidate == "powershell"
+        });
+        assert_eq!(selected.as_deref(), Some("powershell"));
+    }
 
     #[cfg(target_os = "windows")]
     #[test]
@@ -595,13 +744,14 @@ mod tests {
 
     #[test]
     #[cfg(not(target_os = "windows"))]
-    fn native_with_shell_defaults_to_sh() {
+    fn native_with_shell_uses_platform_default() {
         let runtime = NativeRuntime::new();
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
+        let expected = default_shell();
         assert!(
-            format!("{cmd:?}").contains("\"sh\""),
-            "default shell should be 'sh', got: {cmd:?}"
+            format!("{cmd:?}").contains(&format!("\"{expected}\"")),
+            "default shell should be {expected:?}, got: {cmd:?}"
         );
     }
 
