@@ -5,6 +5,7 @@ use crate::traits::{
 };
 use anyhow::Context;
 use async_trait::async_trait;
+#[cfg(test)]
 use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
@@ -908,7 +909,7 @@ impl AnthropicModelProvider {
         if refs.is_empty() {
             // Sweep the *cleaned* text, never the original. An over-ceiling
             // marker yields zero references and lands in `cleaned` as the
-            // fixed refusal note — returning the original instead would
+            // fixed refusal note - returning the original instead would
             // forward its raw oversized body past the marker ceiling. The
             // sweep is still needed on top of `cleaned` because an
             // unterminated marker also yields zero references and copies its
@@ -1436,45 +1437,6 @@ impl AnthropicModelProvider {
                                     continue;
                                 }
                             }
-                        } else if std::path::Path::new(img_ref.trim()).exists() {
-                            // Local file path
-                            match std::fs::read(img_ref.trim()) {
-                                Ok(bytes) => {
-                                    let b64 =
-                                        base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                    let ext = std::path::Path::new(img_ref.trim())
-                                        .extension()
-                                        .and_then(|e| e.to_str())
-                                        .unwrap_or("jpg");
-                                    let mime = match ext {
-                                        "png" => "image/png",
-                                        "gif" => "image/gif",
-                                        "webp" => "image/webp",
-                                        _ => "image/jpeg",
-                                    }
-                                    .to_string();
-                                    (mime, b64)
-                                }
-                                Err(error) => {
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Note
-                                        )
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                        .with_attrs(
-                                            ::serde_json::json!({
-                                                "error": format!("{error}"),
-                                                "error_key": "anthropic_image_local_read_failed",
-                                            })
-                                        ),
-                                        "dropping image marker: local file could not be read"
-                                    );
-                                    omitted += 1;
-                                    continue;
-                                }
-                            }
                         } else {
                             ::zeroclaw_log::record!(
                                 WARN,
@@ -1488,6 +1450,14 @@ impl AnthropicModelProvider {
                                 })),
                                 "dropping image marker: source is neither a data URI nor an existing file"
                             );
+                            // Counted exactly like the tool-result arm. The
+                            // multimodal normalizer is the only component that
+                            // may turn a file reference into inline image
+                            // content, and it has already run by the time a
+                            // message reaches this adapter; reading the path
+                            // here (extension-inferred MIME, no size or
+                            // content validation) would reopen the hole the
+                            // normalizer exists to close.
                             omitted += 1;
                             continue;
                         };
@@ -6129,15 +6099,6 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     /// An oversized local-path marker in a tool result is refused with the
     /// fixed note, never forwarded as raw text.
-    ///
-    /// The zero-reference early return in `tool_result_content` used to sweep
-    /// the *original* carrier, so a local marker over the parser's marker
-    /// ceiling reached the wire verbatim: the residual sweep only removes
-    /// data-URI-shaped material, and a path marker carries none. The early
-    /// return now sweeps the cleaned text, which carries the refusal note in
-    /// place of the body. The terminated and unterminated shapes both produce
-    /// zero references with refusal text in `cleaned`, so both must land on
-    /// the note.
     #[test]
     fn oversized_local_tool_result_marker_is_refused_not_forwarded() {
         for (label, marker) in [
@@ -7859,9 +7820,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn prepared_local_image_reaches_the_wire_as_a_nested_block() {
         let temp = tempfile::tempdir().expect("temp dir");
         let image_path = temp.path().join("screenshot.png");
-        // A real 1x1 PNG, not a bare signature. Preparation now decodes the
-        // pixels to reject corrupt images, so a signature-only file is dropped
-        // before it can reach the converter and this test would assert nothing.
+        // A real 1x1 PNG, not a bare signature. Preparation decodes pixels to
+        // reject corrupt images, so a signature-only file would be dropped.
         let png_bytes = {
             let mut buf = std::io::Cursor::new(Vec::new());
             image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
@@ -7966,6 +7926,50 @@ data: {\"type\":\"message_stop\"}\n\n";
             .flat_map(|m| &m.content)
             .any(|block| matches!(block, NativeContentOut::Image { .. }));
         assert!(has_image, "user-message images must still be delivered");
+    }
+
+    /// A user-message image marker pointing at a real file on disk must not
+    /// be read: the reference is counted as omitted exactly like the
+    /// tool-result arm, no `Image` block is built, and the omission note says
+    /// so. The file carries a genuine PNG signature, so under the old
+    /// raw-path branch this exact input was read from disk and forwarded with
+    /// an extension-inferred MIME type and no size or content validation; the
+    /// note's count of one is the proof no read happened.
+    #[test]
+    fn user_message_path_image_marker_is_omitted_not_read() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image_path = temp.path().join("photo.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .expect("write png");
+
+        let messages = vec![ChatMessage::user(format!(
+            "what is this [IMAGE:{}]",
+            image_path.display()
+        ))];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let blocks = last_user_blocks(&native_msgs);
+
+        assert!(
+            !blocks.iter().any(|block| block["type"] == "image"),
+            "a filesystem path must not become an image block: {blocks:?}"
+        );
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .and_then(|block| block["text"].as_str())
+            .unwrap_or_else(|| panic!("expected a text block: {blocks:?}"));
+        assert!(
+            text.contains(OMISSION_NOTE_ONE),
+            "the dropped path must be surfaced as an omission note: {text}"
+        );
+        assert!(
+            !text.contains(&image_path.display().to_string()),
+            "the raw path must not reach the wire as text either: {text}"
+        );
     }
 
     /// The wire-shape pin for the two-shape content: an image-free tool result
