@@ -18246,6 +18246,105 @@ temperature = 0.1
     }
 
     #[tokio::test]
+    async fn resilient_channel_provider_pins_selected_nested_model_over_legacy_model() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::Mutex as StdMutex;
+        use zeroclaw_config::schema::{
+            Config, ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig, WireApi,
+        };
+        use zeroclaw_providers::ChatRequest;
+
+        type Capture = Arc<StdMutex<Option<Value>>>;
+
+        async fn capture_request(
+            State(capture): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            *capture.lock().unwrap() = Some(body);
+            Json(json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            }))
+        }
+
+        let capture: Capture = Arc::new(StdMutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock model endpoint");
+        let address = listener.local_addr().expect("mock endpoint address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_request))
+            .with_state(Arc::clone(&capture));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock model endpoint");
+        });
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "channel".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("legacy-channel-model".to_string()),
+                    api_key: Some("sk-test".to_string()),
+                    uri: Some(format!("http://{address}/v1")),
+                    wire_api: Some(WireApi::ChatCompletions),
+                    models: HashMap::from([(
+                        "fast".to_string(),
+                        ModelEntryConfig {
+                            id: Some("nested-channel-model".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
+        );
+        let model_entry = config
+            .resolve_model_selection("openai.channel.fast")
+            .and_then(|selection| selection.model_entry.cloned());
+        let provider = create_resilient_model_provider_nonblocking(
+            Arc::new(config.clone()),
+            "openai.channel.fast",
+            Some("sk-test".to_string()),
+            Some(format!("http://{address}/v1")),
+            config.reliability.clone(),
+            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            model_entry,
+        )
+        .await
+        .expect("channel provider should construct");
+        let messages = [ChatMessage::user("hello")];
+        provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "nested-channel-model",
+                None,
+            )
+            .await
+            .expect("channel provider should reach configured endpoint");
+
+        let body = capture
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("mock endpoint was called");
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("nested-channel-model")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn load_runtime_config_rejects_unresolved_agent_provider() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");

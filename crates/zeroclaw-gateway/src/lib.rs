@@ -5451,7 +5451,7 @@ path = "{trigger_path}"
     }
 
     #[tokio::test]
-    async fn gateway_boot_uses_nested_only_provider_selection() {
+    async fn gateway_boot_pins_nested_model_over_legacy_model() {
         use axum::routing::post;
         use serde_json::{Value, json};
         use zeroclaw_api::model_provider::{ChatMessage, ChatRequest};
@@ -5493,6 +5493,7 @@ path = "{trigger_path}"
             "gateway".to_string(),
             OpenAIModelProviderConfig {
                 base: ModelProviderConfig {
+                    model: Some("legacy-boot-model".to_string()),
                     api_key: Some("sk-test".to_string()),
                     uri: Some(format!("http://{address}/v1")),
                     wire_api: Some(WireApi::ChatCompletions),

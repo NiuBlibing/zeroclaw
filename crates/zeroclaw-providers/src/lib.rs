@@ -1878,6 +1878,10 @@ pub fn create_resilient_model_provider_from_ref(
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
+    let selected_model = config
+        .resolve_model_selection(name.trim())
+        .filter(|selection| selection.model_entry.is_some())
+        .and_then(|selection| selection.model_id);
     create_resilient_model_provider_from_ref_with_model_override(
         config,
         name,
@@ -1885,7 +1889,7 @@ pub fn create_resilient_model_provider_from_ref(
         api_url,
         reliability,
         options,
-        None,
+        selected_model.as_deref(),
     )
 }
 
