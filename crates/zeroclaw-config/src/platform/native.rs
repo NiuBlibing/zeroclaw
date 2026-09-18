@@ -70,16 +70,21 @@ pub fn windows_tokio_cmd_shell_command(command: &str) -> tokio::process::Command
 ///
 /// `-NoProfile` skips user/host profile scripts for a predictable, faster
 /// startup; `-NonInteractive` prevents the shell from blocking on prompts; and
-/// `-Command` consumes the final argument as script text. Ordinary `arg`
-/// handling keeps the entire script in one process argument and preserves its
-/// internal PowerShell quoting.
+/// `-Command` consumes the final argument as script text. The script first
+/// attempts to configure UTF-8 output. That setup is deliberately isolated in
+/// an empty `try`/`catch`, so an unsupported setting never prevents the user
+/// command from running. Ordinary `arg` handling keeps the entire script in
+/// one process argument and preserves its internal PowerShell quoting.
 fn tokio_powershell_command(interpreter: &str, command: &str) -> tokio::process::Command {
+    let script = format!(
+        "try {{\n    $utf8 = [System.Text.UTF8Encoding]::new($false)\n    [Console]::OutputEncoding = $utf8\n    $OutputEncoding = $utf8\n}} catch {{\n}}\n{command}"
+    );
     let mut process = tokio::process::Command::new(interpreter);
     process
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-Command")
-        .arg(command);
+        .arg(script);
     process
 }
 
@@ -408,9 +413,14 @@ mod tests {
             OsStr::new("-NoProfile"),
             OsStr::new("-NonInteractive"),
             OsStr::new("-Command"),
-            OsStr::new(script),
         ];
-        assert_eq!(args.as_slice(), expected.as_slice());
+        assert_eq!(&args[..3], expected.as_slice());
+        let script_arg = args[3].to_string_lossy();
+        assert!(script_arg.starts_with("try {"));
+        assert!(script_arg.contains("[Console]::OutputEncoding = $utf8"));
+        assert!(script_arg.contains("$OutputEncoding = $utf8"));
+        assert!(script_arg.contains("} catch {\n}"));
+        assert!(script_arg.ends_with(script));
     }
 
     #[test]
