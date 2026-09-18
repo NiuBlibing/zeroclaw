@@ -1719,11 +1719,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_output_invalid_utf8_uses_replacement_chars() {
-        // 0xFF is not valid UTF-8
+    fn decode_output_invalid_utf8_is_safe() {
+        // 0xFF is not valid UTF-8. Detection may select a legacy encoding,
+        // but the output must remain usable and must never panic.
         let input = b"hello\xFF world";
         let result = super::decode_output(input);
-        // Must not panic; non-UTF-8 bytes become replacement characters on non-Windows
         assert!(result.contains("hello"));
         assert!(result.contains("world"));
     }
@@ -1731,37 +1731,6 @@ mod tests {
     #[test]
     fn decode_output_empty_bytes_returns_empty_string() {
         assert_eq!(super::decode_output(b""), "");
-    }
-
-    #[test]
-    fn windows_code_page_mapping_covers_cjk() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(936), encoding_rs::GBK);
-        assert_eq!(windows_code_page_to_encoding(932), encoding_rs::SHIFT_JIS);
-        assert_eq!(windows_code_page_to_encoding(949), encoding_rs::EUC_KR);
-        assert_eq!(windows_code_page_to_encoding(950), encoding_rs::BIG5);
-    }
-
-    #[test]
-    fn windows_code_page_mapping_utf8_variants() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(65001), encoding_rs::UTF_8);
-        assert_eq!(windows_code_page_to_encoding(20127), encoding_rs::UTF_8);
-    }
-
-    #[test]
-    fn windows_code_page_mapping_unknown_falls_back_to_utf8() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(99999), encoding_rs::UTF_8);
-    }
-
-    #[test]
-    fn decode_output_with_cp936_gbk_bytes_transcodes_to_utf8() {
-        // GBK encoding of "你好" is [0xC4, 0xE3, 0xBA, 0xC3]
-        let gbk_bytes: &[u8] = &[0xC4, 0xE3, 0xBA, 0xC3];
-        let decoded = super::decode_output_with_code_page(gbk_bytes, 936);
-        assert_eq!(decoded, "你好");
-        assert!(!decoded.contains('\u{FFFD}'));
     }
 
     #[tokio::test]
