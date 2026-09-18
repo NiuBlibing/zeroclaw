@@ -1779,6 +1779,33 @@ impl Agent {
         .await
     }
 
+    /// Build a daemon-backed ACP/WS Agent from live tool and history policy
+    /// while keeping its model route generation pinned until reconnect.
+    pub async fn from_live_config_with_session_cwd_and_mcp_backchannel(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        acp_delivery: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
+    ) -> Result<Self> {
+        Self::from_pinned_live_config_with_session_cwd_and_mcp_backchannel(
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            acp_delivery,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+        )
+        .await
+    }
+
     pub async fn from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
         live_config: Arc<parking_lot::RwLock<Config>>,
         agent_alias: &str,
