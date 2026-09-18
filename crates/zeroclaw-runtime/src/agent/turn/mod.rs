@@ -1677,6 +1677,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         model,
         dispatch_model,
         temperature,
+        multimodal_config,
         pacing,
         cancellation_token.as_ref(),
         max_iterations,
