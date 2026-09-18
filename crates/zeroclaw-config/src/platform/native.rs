@@ -6,41 +6,49 @@ use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect, ShellProfile};
 /// Resolve the platform default shell when `runtime.shell` is omitted.
 /// Candidates are only inspected, never executed.
 pub fn default_shell() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        return first_available(["pwsh", "powershell"], shell_is_available)
-            .unwrap_or_else(|| "cmd.exe".to_string());
-    }
+    default_shell_for_platform()
+}
 
-    #[cfg(target_os = "android")]
-    {
-        return "/system/bin/sh".to_string();
-    }
+#[cfg(target_os = "windows")]
+fn default_shell_for_platform() -> String {
+    first_available(["pwsh", "powershell"], shell_is_available)
+        .unwrap_or_else(|| "cmd.exe".to_string())
+}
 
+#[cfg(target_os = "android")]
+fn default_shell_for_platform() -> String {
+    "/system/bin/sh".to_string()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn default_shell_for_platform() -> String {
     #[cfg(target_os = "macos")]
     let fallback = ["zsh", "bash", "/bin/sh"];
 
     #[cfg(target_os = "linux")]
     let fallback = ["bash", "zsh", "/bin/sh"];
 
-    #[cfg(all(
-        unix,
-        not(any(target_os = "android", target_os = "macos", target_os = "linux"))
-    ))]
-    let fallback = ["sh"];
-
-    #[cfg(not(any(unix, target_os = "windows")))]
-    let fallback = ["sh"];
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if let Some(login_shell) = login_shell() {
-        if shell_is_available(&login_shell) {
-            return login_shell;
-        }
+    if let Some(login_shell) = login_shell()
+        && shell_is_available(&login_shell)
+    {
+        return login_shell;
     }
 
     first_available(fallback, shell_is_available)
         .unwrap_or_else(|| fallback[fallback.len() - 1].to_string())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "android", target_os = "macos", target_os = "linux"))
+))]
+fn default_shell_for_platform() -> String {
+    first_available(["sh"], shell_is_available).unwrap_or_else(|| "sh".to_string())
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn default_shell_for_platform() -> String {
+    "sh".to_string()
 }
 
 fn first_available<'a>(
