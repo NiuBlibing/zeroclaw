@@ -139,7 +139,9 @@ fn windows_code_page_to_encoding(code_page: u32) -> Option<&'static encoding_rs:
 
 #[cfg(test)]
 mod tests {
-    use super::decode_shell_output;
+    use super::{
+        decode_shell_output, decode_shell_output_with_context, decode_truncated_shell_output,
+    };
 
     #[test]
     fn preserves_valid_utf8() {
