@@ -40,8 +40,9 @@ fn decode_shell_output_with_context(
     if capture_was_truncated
         && utf8_error.error_len().is_none()
         && utf8_error.valid_up_to() > 0
-        && has_utf8_continuation_context(bytes, utf8_error.valid_up_to())
-        && (code_page_hint.is_none() || bytes.len() > WINDOWS_SHORT_OUTPUT_LIMIT)
+        && (code_page_hint.is_none()
+            || (bytes.len() > WINDOWS_SHORT_OUTPUT_LIMIT
+                && has_utf8_continuation_context(bytes, utf8_error.valid_up_to())))
     {
         let valid_up_to = utf8_error.valid_up_to();
         let prefix = std::str::from_utf8(&bytes[..valid_up_to])
