@@ -37,6 +37,8 @@ pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
+#[cfg(feature = "plugins-wasm")]
+mod plugin_webhook;
 pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
@@ -141,7 +143,9 @@ use zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy;
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
-use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
+use zeroclaw_runtime::security::pairing::{
+    PairingCodePolicy, PairingGuard, constant_time_eq, is_public_bind,
+};
 use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
 use zeroclaw_runtime::tools::scoped;
@@ -169,6 +173,7 @@ pub fn gateway_long_running_request_timeout_secs(
 }
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+
 /// Fallback max distinct client keys tracked in gateway rate limiter.
 pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
@@ -334,7 +339,27 @@ impl GatewayRateLimiter {
 pub struct IdempotencyStore {
     ttl: Duration,
     max_keys: usize,
-    keys: Mutex<HashMap<String, Instant>>,
+    entries: Mutex<IdempotencyEntries>,
+    #[cfg(feature = "plugins-wasm")]
+    next_generation: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct IdempotencyEntries {
+    committed: HashMap<String, Instant>,
+    /// Temporary plugin-delivery owners, bounded independently by `max_keys`.
+    /// Keeping this separate prevents one slow plugin request from making the
+    /// legacy boolean `record_if_new` path misclassify store pressure as a
+    /// committed duplicate.
+    #[cfg(feature = "plugins-wasm")]
+    pending: HashMap<String, PendingIdempotencyReservation>,
+}
+
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug)]
+struct PendingIdempotencyReservation {
+    generation: u64,
+    status: tokio::sync::watch::Sender<zeroclaw_api::webhook::WebhookReservationStatus>,
 }
 
 impl IdempotencyStore {
@@ -342,32 +367,138 @@ impl IdempotencyStore {
         Self {
             ttl,
             max_keys: max_keys.max(1),
-            keys: Mutex::new(HashMap::new()),
+            entries: Mutex::new(IdempotencyEntries::default()),
+            #[cfg(feature = "plugins-wasm")]
+            next_generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
     /// Returns true if this key is new and is now recorded.
     fn record_if_new(&self, key: &str) -> bool {
         let now = Instant::now();
-        let mut keys = self.keys.lock();
+        let mut entries = self.entries.lock();
 
-        keys.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        entries
+            .committed
+            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
 
-        if keys.contains_key(key) {
+        let pending_contains = {
+            #[cfg(feature = "plugins-wasm")]
+            {
+                entries.pending.contains_key(key)
+            }
+            #[cfg(not(feature = "plugins-wasm"))]
+            {
+                false
+            }
+        };
+        if entries.committed.contains_key(key) || pending_contains {
             return false;
         }
 
-        if keys.len() >= self.max_keys {
-            let evict_key = keys
+        if entries.committed.len() >= self.max_keys {
+            let evict_key = entries
+                .committed
                 .iter()
                 .min_by_key(|(_, seen_at)| *seen_at)
                 .map(|(k, _)| k.clone());
             if let Some(evict_key) = evict_key {
-                keys.remove(&evict_key);
+                entries.committed.remove(&evict_key);
+            } else {
+                return false;
             }
         }
 
-        keys.insert(key.to_owned(), now);
+        entries.committed.insert(key.to_owned(), now);
+        true
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    fn begin_reservation(&self, key: &str) -> zeroclaw_api::webhook::WebhookReservation {
+        use zeroclaw_api::webhook::{
+            WebhookReservation, WebhookReservationStatus, WebhookReservationToken,
+            WebhookReservationWaiter,
+        };
+
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        entries
+            .committed
+            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        if entries.committed.contains_key(key) {
+            return WebhookReservation::Committed;
+        }
+        if let Some(pending) = entries.pending.get(key) {
+            return WebhookReservation::InFlight(WebhookReservationWaiter::new(
+                pending.status.subscribe(),
+            ));
+        }
+
+        if entries.pending.len() >= self.max_keys {
+            return WebhookReservation::Unavailable;
+        }
+
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (status, _) = tokio::sync::watch::channel(WebhookReservationStatus::InFlight);
+        entries.pending.insert(
+            key.to_string(),
+            PendingIdempotencyReservation { generation, status },
+        );
+        WebhookReservation::Owner(WebhookReservationToken::new(key.to_string(), generation))
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    fn commit_reservation(&self, token: &zeroclaw_api::webhook::WebhookReservationToken) -> bool {
+        let mut entries = self.entries.lock();
+        if entries
+            .pending
+            .get(token.key())
+            .is_none_or(|pending| pending.generation != token.generation())
+        {
+            return false;
+        }
+        let Some(pending) = entries.pending.remove(token.key()) else {
+            return false;
+        };
+        pending
+            .status
+            .send_replace(zeroclaw_api::webhook::WebhookReservationStatus::Committed);
+        let now = Instant::now();
+        entries
+            .committed
+            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        if entries.committed.len() >= self.max_keys {
+            let evict_key = entries
+                .committed
+                .iter()
+                .min_by_key(|(_, seen_at)| *seen_at)
+                .map(|(key, _)| key.clone());
+            if let Some(evict_key) = evict_key {
+                entries.committed.remove(&evict_key);
+            }
+        }
+        entries.committed.insert(token.key().to_string(), now);
+        true
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    fn rollback_reservation(&self, token: &zeroclaw_api::webhook::WebhookReservationToken) -> bool {
+        let mut entries = self.entries.lock();
+        if entries
+            .pending
+            .get(token.key())
+            .is_none_or(|pending| pending.generation != token.generation())
+        {
+            return false;
+        }
+        let Some(pending) = entries.pending.remove(token.key()) else {
+            return false;
+        };
+        pending
+            .status
+            .send_replace(zeroclaw_api::webhook::WebhookReservationStatus::RolledBack);
         true
     }
 }
@@ -627,8 +758,27 @@ pub struct AppState {
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
+/// Daemon-owned services whose lifecycle matches one supervised gateway run.
+pub struct GatewaySupervision {
+    readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
+    plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+}
+
+impl GatewaySupervision {
+    /// Pair startup readiness with the channel supervisor's route generation.
+    #[must_use]
+    pub fn new(
+        readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
+        plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+    ) -> Self {
+        Self {
+            readiness,
+            plugin_webhooks,
+        }
+    }
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
-#[allow(clippy::too_many_lines)]
 pub async fn run_gateway(
     host: &str,
     port: u16,
@@ -647,6 +797,44 @@ pub async fn run_gateway(
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
+    Box::pin(run_gateway_with_plugin_webhooks(
+        host,
+        port,
+        config,
+        external_event_tx,
+        reload_controls,
+        tui_registry,
+        canvas_store,
+        sop_engine,
+        sop_audit,
+        GatewaySupervision::new(
+            readiness,
+            Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+        ),
+    ))
+    .await
+}
+
+/// Run the supervised gateway with the daemon generation's channel-plugin
+/// webhook registry. Standalone callers use [`run_gateway`], because no channel
+/// supervisor exists there to publish live routes.
+#[allow(clippy::too_many_lines)]
+pub async fn run_gateway_with_plugin_webhooks(
+    host: &str,
+    port: u16,
+    config: Config,
+    external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
+    tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
+    canvas_store: Option<CanvasStore>,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    supervision: GatewaySupervision,
+) -> Result<()> {
+    let GatewaySupervision {
+        readiness,
+        plugin_webhooks,
+    } = supervision;
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -1290,9 +1478,13 @@ pub async fn run_gateway(
     };
 
     // ── Pairing guard ──────────────────────────────────────
+    // The pairing-code policy is resolved from config here and nowhere
+    // else: startup pairing, `gateway get-paircode --new`, the dashboard
+    // pairing flow, and rotate-device all issue through this guard.
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
+        config.gateway.pairing_code,
     ));
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
@@ -1438,11 +1630,14 @@ pub async fn run_gateway(
         );
     }
     if let Some(code) = pairing.pairing_code() {
+        // The box is sized from the code, not from a literal: since the policy became config-driven,
+        // the code length is operator-configurable (6..=128 chars).
+        let rule = "─".repeat(code.chars().count() + 4);
         println!();
         println!("  🔐 PAIRING REQUIRED — use this one-time code:");
-        println!("     ┌──────────────┐");
+        println!("     ┌{rule}┐");
         println!("     │  {code}  │");
-        println!("     └──────────────┘");
+        println!("     └{rule}┘");
         println!("     Send: POST {pfx}/pair with header X-Pairing-Code: {code}");
     } else if pairing.require_pairing() {
         for line in already_paired_pairing_notice(host, actual_port, pfx) {
@@ -1944,6 +2139,11 @@ pub async fn run_gateway(
             get(canvas::handle_canvas_history),
         );
 
+    #[cfg(feature = "plugins-wasm")]
+    let inner = inner.merge(plugin_webhook::routes(plugin_webhooks));
+    #[cfg(not(feature = "plugins-wasm"))]
+    let _ = plugin_webhooks;
+
     #[cfg(feature = "a2a")]
     let inner = inner.merge(a2a::a2a_routes_with_endpoint(Some(
         a2a::AdvertisedGatewayEndpoint::new(host, actual_port),
@@ -2250,13 +2450,39 @@ fn paircode_recovery_curl_host(host: &str) -> &str {
 // AXUM HANDLERS
 // ══════════════════════════════════════════════════════════════════════════════
 
+fn public_health_snapshot() -> serde_json::Value {
+    let snapshot = zeroclaw_runtime::health::snapshot();
+    let components = snapshot
+        .components
+        .into_iter()
+        .map(|(name, component)| {
+            (
+                name,
+                serde_json::json!({
+                    "status": component.status,
+                    "updated_at": component.updated_at,
+                    "last_ok": component.last_ok,
+                    "restart_count": component.restart_count,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    serde_json::json!({
+        "pid": snapshot.pid,
+        "updated_at": snapshot.updated_at,
+        "uptime_seconds": snapshot.uptime_seconds,
+        "components": components,
+    })
+}
+
 /// GET /health — always public (no secrets leaked)
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     let body = serde_json::json!({
         "status": "ok",
         "paired": state.pairing.is_paired(),
         "require_pairing": state.pairing.require_pairing(),
-        "runtime": zeroclaw_runtime::health::snapshot_json(),
+        "runtime": public_health_snapshot(),
     });
     Json(body)
 }
@@ -3934,6 +4160,17 @@ async fn handle_admin_paircode(
     Ok((StatusCode::OK, Json(body)))
 }
 
+/// The pairing-code policy as configured *right now*.
+///
+/// `AppState.pairing` outlives every config write (`persist_and_swap` at
+/// `api_config.rs` replaces the whole `Config`), so the guard deliberately
+/// stores no policy. Resolving it here, per mint, is what makes a
+/// strengthened `[gateway.pairing_code]` take effect on the next code
+/// instead of at the next restart.
+pub(crate) fn live_pairing_code_policy(state: &AppState) -> PairingCodePolicy {
+    state.config.read().gateway.pairing_code
+}
+
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct AdminPaircodeQuery {
     #[serde(default)]
@@ -4063,7 +4300,7 @@ async fn handle_admin_paircode_new(
 
     let code = state
         .pairing
-        .generate_new_pairing_code()
+        .generate_new_pairing_code(live_pairing_code_policy(&state))
         .expect("require_pairing checked above");
     if rotate.is_none() {
         ::zeroclaw_log::record!(
@@ -4303,7 +4540,8 @@ mod tests {
     fn already_paired_notice_states_no_code_was_generated() {
         // the banner must say plainly that NO code exists
         // (already paired), not just "Pairing: ACTIVE" — otherwise the operator
-        // hits the dashboard's 6-digit prompt with no code printed anywhere.
+        // hits the dashboard's pairing-code prompt with no code printed
+        // anywhere.
         let lines = already_paired_pairing_notice("127.0.0.1", 3001, "");
         let joined = lines.join("\n");
         assert!(
@@ -4367,6 +4605,37 @@ mod tests {
         assert_eq!(
             format_paircode_recovery_curl("127.0.0.1", 42617, "/gw"),
             "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_health_omits_component_error_details() {
+        let component = format!("health-public-{}", uuid::Uuid::new_v4());
+        let sensitive_error = "provider failed: token=not-for-public-health";
+        zeroclaw_runtime::health::mark_component_ok(&component);
+        zeroclaw_runtime::health::mark_component_error(&component, sensitive_error);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let response = handle_health(State(admin_paircode_state(&tmp, false, false)))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let public_component = &json["runtime"]["components"][&component];
+
+        assert_eq!(public_component["status"], "error");
+        assert!(public_component["updated_at"].is_string());
+        assert!(public_component["last_ok"].is_string());
+        assert_eq!(public_component["restart_count"], 0);
+        assert!(public_component.get("last_error").is_none());
+        assert!(!json.to_string().contains(sensitive_error));
+        assert_eq!(
+            zeroclaw_runtime::health::snapshot().components[&component]
+                .last_error
+                .as_deref(),
+            Some(sensitive_error)
         );
     }
 
@@ -4450,7 +4719,7 @@ mod tests {
     /// Build an AppState wired with a real pairing guard, on-disk config path,
     /// and an optional device registry so the admin paircode handler's
     /// revoke + persist paths can be exercised end to end.
-    fn admin_paircode_state(
+    pub(super) fn admin_paircode_state(
         tmp: &tempfile::TempDir,
         require_pairing: bool,
         with_registry: bool,
@@ -4476,7 +4745,11 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(require_pairing, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                require_pairing,
+                &[],
+                PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -4689,7 +4962,7 @@ path = "{trigger_path}"
     async fn pair_device(state: &AppState, device_id: &str) -> String {
         let code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(live_pairing_code_policy(state))
             .expect("pairing enabled");
         let token = state
             .pairing
@@ -4748,6 +5021,73 @@ path = "{trigger_path}"
         assert!(
             state.pairing.is_authenticated(&token),
             "add-another-client path must not revoke existing tokens"
+        );
+    }
+
+    /// Review MAJOR-1: `AppState.pairing` outlives every config write, so it
+    /// must not carry a snapshotted pairing-code policy. Strengthening
+    /// `[gateway.pairing_code]` through the live config — exactly what
+    /// `persist_and_swap` does — must change the *next* code the same guard
+    /// instance mints, with no restart and no reconstruction.
+    #[tokio::test]
+    async fn admin_paircode_new_mints_under_live_policy_after_a_config_swap() {
+        use zeroclaw_config::pairing::{PairingCodeCharset, PairingCodePolicy};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+
+        // Boot weak: six numeric digits, the legacy shape.
+        let weak = PairingCodePolicy::numeric_compat();
+        state.config.write().gateway.pairing_code = weak;
+        let guard_before = Arc::as_ptr(&state.pairing);
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let weak_code = json["pairing_code"]
+            .as_str()
+            .expect("code issued")
+            .to_string();
+        assert_eq!(weak_code.len(), 6, "weak policy in force at first mint");
+        assert!(weak_code.chars().all(|c| c.is_ascii_digit()));
+
+        // Operator strengthens the policy. No restart, no new guard.
+        let strong = PairingCodePolicy::new(28, PairingCodeCharset::Unambiguous).unwrap();
+        state.config.write().gateway.pairing_code = strong;
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let strong_code = json["pairing_code"].as_str().expect("code issued");
+
+        assert_eq!(
+            strong_code.len(),
+            28,
+            "the strengthened policy must apply to the very next code, got {strong_code}"
+        );
+        let alphabet = PairingCodeCharset::Unambiguous.alphabet();
+        assert!(
+            strong_code.bytes().all(|b| alphabet.contains(&b)),
+            "code {strong_code} must use the newly configured charset"
+        );
+        assert_eq!(
+            Arc::as_ptr(&state.pairing),
+            guard_before,
+            "the guard must not have been rebuilt — the policy is resolved per mint"
         );
     }
 
@@ -5219,6 +5559,7 @@ path = "{trigger_path}"
                     api_key: Some("sk-test-openai-shaped-key".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 
@@ -5396,7 +5737,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -5482,7 +5823,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -5617,11 +5958,11 @@ path = "{trigger_path}"
         std::thread::sleep(Duration::from_millis(2));
         assert!(store.record_if_new("k3"));
 
-        let keys = store.keys.lock();
-        assert_eq!(keys.len(), 2);
-        assert!(!keys.contains_key("k1"));
-        assert!(keys.contains_key("k2"));
-        assert!(keys.contains_key("k3"));
+        let entries = store.entries.lock();
+        assert_eq!(entries.committed.len(), 2);
+        assert!(!entries.committed.contains_key("k1"));
+        assert!(entries.committed.contains_key("k2"));
+        assert!(entries.committed.contains_key("k3"));
     }
 
     #[test]
@@ -5685,7 +6026,7 @@ path = "{trigger_path}"
         };
         config.save().await.unwrap();
 
-        let guard = PairingGuard::new(true, &[]);
+        let guard = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let code = guard.pairing_code().unwrap();
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
@@ -5741,7 +6082,7 @@ path = "{trigger_path}"
         };
         config.save().await.unwrap();
 
-        let guard = PairingGuard::new(true, &[]);
+        let guard = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let code = guard.pairing_code().unwrap();
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
@@ -6155,7 +6496,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -6993,7 +7334,11 @@ path = "{trigger_path}"
         // bare 64-hex-char value as an already-hashed token, so a "zc_"
         // prefix keeps this one unambiguously plaintext.
         let token = format!("zc_{}", generate_test_secret());
-        state.pairing = Arc::new(PairingGuard::new(true, std::slice::from_ref(&token)));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            std::slice::from_ref(&token),
+            PairingCodePolicy::default(),
+        ));
 
         let response = api_sop_webhook::handle_sop_webhook(
             State(state),
@@ -7061,7 +7406,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7155,6 +7500,7 @@ path = "{trigger_path}"
                     model: Some("agent-model".into()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         let expected_provider = "anthropic.default".to_string();
@@ -7180,7 +7526,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7279,7 +7625,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: true,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7484,7 +7830,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7570,7 +7916,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7661,7 +8007,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7757,7 +8103,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7851,7 +8197,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -7951,7 +8297,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -8091,7 +8437,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -8469,10 +8815,10 @@ path = "{trigger_path}"
         std::thread::sleep(Duration::from_millis(2));
         assert!(store.record_if_new("new-key"));
 
-        let keys = store.keys.lock();
-        assert_eq!(keys.len(), 1);
-        assert!(!keys.contains_key("old-key"));
-        assert!(keys.contains_key("new-key"));
+        let entries = store.entries.lock();
+        assert_eq!(entries.committed.len(), 1);
+        assert!(!entries.committed.contains_key("old-key"));
+        assert!(entries.committed.contains_key("new-key"));
     }
 
     #[test]
@@ -8600,8 +8946,8 @@ path = "{trigger_path}"
             handle.join().unwrap();
         }
 
-        let keys = store.keys.lock();
-        assert!(keys.len() <= 1000, "should respect max_keys");
+        let entries = store.entries.lock();
+        assert!(entries.committed.len() <= 1000, "should respect max_keys");
     }
 
     #[test]
@@ -8713,7 +9059,11 @@ path = "{trigger_path}"
     ) -> AppState {
         let mut state = admin_paircode_state(tmp, require_pairing, false);
         state.config.write().gateway.allow_remote_admin = allow_remote_admin;
-        state.pairing = Arc::new(PairingGuard::new(require_pairing, tokens));
+        state.pairing = Arc::new(PairingGuard::new(
+            require_pairing,
+            tokens,
+            PairingCodePolicy::default(),
+        ));
         state.reload_tx = Some(tokio::sync::watch::channel(false).0);
         state
     }
@@ -8978,7 +9328,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -9063,7 +9413,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -9394,6 +9744,7 @@ path = "{trigger_path}"
         zeroclaw_api::channel::ChannelMessage {
             id: "msg-1".into(),
             sender: sender.into(),
+            platform_sender_id: None,
             reply_target: sender.into(),
             content: content.into(),
             channel: "linq".into(),
@@ -9673,7 +10024,7 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -9930,7 +10281,7 @@ path = "{trigger_path}"
 
         let code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(live_pairing_code_policy(&state))
             .expect("pairing code must be issuable when require_pairing=true");
 
         let mut headers = HeaderMap::new();
@@ -9969,7 +10320,7 @@ path = "{trigger_path}"
 
         let code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(live_pairing_code_policy(&state))
             .expect("pairing code must be issuable when require_pairing=true");
 
         let mut headers = HeaderMap::new();

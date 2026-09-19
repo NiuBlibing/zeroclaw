@@ -24,6 +24,7 @@ pub(crate) async fn gate_tool_approval(
     tool_name: &str,
     tool_args: &serde_json::Value,
     iteration: usize,
+    position: zeroclaw_api::channel::ApprovalPosition,
 ) -> ApprovalGateOutcome {
     let mut approval_requirement = ctx
         .approval
@@ -47,6 +48,7 @@ pub(crate) async fn gate_tool_approval(
                     tool_name: request.tool_name.clone(),
                     arguments_summary: crate::approval::summarize_args(&request.arguments),
                     raw_arguments: Some(request.arguments.clone()),
+                    position: Some(position),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
                 let response = if let Some(cancel) = ctx.cancellation_token {
@@ -296,10 +298,18 @@ mod tests {
             turn_id: "turn-approval",
             agent_alias: Some("default"),
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let arguments = serde_json::json!({"command": "sleep 60"});
-        let approval_wait = gate_tool_approval(&ctx, "shell", &arguments, 0);
+        let approval_wait = gate_tool_approval(
+            &ctx,
+            "shell",
+            &arguments,
+            0,
+            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+        );
         tokio::pin!(approval_wait);
         let line = tokio::select! {
             outcome = &mut approval_wait => panic!("approval completed before cancellation: {}", matches!(outcome, ApprovalGateOutcome::Cancelled)),

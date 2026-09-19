@@ -624,6 +624,7 @@ pub(crate) fn parse_responses_usage(usage: Option<&Value>) -> Option<TokenUsage>
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            cache_creation_input_tokens: None,
         },
     )
 }
@@ -1658,7 +1659,13 @@ impl ModelProvider for OpenAiCodexModelProvider {
                 )
                 .json(&request);
 
-            crate::openai::run_responses_sse(request_builder, &tx, count_tokens).await;
+            crate::openai::run_responses_sse(
+                request_builder,
+                &tx,
+                count_tokens,
+                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+            )
+            .await;
         });
 
         let guard = AbortOnDrop::new(handle.abort_handle());
@@ -1970,6 +1977,7 @@ mod tests {
             [StreamEvent::Usage(TokenUsage {
                 input_tokens: Some(120),
                 cached_input_tokens: Some(45),
+                cache_creation_input_tokens: None,
                 output_tokens: Some(30),
             })]
         ));
