@@ -1350,17 +1350,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // so a direct call keeps the seeded attribution pair (its accepted
         // route names the alias we dispatched to, and its `model()` is the wire
         // selector rather than an attribution name).
-        if let Some(sink) = served_route_sink.as_ref()
+        if served_route_changed
+            && let Some(sink) = served_route_sink.as_ref()
             && let Some(served) = sink.lock().expect("served-route sink lock").as_mut()
         {
-            if served_route_changed {
-                served.provider_name = served_provider.clone();
-                // The normalized key, not the raw accepted model: the terminal
-                // frame is attribution, and a `hint:` wire selector is not an
-                // attribution name.
-                served.model = served_model_key.to_string();
-                served.context_limits = served_context_limits;
-            }
+            served.provider_name = served_provider.clone();
+            // The normalized key, not the raw accepted model: the terminal
+            // frame is attribution, and a `hint:` wire selector is not an
+            // attribution name.
+            served.model = served_model_key.to_string();
+            served.context_limits = served_context_limits;
         }
 
         // A provider transport success is only a candidate. Commit (or clear)
