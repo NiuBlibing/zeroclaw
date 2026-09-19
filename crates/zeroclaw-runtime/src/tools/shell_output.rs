@@ -80,16 +80,7 @@ fn has_utf8_continuation_context(bytes: &[u8], valid_up_to: usize) -> bool {
         0xf0..=0xf4 => 4,
         _ => return false,
     };
-    if suffix.len() >= expected_len || !suffix[1..].iter().all(|byte| (byte & 0xc0) == 0x80) {
-        return false;
-    }
-
-    // A non-ASCII UTF-8 prefix is strong evidence that the stream is UTF-8,
-    // while a short ASCII prefix followed by one legacy byte remains eligible
-    // for the Windows code-page fallback.
-    std::str::from_utf8(&bytes[..valid_up_to])
-        .ok()
-        .is_some_and(|prefix| prefix.chars().any(|character| character.len_utf8() > 1))
+    suffix.len() < expected_len && suffix[1..].iter().all(|byte| (byte & 0xc0) == 0x80)
 }
 
 #[cfg(target_os = "windows")]
@@ -194,12 +185,5 @@ mod tests {
             decode_shell_output_with_context(&[0xc0], false, Some(encoding_rs::WINDOWS_1251));
         assert_eq!(cp1252, "é");
         assert_eq!(cp1251, "А");
-    }
-
-    #[test]
-    fn short_legacy_output_with_capture_marker_is_not_truncation() {
-        let decoded =
-            decode_shell_output_with_context(&[b'p', 0xe9], true, Some(encoding_rs::WINDOWS_1252));
-        assert_eq!(decoded, "pé");
     }
 }
