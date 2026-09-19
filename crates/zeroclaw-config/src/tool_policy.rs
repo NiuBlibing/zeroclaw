@@ -746,10 +746,7 @@ fn extract_one_posix_segment(segment: &str, dialect: ShellDialect) -> Option<Ext
         Some(risk) => risk,
         None => CommandRiskLevel::Low,
     };
-    let is_safe = args_safe(&base, &args_lower, &args_cased)
-        && env_assignments
-            .iter()
-            .all(|(name, _)| !is_unsafe_process_control_assignment_name(name));
+    let is_safe = args_safe(&base, &args_lower, &args_cased);
 
     Some(ExtractedSegment {
         segment: ShellSegment {
@@ -1265,6 +1262,10 @@ pub enum ResolutionReason {
         reason: DegradationReason,
         decision: Decision,
     },
+    /// A leading environment assignment can redirect executable lookup or
+    /// inject process behavior. The assignment is fully fingerprinted, but
+    /// policy still refuses to auto-authorize it.
+    UnsafeProcessControlAssignment { decision: Decision },
     /// No rule matched: the fail-closed default.
     Unmatched,
     /// The runtime exposes no shell for this dialect.
@@ -1361,35 +1362,48 @@ pub fn resolve_decision(action: &ToolAction, scopes: &ResolvedScopes) -> Resolut
         }
     });
 
-    // RFC 7155 §2.3: an apparent Allow on a degraded parse never executes
-    // unconditionally. The escape hatch keeps its historical meaning
-    // (opting out of command-level syntax restrictions).
+    // RFC 7155 §2.3: an apparent Allow on a degraded parse or a process-
+    // control assignment never executes unconditionally. The latter remains
+    // a policy restriction rather than parse degradation: its literal value
+    // is still needed to bind the resolved executable identity.
     if !scopes.profile.escape_hatch()
-        && let ParseStatus::Degraded(reason) = shell.parse_status
+        && (matches!(shell.parse_status, ParseStatus::Degraded(_))
+            || has_unsafe_process_control_assignment(shell))
     {
-        let degraded_decision = if scopes.profile.block_high_risk_commands() {
+        let restricted_decision = if scopes.profile.block_high_risk_commands() {
             Decision::Deny
         } else if resolution.decision == Decision::Allow {
             Decision::Ask
         } else {
             resolution.decision
         };
-        // Rebind the reason even when the DECISION is unchanged (an Ask
-        // staying Ask): a degraded command's Ask is structural — the
-        // syntax could not be trusted — so the validation entries must not
-        // let an approval bit bridge it the way they bridge risk-tier
-        // asks. The legacy allowlist rejected these commands regardless of
-        // approval; the reason is what carries that fact.
-        resolution = Resolution::new(
-            degraded_decision,
-            ResolutionReason::DegradedSyntax {
+        // Rebind the reason even when an Ask stays Ask. Both restrictions
+        // are structural, so validation must not let an approval bit bridge
+        // them the way it bridges risk-tier asks. The legacy allowlist
+        // rejected these commands regardless of approval; the reason is
+        // what carries that fact.
+        let reason = match shell.parse_status {
+            ParseStatus::Degraded(reason) => ResolutionReason::DegradedSyntax {
                 reason,
-                decision: degraded_decision,
+                decision: restricted_decision,
             },
-        );
+            ParseStatus::Clean => ResolutionReason::UnsafeProcessControlAssignment {
+                decision: restricted_decision,
+            },
+        };
+        resolution = Resolution::new(restricted_decision, reason);
     }
 
     resolution
+}
+
+fn has_unsafe_process_control_assignment(shell: &ShellAction) -> bool {
+    shell.segments.iter().any(|segment| {
+        segment
+            .env_assignments
+            .iter()
+            .any(|(name, _)| is_unsafe_process_control_assignment_name(name))
+    })
 }
 
 /// Resolve the tool-name layer question ("does this tool need approval")
@@ -2126,6 +2140,36 @@ mod tests {
         assert_eq!(shell.segments[0].base, "git");
         assert_eq!(shell.segments[0].arguments, vec!["push".to_string()]);
         assert_eq!(shell.parse_status, ParseStatus::Clean);
+    }
+
+    #[test]
+    fn process_control_assignments_are_complete_but_not_auto_authorized() {
+        for command in [
+            "PATH=/opt/bin helper",
+            "LD_PRELOAD=./hook.so helper",
+            "GIT_CONFIG_GLOBAL=./config helper",
+        ] {
+            let action = extract_shell_action(command, ShellDialect::Posix, None);
+            let ToolAction::Shell(shell) = &action;
+            assert_eq!(shell.parse_status, ParseStatus::Clean, "{command}");
+
+            let cfg = profile(AutonomyLevel::Full, &["helper"]);
+            let resolution = resolve_with(&cfg, command, ShellDialect::Posix);
+            assert_eq!(resolution.decision, Decision::Deny, "{command}");
+            assert!(
+                matches!(
+                    resolution.reason,
+                    ResolutionReason::UnsafeProcessControlAssignment {
+                        decision: Decision::Deny
+                    }
+                ),
+                "{command}"
+            );
+        }
+
+        let cfg = profile(AutonomyLevel::Full, &["helper"]);
+        let resolution = resolve_with(&cfg, "LANG=C helper", ShellDialect::Posix);
+        assert_eq!(resolution.decision, Decision::Allow);
     }
 
     #[test]

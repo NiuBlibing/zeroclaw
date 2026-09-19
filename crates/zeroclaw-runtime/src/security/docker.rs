@@ -330,7 +330,10 @@ mod tests {
 
         assert_eq!(
             std::path::Path::new(cmd.get_program()).file_name(),
-            Some(std::ffi::OsStr::new("docker")),
+            Some(std::ffi::OsStr::new(&format!(
+                "docker{}",
+                std::env::consts::EXE_SUFFIX
+            ))),
             "wrapped command should use docker as program"
         );
 

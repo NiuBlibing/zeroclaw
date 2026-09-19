@@ -3626,6 +3626,9 @@ impl SecurityPolicy {
                     && !matches!(
                         resolution.reason,
                         crate::tool_policy::ResolutionReason::DegradedSyntax { .. }
+                            | crate::tool_policy::ResolutionReason::UnsafeProcessControlAssignment {
+                                ..
+                            }
                     ) => {}
             Decision::Ask => {
                 use crate::tool_policy::ResolutionReason;
@@ -3702,7 +3705,9 @@ impl SecurityPolicy {
             ResolutionReason::HighRiskBlocked => {
                 "Command blocked: high-risk command is disallowed by policy".to_string()
             }
-            ResolutionReason::EmptyCommand | ResolutionReason::DegradedSyntax { .. } => {
+            ResolutionReason::EmptyCommand
+            | ResolutionReason::DegradedSyntax { .. }
+            | ResolutionReason::UnsafeProcessControlAssignment { .. } => {
                 format!("Command not allowed by security policy: {command}")
             }
             ResolutionReason::MatchedRule { .. }

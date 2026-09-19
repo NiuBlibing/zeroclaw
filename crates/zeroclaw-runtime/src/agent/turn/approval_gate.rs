@@ -466,6 +466,9 @@ async fn shell_denied_outcome(
         ResolutionReason::DegradedSyntax { .. } => {
             "command syntax cannot be safely evaluated under this policy"
         }
+        ResolutionReason::UnsafeProcessControlAssignment { .. } => {
+            "process-control environment assignment is disallowed by policy"
+        }
         _ => "command is not allowed by security policy",
     };
     let denied = format!(
