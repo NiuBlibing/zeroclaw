@@ -355,16 +355,8 @@ impl Tool for ShellTool {
                     let (stdout_capture, stderr_capture) =
                         tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
 
-                    let mut stdout = if stdout_capture.truncated {
-                        decode_truncated_output(&stdout_capture.bytes)
-                    } else {
-                        decode_output(&stdout_capture.bytes)
-                    };
-                    let mut stderr = if stderr_capture.truncated {
-                        decode_truncated_output(&stderr_capture.bytes)
-                    } else {
-                        decode_output(&stderr_capture.bytes)
-                    };
+                    let mut stdout = decode_capture(&stdout_capture);
+                    let mut stderr = decode_capture(&stderr_capture);
 
                     if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
                         append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
@@ -428,6 +420,15 @@ struct DrainHandle {
 struct DrainOutput {
     bytes: Vec<u8>,
     truncated: bool,
+    complete: bool,
+}
+
+fn decode_capture(capture: &DrainOutput) -> String {
+    if capture.truncated || !capture.complete {
+        decode_truncated_output(&capture.bytes)
+    } else {
+        decode_output(&capture.bytes)
+    }
 }
 
 fn spawn_drain<R>(reader: Option<R>, cap: usize) -> DrainHandle
@@ -472,12 +473,20 @@ async fn drain_capped_into<R>(
 {
     use tokio::io::AsyncReadExt;
     let Some(mut reader) = reader else {
+        if let Ok(mut capture) = output.lock() {
+            capture.complete = true;
+        }
         return;
     };
     let mut chunk = [0u8; 8192];
     loop {
         match reader.read(&mut chunk).await {
-            Ok(0) => break,
+            Ok(0) => {
+                if let Ok(mut capture) = output.lock() {
+                    capture.complete = true;
+                }
+                break;
+            }
             Ok(n) => {
                 let Ok(mut capture) = output.lock() else {
                     break;
@@ -520,6 +529,51 @@ fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct ErrorAfterBytes {
+        bytes: Option<Vec<u8>>,
+    }
+
+    impl tokio::io::AsyncRead for ErrorAfterBytes {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(bytes) = self.bytes.take() {
+                buf.put_slice(&bytes);
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(std::io::Error::other("injected read failure")))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_drain_preserves_utf8_prefix_below_capture_limit() {
+        let mut bytes = "€".repeat(12).into_bytes();
+        bytes.push(0xe2);
+        let output = Arc::new(std::sync::Mutex::new(DrainOutput::default()));
+
+        drain_capped_into(
+            Some(ErrorAfterBytes { bytes: Some(bytes) }),
+            MAX_OUTPUT_BYTES,
+            Arc::clone(&output),
+        )
+        .await;
+
+        let capture = output.lock().unwrap().clone();
+        assert!(!capture.complete);
+        assert!(!capture.truncated);
+        let decoded = decode_capture(&capture);
+        assert!(
+            decoded.starts_with(&"€".repeat(12)),
+            "decoded text: {decoded:?}"
+        );
+        assert!(decoded.ends_with('\u{fffd}'), "decoded text: {decoded:?}");
+    }
 
     #[test]
     fn android_child_path_prefixes_platform_dirs_with_tui_path_winning() {
