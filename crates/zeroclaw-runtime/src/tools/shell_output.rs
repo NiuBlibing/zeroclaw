@@ -171,6 +171,15 @@ mod tests {
     }
 
     #[test]
+    fn truncated_utf8_preserves_prefix_when_only_lead_byte_remains() {
+        let mut bytes = "€€€".as_bytes().to_vec();
+        bytes.push(0xe2);
+        let decoded = decode_truncated_shell_output(&bytes);
+        assert!(decoded.starts_with("€€€"), "decoded text: {decoded:?}");
+        assert!(decoded.ends_with('\u{fffd}'), "decoded text: {decoded:?}");
+    }
+
+    #[test]
     fn short_legacy_output_uses_explicit_hint() {
         let gbk = [0xc4, 0xe3, 0xba, 0xc3];
         let decoded = decode_shell_output_with_context(&gbk, false, Some(encoding_rs::GBK));
