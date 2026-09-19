@@ -80,7 +80,16 @@ fn has_utf8_continuation_context(bytes: &[u8], valid_up_to: usize) -> bool {
         0xf0..=0xf4 => 4,
         _ => return false,
     };
-    suffix.len() < expected_len && suffix[1..].iter().all(|byte| (byte & 0xc0) == 0x80)
+    if suffix.len() >= expected_len || !suffix[1..].iter().all(|byte| (byte & 0xc0) == 0x80) {
+        return false;
+    }
+
+    // A non-ASCII UTF-8 prefix is strong evidence that the stream is UTF-8,
+    // while a short ASCII prefix followed by one legacy byte remains eligible
+    // for the Windows code-page fallback.
+    std::str::from_utf8(&bytes[..valid_up_to])
+        .ok()
+        .is_some_and(|prefix| prefix.chars().any(|character| character.len_utf8() > 1))
 }
 
 #[cfg(target_os = "windows")]
