@@ -1458,7 +1458,6 @@ pub async fn run(
             agent_alias,
             effective_model_ref,
             model_override.as_deref(),
-            crate::agent::agent::BuildCredentials::TargetOnly,
         )?;
         let mut model_provider = entry_rt.provider;
         let mut model_temperature = entry_rt.temperature;
@@ -2000,18 +1999,16 @@ pub async fn run(
 
                             // Rebuild the complete runtime from scratch — same
                             // constructor as the initial construction. The
-                            // switch policy lets a keyless target borrow the
-                            // agent's credential; the raw ref (three-segment
-                            // switches carry the entry's tuning) reaches the
-                            // construction chain, and the derived values
-                            // (temperature, billing name) move with the new
-                            // model.
+                            // selected target owns its credentials; the raw ref
+                            // (three-segment switches carry the entry's tuning)
+                            // reaches the construction chain, and the derived
+                            // values (temperature, billing name) move with the
+                            // new model.
                             let rt = crate::agent::agent::build_model(
                                 &config,
                                 agent_alias,
                                 &new_model_provider,
                                 Some(&new_model),
-                                crate::agent::agent::BuildCredentials::Switch,
                             )?;
                             model_provider = rt.provider;
                             provider_name = rt.provider_name;
@@ -2573,7 +2570,6 @@ pub async fn run(
                                     agent_alias,
                                     &new_model_provider,
                                     Some(&new_model),
-                                    crate::agent::agent::BuildCredentials::Switch,
                                 )?;
                                 model_provider = rt.provider;
                                 provider_name = rt.provider_name;
@@ -3018,7 +3014,6 @@ pub async fn process_message(
             agent_alias,
             agent.model_provider.as_str(),
             None,
-            crate::agent::agent::BuildCredentials::TargetOnly,
         )?;
         let model_provider = entry_rt.provider;
         let provider_name = entry_rt.provider_name;

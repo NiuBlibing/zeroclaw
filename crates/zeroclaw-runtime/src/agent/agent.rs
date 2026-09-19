@@ -39,30 +39,8 @@ pub fn build_session_model_provider(
             "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
         )));
     }
-    let rt = build_model(
-        config,
-        agent_alias,
-        model_provider_ref,
-        model_override,
-        BuildCredentials::TargetOnly,
-    )?;
+    let rt = build_model(config, agent_alias, model_provider_ref, model_override)?;
     Ok((rt.provider, rt.provider_name, rt.model_name))
-}
-
-/// Credential policy for [`build_model`] — the one dimension on which the
-/// construction call sites legitimately differ.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuildCredentials {
-    /// Runtime switch (`model_switch` tool): when neither a matching
-    /// `model_routes` key nor the target profile's own key exists, fall back
-    /// to the agent's original profile key — an in-session switch may borrow
-    /// the session's credential.
-    Switch,
-    /// Config-driven construction (initial construction, hot refresh, session
-    /// overrides): route and target-profile keys only. Borrowing the agent's
-    /// key here would leak a credential across provider families — the same
-    /// isolation the headless driver's override construction documents.
-    TargetOnly,
 }
 
 /// The complete model runtime produced by one [`build_model`] call — ready to
@@ -91,7 +69,7 @@ pub struct ModelRuntime {
 ///
 /// Callers supply only the ref (two- or three-segment, or a bare family name
 /// for the legacy CLI `--provider <family>` form), an optional explicit
-/// model, and the credential policy; everything else (agent config, entry
+/// model; everything else (agent config, entry
 /// overlay, temperature, context window, dispatcher, identity) is derived
 /// from the full config. The raw ref is passed through to the providers
 /// construction chain: that chain re-resolves the model entry from the ref it
@@ -102,7 +80,6 @@ pub fn build_model(
     agent_alias: &str,
     model_provider_ref: &str,
     model_override: Option<&str>,
-    credentials: BuildCredentials,
 ) -> anyhow::Result<ModelRuntime> {
     // A two- or three-segment ref names a profile; a third segment selects a
     // model entry under the profile's `models` map. A bare family name keeps
@@ -184,24 +161,12 @@ pub fn build_model(
     };
     zeroclaw_providers::apply_model_entry_options(&mut runtime_options, model_entry);
 
-    // Credential fallback per policy; the construction chain's own order is
-    // route key → target-profile key → this fallback.
-    let (fallback_key, fallback_uri) = match credentials {
-        BuildCredentials::TargetOnly => (
-            entry.and_then(|e| e.api_key.as_deref()),
-            entry.and_then(|e| e.uri.as_deref()),
-        ),
-        BuildCredentials::Switch => {
-            switch_credential_fallback(config, agent_alias, model_provider_ref, &model_name)
-        }
-    };
-
     let provider = zeroclaw_providers::create_routed_model_provider_with_options(
         config,
         // The raw ref, deliberately: see the function-level comment.
         model_provider_ref,
-        fallback_key,
-        fallback_uri,
+        entry.and_then(|e| e.api_key.as_deref()),
+        entry.and_then(|e| e.uri.as_deref()),
         &config.reliability,
         &config.model_routes,
         &model_name,
@@ -247,35 +212,6 @@ pub fn build_model(
         tool_dispatcher,
         identity,
     })
-}
-
-/// Credential fallback for an in-session model switch: a `model_routes` key
-/// matching the switched ref and model wins, else the agent's original
-/// profile key (and base URL) so a keyless target borrows the session's
-/// credential.
-fn switch_credential_fallback<'a>(
-    config: &'a Config,
-    agent_alias: &str,
-    model_provider_ref: &str,
-    model: &str,
-) -> (Option<&'a str>, Option<&'a str>) {
-    let agent_entry = config
-        .resolved_model_provider_for_agent(agent_alias)
-        .map(|(_ty, _alias, entry)| entry);
-    let default_api_key = agent_entry.and_then(|e| e.api_key.as_deref());
-    let default_base_url = agent_entry.and_then(|e| e.uri.as_deref());
-
-    // Prefer a route-specific api_key when the switched provider/model
-    // matches a configured model_route entry.
-    let route_api_key = config
-        .model_routes
-        .iter()
-        .find(|r| {
-            r.model_provider.eq_ignore_ascii_case(model_provider_ref)
-                && (r.model.eq_ignore_ascii_case(model) || r.hint.eq_ignore_ascii_case(model))
-        })
-        .and_then(|r| r.api_key.as_deref());
-    (route_api_key.or(default_api_key), default_base_url)
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -2152,16 +2088,10 @@ impl Agent {
         // the same constructor every other path uses (switches, live
         // refresh, session overrides). The raw ref reaches the construction
         // chain so a three-segment agent ref carries the selected entry's
-        // tuning; TargetOnly credentials because a config-driven
-        // construction must not borrow another profile's key.
-        let entry_rt = build_model(
-            config,
-            agent_alias,
-            agent_cfg.model_provider.as_str(),
-            None,
-            BuildCredentials::TargetOnly,
-        )
-        .with_context(|| format!("agents.{agent_alias}.model_provider"))?;
+        // tuning. Credentials always come from the selected target profile or
+        // its configured route.
+        let entry_rt = build_model(config, agent_alias, agent_cfg.model_provider.as_str(), None)
+            .with_context(|| format!("agents.{agent_alias}.model_provider"))?;
 
         let route_model_by_hint: HashMap<String, String> = config
             .model_routes
@@ -2544,9 +2474,8 @@ impl Agent {
     /// tool: rebuild the complete model runtime from the agent's captured
     /// config and commit it wholesale.
     ///
-    /// Only the ref and model arrive from the request; the credential
-    /// fallback (a matching `model_routes` key, else the agent's original
-    /// profile key), the entry overlay, temperature, dispatcher, and identity
+    /// Only the ref and model arrive from the request; target profile and route
+    /// credentials, the entry overlay, temperature, dispatcher, and identity
     /// are all derived by [`build_model`]. A switch whose resolved identity
     /// equals the current one is a no-op — two-segment and three-segment refs
     /// naming the same model do not rebuild. Returns the effective model id
@@ -2595,7 +2524,6 @@ impl Agent {
             &self.agent_alias,
             &new_model_provider,
             Some(&new_model),
-            BuildCredentials::Switch,
         ) {
             Ok(rt) => {
                 // Commit state only after the runtime was built successfully.
@@ -3912,14 +3840,7 @@ mod tests {
         );
 
         // Three-segment ref: the selected entry's tuning wins.
-        let rt = build_model(
-            &config,
-            "tester",
-            "openai.gw.cheap",
-            None,
-            BuildCredentials::TargetOnly,
-        )
-        .unwrap();
+        let rt = build_model(&config, "tester", "openai.gw.cheap", None).unwrap();
         assert_eq!(rt.temperature, Some(0.2), "entry temperature beats profile");
         assert_eq!(
             rt.context_window, 8_000,
@@ -3927,14 +3848,7 @@ mod tests {
         );
 
         // Two-segment ref: the profile's values (default entry sets none).
-        let rt = build_model(
-            &config,
-            "tester",
-            "openai.gw",
-            None,
-            BuildCredentials::TargetOnly,
-        )
-        .unwrap();
+        let rt = build_model(&config, "tester", "openai.gw", None).unwrap();
         assert_eq!(rt.temperature, Some(0.9));
         assert_eq!(rt.context_window, 100_000);
 
@@ -3949,14 +3863,7 @@ mod tests {
                 },
             },
         );
-        let rt = build_model(
-            &bare,
-            "tester",
-            "openai.minimal",
-            None,
-            BuildCredentials::TargetOnly,
-        )
-        .unwrap();
+        let rt = build_model(&bare, "tester", "openai.minimal", None).unwrap();
         assert_eq!(
             rt.context_window,
             zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
@@ -4004,14 +3911,7 @@ mod tests {
             },
         );
 
-        let rt = build_model(
-            &config,
-            "tester",
-            "openai.gw.cheap",
-            None,
-            BuildCredentials::TargetOnly,
-        )
-        .unwrap();
+        let rt = build_model(&config, "tester", "openai.gw.cheap", None).unwrap();
 
         assert_eq!(rt.provider_name, "openai.gw");
         assert_eq!(rt.model_name, "gpt-4o-mini");
@@ -4020,6 +3920,104 @@ mod tests {
             "the selected entry's vision tuning must survive construction; a clobber by \
              `models.default` (vision=false) means the raw ref did not reach the providers chain"
         );
+    }
+
+    #[tokio::test]
+    async fn build_model_switch_uses_only_target_profile_endpoint_and_credentials() {
+        use wiremock::{Mock, MockServer, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+
+        let source = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "from target"}}]
+                })),
+            )
+            .expect(2)
+            .mount(&target)
+            .await;
+
+        let mut config = Config::default();
+        {
+            let source_entry = config
+                .providers
+                .models
+                .ensure("custom", "source")
+                .expect("custom source profile");
+            source_entry.uri = Some(source.uri());
+            source_entry.api_key = Some("source-secret".into());
+            source_entry.model = Some("source-model".into());
+        }
+        {
+            let target_entry = config
+                .providers
+                .models
+                .ensure("custom", "target")
+                .expect("custom target profile");
+            target_entry.uri = Some(target.uri());
+            target_entry.api_key = Some("target-secret".into());
+            target_entry.models.insert(
+                "cheap".into(),
+                ModelEntryConfig {
+                    id: Some("target-model".into()),
+                    max_tokens: Some(123),
+                    ..Default::default()
+                },
+            );
+        }
+        config.agents.insert(
+            "tester".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.source".into(),
+                ..Default::default()
+            },
+        );
+
+        let rt = build_model(&config, "tester", "custom.target.cheap", None)
+            .expect("target profile builds");
+        let response = zeroclaw_providers::ProviderDispatch::from_ref(rt.provider.as_ref())
+            .simple_chat("hello", &rt.model_name, rt.temperature)
+            .await
+            .expect("target profile responds");
+        assert_eq!(response, "from target");
+
+        config
+            .providers
+            .models
+            .ensure("custom", "target")
+            .expect("custom target profile")
+            .api_key = None;
+        let keyless_rt = build_model(&config, "tester", "custom.target.cheap", None)
+            .expect("keyless target profile builds");
+        zeroclaw_providers::ProviderDispatch::from_ref(keyless_rt.provider.as_ref())
+            .simple_chat(
+                "hello again",
+                &keyless_rt.model_name,
+                keyless_rt.temperature,
+            )
+            .await
+            .expect("keyless target profile responds");
+
+        assert!(source.received_requests().await.unwrap().is_empty());
+        let requests = target.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let first_auth = requests[0]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(first_auth, Some("Bearer target-secret"));
+        let second_auth = requests[1]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        assert_ne!(second_auth, Some("Bearer source-secret"));
+        for request in requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["model"], "target-model");
+            assert_eq!(body["max_tokens"], 123);
+        }
     }
 
     zeroclaw_api::mock_tool_attribution!(

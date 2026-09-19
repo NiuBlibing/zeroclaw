@@ -1860,14 +1860,9 @@ pub(crate) async fn assemble_owned_execution(
     // Stays sealed into `OwnedAgentExecution.tools_registry` (a `ScopedToolRegistry`).
     let tools_registry = registry;
 
-    let model_runtime = crate::agent::agent::build_model(
-        config,
-        alias,
-        agent.model_provider.as_str(),
-        None,
-        crate::agent::agent::BuildCredentials::TargetOnly,
-    )
-    .with_context(|| format!("SOP step agent '{alias}' has no resolved model provider"))?;
+    let model_runtime =
+        crate::agent::agent::build_model(config, alias, agent.model_provider.as_str(), None)
+            .with_context(|| format!("SOP step agent '{alias}' has no resolved model provider"))?;
 
     // The step agent's risk profile under the PARENT surface's interactivity
     // mode: an operator approval route available to the outer turn stays

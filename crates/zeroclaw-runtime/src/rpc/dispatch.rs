@@ -3003,7 +3003,6 @@ impl RpcDispatcher {
                     &agent_alias,
                     model_provider_ref,
                     merged.model.as_deref(),
-                    crate::agent::agent::BuildCredentials::TargetOnly,
                 )
                 .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?
             };
@@ -3901,7 +3900,6 @@ impl RpcDispatcher {
                     &agent_alias,
                     &model_provider_ref,
                     overrides.model.as_deref(),
-                    crate::agent::agent::BuildCredentials::TargetOnly,
                 ) {
                     Ok(rt) => (rt, overrides.temperature),
                     Err(e) => {
