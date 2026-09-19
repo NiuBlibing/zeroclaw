@@ -2121,10 +2121,19 @@ mod tests {
 
     #[test]
     fn extraction_fails_closed_on_ambiguous_assignments() {
-        for command in [
-            r"FOO=bar\ baz printf ACTUAL",
-            "PATH+=:subdir helper",
-            "PATH=~/bin helper",
+        for (command, expected_reason) in [
+            (
+                r"FOO=bar\ baz printf ACTUAL",
+                DegradationReason::EscapedToken,
+            ),
+            (
+                "PATH+=:subdir helper",
+                DegradationReason::UnsafeExecutableArguments,
+            ),
+            (
+                "PATH=~/bin helper",
+                DegradationReason::UnsafeExecutableArguments,
+            ),
         ] {
             let action = extract_shell_action(command, ShellDialect::Posix, None);
             let ToolAction::Shell(shell) = &action;
@@ -2138,7 +2147,7 @@ mod tests {
             );
             assert_eq!(
                 shell.parse_status,
-                ParseStatus::Degraded(DegradationReason::UnsafeExecutableArguments),
+                ParseStatus::Degraded(expected_reason),
                 "{command}"
             );
 
@@ -2149,9 +2158,9 @@ mod tests {
                 matches!(
                     resolution.reason,
                     ResolutionReason::DegradedSyntax {
-                        reason: DegradationReason::UnsafeExecutableArguments,
+                        reason,
                         ..
-                    }
+                    } if reason == expected_reason
                 ),
                 "{command}"
             );

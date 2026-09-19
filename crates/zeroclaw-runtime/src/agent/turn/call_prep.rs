@@ -526,6 +526,8 @@ mod tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         }
     }
 
@@ -836,6 +838,8 @@ mod tests {
                 turn_id: "turn-prompt-dedup",
                 agent_alias: Some("default"),
                 parent_agent_alias: None,
+                serving_provider_name: None,
+                serving_model: None,
             };
             let forged_args = |confirmation_id: uuid::Uuid, intent: &str, request_tag: &str| {
                 serde_json::json!({

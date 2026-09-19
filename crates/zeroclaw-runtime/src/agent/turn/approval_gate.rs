@@ -597,6 +597,8 @@ mod tests {
             turn_id: "turn-no-route",
             agent_alias: Some("default"),
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
         for command in commands {
             let arguments = serde_json::json!({"command": command});
@@ -645,6 +647,8 @@ mod tests {
             turn_id: "turn-with-route",
             agent_alias: Some("default"),
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
         for command in commands {
             let arguments = serde_json::json!({"command": command});
@@ -736,6 +740,8 @@ mod tests {
             turn_id: "turn-posix-escape-deny",
             agent_alias: Some("default"),
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         assert!(matches!(
@@ -800,6 +806,8 @@ mod tests {
             turn_id: "turn-session-always",
             agent_alias: Some("default"),
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         assert!(matches!(
@@ -872,6 +880,8 @@ mod tests {
             turn_id: "turn-approval",
             agent_alias: Some("default"),
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let arguments = serde_json::json!({"command": "sleep 60"});

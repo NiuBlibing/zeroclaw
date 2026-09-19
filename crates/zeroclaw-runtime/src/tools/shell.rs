@@ -3138,6 +3138,41 @@ mod tests {
         RateLimitedTool::new(ShellTool::new(security.clone(), test_runtime()), security)
     }
 
+    #[tokio::test]
+    async fn wrapped_shell_requires_approval_for_git_diff_output_file() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("a.txt"), "before\n").unwrap();
+        std::fs::write(workspace.path().join("b.txt"), "after\n").unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = wrapped_shell(security);
+
+        let result = tool
+            .execute(json!({
+                "command": "git diff --no-index --output=unapproved.patch a.txt b.txt"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "output-file mutation must require approval"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("requires operator approval")),
+            "unexpected policy result: {:?}",
+            result.error
+        );
+        assert!(!workspace.path().join("unapproved.patch").exists());
+    }
+
     /// A forbidden path argument is refused by whichever guard sees it first,
     /// and the two guards word it differently. On a Windows shell dialect the
     /// policy's own scan inside `validate_command_execution_for_shell` runs
@@ -3420,7 +3455,17 @@ mod tests {
             .expect("disallowed command execution should return a result");
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("not allowed") || error.contains("high-risk"));
+        // Which guard refuses first is dialect-dependent: on POSIX hosts the
+        // allowlist/high-risk checks fire, while under the Windows shell
+        // dialect the forbidden-path scan sees `/` (current-drive root) first
+        // and refuses with its own message. All three are the required
+        // refusal; none may be weakened into a pass.
+        assert!(
+            error.contains("not allowed")
+                || error.contains("high-risk")
+                || error.contains("forbidden path argument"),
+            "expected a refusal reason, got: {error:?}"
+        );
     }
 
     #[tokio::test]
