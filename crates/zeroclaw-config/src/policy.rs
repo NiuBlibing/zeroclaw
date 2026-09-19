@@ -1479,6 +1479,15 @@ fn is_git_write_verb(verb: &str) -> bool {
             | "checkout"
             | "switch"
             | "tag"
+            // Index and working-tree mutations. These are conservatively gated
+            // to medium risk; read-only subcommands such as `git stash list` are
+            // over-approved in the safe direction rather than parsed further.
+            | "add"
+            | "rm"
+            | "mv"
+            | "restore"
+            | "apply"
+            | "stash"
     )
 }
 
@@ -1506,9 +1515,19 @@ fn git_command_is_write(args: &[String]) -> bool {
                 return true;
             }
         }
-        "diff" | "log" | "show" => {
+        "diff" | "diff-tree" | "diff-files" | "diff-index" | "log" | "show" | "whatchanged" => {
             if git_args_before_pathspec(args, subcommand_idx + 1)
                 .any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--output"))
+            {
+                return true;
+            }
+        }
+        "fsck" => {
+            // `git fsck --lost-found` writes recovered objects into
+            // `.git/lost-found/`, so it mutates the repository despite `fsck`
+            // being a read by default.
+            if git_args_before_pathspec(args, subcommand_idx + 1)
+                .any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--lost-found"))
             {
                 return true;
             }
@@ -1879,7 +1898,27 @@ fn git_archive_remote_selects_helper(args: &[String]) -> bool {
 }
 
 fn git_arg_opens_files_in_pager(arg: &str) -> bool {
-    arg.starts_with("-O") || git_arg_is_long_option_or_abbreviation(arg, "--open-files-in-pager")
+    if git_arg_is_long_option_or_abbreviation(arg, "--open-files-in-pager") {
+        return true;
+    }
+    // `git grep -O[<pager>]` opens matches in a pager (external command), even
+    // when clustered behind other short flags (e.g. `-nO`). The scan is
+    // case-sensitive: `-o` is `--only-matching`, a read. Stop at the first
+    // value-consuming short option so its argument is not misread as flags.
+    let Some(short_run) = arg.strip_prefix('-').filter(|run| !run.starts_with('-')) else {
+        return false;
+    };
+    for ch in short_run.chars() {
+        match ch {
+            'O' => return true,
+            // Options whose value consumes the remainder of the run (or the
+            // next argument): `-A`/`-B`/`-C` (context), `-e`/`-f` (patterns),
+            // `-m` (max-count), and any glued `=value`.
+            'A' | 'B' | 'C' | 'e' | 'f' | 'm' | '=' => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
@@ -6164,6 +6203,118 @@ mod tests {
             .validate_command_execution("git -C . commit -m test", true)
             .expect("runtime-approved Git write verb behind global options should remain allowed");
         assert_eq!(global_option_commit_allowed, CommandRiskLevel::Medium);
+    }
+
+    #[test]
+    fn git_read_verb_mutating_args_are_gated_at_the_enforcement_boundary() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Read-by-default verbs that mutate via an argument must require
+        // approval instead of staying Low.
+        for command in [
+            "git fsck --lost-found",
+            "git fsck --lost",
+            "git fsck --l",
+            "git diff --output=/tmp/out",
+            "git diff --output /tmp/out",
+            "git -C . log --output=/tmp/out",
+            "git show --output=/tmp/out",
+            "git whatchanged --output=/tmp/out",
+            "git diff-tree --output=/tmp/out HEAD",
+            "git diff-index --output=/tmp/out HEAD",
+            "git diff-files --output=/tmp/out",
+        ] {
+            let denied = p
+                .validate_command_execution(command, false)
+                .expect_err("Git read verbs that mutate via arguments must require approval");
+            assert!(
+                denied.contains("medium-risk operation"),
+                "{command}: {denied}"
+            );
+            let approved = p
+                .validate_command_execution(command, true)
+                .expect("runtime-approved mutating Git read verb should remain allowed");
+            assert_eq!(approved, CommandRiskLevel::Medium, "{command}");
+        }
+
+        // Plain reads and look-alike options stay Low.
+        for command in [
+            "git fsck",
+            "git diff --output-indicator-new=+ HEAD",
+            "git diff -O/tmp/order HEAD",
+            "git whatchanged --stat",
+        ] {
+            let allowed = p
+                .validate_command_execution(command, false)
+                .expect("plain Git reads should remain allowed without approval");
+            assert_eq!(allowed, CommandRiskLevel::Low, "{command}");
+        }
+
+        // `git grep -O` / `--open-files-in-pager` runs a pager (external
+        // command), even clustered behind other short flags; it must be
+        // rejected outright, not merely gated.
+        for command in [
+            "git grep -O foo",
+            "git grep -Ovim foo",
+            "git grep -nO foo",
+            "git grep --open-files-in-pager=sh foo",
+        ] {
+            let err = p
+                .validate_command_execution(command, true)
+                .expect_err("Git grep pager execution must be rejected even with approval");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        // `-o` is `--only-matching` (a read) and stays allowed and Low; the
+        // pager scan is case-sensitive and stops at value-consuming flags.
+        for command in ["git grep -o needle", "git grep -no needle"] {
+            let allowed = p
+                .validate_command_execution(command, false)
+                .expect("git grep --only-matching should remain a read");
+            assert_eq!(allowed, CommandRiskLevel::Low, "{command}");
+        }
+    }
+
+    #[test]
+    fn git_index_and_worktree_mutations_require_approval() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Verbs that mutate the index or working tree. These stay command-
+        // allowed but must require approval rather than classifying Low.
+        for command in [
+            "git add .",
+            "git add -A",
+            "git rm --cached secret",
+            "git mv a b",
+            "git restore src/main.rs",
+            "git restore --staged src/main.rs",
+            "git apply patch.diff",
+            "git stash",
+            "git stash push -m wip",
+            "git -C . add .",
+        ] {
+            assert!(p.is_command_allowed(command), "{command}");
+            let denied = p
+                .validate_command_execution(command, false)
+                .expect_err("index/working-tree mutations must require approval");
+            assert!(
+                denied.contains("medium-risk operation"),
+                "{command}: {denied}"
+            );
+            let approved = p
+                .validate_command_execution(command, true)
+                .expect("runtime-approved mutation should remain allowed");
+            assert_eq!(approved, CommandRiskLevel::Medium, "{command}");
+        }
     }
 
     #[cfg(not(target_os = "windows"))]

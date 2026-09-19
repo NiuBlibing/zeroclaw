@@ -810,10 +810,8 @@ impl RpcDispatcher {
     }
 
     async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
-        if let Some(event) = event
-            && let Some(notification) = notification_for_turn_event(session_id, &event)
-        {
-            let _ = self.rpc.send_raw(notification).await;
+        if let Some(event) = event {
+            forward_turn_event(&self.rpc, session_id, &event).await;
         }
     }
 
@@ -1667,9 +1665,9 @@ impl RpcDispatcher {
         self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone());
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Some(plan) = self.ctx.sessions.get_plan(&session_id).await
-            && let Some(notification) = plan_replay_notification(&session_id, &plan)
         {
-            let _ = self.rpc.send_raw(notification).await;
+            let event = TurnEvent::Plan { entries: plan };
+            forward_turn_event(&self.rpc, &session_id, &event).await;
         }
         if let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_start(&session_id, "rpc").await;
@@ -1757,6 +1755,7 @@ impl RpcDispatcher {
         // The mode may have changed while this request waited for admission.
         // Re-read under the permit so concurrent replacements cannot remove a
         // newly installed same-mode canonical session based on stale state.
+        let expected_generation = self.ctx.sessions.get_generation(&session_id).await;
         let admitted_mode = self.ctx.sessions.chat_mode(&session_id).await;
         if admitted_mode.as_ref() == Some(&chat_mode)
             && let Some(existing) = self
@@ -1775,10 +1774,6 @@ impl RpcDispatcher {
                 .finish_existing_session_resume(session_id, &chat_mode, existing)
                 .await;
         }
-        if admitted_mode.is_some() {
-            self.ctx.sessions.remove(&session_id).await;
-        }
-
         // Load resumed ACP metadata once, before constructing the live Agent.
         // The durable row owns the original workspace and interaction surface.
         // Runs under the admission permit, so a predecessor turn's persisted
@@ -1973,30 +1968,196 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
-        // Publish through `insert_admitted_if_absent`: the admission permit
-        // acquired at the top of this handler is held across publication AND
-        // the history restore below, so a same-ID prompt cannot be admitted
-        // against the successor until its transcript is restored.
-        // Re-acquiring inside `insert` would deadlock against that guard.
-        // The absence check is the external-boundary fence: under the permit
-        // the slot was cleared above, so a present entry means a concurrent
-        // same-mode resume won the race and must not be replaced.
-        self.ctx
-            .sessions
-            .insert_admitted_if_absent(
-                &_admission,
-                session_id.clone(),
-                super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
-                    .with_owner(self.tui_id.clone()),
-            )
-            .await
-            .map_err(|message| {
-                if message == "session already exists" {
-                    rpc_err(SESSION_BUSY, "Session resume already in progress")
-                } else {
-                    rpc_err(SESSION_LIMIT_REACHED, "Session limit reached")
+        let candidate =
+            super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
+                .with_owner(self.tui_id.clone());
+        let candidate_agent = Arc::clone(&candidate.agent);
+        // Fresh sessions must claim capacity before creating durable rows.
+        // Only a replacement can keep its existing slot throughout preparation.
+        let unpublished = if expected_generation.is_none() {
+            self.ctx
+                .sessions
+                .insert_admitted_if_absent(&_admission, session_id.clone(), candidate)
+                .await
+                .map_err(|message| {
+                    if message == "session already exists" {
+                        rpc_err(SESSION_BUSY, "Session resume already in progress")
+                    } else {
+                        rpc_err(SESSION_LIMIT_REACHED, "Session limit reached")
+                    }
+                })?;
+            None
+        } else {
+            Some(candidate)
+        };
+
+        enum AcpSessionNewLoad {
+            Restored(zeroclaw_infra::acp_session_store::AcpSessionData),
+            Created,
+            Killed,
+        }
+
+        // Prepare replacement history without touching the original Agent.
+        let prepared = async {
+            let mut agent = candidate_agent.lock().await;
+            let mut message_count = 0;
+            let mut seed_event = None;
+            let mut plan = Vec::new();
+            match chat_mode {
+                crate::rpc::types::ChatMode::Acp => {
+                    // Reuse the data already loaded for cwd recovery on resume so the
+                    // store isn't hit twice; otherwise fall through to the restore-
+                    // aware load-or-create path below.
+                    let loaded = if let Some(data) = preloaded_acp.take() {
+                        Ok(Ok(AcpSessionNewLoad::Restored(data)))
+                    } else {
+                        let Some(ref store) = self.ctx.acp_session_store else {
+                            return Err(rpc_err(
+                                INTERNAL_ERROR,
+                                "ACP session store is not available",
+                            ));
+                        };
+
+                        let store_cloned = store.clone();
+                        let sid = session_id.clone();
+                        let alias = req.agent_alias.clone();
+                        let cwd_owned = cwd.clone();
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
+                            match store_cloned.load_session_for_restore(&sid)? {
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
+                                data,
+                            ) => Ok(AcpSessionNewLoad::Restored(data)),
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing => {
+                                store_cloned.create_session_with_interaction_surface(
+                                    &sid,
+                                    &alias,
+                                    &cwd_owned,
+                                    resolved_interaction_surface.map(|surface| surface.as_str()),
+                                )?;
+                                Ok(AcpSessionNewLoad::Created)
+                            }
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
+                                Ok(AcpSessionNewLoad::Killed)
+                            }
+                        }
+                        })
+                        .await
+                    };
+                    match loaded {
+                        Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
+                            if data.agent_alias != req.agent_alias {
+                                return Err(rpc_err(
+                                    INVALID_PARAMS,
+                                    "ACP session belongs to a different agent",
+                                ));
+                            }
+                            message_count = conversation_message_entries(&data.messages).len();
+                            seed_event = agent.seed_conversation_history_with_event(data.messages);
+                            // Restore the durable TodoWrite plan into the fresh
+                            // in-memory session and re-emit it so the resuming /
+                            // reconnecting client's tracker repopulates without a
+                            // model round-trip. Robust against tmux detach, socket
+                            // drop, suspend/resume, and daemon restart.
+                            if let Some(ref store) = self.ctx.acp_session_store {
+                                let store = store.clone();
+                                let sid = session_id.clone();
+                                plan = tokio::task::spawn_blocking(move || {
+                                    store.get_plan(&sid).unwrap_or_default()
+                                })
+                                .await
+                                .unwrap_or_default();
+                            }
+                        }
+                        Ok(Ok(AcpSessionNewLoad::Created)) => {}
+                        Ok(Ok(AcpSessionNewLoad::Killed)) => {
+                            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                        }
+                        Ok(Err(e)) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "session_id": session_id,
+                                    "error": e.to_string(),
+                                })),
+                                "Failed to load or create ACP session"
+                            );
+                            return Err(rpc_err(
+                                INTERNAL_ERROR,
+                                format!("Failed to load or create ACP session: {e}"),
+                            ));
+                        }
+                        Err(join) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "session_id": session_id,
+                                    "error": join.to_string(),
+                                })),
+                                "ACP session load task failed"
+                            );
+                            return Err(rpc_err(
+                                INTERNAL_ERROR,
+                                format!("ACP session load task failed: {join}"),
+                            ));
+                        }
+                    }
                 }
-            })?;
+                crate::rpc::types::ChatMode::Chat => {
+                    if let Some(ref backend) = self.ctx.session_backend {
+                        let session_key = format!("rpc_{session_id}");
+                        let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
+                        let stored = backend.load(&session_key);
+                        if !stored.is_empty() {
+                            seed_event = agent.seed_history_with_event(&stored);
+                            message_count = stored.len();
+                        }
+                    }
+                }
+            }
+
+            Ok::<_, JsonRpcError>((message_count, seed_event, plan))
+        }
+        .await;
+        let (message_count, seed_event, plan) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if unpublished.is_none() {
+                    if let Some(ref hooks) = self.ctx.hooks {
+                        hooks.fire_session_end(&session_id, "rpc").await;
+                    }
+                    self.ctx.sessions.remove(&session_id).await;
+                }
+                return Err(error);
+            }
+        };
+
+        let plan_event = (!plan.is_empty()).then(|| TurnEvent::Plan {
+            entries: plan.clone(),
+        });
+        if let Some(mut candidate) = unpublished {
+            candidate.plan = plan;
+            self.ctx
+                .sessions
+                .publish_prepared(session_id.clone(), candidate, expected_generation)
+                .await
+                .map_err(|message| rpc_err(SESSION_BUSY, message))?;
+        } else {
+            self.ctx.sessions.set_plan(&session_id, plan).await;
+        }
+        self.forward_seed_event(&session_id, seed_event).await;
+        if let Some(event) = plan_event {
+            forward_turn_event(&self.rpc, &session_id, &event).await;
+        }
         drop(config_generation_guard);
 
         if let Some(ref tui_id) = self.tui_id
@@ -2046,144 +2207,6 @@ impl RpcDispatcher {
                         })),
                     "Trimmed glibc arenas after same-mode session eviction"
                 );
-            }
-        }
-
-        enum AcpSessionNewLoad {
-            Restored(zeroclaw_infra::acp_session_store::AcpSessionData),
-            Created,
-            Killed,
-        }
-
-        let mut message_count = 0;
-        match chat_mode {
-            crate::rpc::types::ChatMode::Acp => {
-                // Reuse the data already loaded for cwd recovery on resume so the
-                // store isn't hit twice; otherwise fall through to the restore-
-                // aware load-or-create path below.
-                let loaded = if let Some(data) = preloaded_acp.take() {
-                    Ok(Ok(AcpSessionNewLoad::Restored(data)))
-                } else {
-                    let Some(ref store) = self.ctx.acp_session_store else {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            "ACP session store is not available",
-                        ));
-                    };
-
-                    let store_cloned = store.clone();
-                    let sid = session_id.clone();
-                    let alias = req.agent_alias.clone();
-                    let cwd_owned = cwd.clone();
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
-                        match store_cloned.load_session_for_restore(&sid)? {
-                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
-                                data,
-                            ) => Ok(AcpSessionNewLoad::Restored(data)),
-                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing => {
-                                store_cloned.create_session_with_interaction_surface(
-                                    &sid,
-                                    &alias,
-                                    &cwd_owned,
-                                    resolved_interaction_surface.map(|surface| surface.as_str()),
-                                )?;
-                                Ok(AcpSessionNewLoad::Created)
-                            }
-                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
-                                Ok(AcpSessionNewLoad::Killed)
-                            }
-                        }
-                    })
-                    .await
-                };
-                match loaded {
-                    Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
-                        if data.agent_alias != req.agent_alias {
-                            if let Some(ref hooks) = self.ctx.hooks {
-                                hooks.fire_session_end(&session_id, "rpc").await;
-                            }
-                            self.ctx.sessions.remove(&session_id).await;
-                            return Err(rpc_err(
-                                INVALID_PARAMS,
-                                "ACP session belongs to a different agent",
-                            ));
-                        }
-                        message_count = conversation_message_entries(&data.messages).len();
-                        let seed_event = self
-                            .ctx
-                            .sessions
-                            .seed_conversation_history_with_event(&session_id, data.messages)
-                            .await;
-                        self.forward_seed_event(&session_id, seed_event).await;
-                        // Restore the durable TodoWrite plan into the fresh
-                        // in-memory session. Robust against tmux detach, socket
-                        // drop, suspend/resume, and daemon restart. Shared
-                        // with the prompt-triggered rehydration path.
-                        self.restore_acp_plan(&session_id).await;
-                    }
-                    Ok(Ok(AcpSessionNewLoad::Created)) => {}
-                    Ok(Ok(AcpSessionNewLoad::Killed)) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
-                    }
-                    Ok(Err(e)) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": e.to_string()})),
-                            "Failed to load or create ACP session"
-                        );
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            format!("Failed to load or create ACP session: {e}"),
-                        ));
-                    }
-                    Err(join) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": join.to_string()})),
-                            "ACP session load task failed"
-                        );
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            format!("ACP session load task failed: {join}"),
-                        ));
-                    }
-                }
-            }
-            crate::rpc::types::ChatMode::Chat => {
-                if let Some(ref backend) = self.ctx.session_backend {
-                    let session_key = format!("rpc_{session_id}");
-                    let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
-                    let stored = backend.load(&session_key);
-                    if !stored.is_empty() {
-                        let seed_event = self
-                            .ctx
-                            .sessions
-                            .seed_history_with_event(&session_id, &stored)
-                            .await;
-                        self.forward_seed_event(&session_id, seed_event).await;
-                        message_count = stored.len();
-                    }
-                }
             }
         }
 
@@ -3101,23 +3124,23 @@ impl RpcDispatcher {
                     if let (
                         Some(store),
                         TurnEvent::Usage {
-                            input_tokens: Some(it),
+                            input_tokens,
+                            accepted,
                             ..
                         },
                     ) = (acp_token_store.as_ref(), &event)
                     {
                         let store = store.clone();
                         let sid = sid.clone();
-                        let it = *it;
-                        let _ =
-                            tokio::task::spawn_blocking(move || store.set_token_count(&sid, it))
-                                .await;
+                        let (tokens, is_accepted) = (*input_tokens, *accepted);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            store.persist_usage_snapshot(&sid, tokens, is_accepted)
+                        })
+                        .await;
                     }
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
-                    if let Some(n) = notification_for_turn_event(&sid, &event) {
-                        let _ = rpc.send_raw(n).await;
-                    }
+                    forward_turn_event(&rpc, &sid, &event).await;
                 }
             },
         );
@@ -5924,14 +5947,15 @@ impl RpcDispatcher {
     /// output, and captured tool calls. `sops/runs` intentionally returns
     /// summaries; this is the drill-down a UI uses for a selected run.
     fn handle_sops_run_detail(&self, params: &Value) -> RpcResult {
-        // Local transports only. This dispatcher serves both owner-scoped local
-        // IPC and remote WSS, and a fresh WSS caller can complete `initialize`
-        // without presenting a client credential and still be marked
-        // authenticated — so on that transport this method would hand step
-        // output, tool arguments and errors to anyone who can reach the socket.
-        // The accepted remote-authentication RFC has no implementation on this
-        // branch, so run detail stays off WSS rather than widening a hole it
-        // does not own. Lift this once that boundary lands.
+        // Local transports only. WSS now requires a client certificate, so the
+        // question is no longer whether the caller authenticated — it is what
+        // that authentication entitles them to read. A certificate proves the
+        // peer, not that the peer may see one particular run's step output,
+        // tool arguments and errors, and this dispatcher has no per-run
+        // authorization to consult. Local IPC is owner-scoped by the socket
+        // itself, which is the entitlement this method relies on. Lift the
+        // refusal once there is a principal to authorize run contents against,
+        // and replace it with that check rather than simply removing it.
         if self.peer_label.starts_with("wss:") {
             return Err(rpc_err(
                 AUTH_REQUIRED,
@@ -6664,6 +6688,8 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             context_token_budget,
             model_context_window,
             cost_usd: _,
+            accepted: true,
+            ..
         } => SessionUpdateEvent::ContextUsage {
             session_id: session_id.to_string(),
             input_tokens: *input_tokens,
@@ -6674,11 +6700,33 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             session_id: session_id.to_string(),
             entries: entries.clone(),
         },
+        _ => return None,
     };
 
     let params = serde_json::to_value(update).ok()?;
     let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
     serde_json::to_string(&n).ok()
+}
+
+/// Forward a turn event through the outbound RPC writer as a
+/// serialized `session/update` notification.
+///
+/// Returns `true` when the event type maps to a notification and the
+/// send succeeded. Returns `false` when the event type is not forwarded
+/// (e.g. silent variants) or the writer channel is closed.
+///
+/// The caller is responsible for any pre-send side effects (ACP token
+/// persistence, plan persistence). This helper is the single forward
+/// path used by both production dispatch and regression tests.
+pub(super) async fn forward_turn_event(
+    rpc: &RpcOutbound,
+    session_id: &str,
+    event: &TurnEvent,
+) -> bool {
+    match notification_for_turn_event(session_id, event) {
+        Some(n) => rpc.send_raw(n).await,
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -6879,6 +6927,184 @@ mod tests {
     /// the raw trigger payload, framing marker, revision bookkeeping, and
     /// structured tool output are excluded outright; and exactly the
     /// documented fields cross the wire.
+    /// A run can fail before any step result exists: an input-schema rejection
+    /// finishes the run straight from validation. Without the run-level reason
+    /// the response is `status: failed`, `steps: []`, and no explanation at all
+    /// — which defeats the point of a detail method for a supported failure path.
+    #[tokio::test]
+    async fn run_detail_explains_a_run_that_failed_before_any_step() {
+        use std::sync::{Arc, Mutex};
+
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        use crate::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopStep, SopStepKind,
+            SopTriggerSource, StepSchema,
+        };
+
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.set_sops_for_test(vec![Sop {
+            name: "schema-gate".into(),
+            description: "fails before the first step runs".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Auto,
+            priority: SopPriority::Normal,
+            triggers: vec![],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                kind: SopStepKind::default(),
+                schema: Some(StepSchema {
+                    input: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {"ok": {"type": "string"}},
+                        "required": ["ok"]
+                    })),
+                    output: None,
+                }),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }]);
+        let action = engine
+            .start_run(
+                "schema-gate",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: Some("{}".into()),
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                },
+            )
+            .expect("the start itself succeeds; the run then fails validation");
+        let run_id = match &action {
+            crate::sop::SopRunAction::Failed { run_id, .. } => run_id.clone(),
+            other => panic!("input-schema rejection must fail the run, got {other:?}"),
+        };
+
+        let engine = Arc::new(Mutex::new(engine));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(SessionActorQueue::new(4, 10, 60)),
+        ));
+        let ctx = RpcContext::minimal_with_sop_engine(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Arc::clone(&engine),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+
+        let value = dispatcher
+            .handle_sops_run_detail(&serde_json::json!({ "run_id": run_id }))
+            .expect("the retained failed run resolves");
+        let run = value.get("run").and_then(|v| v.as_object()).expect("run");
+
+        assert_eq!(run.get("status").and_then(|v| v.as_str()), Some("failed"));
+        assert_eq!(
+            run.get("steps").and_then(|v| v.as_array()).map(Vec::len),
+            Some(0),
+            "this failure path records no step result, which is the premise"
+        );
+        let reason = run
+            .get("failure_reason")
+            .and_then(|v| v.as_str())
+            .expect("a failed run with no steps must still explain itself");
+        assert!(
+            reason.contains("input schema validation failed"),
+            "the response must carry the retained run-level cause, got {reason:?}"
+        );
+    }
+
+    /// The new field follows the same redaction policy as the rest of the
+    /// projection. Seeded through the store and restored, because that is what a
+    /// retained failed run actually is after a restart — and because the schema
+    /// validator never echoes instance values, so that path cannot produce a
+    /// credential-shaped reason on its own.
+    #[tokio::test]
+    async fn run_detail_scrubs_the_retained_failure_reason() {
+        use std::sync::{Arc, Mutex};
+
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        use crate::sop::store::{InMemoryRunStore, PersistedRun, SopRunStore};
+        use crate::sop::types::{SopEvent, SopRun, SopRunStatus, SopTriggerSource};
+
+        let store = Arc::new(InMemoryRunStore::new());
+        let run_id = "run-retained-failure-0001";
+        let run = SopRun {
+            run_id: run_id.to_string(),
+            sop_name: "retained".into(),
+            trigger_event: SopEvent {
+                source: SopTriggerSource::Manual,
+                topic: None,
+                payload: None,
+                timestamp: "2026-01-01T00:00:00Z".into(),
+            },
+            frame_marker_id: String::new(),
+            status: SopRunStatus::Failed,
+            current_step: 1,
+            total_steps: 1,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: Some("2026-01-01T00:00:01Z".into()),
+            failure_reason: Some("upstream rejected the call: token=REASONSECRET4242".into()),
+            step_results: Vec::new(),
+            waiting_since: None,
+            llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
+        };
+        let pr = PersistedRun::new(
+            run.clone(),
+            "2026-01-01T00:00:01Z".into(),
+            run.trigger_event.source,
+        );
+        store
+            .finish_run(run_id, &pr)
+            .expect("seed the terminal run");
+
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+            .with_store(store.clone());
+        engine.restore_runs();
+
+        let engine = Arc::new(Mutex::new(engine));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(SessionActorQueue::new(4, 10, 60)),
+        ));
+        let ctx = RpcContext::minimal_with_sop_engine(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Arc::clone(&engine),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+
+        let value = dispatcher
+            .handle_sops_run_detail(&serde_json::json!({ "run_id": run_id }))
+            .expect("the restored failed run resolves");
+        let wire = serde_json::to_string(&value).expect("serializable");
+        assert!(
+            !wire.contains("REASONSECRET4242"),
+            "the failure reason must be scrubbed like every other free-text field: {wire}"
+        );
+        let reason = value
+            .pointer("/run/failure_reason")
+            .and_then(|v| v.as_str())
+            .expect("the reason is still present, just redacted");
+        assert!(
+            reason.contains("[REDACTED]"),
+            "the redaction marker must survive so the cause is still legible, got {reason:?}"
+        );
+    }
+
     #[tokio::test]
     async fn sops_run_detail_serializes_a_scrubbed_projection_of_a_terminal_run() {
         use std::collections::BTreeSet;
@@ -9656,17 +9882,16 @@ mod tests {
             priority: PlanPriority::Medium,
             active_form: None,
         }];
-        let json = plan_replay_notification("sess-9", &entries).expect("nonempty plan replays");
+        let event = TurnEvent::Plan {
+            entries: entries.clone(),
+        };
+        let json = notification_for_turn_event("sess-9", &event)
+            .expect("nonempty plan should serialize as notification");
         let v = parse(&json);
         assert_eq!(v["method"], "session/update");
         assert_eq!(v["params"]["type"], "plan");
         assert_eq!(v["params"]["session_id"], "sess-9");
         assert_eq!(v["params"]["entries"][0]["content"], "Resume me");
-    }
-
-    #[test]
-    fn resume_plan_notification_absent_for_empty_plan() {
-        assert!(plan_replay_notification("sess-9", &[]).is_none());
     }
 
     async fn store_with_one_session(sid: &str) -> Arc<crate::rpc::session::SessionStore> {
@@ -9792,6 +10017,9 @@ mod tests {
             cost_usd: Some(0.01),
             context_token_budget: Some(180_000),
             model_context_window: Some(200_000),
+            provider_ref: "openai.default".to_string(),
+            model: "model-a".to_string(),
+            accepted: true,
         };
         // budget = trim budget (fills toward), window = full model capacity.
         let json = notification_for_turn_event("s1", &event).unwrap();
@@ -9807,6 +10035,26 @@ mod tests {
         // meter fills toward. model_context_window is the full capacity, distinct.
         assert_eq!(v["params"]["max_context_tokens"], 180_000);
         assert_eq!(v["params"]["model_context_window"], 200_000);
+    }
+
+    #[test]
+    fn rejected_usage_event_does_not_advance_context_snapshot() {
+        let event = TurnEvent::Usage {
+            input_tokens: Some(100),
+            cached_input_tokens: None,
+            output_tokens: Some(50),
+            cost_usd: Some(0.01),
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "openai.fallback".to_string(),
+            model: "model-b".to_string(),
+            accepted: false,
+        };
+
+        assert!(
+            notification_for_turn_event("s1", &event).is_none(),
+            "rejected billable attempts must not advance session context state"
+        );
     }
 
     /// Build a Config whose `coder` agent resolves to a provider entry with the
@@ -9951,6 +10199,9 @@ mod tests {
             cost_usd: Some(0.01),
             context_token_budget: Some(max_ctx),
             model_context_window: Some(model_win),
+            provider_ref: "custom.default".to_string(),
+            model: "model-a".to_string(),
+            accepted: true,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -9975,6 +10226,9 @@ mod tests {
             cost_usd: None,
             context_token_budget: None,
             model_context_window: None,
+            provider_ref: "openai.default".to_string(),
+            model: "model-a".to_string(),
+            accepted: true,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -9995,6 +10249,9 @@ mod tests {
             cost_usd: None,
             context_token_budget: Some(200_000),
             model_context_window: None,
+            provider_ref: "openai.default".to_string(),
+            model: "model-a".to_string(),
+            accepted: true,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -10016,6 +10273,9 @@ mod tests {
             cost_usd: None,
             context_token_budget: Some(100_000),
             model_context_window: None,
+            provider_ref: "openai.default".to_string(),
+            model: "model-a".to_string(),
+            accepted: true,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -11244,6 +11504,294 @@ mod tests {
             assert_eq!(running["turn_id"], generation.to_string());
             sessions.remove_cancel_token(session_id, generation);
             assert_eq!(read_state().await["state"], "idle");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_construction_failure_preserves_both_modes() {
+        for (original_mode, target_mode) in [("chat", "acp"), ("acp", "chat")] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let (dispatcher, sessions, chat_backend, acp_store) =
+                make_persistence_test_dispatcher(config, tmp.path());
+            let sid = "failed-mode-replacement";
+            let original_params = json!({
+                "agent_alias": "test-agent", "chat_mode": original_mode,
+                "session_id": sid, "keep_siblings": true,
+            });
+            dispatcher
+                .handle_session_new(&original_params)
+                .await
+                .unwrap();
+            let original = sessions.get_agent(sid).await.unwrap();
+            let generation = sessions.get_generation(sid).await.unwrap();
+            let history = vec![ChatMessage::assistant("retained live history")];
+            sessions.seed_history(sid, &history).await;
+            let original_history = original.lock().await.history().to_vec();
+            chat_backend
+                .append(
+                    &format!("rpc_{sid}"),
+                    &ChatMessage::assistant("durable Chat history"),
+                )
+                .unwrap();
+            if original_mode == "chat" {
+                acp_store
+                    .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+                    .unwrap();
+            }
+            acp_store
+                .append_turn(
+                    sid,
+                    &[zeroclaw_api::model_provider::ConversationMessage::Chat(
+                        ChatMessage::assistant("durable ACP history"),
+                    )],
+                )
+                .unwrap();
+            let chat_before = chat_backend.load(&format!("rpc_{sid}"));
+            let acp_before = acp_store.load_session(sid).unwrap();
+
+            dispatcher
+                .ctx
+                .config
+                .write()
+                .agents
+                .get_mut("test-agent")
+                .unwrap()
+                .model_provider = "openai.missing-profile".into();
+            let failure = dispatcher
+                .handle_session_new(&json!({
+                    "agent_alias": "test-agent", "chat_mode": target_mode,
+                    "session_id": sid,
+                }))
+                .await
+                .unwrap_err();
+            assert!(failure.message.contains("Failed to create agent"));
+            assert!(Arc::ptr_eq(
+                &original,
+                &sessions.get_agent(sid).await.unwrap()
+            ));
+            assert_eq!(sessions.get_generation(sid).await, Some(generation));
+            assert_eq!(
+                serde_json::to_value(original.lock().await.history()).unwrap(),
+                serde_json::to_value(&original_history).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(chat_backend.load(&format!("rpc_{sid}"))).unwrap(),
+                serde_json::to_value(chat_before).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    acp_store
+                        .load_session(sid)
+                        .unwrap()
+                        .map(|data| data.messages)
+                )
+                .unwrap(),
+                serde_json::to_value(acp_before.map(|data| data.messages)).unwrap()
+            );
+            dispatcher
+                .handle_session_new(&original_params)
+                .await
+                .unwrap();
+            assert_eq!(sessions.get_generation(sid).await, Some(generation));
+        }
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_store_failure_preserves_usable_original() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(Arc::clone(&dispatcher.ctx), tx, "test-peer".into());
+        let sid = "late-failed-mode-replacement";
+        let mut agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .unwrap();
+        agent.seed_history(&[ChatMessage::assistant("original conversation")]);
+        sessions
+            .insert(
+                sid.into(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+        let original = sessions.get_agent(sid).await.unwrap();
+        let generation = sessions.get_generation(sid).await;
+        let before = serde_json::to_value(original.lock().await.history()).unwrap();
+
+        // The candidate Agent builds successfully, then ACP store lookup fails.
+        let error = dispatcher
+            .handle_session_new(&json!({
+                "agent_alias": "test-agent", "chat_mode": "acp", "session_id": sid,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "ACP session store is not available");
+        assert!(Arc::ptr_eq(
+            &original,
+            &sessions.get_agent(sid).await.unwrap()
+        ));
+        assert_eq!(sessions.get_generation(sid).await, generation);
+        assert_eq!(
+            sessions.chat_mode(sid).await,
+            Some(crate::rpc::types::ChatMode::Chat)
+        );
+        assert_eq!(
+            serde_json::to_value(original.lock().await.history()).unwrap(),
+            before
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "failure must not emit replacement notifications"
+        );
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid, "prompt": "continue original conversation",
+            }))
+            .await
+            .expect("the original Agent must still serve the next turn");
+        assert_eq!(result["content"], "ok");
+        assert!(Arc::ptr_eq(
+            &original,
+            &sessions.get_agent(sid).await.unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_preserves_fresh_capacity_rejection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            1,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend.clone()),
+            Some(Arc::clone(&acp_store)),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher
+            .handle_session_new(&json!({
+                "agent_alias": "test-agent", "session_id": "occupant", "chat_mode": "chat",
+            }))
+            .await
+            .unwrap();
+        let original = sessions.get_agent("occupant").await.unwrap();
+        let generation = sessions.get_generation("occupant").await;
+        for mode in ["chat", "acp"] {
+            let sid = format!("rejected-{mode}");
+            let error = dispatcher
+                .handle_session_new(&json!({
+                    "agent_alias": "test-agent", "session_id": sid, "chat_mode": mode,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, SESSION_LIMIT_REACHED);
+            assert!(sessions.get_agent(&sid).await.is_none());
+            assert!(acp_store.load_session(&sid).unwrap().is_none());
+            assert!(
+                !chat_backend
+                    .list_sessions_with_metadata()
+                    .iter()
+                    .any(|row| row.key == format!("rpc_{sid}"))
+            );
+            assert!(Arc::ptr_eq(
+                &original,
+                &sessions.get_agent("occupant").await.unwrap()
+            ));
+            assert_eq!(sessions.get_generation("occupant").await, generation);
+            let error = dispatcher
+                .handle_session_prompt(&json!({
+                    "session_id": sid, "prompt": "must not rehydrate",
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, SESSION_NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_success_restores_target_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, tmp.path());
+        let sid = "successful-mode-replacement";
+        acp_store
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .unwrap();
+        acp_store
+            .append_turn(
+                sid,
+                &[zeroclaw_api::model_provider::ConversationMessage::Chat(
+                    ChatMessage::assistant("ACP history"),
+                )],
+            )
+            .unwrap();
+        let plan = vec![zeroclaw_api::plan::PlanEntry {
+            content: "Retained ACP plan".into(),
+            status: zeroclaw_api::plan::PlanStatus::InProgress,
+            priority: zeroclaw_api::plan::PlanPriority::High,
+            active_form: None,
+        }];
+        acp_store.set_plan(sid, &plan).unwrap();
+        chat_backend
+            .append(
+                &format!("rpc_{sid}"),
+                &ChatMessage::assistant("Chat history"),
+            )
+            .unwrap();
+        let mut previous = None;
+        for (mode, expected_history) in [
+            ("chat", "Chat history"),
+            ("acp", "ACP history"),
+            ("chat", "Chat history"),
+        ] {
+            let result = dispatcher
+                .handle_session_new(&json!({
+                    "agent_alias": "test-agent", "chat_mode": mode, "session_id": sid,
+                }))
+                .await
+                .unwrap();
+            assert_eq!(result["message_count"], 1);
+            let current = sessions.get_agent(sid).await.unwrap();
+            let generation = sessions.get_generation(sid).await.unwrap();
+            if let Some((old_agent, old_generation)) = previous.take() {
+                assert!(!Arc::ptr_eq(&old_agent, &current));
+                assert_eq!(generation, old_generation + 1);
+            }
+            assert!(current.lock().await.history().iter().any(|message| matches!(message,
+                zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.content == expected_history)));
+            assert_eq!(
+                sessions.get_plan(sid).await.unwrap().len(),
+                usize::from(mode == "acp")
+            );
+            assert_eq!(sessions.count().await, 1);
+            previous = Some((current, generation));
         }
     }
 
@@ -15412,11 +15960,20 @@ mod tests {
         (dispatcher, rx)
     }
 
+    /// Calibrated stack budget for the constrained-stack regression below.
+    /// Tokio worker threads default to 2 MiB; on macOS/aarch64, debug builds
+    /// need ~1.1 MB of execution stack for a `session/new` dispatch now that
+    /// the largest dispatch branches are heap-pinned, and needed ~2.0 MB
+    /// before that. 1.5 MiB sits between the two: a new inline branch pushing
+    /// the requirement back toward the old level fails this test, while the
+    /// current shape passes with margin.
+    const CONSTRAINED_STACK_BYTES: usize = 1536 * 1024;
+
     #[test]
-    fn process_line_session_new_creates_session_on_two_megabyte_stack() {
+    fn process_line_session_new_creates_session_on_constrained_stack() {
         std::thread::Builder::new()
             .name("rpc-session-new-stack-regression".into())
-            .stack_size(2 * 1024 * 1024)
+            .stack_size(CONSTRAINED_STACK_BYTES)
             .spawn(|| {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -15448,7 +16005,7 @@ mod tests {
             })
             .expect("stack regression thread should spawn")
             .join()
-            .expect("session/new should not exhaust a two-megabyte stack");
+            .expect("session/new should not exhaust the constrained stack");
     }
 
     /// `process_line`'s exhaustive `match` sizes its generated state machine
@@ -15462,7 +16019,7 @@ mod tests {
     /// bound: the intent is to catch a new multi-hundred-KB branch, not to
     /// force every incidental size change through this test.
     #[test]
-    fn process_line_future_stays_small_enough_for_a_two_megabyte_stack() {
+    fn process_line_future_stays_small_enough_for_a_constrained_stack() {
         let tmp = tempfile::TempDir::new().expect("temporary test directory");
         let config = make_acp_test_config(&tmp);
         let (mut dispatcher, _sessions, _rx) = make_acp_test_dispatcher_with_receiver(config);
@@ -15473,7 +16030,7 @@ mod tests {
             "process_line's future grew to {size} bytes; a new or changed handler is now \
              inlined into this match without Box::pin, which can overflow the 2MB Windows \
              thread stack this exists to protect (see \
-             process_line_session_new_creates_session_on_two_megabyte_stack). Box::pin the \
+             process_line_session_new_creates_session_on_constrained_stack). Box::pin the \
              large new branch the same way ConfigSet, QuickstartApply, and the other handlers \
              above are"
         );

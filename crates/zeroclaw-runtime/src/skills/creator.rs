@@ -208,12 +208,17 @@ impl SkillCreator {
             dispatch_model: model,
             temperature: None,
         };
+        // Skill reflection is not part of any gateway turn ledger, so its
+        // settled-attempt summaries are intentionally discarded.
         let resp = access
-            .run_model_query(ChatRequest {
-                messages: &messages,
-                tools: None,
-                thinking: None,
-            })
+            .run_model_query(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                &mut Vec::new(),
+            )
             .await
             .context("reflection provider call failed")?;
         let raw = resp.text.unwrap_or_default();
