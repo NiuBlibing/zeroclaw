@@ -16,6 +16,16 @@ pub enum CommandRiskLevel {
     High,
 }
 
+impl CommandRiskLevel {
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 /// Classifies whether a tool operation is read-only or side-effecting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolOperation {
@@ -3496,7 +3506,8 @@ impl SecurityPolicy {
                 ResolutionReason::SupervisedRiskAsk { .. } if approved => {}
                 ResolutionReason::SupervisedRiskAsk { level } => {
                     return Err(format!(
-                        "Command requires operator approval: {level:?}-risk operation"
+                        "Command requires operator approval: {}-risk operation",
+                        level.as_label()
                     ));
                 }
                 // Unmatched (or degraded-to-Ask): this entry never bridges
@@ -3556,7 +3567,10 @@ impl SecurityPolicy {
                 use crate::tool_policy::ResolutionReason;
                 return Err(match resolution.reason {
                     ResolutionReason::SupervisedRiskAsk { level } => {
-                        format!("Command requires operator approval: {level:?}-risk operation")
+                        format!(
+                            "Command requires operator approval: {}-risk operation",
+                            level.as_label()
+                        )
                     }
                     _ => format!("Command not allowed by security policy: {command}"),
                 });
@@ -6057,7 +6071,7 @@ mod tests {
             let err = p
                 .validate_command_execution(command, false)
                 .expect_err("Git output-file options must require approval");
-            assert!(err.contains("Medium-risk operation"), "{command}: {err}");
+            assert!(err.contains("medium-risk operation"), "{command}: {err}");
 
             let risk = p
                 .validate_command_execution(command, true)
@@ -6509,9 +6523,12 @@ mod tests {
             "git -C . add .",
         ] {
             assert!(p.is_command_allowed(command), "{command}");
-            let denied = p
-                .validate_command_execution(command, false)
-                .expect_err("index/working-tree mutations must require approval");
+            let result = p.validate_command_execution(command, false);
+            assert!(
+                result.is_err(),
+                "{command}: index/working-tree mutations must require approval, got {result:?}"
+            );
+            let denied = result.unwrap_err();
             assert!(
                 denied.contains("medium-risk operation"),
                 "{command}: {denied}"

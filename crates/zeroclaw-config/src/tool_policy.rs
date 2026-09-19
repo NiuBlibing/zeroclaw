@@ -741,7 +741,7 @@ fn extract_one_posix_segment(segment: &str, dialect: ShellDialect) -> Option<Ext
         .iter()
         .map(|word| word.to_ascii_lowercase())
         .collect();
-    let risk = match generic_segment_risk(&base, &args_lower, &cmd_part.to_ascii_lowercase()) {
+    let risk = match generic_segment_risk(&base, &args_cased, &cmd_part.to_ascii_lowercase()) {
         Some(risk) => risk,
         None => CommandRiskLevel::Low,
     };
