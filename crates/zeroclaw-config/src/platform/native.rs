@@ -177,21 +177,41 @@ fn powershell_keyword_at(command: &str, cursor: usize, keyword: &str) -> bool {
 fn powershell_statement_end(command: &str, cursor: usize) -> usize {
     let bytes = command.as_bytes();
     let mut quote = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
     let mut index = cursor;
     while index < bytes.len() {
         let byte = bytes[index];
-        if let Some(active_quote) = quote {
+        if line_comment {
+            if byte == b'\n' || byte == b'\r' {
+                return index + 1;
+            }
+        } else if block_comment {
+            if bytes.get(index..index + 2) == Some(b"#>") {
+                block_comment = false;
+                index += 2;
+                continue;
+            }
+        } else if let Some(active_quote) = quote {
             if byte == active_quote {
                 if active_quote == b'\'' && bytes.get(index + 1) == Some(&b'\'') {
                     index += 2;
                     continue;
                 }
                 quote = None;
-            } else if byte == b'`' {
+            } else if active_quote == b'"' && byte == b'`' {
                 index += 1;
             }
+        } else if bytes.get(index..index + 2) == Some(b"<#") {
+            block_comment = true;
+            index += 2;
+            continue;
+        } else if byte == b'#' {
+            line_comment = true;
         } else if byte == b'\'' || byte == b'"' {
             quote = Some(byte);
+        } else if byte == b'`' {
+            index += 1;
         } else if byte == b';' || byte == b'\n' || byte == b'\r' {
             return index + 1;
         }
@@ -212,20 +232,40 @@ fn powershell_param_end(command: &str, cursor: usize) -> Option<usize> {
 
     let mut depth = 0usize;
     let mut quote = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
     while index < bytes.len() {
         let byte = bytes[index];
-        if let Some(active_quote) = quote {
+        if line_comment {
+            if byte == b'\n' || byte == b'\r' {
+                line_comment = false;
+            }
+        } else if block_comment {
+            if bytes.get(index..index + 2) == Some(b"#>") {
+                block_comment = false;
+                index += 2;
+                continue;
+            }
+        } else if let Some(active_quote) = quote {
             if byte == active_quote {
                 if active_quote == b'\'' && bytes.get(index + 1) == Some(&b'\'') {
                     index += 2;
                     continue;
                 }
                 quote = None;
-            } else if byte == b'`' {
+            } else if active_quote == b'"' && byte == b'`' {
                 index += 1;
             }
+        } else if bytes.get(index..index + 2) == Some(b"<#") {
+            block_comment = true;
+            index += 2;
+            continue;
+        } else if byte == b'#' {
+            line_comment = true;
         } else if byte == b'\'' || byte == b'"' {
             quote = Some(byte);
+        } else if byte == b'`' {
+            index += 1;
         } else if byte == b'(' {
             depth += 1;
         } else if byte == b')' {
@@ -580,7 +620,7 @@ mod tests {
 
     #[test]
     fn powershell_utf8_setup_follows_required_declarations() {
-        let command = "# comment\n#requires -Version 5.1\nusing namespace System.Text; using namespace System.IO\nparam([string]$Value)\nWrite-Output $Value";
+        let command = "# comment\n#requires -Version 5.1 # keep; this comment\nusing namespace System.Text # keep; this comment too\nparam(\n    [string]$Value # the comment may contain )\n)\nWrite-Output $Value";
         let cwd = std::env::temp_dir();
         let process = NativeRuntime::with_shell("pwsh".into())
             .build_shell_command(command, &cwd)
@@ -589,36 +629,47 @@ mod tests {
         let script = process.get_args().nth(3).unwrap().to_string_lossy();
 
         let setup = script.find(POWERSHELL_UTF8_SETUP).unwrap();
-        assert!(setup > script.find("param([string]$Value)").unwrap());
+        assert!(setup > script.find("\n)\n").unwrap());
         assert!(script[..setup].contains("#requires -Version 5.1"));
-        assert!(script[..setup].contains("using namespace System.IO"));
+        assert!(script[..setup].contains("using namespace System.Text"));
         assert!(script.ends_with("Write-Output $Value"));
     }
 
     #[tokio::test]
     async fn powershell_declaration_script_executes_with_utf8_setup() {
-        if std::process::Command::new("pwsh")
-            .arg("-NoProfile")
-            .arg("-Command")
-            .arg("exit 0")
-            .output()
-            .is_err()
-        {
+        let Some(interpreter) = ["pwsh", "powershell"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("exit 0")
+                .output()
+                .is_ok()
+        }) else {
             return;
+        };
+
+        for (command, expected) in [
+            (
+                "#requires -Version 5.1 # keep; this comment\nusing namespace System.Text # keep; this comment too\n[Console]::Write('声明-ok')",
+                "声明-ok",
+            ),
+            (
+                "param(\n    [string]$Name = '参数-ok' # the comment may contain )\n)\n[Console]::Write($Name)",
+                "参数-ok",
+            ),
+        ] {
+            let output = tokio_powershell_command(interpreter, command)
+                .output()
+                .await
+                .unwrap();
+
+            assert!(
+                output.status.success(),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
         }
-
-        let command = "using namespace System.Text\nparam()\n[Console]::Write('声明-ok')";
-        let output = tokio_powershell_command("pwsh", command)
-            .output()
-            .await
-            .unwrap();
-
-        assert!(
-            output.status.success(),
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(String::from_utf8(output.stdout).unwrap(), "声明-ok");
     }
 
     #[test]
