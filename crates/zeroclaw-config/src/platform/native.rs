@@ -29,6 +29,7 @@ fn default_shell_for_platform() -> String {
     let fallback = ["bash", "zsh", "/bin/sh"];
 
     if let Some(login_shell) = login_shell()
+        && is_supported_login_shell(&login_shell)
         && shell_is_available(&login_shell)
     {
         return login_shell;
@@ -59,6 +60,17 @@ fn first_available<'a>(
         .into_iter()
         .find(|candidate| available(candidate))
         .map(str::to_owned)
+}
+
+/// Return whether a passwd login-shell name maps to a dialect understood by
+/// the native runtime.  Explicit `runtime.shell` values retain the broader
+/// historical Unix validation; this allowlist only prevents service shells
+/// and unsupported interactive shells from becoming an implicit default.
+fn is_supported_login_shell(shell: &str) -> bool {
+    matches!(
+        shell_stem(shell).to_ascii_lowercase().as_str(),
+        "sh" | "bash" | "zsh" | "ksh" | "dash" | "ash" | "powershell" | "pwsh"
+    )
 }
 
 #[cfg(unix)]
@@ -416,6 +428,36 @@ mod tests {
             candidate == "powershell"
         });
         assert_eq!(selected.as_deref(), Some("powershell"));
+    }
+
+    #[test]
+    fn login_shell_filter_accepts_supported_dialects_only() {
+        for shell in [
+            "/bin/sh",
+            "/bin/bash",
+            "/bin/zsh",
+            "/usr/bin/ksh",
+            "/usr/bin/dash",
+            "/usr/bin/pwsh",
+            "/usr/bin/powershell",
+        ] {
+            assert!(
+                is_supported_login_shell(shell),
+                "expected supported login shell: {shell}"
+            );
+        }
+        for shell in [
+            "/usr/bin/fish",
+            "/bin/csh",
+            "/bin/nu",
+            "/sbin/nologin",
+            "/bin/false",
+        ] {
+            assert!(
+                !is_supported_login_shell(shell),
+                "unsupported/service shell must use fallback: {shell}"
+            );
+        }
     }
 
     #[cfg(target_os = "windows")]
