@@ -11,7 +11,7 @@ use zeroclaw_api::media::{
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
-const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
+pub const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 
 /// Maximum byte length for a single image marker candidate, enforced before any
 /// allocation or owned copy is made.
@@ -540,9 +540,9 @@ fn is_windows_unc_path(candidate: &str) -> bool {
     !server.is_empty() && !share.is_empty()
 }
 
-fn collapse_wrapped_marker(raw: &str) -> String {
+fn collapse_wrapped_marker(raw: &str) -> Cow<'_, str> {
     if !raw.contains('\n') && !raw.contains('\r') {
-        return raw.trim().to_string();
+        return Cow::Borrowed(raw.trim());
     }
     let mut out = String::with_capacity(raw.len());
     let mut skip_ws = false;
@@ -559,7 +559,7 @@ fn collapse_wrapped_marker(raw: &str) -> String {
         }
         out.push(ch);
     }
-    trim_string_in_place(out)
+    Cow::Owned(trim_string_in_place(out))
 }
 
 fn trim_string_in_place(mut value: String) -> String {
@@ -591,6 +591,8 @@ struct ParsedImageMarkers {
     refs: Vec<String>,
     loadable_count: usize,
     rejected_count: usize,
+    /// Bytes retained as text before the cleaned output's outer trim.
+    text_bytes: usize,
     /// Byte offsets `(marker_start, end)` of each under-ceiling loadable
     /// marker, in document order. Positions into the borrowed input, not
     /// owned bodies — they let a caller select a subset of the loadable set
@@ -622,11 +624,40 @@ enum ParseMode {
     RewriteAndCollect,
 }
 
-fn push_rejected_image_marker(cleaned: &mut String) {
-    if cleaned.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
-        cleaned.push(' ');
+fn retain_marker_text(
+    cleaned: &mut String,
+    materialize: bool,
+    text_bytes: &mut usize,
+    retained_ends_with_whitespace: &mut Option<bool>,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
     }
-    cleaned.push_str(REJECTED_IMAGE_MARKER_NOTE);
+    if materialize {
+        cleaned.push_str(text);
+    }
+    *text_bytes += text.len();
+    *retained_ends_with_whitespace = text.chars().last().map(char::is_whitespace);
+}
+
+fn push_rejected_image_marker(
+    cleaned: &mut String,
+    materialize: bool,
+    text_bytes: &mut usize,
+    retained_ends_with_whitespace: &mut Option<bool>,
+) {
+    if matches!(retained_ends_with_whitespace, Some(false)) {
+        if materialize {
+            cleaned.push(' ');
+        }
+        *text_bytes += 1;
+    }
+    if materialize {
+        cleaned.push_str(REJECTED_IMAGE_MARKER_NOTE);
+    }
+    *text_bytes += REJECTED_IMAGE_MARKER_NOTE.len();
+    *retained_ends_with_whitespace = Some(false);
 }
 
 fn parse_image_markers_inner(content: &str, mode: ParseMode) -> ParsedImageMarkers {
@@ -639,25 +670,40 @@ fn parse_image_markers_inner(content: &str, mode: ParseMode) -> ParsedImageMarke
     let mut cleaned = String::new();
     let mut loadable_count = 0usize;
     let mut rejected_count = 0usize;
+    let mut text_bytes = 0usize;
+    let mut retained_ends_with_whitespace = None;
     let mut loadable_spans: Vec<(usize, usize)> = Vec::new();
     let mut cursor = 0usize;
 
     while let Some(rel_start) = content[cursor..].find(IMAGE_MARKER_PREFIX) {
         let start = cursor + rel_start;
-        if materialize {
-            cleaned.push_str(&content[cursor..start]);
-        }
+        retain_marker_text(
+            &mut cleaned,
+            materialize,
+            &mut text_bytes,
+            &mut retained_ends_with_whitespace,
+            &content[cursor..start],
+        );
 
         let marker_start = start + IMAGE_MARKER_PREFIX.len();
         let Some(rel_end) = content[marker_start..].find(']') else {
             let marker_len = content.len() - marker_start;
             if marker_len > MAX_IMAGE_MARKER_BYTES {
                 rejected_count += 1;
-                if materialize {
-                    push_rejected_image_marker(&mut cleaned);
-                }
-            } else if materialize {
-                cleaned.push_str(&content[start..]);
+                push_rejected_image_marker(
+                    &mut cleaned,
+                    materialize,
+                    &mut text_bytes,
+                    &mut retained_ends_with_whitespace,
+                );
+            } else {
+                retain_marker_text(
+                    &mut cleaned,
+                    materialize,
+                    &mut text_bytes,
+                    &mut retained_ends_with_whitespace,
+                    &content[start..],
+                );
             }
             cursor = content.len();
             break;
@@ -683,15 +729,22 @@ fn parse_image_markers_inner(content: &str, mode: ParseMode) -> ParsedImageMarke
         if end - marker_start > MAX_IMAGE_MARKER_BYTES {
             match marker_span_class(&content[marker_start..end]) {
                 MarkerSpanClass::Prose => {
-                    if materialize {
-                        cleaned.push_str(&content[start..=end]);
-                    }
+                    retain_marker_text(
+                        &mut cleaned,
+                        materialize,
+                        &mut text_bytes,
+                        &mut retained_ends_with_whitespace,
+                        &content[start..=end],
+                    );
                 }
                 MarkerSpanClass::Loadable | MarkerSpanClass::Undecidable => {
                     rejected_count += 1;
-                    if materialize {
-                        push_rejected_image_marker(&mut cleaned);
-                    }
+                    push_rejected_image_marker(
+                        &mut cleaned,
+                        materialize,
+                        &mut text_bytes,
+                        &mut retained_ends_with_whitespace,
+                    );
                 }
             }
             cursor = end + 1;
@@ -712,15 +765,22 @@ fn parse_image_markers_inner(content: &str, mode: ParseMode) -> ParsedImageMarke
                 // Preserve the original marker text (placeholders like
                 // `[IMAGE:...]` or `[IMAGE:<path>]` should survive as prose
                 // rather than triggering a loader error).
-                if materialize {
-                    cleaned.push_str(&content[start..=end]);
-                }
+                retain_marker_text(
+                    &mut cleaned,
+                    materialize,
+                    &mut text_bytes,
+                    &mut retained_ends_with_whitespace,
+                    &content[start..=end],
+                );
             }
             MarkerSpanClass::Undecidable => {
                 rejected_count += 1;
-                if materialize {
-                    push_rejected_image_marker(&mut cleaned);
-                }
+                push_rejected_image_marker(
+                    &mut cleaned,
+                    materialize,
+                    &mut text_bytes,
+                    &mut retained_ends_with_whitespace,
+                );
             }
             MarkerSpanClass::Loadable => {
                 loadable_count += 1;
@@ -729,7 +789,7 @@ fn parse_image_markers_inner(content: &str, mode: ParseMode) -> ParsedImageMarke
                     let candidate = collapse_wrapped_marker(&content[marker_start..end]);
                     #[cfg(test)]
                     record_candidate_ownership(candidate.len());
-                    refs.push(candidate);
+                    refs.push(candidate.into_owned());
                 }
             }
         }
@@ -737,8 +797,14 @@ fn parse_image_markers_inner(content: &str, mode: ParseMode) -> ParsedImageMarke
         cursor = end + 1;
     }
 
-    if materialize && cursor < content.len() {
-        cleaned.push_str(&content[cursor..]);
+    if cursor < content.len() {
+        retain_marker_text(
+            &mut cleaned,
+            materialize,
+            &mut text_bytes,
+            &mut retained_ends_with_whitespace,
+            &content[cursor..],
+        );
     }
 
     ParsedImageMarkers {
@@ -750,6 +816,7 @@ fn parse_image_markers_inner(content: &str, mode: ParseMode) -> ParsedImageMarke
         refs,
         loadable_count,
         rejected_count,
+        text_bytes,
         loadable_spans,
     }
 }
@@ -757,6 +824,23 @@ fn parse_image_markers_inner(content: &str, mode: ParseMode) -> ParsedImageMarke
 pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     let parsed = parse_image_markers_inner(content, ParseMode::RewriteAndCollect);
     (parsed.cleaned, parsed.refs)
+}
+
+/// Byte count of the non-marker text and the number of loadable references,
+/// computed by the same scanner as `parse_image_markers` without building
+/// the cleaned string or copying references.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageMarkerSummary {
+    pub text_bytes: usize,
+    pub image_refs: usize,
+}
+
+pub fn image_marker_summary(content: &str) -> ImageMarkerSummary {
+    let parsed = parse_image_markers_inner(content, ParseMode::Scan);
+    ImageMarkerSummary {
+        text_bytes: parsed.text_bytes,
+        image_refs: parsed.loadable_count,
+    }
 }
 
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
@@ -1104,6 +1188,40 @@ fn should_normalize_message_images(
     }
 
     message.role == "user"
+}
+
+/// How multimodal preparation will treat the `[IMAGE:...]` markers in a
+/// message at its position in the history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageMarkerDisposition {
+    /// Loadable markers become provider image blocks: user messages and the
+    /// latest run of tool-result carriers.
+    Normalized,
+    /// Markers are stripped before dispatch: tool-result carriers outside the
+    /// latest run.
+    Stripped,
+    /// Content is dispatched verbatim as text: system and assistant messages.
+    Literal,
+}
+
+/// One disposition per message, computed with the same predicates preparation
+/// uses (`is_tool_result_carrier`, `latest_tool_result_indices`,
+/// `should_normalize_message_images`).
+pub fn image_marker_dispositions(messages: &[ChatMessage]) -> Vec<ImageMarkerDisposition> {
+    let latest_indices = latest_tool_result_indices(messages);
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            if should_normalize_message_images(index, message, &latest_indices) {
+                ImageMarkerDisposition::Normalized
+            } else if is_tool_result_carrier(message) {
+                ImageMarkerDisposition::Stripped
+            } else {
+                ImageMarkerDisposition::Literal
+            }
+        })
+        .collect()
 }
 
 fn stripped_image_marker_text(content: &str) -> String {
@@ -1525,7 +1643,7 @@ fn trim_image_markers(text: &str, drop_here: usize) -> String {
                 let candidate = collapse_wrapped_marker(&text[start..end]);
                 #[cfg(test)]
                 record_candidate_ownership(candidate.len());
-                candidate
+                candidate.into_owned()
             })
             .collect();
         compose_multimodal_message(&parsed.cleaned, &retained)
@@ -3435,6 +3553,66 @@ mod tests {
         out.extend_from_slice(b"IEND");
         out.extend_from_slice(&crc32(b"IEND").to_be_bytes());
         out
+    }
+
+    #[test]
+    fn image_marker_dispositions_match_preparation() {
+        let native = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("yo"),
+            ChatMessage::tool("early result"),
+            ChatMessage::user("turn two"),
+            ChatMessage::assistant("calling"),
+            ChatMessage::tool("latest result"),
+        ];
+        assert_eq!(
+            image_marker_dispositions(&native),
+            vec![
+                ImageMarkerDisposition::Literal,
+                ImageMarkerDisposition::Normalized,
+                ImageMarkerDisposition::Literal,
+                ImageMarkerDisposition::Stripped,
+                ImageMarkerDisposition::Normalized,
+                ImageMarkerDisposition::Literal,
+                ImageMarkerDisposition::Normalized,
+            ]
+        );
+
+        let prompt_mode = vec![
+            ChatMessage::user("[Tool results]\nearly carrier"),
+            ChatMessage::user("turn"),
+            ChatMessage::user("[Tool results]\nlatest carrier"),
+        ];
+        assert_eq!(
+            image_marker_dispositions(&prompt_mode),
+            vec![
+                ImageMarkerDisposition::Stripped,
+                ImageMarkerDisposition::Normalized,
+                ImageMarkerDisposition::Normalized,
+            ]
+        );
+    }
+
+    #[test]
+    fn image_marker_summary_matches_parse_image_markers() {
+        let placeholder = "[IMAGE:...]";
+        let content = format!(
+            "  see [IMAGE:/tmp/a.png] plus {placeholder} and [IMAGE:/tmp/wrapped-\nlong.png] ok  "
+        );
+        let (cleaned, refs) = parse_image_markers(&content);
+        let summary = image_marker_summary(&content);
+
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0], "/tmp/a.png");
+        assert_eq!(refs[1], "/tmp/wrapped-long.png");
+        assert_eq!(summary.image_refs, refs.len());
+
+        // Every byte the scanner keeps as text, placeholder included, without
+        // the trim parse applies to its cleaned string.
+        let expected_text = format!("  see  plus {placeholder} and  ok  ");
+        assert_eq!(summary.text_bytes, expected_text.len());
+        assert_eq!(summary.text_bytes, cleaned.len() + 4);
     }
 
     #[test]
