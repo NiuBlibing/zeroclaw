@@ -79,7 +79,7 @@ use crate::agent::tool_execution::{
 };
 use crate::security::ingress::{IngressPolicy, ingress_policy};
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::collections::HashSet;
 use std::io::Write as _;
 use std::sync::Arc;
@@ -379,6 +379,38 @@ impl<'a> TurnState<'a> {
     }
 }
 
+/// Emit `TurnEvent::Usage` for each billable attempt in `attempts` as a
+/// rejected (`accepted: false`) event, so the gateway's `usage_by_provider`
+/// breakdown includes all billable attempts (accepted + rejected). Callers
+/// pass the attempts settled for an iteration that will not reach an
+/// accepted response: each iteration's `attempts` vec is fresh from its own
+/// `call_provider`, so projecting here cannot double-emit.
+async fn emit_rejected_attempt_usage(
+    event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+) {
+    if let Some(tx) = event_tx {
+        for billable in crate::agent::cost::billable_provider_attempts(attempts) {
+            let cost_usd = crate::agent::cost::compute_cost_usd(
+                billable.attempt.provider_ref(),
+                billable.attempt.model(),
+                billable.usage,
+            );
+            let _ = tx
+                .send(TurnEvent::Usage {
+                    input_tokens: billable.usage.input_tokens,
+                    cached_input_tokens: billable.usage.cached_input_tokens,
+                    output_tokens: billable.usage.output_tokens,
+                    cost_usd,
+                    provider_ref: billable.attempt.provider_ref().to_string(),
+                    model: billable.attempt.model().to_string(),
+                    accepted: false,
+                })
+                .await;
+        }
+    }
+}
+
 pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let model_switch_state = p
         .exec
@@ -546,7 +578,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
     // `turn.context.TurnCtx`).
-    let ctx = TurnCtx {
+    let mut ctx = TurnCtx {
         observer,
         provider_name,
         model,
@@ -566,6 +598,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         agent_alias,
         parent_agent_alias,
+        serving_provider_name: None,
+        serving_model: None,
     };
 
     // Cross-agent SOP step contexts memoized for the WHOLE turn (see the
@@ -777,6 +811,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             (model_provider, provider_name, model)
         };
+        // Vision routing override: set the per-iteration serving identity.
+        ctx.serving_provider_name = if vision_model_provider_box.is_some() {
+            Some(active_model_provider_name.to_string())
+        } else {
+            None
+        };
+        ctx.serving_model = if vision_model_provider_box.is_some() {
+            Some(active_model.to_string())
+        } else {
+            None
+        };
         let prepared_messages = prepare_messages_for_iteration(
             turn_state.history,
             multimodal_config,
@@ -802,6 +847,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         }
         let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
+        // The hook may have changed the model actually sent; the serving identity
+        // must describe the post-hook model, not the pre-hook vision-routed one.
+        ctx.serving_model = Some(provider_request_model.to_string());
         // Only direct Agent turns scope the complete prompt variants. Preserve
         // the channel loop's existing hook/protocol behavior rather than
         // silently widening this delegation-focused repair into channel prompt
@@ -913,6 +961,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } = call_provider(
             &ctx,
             active_model_provider,
+            active_model_provider_name,
             provider_request_model,
             &provider_request_messages,
             request_tools,
@@ -922,10 +971,21 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         .await?;
 
         // Reliable reports its actually served candidate; direct providers
-        // intentionally retain the requested route as the accounting fallback.
+        // use the vision-routing identity when present, otherwise the
+        // requested route as the accounting fallback.
         let (served_provider, served_model) = accepted_route
             .as_ref()
             .map(|route| (route.provider_ref(), route.model()))
+            .or_else(|| {
+                ctx.serving_provider_name.as_deref().map(|p| {
+                    (
+                        p,
+                        ctx.serving_model
+                            .as_deref()
+                            .unwrap_or(provider_request_model),
+                    )
+                })
+            })
             .unwrap_or((ctx.provider_name, provider_request_model));
 
         // Reliable providers classify this before retries and fallback. Keep
@@ -981,6 +1041,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
             Err(e) => {
                 crate::agent::cost::settle_provider_attempts(&attempts, None);
+                // This iteration's attempts never reach an accepted response
+                // (recovery continues with a fresh attempt vec, otherwise the
+                // turn fails) — project them now so the gateway ledger stays
+                // complete.
+                emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
@@ -1036,6 +1101,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // candidate, including a response that also carries native tool calls.
         if parse_issue_detected {
             crate::agent::cost::settle_provider_attempts(&attempts, None);
+            // Same contract as the error branch: this iteration's attempts
+            // are settled but never accepted — project them before retrying
+            // with a fresh vec or returning the fallback.
+            emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
@@ -1099,6 +1168,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &attempts[..attempts.len().saturating_sub(1)],
             None,
         );
+        // Emit TurnEvent::Usage for each billable rejected attempt so the
+        // gateway's usage_by_provider breakdown includes all billable attempts
+        // (accepted + rejected). This makes the breakdown the single source of
+        // truth that the done-frame cost_usd can be derived from.
+        emit_rejected_attempt_usage(ctx.event_tx, &attempts[..attempts.len().saturating_sub(1)])
+            .await;
         record_accepted_chat_response(
             &ctx,
             served_provider,
@@ -1110,6 +1185,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &provider_request_messages,
             llm_started_at,
             iteration,
+            accepted_route.as_ref(),
         )
         .await;
 
@@ -1485,6 +1561,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         provider_name,
         model,
         temperature,
+        multimodal_config,
         pacing,
         cancellation_token.as_ref(),
         max_iterations,
@@ -1783,21 +1860,14 @@ pub(crate) async fn assemble_owned_execution(
     // Stays sealed into `OwnedAgentExecution.tools_registry` (a `ScopedToolRegistry`).
     let tools_registry = registry;
 
-    let provider_ref = config
-        .resolved_model_provider_for_agent(alias)
-        .map(|(ty, al, _)| format!("{ty}.{al}"))
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "SOP step agent '{alias}' has no resolved model provider"
-            ))
-        })?;
-    let (model_provider, provider_name, model) =
-        crate::agent::agent::build_session_model_provider(config, alias, &provider_ref, None)?;
-    // The step agent's own configured temperature — the same source the
-    // headless driver reads for `crate::agent::run`.
-    let temperature = config
-        .model_provider_for_agent(alias)
-        .and_then(|e| e.temperature);
+    let model_runtime = crate::agent::agent::build_model(
+        config,
+        alias,
+        agent.model_provider.as_str(),
+        None,
+        crate::agent::agent::BuildCredentials::TargetOnly,
+    )
+    .with_context(|| format!("SOP step agent '{alias}' has no resolved model provider"))?;
 
     // The step agent's risk profile under the PARENT surface's interactivity
     // mode: an operator approval route available to the outer turn stays
@@ -1808,10 +1878,10 @@ pub(crate) async fn assemble_owned_execution(
     };
 
     Ok(OwnedAgentExecution {
-        model_provider,
-        provider_name,
-        model,
-        temperature,
+        model_provider: model_runtime.provider,
+        provider_name: model_runtime.provider_name,
+        model: model_runtime.model_name,
+        temperature: model_runtime.temperature,
         tools_registry,
         approval,
         activated_tools: activated_handle,
@@ -2763,8 +2833,8 @@ mod sop_step_reassembly_tests {
     async fn reassembly_yields_the_named_agents_own_scope() {
         use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
-            RiskProfileConfig, SopConfig,
+            AliasedAgentConfig, Config, ModelEntryConfig, ModelProviderConfig,
+            OllamaModelProviderConfig, RiskProfileConfig, SopConfig,
         };
 
         let root =
@@ -2794,7 +2864,25 @@ mod sop_step_reassembly_tests {
             "p".to_string(),
             OllamaModelProviderConfig {
                 base: ModelProviderConfig {
-                    model: Some("test-model".to_string()),
+                    model: Some("legacy-model".to_string()),
+                    models: std::collections::HashMap::from([
+                        (
+                            "default".to_string(),
+                            ModelEntryConfig {
+                                id: Some("default-model".to_string()),
+                                temperature: Some(0.1),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "fast".to_string(),
+                            ModelEntryConfig {
+                                id: Some("fast-model".to_string()),
+                                temperature: Some(0.42),
+                                ..Default::default()
+                            },
+                        ),
+                    ]),
                     ..ModelProviderConfig::default()
                 },
                 ..OllamaModelProviderConfig::default()
@@ -2805,7 +2893,7 @@ mod sop_step_reassembly_tests {
                 alias.to_string(),
                 AliasedAgentConfig {
                     enabled: true,
-                    model_provider: "ollama.p".into(),
+                    model_provider: "ollama.p.fast".into(),
                     risk_profile: profile.into(),
                     memory: AgentMemoryConfig {
                         backend: MemoryBackendKind::Markdown,
@@ -2826,6 +2914,12 @@ mod sop_step_reassembly_tests {
             .expect("writer assembles");
         let reader_names = tool_names(&reader.tools_registry);
         let writer_names = tool_names(&writer.tools_registry);
+
+        for owned in [&reader, &writer] {
+            assert_eq!(owned.provider_name, "ollama.p");
+            assert_eq!(owned.model, "fast-model");
+            assert_eq!(owned.temperature, Some(0.42));
+        }
 
         assert!(
             reader_names.contains(&"file_read".to_string())

@@ -557,11 +557,10 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        // A three-segment reference targets the nested model entry itself;
-        // a bare or two-segment reference keeps the legacy profile-level
-        // behavior. Parsing mirrors `resolve_model_selection` (`splitn(3)`),
-        // so the model alias may itself contain dots.
-        let target_model_alias = match &provider_update {
+        // A three-segment reference explicitly targets a nested model entry.
+        // Parsing mirrors `resolve_model_selection` (`splitn(3)`), so the
+        // model alias may itself contain dots.
+        let explicit_model_alias = match &provider_update {
             MaybeSet::Set(model_provider) => {
                 let mut parts = model_provider.splitn(3, '.');
                 let family = parts.next().unwrap_or_default();
@@ -584,7 +583,7 @@ impl ModelRoutingConfigTool {
 
         // A three-segment reference carries no meaning on its own — there is
         // no separate "selected model" pointer, so nothing would be written.
-        if target_model_alias.is_some()
+        if explicit_model_alias.is_some()
             && matches!(model_update, MaybeSet::Unset)
             && matches!(temperature_update, MaybeSet::Unset)
         {
@@ -610,6 +609,22 @@ impl ModelRoutingConfigTool {
                     .unwrap_or_else(|| ("custom".to_string(), "default".to_string()))
             }
         };
+
+        // Keep writes aligned with `Config::resolve_model_selection`: a
+        // two-segment profile ref resolves `models.default`, then a sole
+        // nested entry, before falling back to the legacy profile fields.
+        // Updating those legacy fields while a nested entry is selected would
+        // persist a value the runtime never reads.
+        let target_model_alias = explicit_model_alias.or_else(|| {
+            let entry = cfg.providers.models.find(&type_k, &alias_k)?;
+            if entry.models.contains_key("default") {
+                Some("default".to_string())
+            } else if entry.models.len() == 1 {
+                entry.models.keys().next().cloned()
+            } else {
+                None
+            }
+        });
 
         // Capture previous provider entry for rollback on probe failure.
         let previous_provider_entry = cfg.providers.models.find(&type_k, &alias_k).cloned();
@@ -1460,6 +1475,57 @@ mod tests {
             .expect("nested reasoning model entry must exist");
         assert_eq!(nested.id.as_deref(), Some("gpt-5.3-mini"));
         assert_eq!(nested.temperature, Some(0.1));
+    }
+
+    #[tokio::test]
+    async fn set_default_profile_ref_updates_the_selected_nested_default() {
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: cfg_path.clone(),
+            ..Config::default()
+        };
+        config.providers.models.openai.insert(
+            "gateway".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("legacy-shadowed".to_string()),
+                    models: std::collections::HashMap::from([(
+                        "default".to_string(),
+                        ModelEntryConfig {
+                            id: Some("old-default".to_string()),
+                            temperature: Some(0.8),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.save().await.unwrap();
+        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": "openai.gateway",
+                "model": "new-default",
+                "temperature": 0.3
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let entry = read_saved_provider_entry(&cfg_path, "openai", "gateway").unwrap();
+        assert_eq!(entry.model.as_deref(), Some("legacy-shadowed"));
+        let selected = entry.models.get("default").unwrap();
+        assert_eq!(selected.id.as_deref(), Some("new-default"));
+        assert_eq!(selected.temperature, Some(0.3));
     }
 
     #[tokio::test]

@@ -1699,6 +1699,7 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1726,6 +1727,37 @@ impl Agent {
             sop_engine,
             sop_audit,
             canvas_store,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
+        config: &Config,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        acp_delivery: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) -> Result<Self> {
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            true,
+            exclude_memory,
+            acp_delivery,
+            None,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+            Some(acp_session_store),
             None,
         )
         .await
@@ -1757,6 +1789,38 @@ impl Agent {
             sop_engine,
             sop_audit,
             canvas_store,
+            None,
+            Some(live_config),
+        )
+        .await
+    }
+
+    pub async fn from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        acp_delivery: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) -> Result<Self> {
+        let config = live_config.read().clone();
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            &config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            true,
+            exclude_memory,
+            acp_delivery,
+            None,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+            Some(acp_session_store),
             Some(live_config),
         )
         .await
@@ -1790,6 +1854,7 @@ impl Agent {
             sop_audit,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1820,6 +1885,41 @@ impl Agent {
             sop_engine,
             sop_audit,
             None,
+            None,
+            Some(live_config),
+        )
+        .await
+    }
+
+    /// Build a daemon-backed ACP TUI Agent with access to the shared durable
+    /// session store. The store is a read view for session tools; TUI turns do
+    /// not gain ACP file-delivery authority.
+    pub(crate) async fn from_live_config_with_tui_env_and_acp_sessions(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) -> Result<Self> {
+        let config = live_config.read().clone();
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            &config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            true,
+            exclude_memory,
+            // TUI turns never transport an ACP file attachment.
+            false,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            None,
+            Some(acp_session_store),
             Some(live_config),
         )
         .await
@@ -1838,6 +1938,7 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
+        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
         live_config: Option<Arc<parking_lot::RwLock<Config>>>,
     ) -> Result<Self> {
         let agent_cfg = config
@@ -1956,7 +2057,9 @@ impl Agent {
             _ => (None, None),
         };
 
-        let all_tools_result = tools::all_tools_with_runtime(
+        let acp_sessions =
+            acp_session_store.map(|store| tools::AcpSessionReadView::new(store, agent_alias));
+        let all_tools_result = tools::all_tools_with_runtime_and_acp_sessions(
             Arc::new(config.clone()),
             &security,
             risk_profile,
@@ -1984,6 +2087,7 @@ impl Agent {
             // startup state for the Agent's whole lifetime. One-shot callers
             // pass `None` and keep the documented snapshot fallback.
             live_config.clone(),
+            acp_sessions,
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -7362,6 +7466,105 @@ mod tests {
             "openai alias with requires_openai_auth should construct via Codex OAuth path: {}",
             result.err().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn acp_agent_session_tools_receive_the_owned_store_view() {
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+            RiskProfileConfig,
+        };
+        use zeroclaw_infra::acp_session_store::AcpSessionStore;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let mut config = Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        config.providers.models.openai.insert(
+            "default".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.default".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let store = Arc::new(AcpSessionStore::new(tmp.path()).expect("ACP store"));
+        let current = "11111111-1111-4111-8111-111111111111";
+        let previous = "22222222-2222-4222-8222-222222222222";
+        store
+            .create_session(current, "test-agent", "/current")
+            .unwrap();
+        store
+            .create_session(previous, "test-agent", "/previous")
+            .unwrap();
+        store
+            .append_turn(
+                previous,
+                &[ConversationMessage::Chat(ChatMessage::assistant(
+                    "durable previous answer",
+                ))],
+            )
+            .unwrap();
+
+        let agent = Agent::from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
+            &config,
+            "test-agent",
+            Some(&data_dir),
+            false,
+            true,
+            true,
+            None,
+            None,
+            None,
+            Arc::clone(&store),
+        )
+        .await
+        .expect("ACP agent construction");
+
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(current.to_string()), async {
+                let listed = agent
+                    .execute_tool_for_test("sessions_list", serde_json::json!({}))
+                    .await
+                    .expect("sessions_list registered")
+                    .unwrap();
+                assert!(listed.success);
+                assert!(listed.output.contains(current));
+                assert!(listed.output.contains(previous));
+
+                let history = agent
+                    .execute_tool_for_test(
+                        "sessions_history",
+                        serde_json::json!({"session_id": previous}),
+                    )
+                    .await
+                    .expect("sessions_history registered")
+                    .unwrap();
+                assert!(history.success);
+                assert!(history.output.contains("durable previous answer"));
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -13435,6 +13638,62 @@ mod tests {
             agent.model_name, "llama3",
             "model_name must reflect the switched model after success"
         );
+    }
+
+    /// Regression: model_provider_context_window_opt follows the in-turn
+    /// provider switch, not the static agent alias.
+    #[test]
+    fn model_context_window_follows_in_turn_model_switch() {
+        let mut cfg = Config::default();
+        let provider_a = cfg
+            .providers
+            .models
+            .ensure("openai", "provider-a")
+            .expect("ensure provider A");
+        provider_a.context_window = Some(128_000);
+        provider_a.model = Some("gpt-4o-mini".into());
+        let provider_b = cfg
+            .providers
+            .models
+            .ensure("ollama", "provider-b")
+            .expect("ensure provider B");
+        provider_b.context_window = Some(1_000_000);
+        provider_b.model = Some("llama3".into());
+
+        let cfg_arc = std::sync::Arc::new(cfg);
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(cfg_arc.clone()),
+        };
+
+        let mut agent = build_test_agent("openai.provider-a", "gpt-4o-mini", Some(switch_cfg));
+
+        // Before switch: resolve with provider A's ref
+        let (_, live_provider_before, live_model_before) = agent.attribution_fields();
+        assert_eq!(live_provider_before, "openai.provider-a");
+        let window_before = cfg_arc
+            .model_provider_context_window_opt(&live_provider_before, &live_model_before)
+            .map(|v| v as u64);
+        assert_eq!(window_before, Some(128_000));
+
+        // Apply in-turn switch
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "ollama.provider-b".to_string(),
+            "llama3".to_string(),
+        );
+        assert_eq!(
+            result.as_deref(),
+            Some("llama3"),
+            "switch must return the new effective model (proves switch ran, not short-circuited)"
+        );
+
+        // After switch: B's ref and window
+        let (_, live_provider_after, live_model_after) = agent.attribution_fields();
+        assert_eq!(live_provider_after, "ollama.provider-b");
+        let window_after = cfg_arc
+            .model_provider_context_window_opt(&live_provider_after, &live_model_after)
+            .map(|v| v as u64);
+        assert_eq!(window_after, Some(1_000_000));
     }
 
     #[test]
