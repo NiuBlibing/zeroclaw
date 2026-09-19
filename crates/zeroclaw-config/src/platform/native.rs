@@ -127,7 +127,11 @@ fn powershell_declaration_end(command: &str) -> usize {
         }
     }
 
-    found_declaration.then_some(cursor).unwrap_or(0)
+    if found_declaration {
+        cursor
+    } else {
+        0
+    }
 }
 
 fn powershell_skip_leading_trivia(command: &str, mut cursor: usize) -> usize {
