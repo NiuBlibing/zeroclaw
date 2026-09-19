@@ -38,13 +38,14 @@ use serde::{Deserialize, Serialize};
 use zeroclaw_api::runtime_traits::ShellDialect;
 
 use crate::policy::{
-    CommandRiskLevel, CommandSeparator, args_safe, command_basename, command_names_equivalent,
-    contains_unquoted_input_redirect, contains_unquoted_posix_grouping,
-    contains_unquoted_shell_variable_expansion, contains_unquoted_single_ampersand,
-    contains_unsafe_output_redirect_for_shell, generic_segment_risk, is_allowlist_entry_match,
-    is_powershell_provider_argument, powershell_segment_risk,
+    CommandRiskLevel, CommandSeparator, args_safe, command_basename, command_basename_for_shell,
+    command_names_equivalent, contains_unquoted_input_redirect_for_shell,
+    contains_unquoted_posix_grouping, contains_unquoted_shell_variable_expansion,
+    contains_unquoted_single_ampersand, contains_unsafe_output_redirect_for_shell,
+    generic_segment_risk, is_allowlist_entry_match_for_shell, is_powershell_provider_argument,
+    is_unsafe_process_control_assignment_name, normalized_shell_command, powershell_segment_risk,
     simple_posix_env_assignment_remainder, split_simple_powershell_pipeline,
-    split_unquoted_segments_with_separators, strip_fd_merge_redirects, strip_windows_exe_suffix,
+    split_unquoted_segments_with_separators, strip_exe_suffix_for_shell, strip_fd_merge_redirects,
     strip_wrapping_quotes,
 };
 use crate::schema::RiskProfileConfig;
@@ -625,7 +626,7 @@ fn extract_posix_like_segments(
     if degradation.is_none() && contains_unsafe_output_redirect_for_shell(command, dialect) {
         degradation = Some(DegradationReason::UnsafeOutputRedirect);
     }
-    if degradation.is_none() && contains_unquoted_input_redirect(command) {
+    if degradation.is_none() && contains_unquoted_input_redirect_for_shell(command, dialect) {
         degradation = Some(DegradationReason::UnsafeInputRedirect);
     }
     if degradation.is_none()
@@ -637,13 +638,13 @@ fn extract_posix_like_segments(
     }
     if degradation.is_none() {
         let ampersand_check = strip_fd_merge_redirects(command);
-        if contains_unquoted_single_ampersand(&ampersand_check) {
+        if contains_unquoted_single_ampersand(&ampersand_check, dialect) {
             degradation = Some(DegradationReason::BackgroundChaining);
         }
     }
 
     let mut segments = Vec::new();
-    for (connector, segment) in split_unquoted_segments_with_separators(command) {
+    for (connector, segment) in split_unquoted_segments_with_separators(command, dialect) {
         let Some(extracted) = extract_one_posix_segment(&segment, dialect) else {
             if degradation.is_none() && !segment.trim().is_empty() {
                 degradation = Some(DegradationReason::UnsafeExecutableArguments);
@@ -701,9 +702,8 @@ struct ExtractedSegment {
 
 /// Extract one POSIX-like segment, mirroring
 /// `is_posix_like_command_allowed`'s per-segment loop exactly: env-assignment
-/// skip, quote strip + trim, inline-redirect strip, basename + suffix +
-/// lowercase, raw whitespace argument tokens (cased and lowered for the
-/// argument-safety check).
+/// capture, canonical shell-word normalization, dialect-aware basename and
+/// suffix handling, and cased/lowercased arguments for the safety check.
 fn extract_one_posix_segment(segment: &str, dialect: ShellDialect) -> Option<ExtractedSegment> {
     let (cmd_part, env_assignments) = if dialect == ShellDialect::Posix {
         let cmd_part = simple_posix_env_assignment_remainder(segment)?;
@@ -712,17 +712,18 @@ fn extract_one_posix_segment(segment: &str, dialect: ShellDialect) -> Option<Ext
         (segment, Vec::new())
     };
 
-    let mut words = cmd_part.split_whitespace();
-    let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-    let mut executable = match raw_executable.find(['<', '>']) {
-        Some(idx) => raw_executable[..idx].to_string(),
-        None => raw_executable.to_string(),
-    };
-    let mut args_cased: Vec<String> = words
-        .map(|word| strip_wrapping_quotes(word).to_string())
-        .collect();
-    let initial_base =
-        strip_windows_exe_suffix(&command_basename(&executable).to_ascii_lowercase()).to_string();
+    let normalized = normalized_shell_command(cmd_part, dialect);
+    if normalized.has_ambiguous_redirection {
+        return None;
+    }
+    let mut words = normalized.words.into_iter();
+    let mut executable = words.next().unwrap_or_default();
+    let mut args_cased: Vec<String> = words.collect();
+    let initial_base = strip_exe_suffix_for_shell(
+        &command_basename_for_shell(&executable, dialect).to_ascii_lowercase(),
+        dialect,
+    )
+    .to_string();
     if dialect == ShellDialect::Posix
         && initial_base == "command"
         && args_cased
@@ -731,8 +732,8 @@ fn extract_one_posix_segment(segment: &str, dialect: ShellDialect) -> Option<Ext
     {
         executable = args_cased.remove(0);
     }
-    let base_owned = command_basename(&executable).to_ascii_lowercase();
-    let base = strip_windows_exe_suffix(&base_owned).to_string();
+    let base_owned = command_basename_for_shell(&executable, dialect).to_ascii_lowercase();
+    let base = strip_exe_suffix_for_shell(&base_owned, dialect).to_string();
     if base.is_empty() {
         return None;
     }
@@ -745,7 +746,10 @@ fn extract_one_posix_segment(segment: &str, dialect: ShellDialect) -> Option<Ext
         Some(risk) => risk,
         None => CommandRiskLevel::Low,
     };
-    let is_safe = args_safe(&base, &args_lower, &args_cased);
+    let is_safe = args_safe(&base, &args_lower, &args_cased)
+        && env_assignments
+            .iter()
+            .all(|(name, _)| !is_unsafe_process_control_assignment_name(name));
 
     Some(ExtractedSegment {
         segment: ShellSegment {
@@ -1327,7 +1331,7 @@ pub fn resolve_decision(action: &ToolAction, scopes: &ResolvedScopes) -> Resolut
 
     let mut combined: Option<Resolution> = None;
     for segment in &shell.segments {
-        let segment_resolution = resolve_segment(segment, explicit, scopes);
+        let segment_resolution = resolve_segment(segment, shell.dialect, explicit, scopes);
         combined = Some(match combined {
             None => segment_resolution,
             Some(mut prev) if prev.decision == segment_resolution.decision => {
@@ -1428,6 +1432,7 @@ fn rule_matches_tool_name(rule: &PolicyRule, tool_name: &str) -> bool {
 
 fn resolve_segment(
     segment: &ShellSegment,
+    dialect: ShellDialect,
     command_explicit: bool,
     scopes: &ResolvedScopes,
 ) -> Resolution {
@@ -1436,13 +1441,13 @@ fn resolve_segment(
             .profile
             .rules()
             .iter()
-            .filter(|rule| rule_matches_segment(rule, segment, command_explicit))
+            .filter(|rule| rule_matches_segment(rule, segment, dialect, command_explicit))
     };
     let matched = profile_matches().chain(
         scopes
             .session_rules
             .iter()
-            .filter(|rule| rule_matches_segment(rule, segment, command_explicit)),
+            .filter(|rule| rule_matches_segment(rule, segment, dialect, command_explicit)),
     );
 
     let mut resolution = resolve_matched_rules(matched);
@@ -1525,7 +1530,12 @@ where
 
 /// Whether a rule matches one shell segment — including the built-in
 /// predicates, whose "match" is the action-dependent condition itself.
-fn rule_matches_segment(rule: &PolicyRule, segment: &ShellSegment, command_explicit: bool) -> bool {
+fn rule_matches_segment(
+    rule: &PolicyRule,
+    segment: &ShellSegment,
+    dialect: ShellDialect,
+    command_explicit: bool,
+) -> bool {
     match &rule.matcher {
         RuleMatcher::AnyShell => match &rule.source {
             RuleSource::Builtin(BuiltinPredicate::HighRiskBlocked) => {
@@ -1545,7 +1555,12 @@ fn rule_matches_segment(rule: &PolicyRule, segment: &ShellSegment, command_expli
             executable,
             arg_pattern,
         } => {
-            if !is_allowlist_entry_match(executable, &segment.executable, &segment.base) {
+            if !is_allowlist_entry_match_for_shell(
+                executable,
+                &segment.executable,
+                &segment.base,
+                dialect,
+            ) {
                 return false;
             }
             arg_pattern_matches(arg_pattern, segment)
@@ -1587,7 +1602,12 @@ fn command_explicitly_allowed(shell: &ShellAction, scopes: &ResolvedScopes) -> b
                 (
                     RuleSource::Legacy(LegacyField::AllowedCommands),
                     RuleMatcher::ShellCommand { executable, .. },
-                ) if is_allowlist_entry_match(executable, &segment.executable, &segment.base)
+                ) if is_allowlist_entry_match_for_shell(
+                    executable,
+                    &segment.executable,
+                    &segment.base,
+                    shell.dialect,
+                )
             )
         })
     })

@@ -1066,6 +1066,16 @@ fn normalized_assignment_name(raw_name: &str) -> Option<&str> {
     }
 }
 
+pub(crate) fn is_unsafe_process_control_assignment_name(raw_name: &str) -> bool {
+    let Some(name) = normalized_assignment_name(raw_name) else {
+        return false;
+    };
+    matches!(
+        name,
+        "PATH" | "LD_PRELOAD" | "GIT_EXEC_PATH" | "GIT_SSH_COMMAND"
+    ) || name.starts_with("GIT_CONFIG_")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuoteState {
     None,
@@ -1083,12 +1093,15 @@ pub(crate) enum CommandSeparator {
 
 pub(crate) fn split_unquoted_segments_with_separators(
     command: &str,
+    dialect: ShellDialect,
 ) -> Vec<(Option<CommandSeparator>, String)> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut separator = None;
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
     // Heredoc state: Some(delim) while inside a heredoc body.
     let mut heredoc_delimiter: Option<String> = None;
     // Accumulates the current line while inside a heredoc body, for terminator detection.
@@ -1122,7 +1135,7 @@ pub(crate) fn split_unquoted_segments_with_separators(
                     current.push(ch);
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     current.push(ch);
                     continue;
@@ -1142,7 +1155,7 @@ pub(crate) fn split_unquoted_segments_with_separators(
                     }
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     if heredoc_delimiter.is_some() {
                         heredoc_line_buf.push(ch);
@@ -1192,7 +1205,7 @@ pub(crate) fn split_unquoted_segments_with_separators(
                 }
 
                 match ch {
-                    '\'' => {
+                    '\'' if single_quotes_are_syntax => {
                         quote = QuoteState::Single;
                         current.push(ch);
                     }
@@ -1249,8 +1262,8 @@ pub(crate) fn split_unquoted_segments_with_separators(
     segments
 }
 
-pub(crate) fn split_unquoted_segments(command: &str) -> Vec<String> {
-    split_unquoted_segments_with_separators(command)
+pub(crate) fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
+    split_unquoted_segments_with_separators(command, dialect)
         .into_iter()
         .map(|(_, segment)| segment)
         .collect()
@@ -1474,15 +1487,20 @@ fn split_shell_words_with_metadata(segment: &str, dialect: ShellDialect) -> Vec<
     words
 }
 
-struct NormalizedShellCommand {
-    has_leading_env_assignment: bool,
-    words: Vec<String>,
-    has_ambiguous_redirection: bool,
+pub(crate) struct NormalizedShellCommand {
+    pub(crate) has_leading_env_assignment: bool,
+    pub(crate) has_unsafe_process_control_assignment: bool,
+    pub(crate) words: Vec<String>,
+    pub(crate) has_ambiguous_redirection: bool,
 }
 
-fn normalized_shell_command(segment: &str, dialect: ShellDialect) -> NormalizedShellCommand {
+pub(crate) fn normalized_shell_command(
+    segment: &str,
+    dialect: ShellDialect,
+) -> NormalizedShellCommand {
     let raw_words = split_shell_words_with_metadata(segment, dialect);
     let mut has_leading_env_assignment = false;
+    let mut has_unsafe_process_control_assignment = false;
     let mut words = Vec::with_capacity(raw_words.len());
     let mut has_ambiguous_redirection = false;
     let mut before_executable = true;
@@ -1492,6 +1510,12 @@ fn normalized_shell_command(segment: &str, dialect: ShellDialect) -> NormalizedS
         let raw = raw_words[idx].text.as_str();
         if before_executable && raw_words[idx].is_assignment {
             has_leading_env_assignment = true;
+            if raw
+                .split_once('=')
+                .is_some_and(|(name, _)| is_unsafe_process_control_assignment_name(name))
+            {
+                has_unsafe_process_control_assignment = true;
+            }
             idx += 1;
             continue;
         }
@@ -1528,6 +1552,7 @@ fn normalized_shell_command(segment: &str, dialect: ShellDialect) -> NormalizedS
 
     NormalizedShellCommand {
         has_leading_env_assignment,
+        has_unsafe_process_control_assignment,
         words,
         has_ambiguous_redirection,
     }
@@ -2006,10 +2031,12 @@ pub(crate) fn strip_fd_merge_redirects(command: &str) -> String {
 
 /// We treat any standalone `&` as unsafe in policy validation because it can
 /// chain hidden sub-commands and escape foreground timeout expectations.
-pub(crate) fn contains_unquoted_single_ampersand(command: &str) -> bool {
+pub(crate) fn contains_unquoted_single_ampersand(command: &str, dialect: ShellDialect) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
     let mut chars = command.chars().peekable();
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
 
     while let Some(ch) = chars.next() {
         match quote {
@@ -2023,7 +2050,7 @@ pub(crate) fn contains_unquoted_single_ampersand(command: &str) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
@@ -2036,12 +2063,12 @@ pub(crate) fn contains_unquoted_single_ampersand(command: &str) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
                 match ch {
-                    '\'' => quote = QuoteState::Single,
+                    '\'' if single_quotes_are_syntax => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     // This must consume the second '&' so `&&` is not later
                     // re-read as a lone trailing '&'.
@@ -2058,9 +2085,11 @@ pub(crate) fn contains_unquoted_single_ampersand(command: &str) -> bool {
 }
 
 /// Detect an unquoted character in a shell command.
-fn contains_unquoted_char(command: &str, target: char) -> bool {
+fn contains_unquoted_char(command: &str, target: char, dialect: ShellDialect) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
 
     for ch in command.chars() {
         match quote {
@@ -2074,7 +2103,7 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
@@ -2087,12 +2116,12 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
                 match ch {
-                    '\'' => quote = QuoteState::Single,
+                    '\'' if single_quotes_are_syntax => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     _ if ch == target => return true,
                     _ => {}
@@ -2105,7 +2134,8 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
 }
 
 pub(crate) fn contains_unquoted_posix_grouping(command: &str) -> bool {
-    contains_unquoted_char(command, '(') || contains_unquoted_char(command, ')')
+    contains_unquoted_char(command, '(', ShellDialect::Posix)
+        || contains_unquoted_char(command, ')', ShellDialect::Posix)
 }
 
 /// Returns true if `command` contains an unquoted `>` that is NOT a safe
@@ -2128,7 +2158,11 @@ pub(crate) fn contains_unsafe_output_redirect_for_shell(
         .expect("static safe-device redirect regex must compile")
     });
 
-    let safe = re.replace_all(command, "$2").to_string();
+    let safe = if matches!(dialect, ShellDialect::Posix) {
+        re.replace_all(command, "$2").to_string()
+    } else {
+        command.to_string()
+    };
     // Windows null device: strip `>nul`, `1>nul`, `2>nul`, `2>NUL`, and the
     // `\\.\nul` device form (case-insensitive) — the platform equivalent of the
     // `/dev/null` forms stripped above. A trailing non-boundary char (e.g.
@@ -2151,7 +2185,7 @@ pub(crate) fn contains_unsafe_output_redirect_for_shell(
     };
     // Also strip fd-merge redirects (2>&1, 1>&2, >&N, etc.)
     let safe = strip_fd_merge_redirects(&safe);
-    contains_unquoted_char(&safe, '>')
+    contains_unquoted_char(&safe, '>', dialect)
 }
 
 /// POSIX-dialect convenience wrapper for tests — the conservative default that
@@ -2164,7 +2198,10 @@ fn contains_unsafe_output_redirect(command: &str) -> bool {
 
 /// Returns true if `command` contains an unquoted `<` that is NOT a heredoc (`<<`)
 /// or a safe input redirect from `/dev/*`.
-pub(crate) fn contains_unquoted_input_redirect(command: &str) -> bool {
+pub(crate) fn contains_unquoted_input_redirect_for_shell(
+    command: &str,
+    dialect: ShellDialect,
+) -> bool {
     // Strip here-strings (`<<<`) first, then heredocs (`<<`), then safe /dev/* sources
     // with word boundary enforcement.
     use regex::Regex;
@@ -2175,11 +2212,20 @@ pub(crate) fn contains_unquoted_input_redirect(command: &str) -> bool {
         Regex::new(r"<[ ]?/dev/(null|zero)(\s|[;&|)]|$)").expect("SAFE_INPUT_RE regex must compile")
     });
 
-    let safe = command.replace("<<<", "").replace("<<", "");
-    let safe = re.replace_all(&safe, "$2").to_string();
+    let safe = if matches!(dialect, ShellDialect::Posix) {
+        let safe = command.replace("<<<", "").replace("<<", "");
+        re.replace_all(&safe, "$2").to_string()
+    } else {
+        command.to_string()
+    };
     // Also strip fd-merge redirects (<&0, <&-, etc.) so they don't leave a bare `<`
     let safe = strip_fd_merge_redirects(&safe);
-    contains_unquoted_char(&safe, '<')
+    contains_unquoted_char(&safe, '<', dialect)
+}
+
+#[cfg(test)]
+fn contains_unquoted_input_redirect(command: &str) -> bool {
+    contains_unquoted_input_redirect_for_shell(command, ShellDialect::Posix)
 }
 
 /// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
@@ -2456,6 +2502,7 @@ pub(crate) fn contains_mixed_quoted_token(command: &str) -> bool {
 pub(crate) fn contains_posix_token_escape(command: &str) -> bool {
     let mut quote = QuoteState::None;
     let mut chars = command.chars().peekable();
+    let mut redirection_in_word = false;
 
     while let Some(ch) = chars.next() {
         match quote {
@@ -2472,13 +2519,23 @@ pub(crate) fn contains_posix_token_escape(command: &str) -> bool {
                         .peek()
                         .is_some_and(|next| matches!(next, '$' | '`' | '"' | '\\' | '\n'))
                 {
-                    return true;
+                    if !redirection_in_word {
+                        return true;
+                    }
+                    chars.next();
                 }
             }
             QuoteState::None => match ch {
                 '\'' => quote = QuoteState::Single,
                 '"' => quote = QuoteState::Double,
+                '<' | '>' => redirection_in_word = true,
+                '\\' if redirection_in_word => {
+                    chars.next();
+                }
                 '\\' => return true,
+                _ if ch.is_whitespace() || matches!(ch, ';' | '|' | '&') => {
+                    redirection_in_word = false;
+                }
                 _ => {}
             },
         }
@@ -2645,7 +2702,7 @@ fn safe_device_redirect_names_pattern() -> String {
 
 fn is_safe_device_redirect_target(target: &str, dialect: ShellDialect) -> bool {
     let target = strip_wrapping_quotes(target).trim();
-    if SAFE_DEVICE_REDIRECT_TARGETS.contains(&target) {
+    if matches!(dialect, ShellDialect::Posix) && SAFE_DEVICE_REDIRECT_TARGETS.contains(&target) {
         return true;
     }
     // Windows null device: `nul`/`NUL` (case-insensitive) and the full `\\.\nul`
@@ -2664,11 +2721,21 @@ pub(crate) fn command_basename(raw: &str) -> &str {
     after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
 }
 
-/// Strip common Windows executable suffixes (.exe, .cmd, .bat) for uniform
-/// matching against allowlists and risk tables. On non-Windows platforms this
-/// is a no-op that returns the input unchanged.
-pub(crate) fn strip_windows_exe_suffix(name: &str) -> &str {
-    if cfg!(target_os = "windows") {
+pub(crate) fn command_basename_for_shell(raw: &str, dialect: ShellDialect) -> &str {
+    let after_fwd = raw.rsplit('/').next().unwrap_or(raw);
+    if shell_uses_windows_path_syntax(dialect) {
+        after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
+    } else {
+        after_fwd
+    }
+}
+
+/// Normalize executable suffixes according to the shell that will resolve
+/// the command, rather than the host compiling the policy. `cmd.exe` and
+/// PowerShell treat a bare name and its `.exe` form as the same executable;
+/// POSIX shells do not, including Docker `sh` running on a Windows host.
+pub(crate) fn strip_exe_suffix_for_shell(name: &str, dialect: ShellDialect) -> &str {
+    if matches!(dialect, ShellDialect::WindowsCmd | ShellDialect::PowerShell) {
         name.strip_suffix(".exe")
             .or_else(|| name.strip_suffix(".cmd"))
             .or_else(|| name.strip_suffix(".bat"))
@@ -2721,34 +2788,25 @@ fn command_allowlist_entries_equivalent(left: &str, right: &str) -> bool {
     command_names_equivalent(left, right)
 }
 
-pub(crate) fn is_allowlist_entry_match(
+pub(crate) fn is_allowlist_entry_match_for_shell(
     allowed: &str,
     executable: &str,
     executable_base: &str,
+    dialect: ShellDialect,
 ) -> bool {
     let allowed = strip_wrapping_quotes(allowed).trim();
     if allowed.is_empty() {
         return false;
     }
-
-    // Explicit wildcard support for "allow any command name/path".
     if allowed == "*" {
         return true;
     }
-
-    // Path-like allowlist entries must match the executable token exactly
-    // after "~" expansion.
     if looks_like_path(allowed) {
-        let allowed_path = expand_user_path(allowed);
-        let executable_path = expand_user_path(executable);
-        return executable_path == allowed_path;
+        return expand_user_path(executable) == expand_user_path(allowed);
     }
 
-    // Command-name entries continue to match by basename, case-insensitively.
-    // Callers lowercase the basename before it reaches here, so folding only
-    // one side would leave an entry written as `Git` or `Docker` unable to
-    // match anything.
-    command_names_equivalent(allowed, executable_base)
+    let allowed_lower = allowed.to_ascii_lowercase();
+    strip_exe_suffix_for_shell(&allowed_lower, dialect) == executable_base
 }
 
 /// Decide whether a completed PowerShell token must be rejected by the bounded
@@ -3157,8 +3215,14 @@ pub(crate) fn args_safe(base: &str, args: &[String], args_cased: &[String]) -> b
             // find -exec and find -ok allow arbitrary command execution
             !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
         }
+        // `env` with arguments can inject process controls and launch a second
+        // executable outside the allowlist. Bare `env` remains a read-only
+        // environment listing.
+        "env" => args.is_empty(),
         "git" => {
-            !args_cased.iter().any(|arg| arg == "-c")
+            !args_cased
+                .iter()
+                .any(|arg| arg == "-c" || arg.starts_with("-c"))
                 && !git_delegates_to_external_command(args_cased)
                 && !args.iter().any(|arg| {
                     arg == "--config-env"
@@ -3396,7 +3460,7 @@ impl SecurityPolicy {
     ) -> CommandRiskLevel {
         let mut saw_medium = false;
 
-        for segment in split_unquoted_segments(command) {
+        for segment in split_unquoted_segments(command, dialect) {
             let cmd_part = skip_env_assignments(&segment);
             let normalized = normalized_shell_command(&segment, dialect);
             if normalized.has_ambiguous_redirection {
@@ -3407,8 +3471,8 @@ impl SecurityPolicy {
                 continue;
             };
 
-            let base_owned = command_basename(base_raw).to_ascii_lowercase();
-            let base = strip_windows_exe_suffix(&base_owned);
+            let base_owned = command_basename_for_shell(base_raw, dialect).to_ascii_lowercase();
+            let base = strip_exe_suffix_for_shell(&base_owned, dialect);
 
             let args: Vec<String> = words.iter().skip(1).cloned().collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
@@ -3768,7 +3832,7 @@ impl SecurityPolicy {
         if contains_unsafe_output_redirect_for_shell(command, dialect) {
             return false;
         }
-        if contains_unquoted_input_redirect(command) {
+        if contains_unquoted_input_redirect_for_shell(command, dialect) {
             return false;
         }
 
@@ -3786,15 +3850,16 @@ impl SecurityPolicy {
         // Strip fd-merge redirects (N>&M, N<&M) first so their `&` isn't
         // flagged as background chaining.
         let ampersand_check = strip_fd_merge_redirects(command);
-        if contains_unquoted_single_ampersand(&ampersand_check) {
+        if contains_unquoted_single_ampersand(&ampersand_check, dialect) {
             return false;
         }
 
         // Split on unquoted command separators and validate each sub-command.
-        let segments = split_unquoted_segments(command);
+        let segments = split_unquoted_segments(command, dialect);
         for segment in &segments {
             let normalized = normalized_shell_command(segment, dialect);
             if normalized.has_ambiguous_redirection
+                || normalized.has_unsafe_process_control_assignment
                 || (normalized.has_leading_env_assignment
                     && simple_posix_env_assignment_remainder(segment).is_none())
             {
@@ -3802,18 +3867,17 @@ impl SecurityPolicy {
             }
             let words = normalized.words;
             let executable = words.first().map(String::as_str).unwrap_or_default();
-            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
-            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+            let base_cmd_owned =
+                command_basename_for_shell(executable, dialect).to_ascii_lowercase();
+            let base_cmd = strip_exe_suffix_for_shell(&base_cmd_owned, dialect);
 
             if base_cmd.is_empty() {
                 continue;
             }
 
-            if !self
-                .allowed_commands
-                .iter()
-                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
-            {
+            if !self.allowed_commands.iter().any(|allowed| {
+                is_allowlist_entry_match_for_shell(allowed, executable, base_cmd, dialect)
+            }) {
                 return false;
             }
 
@@ -3876,6 +3940,13 @@ impl SecurityPolicy {
     ) -> Option<String> {
         let forbidden_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
+            let normalized_candidate;
+            let candidate = if dialect == ShellDialect::Posix && candidate.contains("\\/") {
+                normalized_candidate = candidate.replace("\\/", "/");
+                normalized_candidate.as_str()
+            } else {
+                candidate
+            };
             if candidate.is_empty() || candidate.contains("://") {
                 return None;
             }
@@ -3947,7 +4018,7 @@ impl SecurityPolicy {
             })
         };
 
-        for segment in split_unquoted_segments(command) {
+        for segment in split_unquoted_segments(command, dialect) {
             let cmd_part = skip_env_assignments(&segment);
             let mut words = cmd_part.split_whitespace();
             let Some(executable) = words.next() else {
@@ -5968,7 +6039,7 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
-        assert!(p.is_command_allowed_for_shell("c\\at ./src/main.rs", ShellDialect::Posix,));
+        assert!(!p.is_command_allowed_for_shell("c\\at ./src/main.rs", ShellDialect::Posix,));
         assert!(!p.is_command_allowed_for_shell("c\\at ./src/main.rs", ShellDialect::WindowsCmd,));
 
         assert!(!p.is_command_allowed("find . '-exec' echo"));
@@ -6671,6 +6742,44 @@ mod tests {
             err.contains("Command not allowed by security policy"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn windows_cmd_operators_do_not_inherit_posix_quote_or_escape_rules() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["git".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git status 'x & echo pwned'",
+            r"git status x\& echo pwned",
+            "git status 'x > captured.txt'",
+        ] {
+            assert!(
+                p.validate_command_execution_for_shell(command, false, ShellDialect::WindowsCmd,)
+                    .is_err(),
+                "cmd.exe operator syntax must fail closed: {command}"
+            );
+        }
+
+        assert!(!contains_unquoted_single_ampersand(
+            "git status 'x & y'",
+            ShellDialect::Posix,
+        ));
+        assert!(contains_unquoted_single_ampersand(
+            "git status 'x & y'",
+            ShellDialect::WindowsCmd,
+        ));
+        assert!(!contains_unquoted_single_ampersand(
+            r"git status x\& y",
+            ShellDialect::Posix,
+        ));
+        assert!(contains_unquoted_single_ampersand(
+            r"git status x\& y",
+            ShellDialect::WindowsCmd,
+        ));
     }
 
     #[cfg(target_os = "windows")]
@@ -7607,10 +7716,10 @@ mod tests {
             Posix
         ));
 
-        // /dev/null stays safe under BOTH dialects; a real file and a non-bare
-        // `nul`-prefixed name stay blocked under both.
+        // `/dev/null` is a safe device only under POSIX. Under cmd.exe it is a
+        // filesystem path, so only the native `nul` spelling is discard-safe.
         assert!(p.is_command_allowed_for_shell("git status 2>/dev/null", Posix));
-        assert!(p.is_command_allowed_for_shell("git status 2>/dev/null", WindowsCmd));
+        assert!(!p.is_command_allowed_for_shell("git status 2>/dev/null", WindowsCmd));
         assert!(!p.is_command_allowed_for_shell("echo secret 2>out.txt", WindowsCmd));
         assert!(!p.is_command_allowed_for_shell("echo secret >nul.txt", WindowsCmd));
         assert!(contains_unsafe_output_redirect_for_shell(
