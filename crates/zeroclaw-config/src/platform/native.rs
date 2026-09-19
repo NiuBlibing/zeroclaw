@@ -66,6 +66,7 @@ fn first_available<'a>(
 /// the native runtime.  Explicit `runtime.shell` values retain the broader
 /// historical Unix validation; this allowlist only prevents service shells
 /// and unsupported interactive shells from becoming an implicit default.
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 fn is_supported_login_shell(shell: &str) -> bool {
     matches!(
         shell_stem(shell).to_ascii_lowercase().as_str(),
