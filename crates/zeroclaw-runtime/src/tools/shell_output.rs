@@ -7,12 +7,54 @@
 /// Decode shell output as text without panicking on arbitrary bytes.
 ///
 /// Valid UTF-8 is always preferred. For other byte sequences, use chardetng
-/// to select an `encoding_rs` decoder. The final UTF-8 lossy conversion keeps
-/// the result representable even when detection returns UTF-8 for malformed
-/// or binary input.
+/// to select an `encoding_rs` decoder. On Windows, a short legacy-encoded
+/// result uses the current console/system code page as context because there
+/// is not enough text for reliable statistical detection. The final UTF-8
+/// lossy conversion keeps the result representable for malformed input.
+const WINDOWS_SHORT_OUTPUT_LIMIT: usize = 32;
+
 pub(crate) fn decode_shell_output(bytes: &[u8]) -> String {
+    decode_shell_output_with_context(bytes, false, windows_code_page_hint())
+}
+
+/// Decode output captured at a byte limit. An incomplete UTF-8 suffix is only
+/// preserved when the caller knows that the capture was truncated; without
+/// that signal, bytes such as a lone CP1252 `0xe9` must remain eligible for
+/// legacy encoding detection.
+pub(crate) fn decode_truncated_shell_output(bytes: &[u8]) -> String {
+    decode_shell_output_with_context(bytes, true, windows_code_page_hint())
+}
+
+fn decode_shell_output_with_context(
+    bytes: &[u8],
+    capture_was_truncated: bool,
+    code_page_hint: Option<&'static encoding_rs::Encoding>,
+) -> String {
     if let Ok(text) = std::str::from_utf8(bytes) {
         return text.to_owned();
+    }
+
+    // A capture limit can split a UTF-8 sequence at EOF. Preserve the valid
+    // prefix instead of feeding it back into a legacy-encoding detector.
+    let utf8_error = std::str::from_utf8(bytes).expect_err("invalid UTF-8 checked above");
+    if capture_was_truncated
+        && utf8_error.error_len().is_none()
+        && utf8_error.valid_up_to() > 0
+        && has_utf8_continuation_context(bytes, utf8_error.valid_up_to())
+    {
+        let valid_up_to = utf8_error.valid_up_to();
+        let prefix = std::str::from_utf8(&bytes[..valid_up_to])
+            .expect("valid_up_to always identifies a UTF-8 boundary");
+        return format!("{prefix}{}", String::from_utf8_lossy(&bytes[valid_up_to..]));
+    }
+
+    // Very short legacy output is inherently ambiguous to statistical
+    // detection. On Windows the active console code page is useful context,
+    // but only as a short-output fallback; longer output remains detector-led.
+    if bytes.len() <= WINDOWS_SHORT_OUTPUT_LIMIT
+        && let Some(encoding) = code_page_hint
+    {
+        return encoding.decode(bytes).0.into_owned();
     }
 
     let mut detector = chardetng::EncodingDetector::new();
@@ -25,6 +67,56 @@ pub(crate) fn decode_shell_output(bytes: &[u8]) -> String {
     }
 
     text.into_owned()
+}
+
+fn has_utf8_continuation_context(bytes: &[u8], valid_up_to: usize) -> bool {
+    let suffix = &bytes[valid_up_to..];
+    suffix.len() >= 2 && suffix[1..].iter().all(|byte| (byte & 0xc0) == 0x80)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_code_page_hint() -> Option<&'static encoding_rs::Encoding> {
+    use windows::Win32::Globalization::GetACP;
+    use windows::Win32::System::Console::GetConsoleOutputCP;
+
+    // SAFETY: both Win32 functions are parameter-free code-page queries. A
+    // zero console code page selects the documented system ANSI fallback.
+    let code_page = unsafe {
+        let console_code_page = GetConsoleOutputCP();
+        if console_code_page == 0 {
+            GetACP()
+        } else {
+            console_code_page
+        }
+    };
+
+    windows_code_page_to_encoding(code_page)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_code_page_hint() -> Option<&'static encoding_rs::Encoding> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn windows_code_page_to_encoding(code_page: u32) -> Option<&'static encoding_rs::Encoding> {
+    Some(match code_page {
+        932 => encoding_rs::SHIFT_JIS,
+        936 | 54936 => encoding_rs::GBK,
+        949 => encoding_rs::EUC_KR,
+        950 => encoding_rs::BIG5,
+        1250 => encoding_rs::WINDOWS_1250,
+        1251 => encoding_rs::WINDOWS_1251,
+        1252 => encoding_rs::WINDOWS_1252,
+        1253 => encoding_rs::WINDOWS_1253,
+        1254 => encoding_rs::WINDOWS_1254,
+        1255 => encoding_rs::WINDOWS_1255,
+        1256 => encoding_rs::WINDOWS_1256,
+        1257 => encoding_rs::WINDOWS_1257,
+        1258 => encoding_rs::WINDOWS_1258,
+        20127 | 65001 => encoding_rs::UTF_8,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -54,8 +146,36 @@ mod tests {
     }
 
     #[test]
-    fn truncated_utf8_is_safe() {
-        let decoded = decode_shell_output(&[b'p', 0xe2, 0x82]);
-        assert!(decoded.starts_with('p'));
+    fn truncated_utf8_preserves_valid_prefix() {
+        let decoded = decode_truncated_shell_output(&[b'p', b'r', b'e', b'f', 0xe2, 0x82]);
+        assert!(decoded.starts_with("pref"), "decoded text: {decoded:?}");
+        assert!(decoded.contains('\u{fffd}'), "decoded text: {decoded:?}");
+    }
+
+    #[test]
+    fn short_legacy_output_uses_explicit_hint() {
+        let gbk = [0xc4, 0xe3, 0xba, 0xc3];
+        let decoded = decode_shell_output_with_context(&gbk, false, Some(encoding_rs::GBK));
+        assert_eq!(decoded, "你好");
+    }
+
+    #[test]
+    fn short_single_byte_legacy_output_is_not_truncation() {
+        let cp1252 =
+            decode_shell_output_with_context(&[0xe9], false, Some(encoding_rs::WINDOWS_1252));
+        let cp1251 =
+            decode_shell_output_with_context(&[0xc0], false, Some(encoding_rs::WINDOWS_1251));
+        assert_eq!(cp1252, "é");
+        assert_eq!(cp1251, "А");
+    }
+
+    #[test]
+    fn short_legacy_output_with_capture_marker_is_not_truncation() {
+        let decoded = decode_shell_output_with_context(
+            &[b'p', 0xe9],
+            true,
+            Some(encoding_rs::WINDOWS_1252),
+        );
+        assert_eq!(decoded, "pé");
     }
 }

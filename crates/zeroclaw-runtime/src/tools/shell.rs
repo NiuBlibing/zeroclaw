@@ -125,6 +125,10 @@ fn decode_output(bytes: &[u8]) -> String {
     super::shell_output::decode_shell_output(bytes)
 }
 
+fn decode_truncated_output(bytes: &[u8]) -> String {
+    super::shell_output::decode_truncated_shell_output(bytes)
+}
+
 fn is_valid_env_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -351,8 +355,16 @@ impl Tool for ShellTool {
                     let (stdout_capture, stderr_capture) =
                         tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
 
-                    let mut stdout = decode_output(&stdout_capture.bytes);
-                    let mut stderr = decode_output(&stderr_capture.bytes);
+                    let mut stdout = if stdout_capture.truncated {
+                        decode_truncated_output(&stdout_capture.bytes)
+                    } else {
+                        decode_output(&stdout_capture.bytes)
+                    };
+                    let mut stderr = if stderr_capture.truncated {
+                        decode_truncated_output(&stderr_capture.bytes)
+                    } else {
+                        decode_output(&stderr_capture.bytes)
+                    };
 
                     if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
                         append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
