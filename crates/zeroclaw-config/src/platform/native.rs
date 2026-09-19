@@ -462,12 +462,19 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn native_shell_dialect_is_windows_cmd_on_windows() {
-        // Native execution on Windows runs through `cmd.exe /C`, so the policy
-        // must see `WindowsCmd` and accept the `nul` null device there.
+    fn explicit_cmd_shell_dialect_is_windows_cmd_on_windows() {
+        assert_eq!(
+            NativeRuntime::with_shell("cmd.exe".into()).shell_dialect(),
+            ShellDialect::WindowsCmd
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_shell_dialect_matches_resolved_windows_default() {
         assert_eq!(
             NativeRuntime::new().shell_dialect(),
-            ShellDialect::WindowsCmd
+            NativeRuntime::with_shell(default_shell()).shell_dialect()
         );
     }
 
@@ -631,7 +638,11 @@ mod tests {
     #[test]
     fn shell_command_preserves_double_quotes() {
         let cwd = std::env::temp_dir();
-        let command = NativeRuntime::new()
+        #[cfg(target_os = "windows")]
+        let runtime = NativeRuntime::with_shell("cmd.exe".into());
+        #[cfg(not(target_os = "windows"))]
+        let runtime = NativeRuntime::new();
+        let command = runtime
             .build_shell_command(r#"dir "C:\Users\test\Desktop" /b"#, &cwd)
             .unwrap();
         let debug = format!("{command:?}");
@@ -682,7 +693,11 @@ mod tests {
     #[test]
     fn shell_command_preserves_mixed_quoted_unquoted() {
         let cwd = std::env::temp_dir();
-        let command = NativeRuntime::new()
+        #[cfg(target_os = "windows")]
+        let runtime = NativeRuntime::with_shell("cmd.exe".into());
+        #[cfg(not(target_os = "windows"))]
+        let runtime = NativeRuntime::new();
+        let command = runtime
             .build_shell_command(
                 r#"dir "C:\path with spaces" /b 2>nul || echo "directory missing""#,
                 &cwd,
@@ -727,7 +742,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     async fn windows_echo_quoted_argument_succeeds() {
         let cwd = std::env::temp_dir();
-        let output = NativeRuntime::new()
+        let output = NativeRuntime::with_shell("cmd.exe".into())
             .build_shell_command(r#"echo "hello world""#, &cwd)
             .unwrap()
             .output()
@@ -746,7 +761,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     async fn windows_dir_quoted_path_succeeds() {
         let cwd = std::env::temp_dir();
-        let output = NativeRuntime::new()
+        let output = NativeRuntime::with_shell("cmd.exe".into())
             .build_shell_command(r#"dir "C:\Windows" /b"#, &cwd)
             .unwrap()
             .output()
@@ -775,7 +790,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     async fn windows_echo_percent_expansion_preserved() {
         let cwd = std::env::temp_dir();
-        let output = NativeRuntime::new()
+        let output = NativeRuntime::with_shell("cmd.exe".into())
             .build_shell_command("echo %USERPROFILE%", &cwd)
             .unwrap()
             .output()
