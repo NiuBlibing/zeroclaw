@@ -3756,51 +3756,16 @@ impl Agent {
                         .lock()
                         .expect("served-route sink lock")
                         .clone();
-                    let (final_provider, final_model, final_limits, final_reported_usage) =
-                        match served {
-                            Some(route) => (
-                                route.provider_name,
-                                route.model,
-                                Some(route.context_limits),
-                                route.reported_usage,
-                            ),
-                            None => (
-                                selected_route.provider_name.clone(),
-                                selected_route.model.clone(),
-                                None,
-                                false,
-                            ),
-                        };
-                    // Publish one terminal context snapshot for the final served
-                    // route only when that final call emitted no usage-bearing
-                    // frame of its own. A no-usage final call (e.g. a vision reply
-                    // without token usage) otherwise leaves the client meter on an
-                    // earlier route's numbers; this authoritative frame carries the
-                    // final route's budget/window even with no token counts. When
-                    // the final call already reported usage, its per-call frame
-                    // carried the route limits and this snapshot would be redundant.
-                    //
-                    // The gate keys on the FINAL served call's usage — not the
-                    // turn's cumulative usage — so a multi-iteration turn whose
-                    // earlier call reported usage but whose final call switched to
-                    // a usage-less route still publishes the final route's window.
-                    if let Some(limits) = final_limits.filter(|_| !final_reported_usage) {
-                        let _ = event_tx
-                            .send(TurnEvent::Usage {
-                                input_tokens: None,
-                                cached_input_tokens: None,
-                                output_tokens: None,
-                                cost_usd: None,
-                                context_token_budget: Some(limits.context_token_budget as u64),
-                                model_context_window: limits
-                                    .configured_model_context_window()
-                                    .map(|t| t as u64),
-                                provider_ref: final_provider.clone(),
-                                model: final_model.clone(),
-                                accepted: true,
-                            })
-                            .await;
-                    }
+                    let (final_provider, final_model, final_limits) = match served {
+                        Some(route) => {
+                            (route.provider_name, route.model, Some(route.context_limits))
+                        }
+                        None => (
+                            selected_route.provider_name.clone(),
+                            selected_route.model.clone(),
+                            None,
+                        ),
+                    };
                     return Ok(StreamedTurnSuccess {
                         response: committed_response,
                         new_messages: new_msgs,

@@ -794,16 +794,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         );
 
         // Record the route about to serve this iteration's call. The last write
-        // is the final serving route, so a terminal snapshot is authoritative
-        // even when the provider returns no usage. `reported_usage` is
-        // provisionally `false` and backfilled after the call once we know
-        // whether this call emitted a usage-bearing per-call frame.
+        // is the final serving route returned to the caller.
         if let Some(sink) = served_route_sink.as_ref() {
             *sink.lock().expect("served-route sink lock") = Some(outcome::ServedRoute {
                 provider_name: active_model_provider_name.to_string(),
                 model: active_model.to_string(),
                 context_limits: active_context_limits,
-                reported_usage: false,
             });
         }
 
@@ -1345,16 +1341,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         .await;
 
         // Backfill the final served route only after protocol classification
-        // accepts the response. Accepted usage emits the per-call frame above;
-        // an accepted usage-less response needs the terminal context snapshot.
+        // accepts the response.
         //
         // When a reliable fallback answered from a different alias, the whole
-        // triple is rewritten here, not just `reported_usage`: the sink was
-        // seeded pre-dispatch with the REQUESTED route, so leaving it would let
-        // the terminal gateway frame report the served alias against the
-        // requested route's capacity. Same gate as the limit re-key above, so a
-        // direct call keeps the seeded attribution pair (its accepted route
-        // names the alias we dispatched to, and its `model()` is the wire
+        // triple is rewritten here: the sink was seeded pre-dispatch with the
+        // REQUESTED route, so leaving it would report the served alias against
+        // the requested route's capacity. Same gate as the limit re-key above,
+        // so a direct call keeps the seeded attribution pair (its accepted
+        // route names the alias we dispatched to, and its `model()` is the wire
         // selector rather than an attribution name).
         if let Some(sink) = served_route_sink.as_ref()
             && let Some(served) = sink.lock().expect("served-route sink lock").as_mut()
@@ -1367,7 +1361,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 served.model = served_model_key.to_string();
                 served.context_limits = served_context_limits;
             }
-            served.reported_usage = ctx.event_tx.is_some() && response_usage.is_some();
         }
 
         // A provider transport success is only a candidate. Commit (or clear)
