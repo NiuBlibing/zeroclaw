@@ -77,7 +77,9 @@ pub fn windows_tokio_cmd_shell_command(command: &str) -> tokio::process::Command
 /// isolated in an empty `try`/`catch`, so an unsupported setting never prevents
 /// the user command from running. Parsing the original source as its own script
 /// block preserves leading `#requires`, `using`, and `param` declarations
-/// without trying to rewrite PowerShell syntax.
+/// without trying to rewrite PowerShell syntax. A fixed postlude in that block
+/// converts a final failed statement to exit code 1 before the outer invocation
+/// can reset `$?`; explicit `exit` calls still propagate their requested code.
 fn tokio_powershell_command(interpreter: &str, command: &str) -> tokio::process::Command {
     let script = powershell_script_with_utf8_setup(command);
     let mut process = tokio::process::Command::new(interpreter);
@@ -90,11 +92,12 @@ fn tokio_powershell_command(interpreter: &str, command: &str) -> tokio::process:
 }
 
 const POWERSHELL_UTF8_SETUP: &str = "try {\n    $utf8 = [System.Text.UTF8Encoding]::new($false)\n    [Console]::OutputEncoding = $utf8\n    $OutputEncoding = $utf8\n} catch {\n}";
+const POWERSHELL_STATUS_POSTLUDE: &str = "if (-not $?) { exit 1 }";
 
 fn powershell_script_with_utf8_setup(command: &str) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(command.as_bytes());
     format!(
-        "{POWERSHELL_UTF8_SETUP}\n. ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))))"
+        "{POWERSHELL_UTF8_SETUP}\n. ([ScriptBlock]::Create(\n    [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}')) +\n    [Environment]::NewLine +\n    '{POWERSHELL_STATUS_POSTLUDE}'\n))"
     )
 }
 
@@ -441,6 +444,7 @@ mod tests {
         assert!(script_arg.contains("$OutputEncoding = $utf8"));
         assert!(script_arg.contains("} catch {\n}"));
         assert!(script_arg.contains("[ScriptBlock]::Create"));
+        assert!(script_arg.contains(POWERSHELL_STATUS_POSTLUDE));
         assert_eq!(decoded_powershell_payload(&script_arg), script);
     }
 
@@ -508,6 +512,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.status.code(), Some(23));
+    }
+
+    #[tokio::test]
+    async fn powershell_wrapper_preserves_native_command_status() {
+        let Some(interpreter) = ["pwsh", "powershell"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("exit 0")
+                .output()
+                .is_ok()
+        }) else {
+            return;
+        };
+
+        #[cfg(target_os = "windows")]
+        let native_failure = "cmd /c exit 7";
+        #[cfg(not(target_os = "windows"))]
+        let native_failure = "sh -c 'exit 7'";
+
+        for (command, expected_success) in [
+            (native_failure.to_owned(), false),
+            ("[Console]::Write('status-ok')".to_owned(), true),
+            (
+                format!("{native_failure}; [Console]::Write('recovered')"),
+                true,
+            ),
+        ] {
+            let raw_status = tokio::process::Command::new(interpreter)
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
+                .arg(&command)
+                .output()
+                .await
+                .unwrap()
+                .status;
+            let wrapped_status = tokio_powershell_command(interpreter, &command)
+                .output()
+                .await
+                .unwrap()
+                .status;
+
+            assert_eq!(raw_status.success(), expected_success, "raw: {command}");
+            assert_eq!(wrapped_status.success(), expected_success, "{command}");
+            assert_eq!(wrapped_status.code(), raw_status.code(), "{command}");
+        }
     }
 
     #[test]
