@@ -863,31 +863,26 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_powershell_shell_builds_powershell_command() {
+        use std::ffi::OsStr;
+
         let script = r#"Write-Output "quoted safe value" | Select-Object -First 1"#;
         let cwd = std::env::temp_dir();
-        let cmd = NativeRuntime::with_shell("pwsh".into())
+        let command = NativeRuntime::with_shell("pwsh".into())
             .build_shell_command(script, &cwd)
             .unwrap();
-        let debug = format!("{cmd:?}");
-        assert!(
-            debug.contains("pwsh"),
-            "PowerShell interpreter should appear, got: {debug}"
-        );
-        assert!(
-            debug.contains("-Command"),
-            "PowerShell invocation must use -Command, got: {debug}"
-        );
-        assert!(
-            debug.contains("quoted safe value"),
-            "PowerShell invocation must contain the script argument, got: {debug}"
-        );
-        assert!(
-            debug.contains("-NoProfile"),
-            "PowerShell invocation should pass -NoProfile, got: {debug}"
-        );
-        assert!(
-            !debug.contains("cmd.exe"),
-            "PowerShell shell must not fall back to cmd.exe, got: {debug}"
+        let command = command.as_std();
+
+        assert_eq!(command.get_program(), OsStr::new("pwsh"));
+        let args: Vec<_> = command.get_args().collect();
+        let expected = [
+            OsStr::new("-NoProfile"),
+            OsStr::new("-NonInteractive"),
+            OsStr::new("-Command"),
+        ];
+        assert_eq!(&args[..3], expected.as_slice());
+        assert_eq!(
+            decoded_powershell_payload(&args[3].to_string_lossy()),
+            script
         );
     }
 
