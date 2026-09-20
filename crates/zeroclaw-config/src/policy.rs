@@ -9825,6 +9825,36 @@ mod tests {
     }
 
     #[test]
+    fn explicit_deny_survives_degraded_wildcard_escape_hatch_at_execution() {
+        use crate::tool_policy::{Decision, PolicyRuleConfig};
+
+        let mut profile = crate::schema::RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            allowed_commands: vec!["*".to_string()],
+            block_high_risk_commands: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.tool_policy.rules.push(PolicyRuleConfig {
+            pattern: "Shell(git push:*)".to_string(),
+            decision: Decision::Deny,
+        });
+        let policy = SecurityPolicy::from_risk_profile(&profile, Path::new("/workspace"));
+
+        for (command, dialect) in [
+            ("echo $(git push)", ShellDialect::Posix),
+            ("git push;", ShellDialect::PowerShell),
+        ] {
+            let error = policy
+                .validate_command_execution_confirmed(command, true, dialect)
+                .expect_err("a confirmation must not bridge a hidden explicit Deny");
+            assert!(
+                error.contains("security policy"),
+                "unexpected rejection for {command}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_config_paths_are_protected() {
         let workspace = PathBuf::from("/tmp/zeroclaw-profile/workspace");
         let policy = SecurityPolicy {

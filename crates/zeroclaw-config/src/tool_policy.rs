@@ -27,7 +27,8 @@
 //! (RFC 7155 §2.3). The one exemption is the legacy trusted-environment
 //! escape hatch (`allowed_commands = ["*"]` with
 //! `block_high_risk_commands = false`), which keeps its historical meaning
-//! of opting out of command-level syntax restrictions.
+//! only when no explicit `Ask` or `Deny` shell rule could be hidden by the
+//! degraded parse.
 //!
 //! v1 registers only the shell extractor; cross-tool variants are roadmap
 //! Phase 2 and rejected at pattern-parse time.
@@ -1209,6 +1210,26 @@ impl CompiledRuleSet {
         self.escape_hatch
     }
 
+    /// Most restrictive explicit shell rule that a degraded parse could hide.
+    ///
+    /// This is derived from the canonical rule table at resolution time. A
+    /// wildcard legacy allow must not erase an operator's explicit restriction
+    /// merely because the extractor cannot see the nested or unparseable action.
+    fn hidden_explicit_shell_restriction(&self) -> Option<Decision> {
+        self.rules
+            .iter()
+            .filter(|rule| {
+                rule.source == RuleSource::Explicit
+                    && rule.decision != Decision::Allow
+                    && matches!(
+                        &rule.matcher,
+                        RuleMatcher::ShellCommand { .. } | RuleMatcher::AnyShell
+                    )
+            })
+            .map(|rule| rule.decision)
+            .min()
+    }
+
     #[must_use]
     pub fn block_high_risk_commands(&self) -> bool {
         self.block_high_risk_commands
@@ -1313,7 +1334,8 @@ impl Resolution {
 /// Compound commands resolve segment-by-segment and combine to the most
 /// restrictive decision. Degraded parses downgrade an apparent `Allow` to
 /// `Ask` — or `Deny` under `block_high_risk_commands` — unless the
-/// trusted-environment escape hatch is active.
+/// trusted-environment escape hatch is active and no explicit shell
+/// restriction could be hidden by the degraded parse.
 pub fn resolve_decision(action: &ToolAction, scopes: &ResolvedScopes) -> Resolution {
     let ToolAction::Shell(shell) = action;
 
@@ -1329,6 +1351,11 @@ pub fn resolve_decision(action: &ToolAction, scopes: &ResolvedScopes) -> Resolut
     }
 
     let explicit = command_explicitly_allowed(shell, scopes);
+    let hidden_explicit_restriction = matches!(shell.parse_status, ParseStatus::Degraded(_))
+        .then(|| scopes.profile.hidden_explicit_shell_restriction())
+        .flatten();
+    let degraded_escape_hatch =
+        scopes.profile.escape_hatch() && hidden_explicit_restriction.is_none();
 
     let mut combined: Option<Resolution> = None;
     for segment in &shell.segments {
@@ -1348,7 +1375,7 @@ pub fn resolve_decision(action: &ToolAction, scopes: &ResolvedScopes) -> Resolut
     // is active, whose historical meaning is skipping command-level syntax
     // restrictions entirely.
     let mut resolution = combined.unwrap_or_else(|| {
-        if scopes.profile.escape_hatch() {
+        if degraded_escape_hatch {
             Resolution::new(
                 Decision::Allow,
                 ResolutionReason::MatchedRule {
@@ -1366,17 +1393,20 @@ pub fn resolve_decision(action: &ToolAction, scopes: &ResolvedScopes) -> Resolut
     // control assignment never executes unconditionally. The latter remains
     // a policy restriction rather than parse degradation: its literal value
     // is still needed to bind the resolved executable identity.
-    if !scopes.profile.escape_hatch()
+    if !degraded_escape_hatch
         && (matches!(shell.parse_status, ParseStatus::Degraded(_))
             || has_unsafe_process_control_assignment(shell))
     {
-        let restricted_decision = if scopes.profile.block_high_risk_commands() {
+        let structural_decision = if scopes.profile.block_high_risk_commands() {
             Decision::Deny
+        } else if let Some(explicit_restriction) = hidden_explicit_restriction {
+            explicit_restriction
         } else if resolution.decision == Decision::Allow {
             Decision::Ask
         } else {
             resolution.decision
         };
+        let restricted_decision = resolution.decision.min(structural_decision);
         // Rebind the reason even when an Ask stays Ask. Both restrictions
         // are structural, so validation must not let an approval bit bridge
         // them the way it bridges risk-tier asks. The legacy allowlist
@@ -2593,6 +2623,35 @@ mod tests {
         cfg.block_high_risk_commands = false;
         let resolution = resolve_with(&cfg, "echo `date`", ShellDialect::Posix);
         assert_eq!(resolution.decision, Decision::Allow);
+    }
+
+    #[test]
+    fn escape_hatch_cannot_hide_explicit_shell_restrictions() {
+        let mut cfg = profile(AutonomyLevel::Full, &["*"]);
+        cfg.block_high_risk_commands = false;
+        cfg.tool_policy.rules = vec![PolicyRuleConfig {
+            pattern: "Shell(git push:*)".into(),
+            decision: Decision::Deny,
+        }];
+
+        for (command, dialect) in [
+            ("echo $(git push)", ShellDialect::Posix),
+            ("git push;", ShellDialect::PowerShell),
+        ] {
+            let resolution = resolve_with(&cfg, command, dialect);
+            assert_eq!(resolution.decision, Decision::Deny, "{command}");
+            assert!(
+                matches!(
+                    resolution.reason,
+                    ResolutionReason::DegradedSyntax {
+                        decision: Decision::Deny,
+                        ..
+                    }
+                ),
+                "{command}: {:?}",
+                resolution.reason
+            );
+        }
     }
 
     // ── Session rules ──────────────────────────────────────────────

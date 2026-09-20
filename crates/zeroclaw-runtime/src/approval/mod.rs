@@ -324,6 +324,22 @@ impl ApprovalManager {
         !self.non_interactive || self.non_interactive_shell_requires_approval
     }
 
+    /// The autonomy level this manager enforces. Prompt rendering reads the
+    /// same policy the execution gate consults so the two cannot diverge.
+    pub fn autonomy_level(&self) -> AutonomyLevel {
+        self.autonomy_level
+    }
+
+    /// Tools that still require approval even under Full autonomy, in
+    /// deterministic (sorted) order so rendered prompt text is stable.
+    /// The manager stores these as a set because enforcement is order-blind;
+    /// prompts need a stable ordering instead.
+    pub fn always_ask_tools(&self) -> Vec<String> {
+        let mut tools: Vec<String> = self.always_ask.iter().cloned().collect();
+        tools.sort();
+        tools
+    }
+
     /// Check whether a tool call requires interactive approval.
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
     pub fn needs_approval(&self, tool_name: &str) -> bool {
@@ -331,19 +347,20 @@ impl ApprovalManager {
     }
 
     pub fn approval_requirement(&self, tool_name: &str) -> ApprovalRequirement {
-        // Full autonomy never prompts.
-        if self.autonomy_level == AutonomyLevel::Full {
-            return ApprovalRequirement::Approved;
-        }
-
         // ReadOnly blocks everything — handled elsewhere; no prompt needed.
         if self.autonomy_level == AutonomyLevel::ReadOnly {
             return ApprovalRequirement::NotRequired;
         }
 
-        // always_ask overrides everything.
+        // always_ask overrides everything, including Full autonomy — an operator
+        // who explicitly lists a tool here wants a prompt regardless of level.
         if self.always_ask.contains("*") || self.always_ask.contains(tool_name) {
             return ApprovalRequirement::Prompt;
+        }
+
+        // Full autonomy auto-approves only tools that are not always_ask.
+        if self.autonomy_level == AutonomyLevel::Full {
+            return ApprovalRequirement::Approved;
         }
 
         if self.non_interactive
@@ -809,6 +826,7 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::RiskProfileConfig;
+    use zeroclaw_config::tool_policy::{Decision, PolicyRuleConfig};
 
     #[test]
     fn sanitize_replacement_strips_control_chars_keeps_whitespace() {
@@ -971,6 +989,113 @@ mod tests {
                 .authorize_shell_execution(&serde_json::json!({"command": "echo static"}))
                 .0,
             ShellAuthorizationOutcome::StaticAllow
+        );
+    }
+
+    #[test]
+    fn shell_authorization_rejects_explicit_deny_hidden_by_degraded_syntax() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut profile = RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            allowed_commands: vec!["*".to_string()],
+            block_high_risk_commands: false,
+            ..RiskProfileConfig::default()
+        };
+        profile.tool_policy.rules.push(PolicyRuleConfig {
+            pattern: "Shell(git push:*)".to_string(),
+            decision: Decision::Deny,
+        });
+
+        for (command, dialect) in [
+            (
+                "echo $(git push)",
+                zeroclaw_api::runtime_traits::ShellDialect::Posix,
+            ),
+            (
+                "git push;",
+                zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+            ),
+        ] {
+            let security = Arc::new(crate::security::SecurityPolicy::from_risk_profile(
+                &profile,
+                workspace.path(),
+            ));
+            let manager = ApprovalManager::from_risk_profile(&profile);
+            manager.set_policy_context(security, dialect);
+
+            assert_eq!(
+                manager
+                    .authorize_shell_execution(&serde_json::json!({"command": command}))
+                    .0,
+                ShellAuthorizationOutcome::Rejected,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_autonomy_prompts_for_always_ask_tool() {
+        // always_ask must survive Full autonomy: an operator who explicitly
+        // lists a tool wants a prompt regardless of autonomy level.
+        let mgr = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            always_ask: vec![" shell ".into(), "shell".into(), "   ".into()],
+            ..RiskProfileConfig::default()
+        });
+        assert!(
+            mgr.needs_approval("shell"),
+            "always_ask tool must prompt even under Full autonomy"
+        );
+        // an uncovered tool is still auto-approved
+        assert!(
+            !mgr.needs_approval("file_write"),
+            "uncovered tool should be auto-approved under Full autonomy"
+        );
+        assert_eq!(
+            mgr.always_ask_tools(),
+            vec!["shell"],
+            "prompt rendering must receive the same canonical entry as enforcement"
+        );
+    }
+
+    #[test]
+    fn full_autonomy_wildcard_always_ask_prompts_for_everything() {
+        let mgr = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            always_ask: vec![" * ".into()],
+            ..RiskProfileConfig::default()
+        });
+        assert!(mgr.needs_approval("shell"));
+        assert!(mgr.needs_approval("file_write"));
+        assert!(mgr.needs_approval("anything"));
+    }
+
+    #[test]
+    fn full_autonomy_always_ask_wins_over_auto_approve() {
+        // If a tool is in both auto_approve and always_ask, always_ask wins.
+        let mgr = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            auto_approve: vec!["shell".into()],
+            always_ask: vec!["shell".into()],
+            ..RiskProfileConfig::default()
+        });
+        assert!(
+            mgr.needs_approval("shell"),
+            "always_ask must win over auto_approve even under Full autonomy"
+        );
+    }
+
+    #[test]
+    fn read_only_still_not_required_even_with_always_ask() {
+        // ReadOnly blocks execution elsewhere; always_ask does not change that.
+        let mgr = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            level: AutonomyLevel::ReadOnly,
+            always_ask: vec!["shell".into()],
+            ..RiskProfileConfig::default()
+        });
+        assert_eq!(
+            mgr.approval_requirement("shell"),
+            ApprovalRequirement::NotRequired
         );
     }
 
@@ -1326,10 +1451,68 @@ mod tests {
     #[test]
     fn non_interactive_full_autonomy_never_needs_approval() {
         let mgr = ApprovalManager::for_non_interactive(&full_config());
-        // Full autonomy means no approval needed, even in non-interactive mode.
+        // Full autonomy with empty always_ask means no approval needed,
+        // even in non-interactive mode.
         assert!(!mgr.needs_approval("shell"));
         assert!(!mgr.needs_approval("file_write"));
         assert!(!mgr.needs_approval("anything"));
+    }
+
+    fn full_always_ask_config(always_ask: &[&str], auto_approve: &[&str]) -> RiskProfileConfig {
+        RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            always_ask: always_ask.iter().map(|tool| (*tool).to_string()).collect(),
+            auto_approve: auto_approve
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+            ..RiskProfileConfig::default()
+        }
+    }
+
+    #[test]
+    fn non_interactive_full_autonomy_honors_exact_always_ask() {
+        let profile = full_always_ask_config(&[" shell "], &[]);
+        for mgr in [
+            ApprovalManager::for_non_interactive(&profile),
+            ApprovalManager::for_non_interactive_backchannel(&profile),
+        ] {
+            assert!(
+                mgr.needs_approval("shell"),
+                "exact always_ask must prompt under Full, including non-interactive"
+            );
+            assert!(
+                !mgr.needs_approval("file_write"),
+                "uncovered Full tool must still auto-approve"
+            );
+        }
+    }
+
+    #[test]
+    fn non_interactive_full_autonomy_honors_wildcard_always_ask() {
+        let profile = full_always_ask_config(&[" * "], &[]);
+        for mgr in [
+            ApprovalManager::for_non_interactive(&profile),
+            ApprovalManager::for_non_interactive_backchannel(&profile),
+        ] {
+            assert!(mgr.needs_approval("shell"));
+            assert!(mgr.needs_approval("file_write"));
+            assert!(mgr.needs_approval("anything"));
+        }
+    }
+
+    #[test]
+    fn non_interactive_full_autonomy_always_ask_wins_over_auto_approve() {
+        let profile = full_always_ask_config(&["shell"], &["shell"]);
+        for mgr in [
+            ApprovalManager::for_non_interactive(&profile),
+            ApprovalManager::for_non_interactive_backchannel(&profile),
+        ] {
+            assert!(
+                mgr.needs_approval("shell"),
+                "always_ask must win over auto_approve under Full non-interactive"
+            );
+        }
     }
 
     #[test]
@@ -1341,6 +1524,19 @@ mod tests {
         let mgr = ApprovalManager::for_non_interactive(&config);
         // ReadOnly blocks execution elsewhere; approval manager does not prompt.
         assert!(!mgr.needs_approval("shell"));
+    }
+
+    #[test]
+    fn derived_manager_normalizes_always_ask() {
+        let parent = ApprovalManager::for_non_interactive(&RiskProfileConfig::default());
+        let profile = full_always_ask_config(&[" shell "], &[]);
+        let derived = parent.derive_for_risk_profile(&profile);
+
+        assert_eq!(
+            derived.approval_requirement("shell"),
+            ApprovalRequirement::Prompt
+        );
+        assert_eq!(derived.always_ask_tools(), vec!["shell"]);
     }
 
     #[test]
