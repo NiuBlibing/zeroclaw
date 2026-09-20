@@ -400,6 +400,28 @@ mod tests {
     }
 
     #[test]
+    fn executable_degraded_guidance_falls_back_past_stale_translated_catalog() {
+        let stale_disk =
+            "cli-config-section-degraded = advertencia: Ejecuta `zeroclaw config migrate`.\n";
+        let executable = "/opt/zeroclaw/bin/zeroclaw";
+
+        let rendered = get_disk_override_cli_string_for_test(
+            "es",
+            stale_disk,
+            "cli-config-section-degraded-executable",
+            &[
+                ("section", "risk_profiles"),
+                ("path", "/tmp/config.toml"),
+                ("executable", executable),
+            ],
+        );
+
+        assert!(rendered.contains(executable));
+        assert!(rendered.contains("config migrate"));
+        assert!(!rendered.contains("`zeroclaw config migrate`"));
+    }
+
+    #[test]
     fn paircode_cli_strings_format_in_every_builtin_locale() {
         let endpoint = "gateway.example:49001";
         let cases = [
@@ -591,6 +613,102 @@ mod tests {
         .expect("missing disk key should fall back to built-in zh-CN");
         assert!(built_in.contains("123456"));
         assert!(built_in.contains("需要绑定"));
+    }
+
+    #[test]
+    fn quickstart_terminal_size_errors_format_from_english_fluent() {
+        let width_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-too-narrow",
+            &[("min_width", "3"), ("width", "2")],
+        );
+        assert_eq!(
+            width_message,
+            "Quickstart needs a terminal at least 3 columns wide; the current terminal is 2 columns. Widen the terminal and try again."
+        );
+
+        let height_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-too-short",
+            &[("height", "8"), ("min_height", "9")],
+        );
+        assert_eq!(
+            height_message,
+            "Quickstart needs a terminal at least 9 rows tall; the current terminal is 8 rows. Make the terminal taller and try again."
+        );
+
+        let resized_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-resized",
+            &[
+                ("initial_width", "40"),
+                ("initial_height", "9"),
+                ("current_width", "4"),
+                ("current_height", "9"),
+            ],
+        );
+        assert_eq!(
+            resized_message,
+            "The terminal changed from 40x9 to 4x9 while the Quickstart checklist was open. Reopen the checklist to continue."
+        );
+
+        assert_eq!(
+            get_english_cli_string_with_args("cli-quickstart-empty-checklist", &[]),
+            "Quickstart cannot open an empty checklist."
+        );
+    }
+
+    #[test]
+    fn quickstart_terminal_geometry_errors_are_defined_in_every_locale() {
+        // The checklist fails closed when `Term::size_checked()` returns None.
+        // That path is only reachable through this key, so a locale missing it
+        // would render the raw `{key}` placeholder to the user at exactly the
+        // moment we are refusing to draw an unverifiable menu.
+        let cases = [
+            ("cli-quickstart-terminal-size-unknown", vec![]),
+            (
+                "cli-quickstart-terminal-too-narrow",
+                vec![("min_width", "20"), ("width", "19")],
+            ),
+            (
+                "cli-quickstart-terminal-too-short",
+                vec![("min_height", "9"), ("height", "8")],
+            ),
+            (
+                "cli-quickstart-terminal-resized",
+                vec![
+                    ("initial_width", "80"),
+                    ("initial_height", "20"),
+                    ("current_width", "40"),
+                    ("current_height", "20"),
+                ],
+            ),
+            ("cli-quickstart-empty-checklist", vec![]),
+        ];
+        for locale in available_locales() {
+            let source = if locale.code == "en" {
+                include_str!("../locales/en/cli.ftl")
+            } else {
+                builtin_cli_ftl_source(&locale.code)
+                    .unwrap_or_else(|| panic!("{} must have a built-in CLI catalogue", locale.code))
+            };
+            for (key, args) in &cases {
+                let message = format_ftl_message(source, &locale.code, key, args)
+                    .unwrap_or_else(|| panic!("{}: {key} should be defined", locale.code));
+                assert!(
+                    !message.trim().is_empty(),
+                    "{}: {key} should not be empty",
+                    locale.code
+                );
+                assert!(
+                    !message.contains('{'),
+                    "{}: {key} should interpolate every argument; got {message:?}",
+                    locale.code
+                );
+            }
+        }
+
+        assert_eq!(
+            get_english_cli_string_with_args("cli-quickstart-terminal-size-unknown", &[]),
+            "Quickstart could not determine the terminal size, so it cannot verify the checklist fits. Run it from a terminal that reports its dimensions, or use `zeroclaw config set <path> <value>` for headless configuration."
+        );
     }
 
     #[test]
@@ -1047,6 +1165,11 @@ mod tests {
             ("channel-runtime-new-session", &[][..], [].as_slice()),
             ("channel-runtime-stop-sent", &[][..], [].as_slice()),
             ("channel-runtime-stop-no-task", &[][..], [].as_slice()),
+            (
+                "channel-runtime-stop-folded-followup",
+                &[][..],
+                [].as_slice(),
+            ),
             (
                 "channel-runtime-model-empty",
                 &[][..],
@@ -1599,6 +1722,69 @@ mod tests {
                 !bar_formatted.contains("{pct}"),
                 "{locale}: cli-agent-context-bar has unformatted placeholder in: {bar_formatted}"
             );
+        }
+    }
+
+    #[test]
+    fn integration_info_chrome_strings_format_in_all_locales() {
+        let argless_keys = [
+            "cli-integrations-category-heading",
+            "cli-integrations-category-chat",
+            "cli-integrations-category-ai-model",
+            "cli-integrations-category-tools-automation",
+            "cli-integrations-category-platform",
+            "cli-integrations-status-heading",
+            "cli-integrations-status-active",
+            "cli-integrations-status-available",
+            "cli-integrations-setup-heading",
+            "cli-integrations-setup-macos-heading",
+            "cli-integrations-builtin-heading",
+        ];
+        let args = [
+            ("name", "definitely-not-a-real-integration"),
+            ("quickstart", "`zeroclaw quickstart`"),
+            (
+                "channel_config",
+                "`zeroclaw config set channels.<name>.<field>=<value>`",
+            ),
+        ];
+
+        for (source, locale) in committed_locale_sources() {
+            for key in argless_keys {
+                let formatted = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(!formatted.is_empty(), "{locale}: {key} should not be empty");
+                assert!(
+                    !formatted.contains('{') && !formatted.contains('}'),
+                    "{locale}: {key} left an unformatted placeholder: {formatted}"
+                );
+            }
+
+            let unknown = format_ftl_message(source, locale, "cli-integrations-unknown", &args)
+                .unwrap_or_else(|| panic!("{locale}: cli-integrations-unknown should format"));
+            for protected in [
+                "definitely-not-a-real-integration",
+                "`zeroclaw quickstart`",
+                "`zeroclaw config set channels.<name>.<field>=<value>`",
+            ] {
+                assert!(
+                    unknown.contains(protected),
+                    "{locale}: cli-integrations-unknown must preserve {protected:?}: {unknown}"
+                );
+            }
+            assert!(
+                !unknown.contains('{') && !unknown.contains('}'),
+                "{locale}: cli-integrations-unknown left an unformatted placeholder: {unknown}"
+            );
+
+            match locale {
+                "es" => assert!(unknown.contains("Integración desconocida")),
+                "fr" => assert!(unknown.contains("Intégration inconnue")),
+                "ja" => assert!(unknown.contains("不明なインテグレーション")),
+                "zh-CN" => assert!(unknown.contains("未知的集成")),
+                "en" => assert!(unknown.contains("Unknown integration")),
+                _ => unreachable!("unlisted committed locale: {locale}"),
+            }
         }
     }
 

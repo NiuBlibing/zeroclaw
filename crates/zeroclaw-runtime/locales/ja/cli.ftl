@@ -15,6 +15,18 @@ cli-models-about = プロバイダーモデルカタログを管理
 cli-providers-about = サポートされているAIプロバイダーをリスト表示
 cli-channel-about = 通信チャネルを管理
 cli-integrations-about = 50以上の統合を参照
+cli-integrations-unknown = 不明なインテグレーション: {$name}。対応しているインテグレーションは README を確認してください。モデルプロバイダーを設定するには {$quickstart} を実行し、チャネルには {$channel_config} を実行してください。
+cli-integrations-category-heading = カテゴリ
+cli-integrations-category-chat = チャットプロバイダー
+cli-integrations-category-ai-model = AIモデル
+cli-integrations-category-tools-automation = ツールと自動化
+cli-integrations-category-platform = プラットフォーム
+cli-integrations-status-heading = 状態
+cli-integrations-status-active = 有効
+cli-integrations-status-available = 利用可能
+cli-integrations-setup-heading = セットアップ
+cli-integrations-setup-macos-heading = セットアップ (macOS専用)
+cli-integrations-builtin-heading = 組み込み
 cli-skills-about = スキル (ユーザー定義機能) を管理
 cli-sop-about = 標準操作手順 (SOP) を管理
 cli-migrate-about = 他のエージェントランタイムからデータを移行
@@ -187,6 +199,7 @@ cli-acp-long-about =
 
     例:
     zeroclaw acp                        # ACP サーバーを起動
+    zeroclaw acp --agent fable         # 新しいセッションの既定エージェントを fable に設定
     zeroclaw acp --max-sessions 5       # 同時セッション数を制限
 cli-daemon-long-about =
     長時間実行の自律型デーモンを起動します。
@@ -519,6 +532,11 @@ cli-no-command = コマンドが指定されていません。
 cli-press-enter = 終了するにはEnterキーを押してください...
 cli-quickstart-title = クイックスタート — 1つの動作するエージェントをエンドツーエンドで作成します。
 cli-quickstart-needs-tty = クイックスタートは対話式で、stdin と stderr にターミナルが必要です。対話式シェルから実行するか、ヘッドレス設定には `zeroclaw config set <path> <value>` を使用してください。
+cli-quickstart-terminal-size-unknown = クイックスタートはターミナルのサイズを判定できなかったため、チェックリストが収まるか確認できません。サイズを報告するターミナルから実行するか、ヘッドレス設定には `zeroclaw config set <path> <value>` を使用してください。
+cli-quickstart-terminal-too-narrow = クイックスタートには幅が {$min_width} 列以上のターミナルが必要です。現在の幅は {$width} 列です。ターミナルを広げて再試行してください。
+cli-quickstart-terminal-too-short = クイックスタートには高さが {$min_height} 行以上のターミナルが必要です。現在の高さは {$height} 行です。ターミナルを高くして再試行してください。
+cli-quickstart-terminal-resized = クイックスタートのチェックリストを開いている間に、ターミナルが {$initial_width}x{$initial_height} から {$current_width}x{$current_height} に変更されました。続行するにはチェックリストを開き直してください。
+cli-quickstart-empty-checklist = クイックスタートは空のチェックリストを開けません。
 cli-quickstart-cancelled = クイックスタートをキャンセルしました。設定は書き込まれていません。
 cli-quickstart-incomplete = {"  "}すべてのセレクターがまだ入力されていません。
 cli-quickstart-create-agent = ── エージェントを作成
@@ -844,6 +862,8 @@ cli-models-status-none = デフォルトモデルが設定されていません�
 turn-interrupted-by-user = [ユーザーによって中断されました]
 turn-cancelled-client-rpc = [クライアント経由でターンがキャンセルされました]
 turn-stream-interrupted = [ストリームが中断されました]
+turn-failed = [ターンが失敗しました]
+turn-failed-attachment-omitted = [添付は省略されました: 失敗したターンでプロバイダーが拒否しました]
 turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }）が利用できなかったため、この応答は { $actual_model }（{ $actual_provider }）によって生成されました。
 turn-max-iterations-reached = *ターン停止: ツールの最大反復回数 ({ $max_iterations }) に達しました。*
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
@@ -863,6 +883,8 @@ channel-runtime-matrix-progress-item-too-large = ⚠️ この行は 1 件の Ma
 channel-runtime-new-session = 会話履歴を消去しました。新しく開始します。
 channel-runtime-stop-sent = 停止シグナルを送信しました。
 channel-runtime-stop-no-task = この送信者スコープに実行中のタスクはありません。
+channel-runtime-stop-folded-followup = ここで停止できるものはありません。この返信は、返信先のまだ処理中のメッセージに統合されました。その会話で /stop を送ってください。
+channel-runtime-conversation-busy = この会話には保留中のメッセージが多すぎるため、このメッセージは破棄されました。返信を待つか、/stop を送信して待機中のリクエストを消去してください。
 channel-runtime-model-empty = モデル ID は空にできません。`/model <model-id>` を使用してください。
 channel-runtime-model-switched = モデルを `{ $model }`（model_provider: `{ $provider }`）に切り替えました。コンテキストは保持されています。
 channel-runtime-agent-scope-rejected = 送信者 `{ $sender }` はエージェント `{ $agent }` で `/model --agent` を実行する権限がありません。セッション限定の上書きには `/model --user { $model }` を使用するか、管理者にあなたをメンバーとして `admin_for_agent_scope = true` のピアグループへ登録するよう依頼してください。
@@ -1063,6 +1085,7 @@ channel-approval-btn-approve = 承認
 channel-approval-btn-deny = 拒否
 channel-approval-btn-always = 常に
 channel-approval-tap-instruction = 下のボタンをタップしてください：
+channel-approval-position = ツール呼び出し { $total } 件中 { $index } 件目
 channel-approval-reply-instruction-yesno = 返信：「{ $yes_command }」、「{ $no_command }」、または「{ $always_command }」
 channel-approval-reply-instruction-approve-deny = 「{ $approve_command }」/「{ $deny_command }」/「{ $always_command }」と返信してください。
 channel-approval-group-visibility-warning = これはグループチャットのため、ここにいる全員がこのコードと上に表示されたツールの引数を見ることができます。このチャンネルの承認されたピアのみが応答できます。

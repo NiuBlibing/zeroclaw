@@ -15,6 +15,18 @@ cli-models-about = 管理提供商模型目录
 cli-providers-about = 列出支持的 AI 提供商
 cli-channel-about = 管理通信渠道
 cli-integrations-about = 浏览 50+ 个集成
+cli-integrations-unknown = 未知的集成：{$name}。请查看 README 了解支持的集成，或运行 {$quickstart} 配置模型提供商，然后运行 {$channel_config} 配置渠道。
+cli-integrations-category-heading = 类别
+cli-integrations-category-chat = 聊天提供商
+cli-integrations-category-ai-model = AI 模型
+cli-integrations-category-tools-automation = 工具与自动化
+cli-integrations-category-platform = 平台
+cli-integrations-status-heading = 状态
+cli-integrations-status-active = 已启用
+cli-integrations-status-available = 可用
+cli-integrations-setup-heading = 配置
+cli-integrations-setup-macos-heading = macOS 专用配置
+cli-integrations-builtin-heading = 内置
 cli-skills-about = 管理技能（用户自定义能力）
 cli-sop-about = 管理标准操作程序（SOPs）
 cli-migrate-about = 从其他智能体运行时迁移数据
@@ -188,6 +200,7 @@ cli-acp-long-about =
 
     示例：
     zeroclaw acp                        # 启动 ACP 服务器
+    zeroclaw acp --agent fable         # 将新会话的默认智能体设为 fable
     zeroclaw acp --max-sessions 5       # 限制并发会话数
 cli-daemon-long-about =
     启动长期运行的自主守护进程。
@@ -520,6 +533,11 @@ cli-no-command = 未提供命令。
 cli-press-enter = 按 Enter 退出...
 cli-quickstart-title = Quickstart — 端到端创建一个可用的 agent。
 cli-quickstart-needs-tty = Quickstart 是交互式流程，需要 stdin 和 stderr 连接到终端。请从交互式 shell 中运行，或使用 `zeroclaw config set <path> <value>` 进行无头配置。
+cli-quickstart-terminal-size-unknown = Quickstart 无法确定终端尺寸，因此无法验证清单能否完整显示。请在会报告尺寸的终端中运行，或使用 `zeroclaw config set <path> <value>` 进行无头配置。
+cli-quickstart-terminal-too-narrow = Quickstart 需要终端宽度至少为 {$min_width} 列；当前终端宽度为 {$width} 列。请加宽终端后重试。
+cli-quickstart-terminal-too-short = Quickstart 需要终端高度至少为 {$min_height} 行；当前终端高度为 {$height} 行。请增高终端后重试。
+cli-quickstart-terminal-resized = Quickstart 清单打开期间，终端从 {$initial_width}x{$initial_height} 变为 {$current_width}x{$current_height}。请重新打开清单以继续。
+cli-quickstart-empty-checklist = Quickstart 无法打开空清单。
 cli-quickstart-cancelled = 已取消 quickstart。未写入配置。
 cli-quickstart-incomplete = {"  "}尚未填写所有选择器。
 cli-quickstart-create-agent = ── 创建 agent
@@ -845,6 +863,8 @@ cli-models-status-none = 未配置默认模型。
 turn-interrupted-by-user = [被用户中断]
 turn-cancelled-client-rpc = [已通过客户端取消回合]
 turn-stream-interrupted = [流已中断]
+turn-failed = [回合失败]
+turn-failed-attachment-omitted = [附件已省略：提供方在失败的回合中拒绝了它]
 turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }）不可用；此回复由 { $actual_model }（{ $actual_provider }）生成。
 turn-max-iterations-reached = *轮次已停止：已达到最大工具迭代次数（{ $max_iterations }）。*
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
@@ -864,6 +884,8 @@ channel-runtime-matrix-progress-item-too-large = ⚠️ 此行太大，无法放
 channel-runtime-new-session = 对话历史已清除。重新开始。
 channel-runtime-stop-sent = 已发送停止信号。
 channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
+channel-runtime-stop-folded-followup = 这里没有可停止的内容：这条回复已合并到仍在处理的上一条消息中。请在该会话中发送 /stop 取消。
+channel-runtime-conversation-busy = 此会话待处理的消息过多，本条消息已被丢弃。请等待回复，或发送 /stop 清空您排队中的请求。
 channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-id>`。
 channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
 channel-runtime-agent-scope-rejected = 发送者 `{ $sender }` 无权在 agent `{ $agent }` 上执行 `/model --agent`。请改用 `/model --user { $model }`（仅本次会话生效），或请管理员将 peer group 的 `admin_for_agent_scope` 设为 `true` 并将你列为成员。
@@ -1064,6 +1086,7 @@ channel-approval-btn-approve = 批准
 channel-approval-btn-deny = 拒绝
 channel-approval-btn-always = 始终
 channel-approval-tap-instruction = 点击下方按钮：
+channel-approval-position = 第 { $index } 个工具调用，共 { $total } 个
 channel-approval-reply-instruction-yesno = 回复：“{ $yes_command }”、“{ $no_command }” 或 “{ $always_command }”
 channel-approval-reply-instruction-approve-deny = 回复 `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`。
 channel-approval-group-visibility-warning = 这是群聊，因此这里的所有人都能看到此代码和上面显示的工具参数。只有该通道的授权对等方才能回复。
