@@ -14274,7 +14274,16 @@ mod tests {
     #[tokio::test]
     async fn staged_model_route_becomes_live_only_when_complete() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let mut cfg = make_model_refresh_test_config(&tmp);
+        let staged = cfg
+            .providers
+            .models
+            .ensure("openai", "staged-provider")
+            .expect("openai staged-provider slot exists");
+        staged.api_key = Some("test-key-staged".into());
+        staged.uri = Some("http://127.0.0.1:1".into());
+        staged.model = None;
+        let dispatcher = make_config_set_test_dispatcher(cfg);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
 
         dispatcher
@@ -14287,7 +14296,7 @@ mod tests {
         dispatcher
             .handle_config_set(&json!({
                 "prop": "model_routes.reasoning.model_provider",
-                "value": "openai.test-provider"
+                "value": "openai.staged-provider"
             }))
             .await
             .expect("setting the staged route provider must succeed");
@@ -14325,7 +14334,7 @@ mod tests {
             route.kind,
             zeroclaw_providers::router::RouteResolutionKind::MatchedHint
         ));
-        assert_eq!(route.provider_name, "openai.test-provider");
+        assert_eq!(route.provider_name, "openai.staged-provider");
         assert_eq!(route.model, "old-model");
     }
 
