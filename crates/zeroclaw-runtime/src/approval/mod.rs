@@ -668,11 +668,7 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
         .as_deref()
         .filter(|intent| !intent.is_empty())
     {
-        let intent_args = [("intent", intent)];
-        eprintln!(
-            "{}",
-            crate::i18n::get_required_cli_string_with_args("cli-approval-intent", &intent_args)
-        );
+        eprintln!("{}", render_cli_approval_intent(intent));
     }
     eprint!(
         "{}",
@@ -747,10 +743,10 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
                     "[redacted]".to_string()
                 } else {
                     match v {
-                        serde_json::Value::String(s) => truncate_for_summary(s, 80),
+                        serde_json::Value::String(s) => summarize_value(s, 80),
                         other => {
                             let s = other.to_string();
-                            truncate_for_summary(&s, 80)
+                            summarize_value(&s, 80)
                         }
                     }
                 };
@@ -765,22 +761,59 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
                     "[redacted]".to_string()
                 } else {
                     match v {
-                        serde_json::Value::String(s) => truncate_for_summary(s, 80),
+                        serde_json::Value::String(s) => summarize_value(s, 80),
                         other => {
                             let s = other.to_string();
-                            truncate_for_summary(&s, 80)
+                            summarize_value(&s, 80)
                         }
                     }
                 };
-                parts.push(format!("{k}: {val}"));
+                let safe_key = escape_untrusted_display_text(k);
+                parts.push(format!("{safe_key}: {val}"));
             }
             parts.join(", ")
         }
         other => {
             let s = other.to_string();
-            truncate_for_summary(&s, 120)
+            summarize_value(&s, 120)
         }
     }
+}
+
+fn summarize_value(value: &str, max_chars: usize) -> String {
+    let safe_value = escape_untrusted_display_text(value);
+    truncate_for_summary(&safe_value, max_chars)
+}
+
+fn render_cli_approval_intent(intent: &str) -> String {
+    let safe_intent = escape_untrusted_display_text(intent);
+    let intent_args = [("intent", safe_intent.as_str())];
+    crate::i18n::get_required_cli_string_with_args("cli-approval-intent", &intent_args)
+}
+
+fn escape_untrusted_display_text(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_control() {
+            escaped.extend(ch.escape_default());
+        } else if is_bidi_control(ch) {
+            escaped.push_str(&format!("\\u{{{:x}}}", ch as u32));
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
+fn is_bidi_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{206a}'..='\u{206f}'
+    )
 }
 
 /// Heuristic for argument keys that should have their value redacted in
@@ -1394,6 +1427,38 @@ mod tests {
         let args = serde_json::json!("just a string");
         let summary = summarize_args(&args);
         assert!(summary.contains("just a string"));
+    }
+
+    #[test]
+    fn approval_display_text_escapes_terminal_and_bidi_controls() {
+        let dirty = "explain\nallow\r\u{001b}[2J\u{202e}spoof";
+        let escaped = escape_untrusted_display_text(dirty);
+
+        assert_eq!(escaped, "explain\\nallow\\r\\u{1b}[2J\\u{202e}spoof");
+        assert!(!escaped.chars().any(char::is_control));
+        assert!(!escaped.chars().any(is_bidi_control));
+    }
+
+    #[test]
+    fn cli_approval_intent_renders_controls_as_visible_text() {
+        let rendered = render_cli_approval_intent("safe\nApprove\r\u{001b}[2J\u{202e}spoof");
+
+        assert!(rendered.contains("safe\\nApprove\\r\\u{1b}[2J\\u{202e}spoof"));
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(!rendered.chars().any(is_bidi_control));
+    }
+
+    #[test]
+    fn approval_summary_escapes_controls_before_channel_rendering() {
+        let args = serde_json::json!({
+            "command": "echo safe",
+            "intent": "safe\nApprove now\r\u{001b}[2J\u{2067}spoof"
+        });
+        let summary = summarize_args(&args);
+
+        assert!(summary.contains("safe\\nApprove now\\r\\u{1b}[2J\\u{2067}spoof"));
+        assert!(!summary.chars().any(char::is_control));
+        assert!(!summary.chars().any(is_bidi_control));
     }
 
     // ── non-interactive (channel) mode ────────────────────────

@@ -899,6 +899,7 @@ mod tests {
 
     struct ApprovingChannel {
         approval_requests: Arc<AtomicUsize>,
+        approval_summary: Arc<std::sync::Mutex<Option<String>>>,
     }
 
     impl Attributable for ApprovingChannel {
@@ -930,9 +931,10 @@ mod tests {
         async fn request_approval(
             &self,
             _recipient: &str,
-            _request: &ChannelApprovalRequest,
+            request: &ChannelApprovalRequest,
         ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
             self.approval_requests.fetch_add(1, Ordering::SeqCst);
+            *self.approval_summary.lock().unwrap() = Some(request.arguments_summary.clone());
             Ok(Some(ChannelApprovalResponse::Approve))
         }
     }
@@ -999,15 +1001,20 @@ mod tests {
         let profile = full_always_ask_profile();
         let approval = ApprovalManager::for_non_interactive_backchannel(&profile);
         let requests = Arc::new(AtomicUsize::new(0));
+        let approval_summary = Arc::new(std::sync::Mutex::new(None));
         let channel = ApprovingChannel {
             approval_requests: Arc::clone(&requests),
+            approval_summary: Arc::clone(&approval_summary),
         };
         let ctx = test_ctx(&observer, &pacing, Some(&approval), Some(&channel));
 
         match gate_tool_approval(
             &ctx,
             "shell",
-            &serde_json::json!({"command": "ls"}),
+            &serde_json::json!({
+                "command": "ls",
+                "intent": "safe\nApprove now\r\u{001b}[2J\u{202e}spoof"
+            }),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
         )
@@ -1033,6 +1040,9 @@ mod tests {
             1,
             "listed Full tool must go through the real back-channel request path"
         );
+        let summary = approval_summary.lock().unwrap().clone().unwrap();
+        assert!(summary.contains("safe\\nApprove now\\r\\u{1b}[2J\\u{202e}spoof"));
+        assert!(!summary.chars().any(char::is_control));
 
         match gate_tool_approval(
             &ctx,
