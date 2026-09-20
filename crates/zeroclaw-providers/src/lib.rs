@@ -126,6 +126,7 @@ pub use traits::{
 use reliable::{ReliableModelProvider, ReliableModelProviderEntry};
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const MAX_API_ERROR_CHARS: usize = 500;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
@@ -2082,8 +2083,48 @@ pub fn create_routed_model_provider_with_options(
     default_model: &str,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
-    if model_routes.is_empty() {
-        return create_resilient_model_provider_from_ref_with_model_override(
+    create_routed_model_provider_with_options_and_resolver(
+        config,
+        primary_name,
+        api_key,
+        api_url,
+        reliability,
+        model_routes,
+        default_model,
+        options,
+    )
+    .map(|(provider, _)| provider)
+}
+
+/// Build the routed provider together with the exact immutable route resolver
+/// it uses. Agent turn metadata can therefore resolve the serving profile and
+/// model without maintaining a second hint table.
+pub fn create_routed_model_provider_with_options_and_resolver(
+    config: &zeroclaw_config::schema::Config,
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
+    default_model: &str,
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<(Box<dyn ModelProvider>, Arc<router::ModelRouteResolver>)> {
+    // Config map editing creates a default route entry and then fills its
+    // required fields through separate writes. Such a staged entry is not yet
+    // a routing fact: omit it from the materialized provider/resolver until all
+    // three identity fields are present. `Config::validate` remains the
+    // canonical persisted-config gate and still rejects incomplete routes.
+    let materialized_routes: Vec<_> = model_routes
+        .iter()
+        .filter(|route| {
+            !route.hint.trim().is_empty()
+                && !route.model_provider.trim().is_empty()
+                && !route.model.trim().is_empty()
+        })
+        .collect();
+
+    if materialized_routes.is_empty() {
+        let provider = create_resilient_model_provider_from_ref_with_model_override(
             config,
             primary_name,
             api_key,
@@ -2091,12 +2132,18 @@ pub fn create_routed_model_provider_with_options(
             reliability,
             options,
             Some(default_model),
-        );
+        )?;
+        let resolver = Arc::new(router::ModelRouteResolver::new(
+            Vec::new(),
+            primary_name.to_string(),
+            default_model.to_string(),
+        ));
+        return Ok((provider, resolver));
     }
 
     // Collect unique model_provider names needed
     let mut needed: Vec<String> = vec![primary_name.to_string()];
-    for route in model_routes {
+    for route in &materialized_routes {
         if !needed.iter().any(|n| n == &route.model_provider) {
             needed.push(route.model_provider.clone());
         }
@@ -2109,7 +2156,7 @@ pub fn create_routed_model_provider_with_options(
     let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
     for name in &needed {
         let is_primary = name == primary_name;
-        let routed_credential = model_routes
+        let routed_credential = materialized_routes
             .iter()
             .find(|r| &r.model_provider == name)
             .and_then(|r| {
@@ -2152,6 +2199,17 @@ pub fn create_routed_model_provider_with_options(
                 .and_then(|s| s.model_entry),
         );
 
+        let nested_model_override = name
+            .splitn(3, '.')
+            .nth(2)
+            .and_then(|_| config.resolve_model_selection(name))
+            .and_then(|selection| selection.model_id);
+        let model_override = if is_primary {
+            Some(default_model)
+        } else {
+            nested_model_override.as_deref()
+        };
+
         match create_resilient_model_provider_from_ref_with_model_override(
             config,
             name,
@@ -2159,7 +2217,7 @@ pub fn create_routed_model_provider_with_options(
             url,
             reliability,
             &entry_options,
-            is_primary.then_some(default_model),
+            model_override,
         ) {
             Ok(model_provider) => model_providers.push((name.clone(), model_provider)),
             Err(e) => {
@@ -2169,7 +2227,7 @@ pub fn create_routed_model_provider_with_options(
     }
 
     // Build route table
-    let routes: Vec<(String, router::Route)> = model_routes
+    let routes: Vec<(String, router::Route)> = materialized_routes
         .iter()
         .map(|r| {
             (
@@ -2185,12 +2243,14 @@ pub fn create_routed_model_provider_with_options(
         })
         .collect();
 
-    Ok(Box::new(router::RouterModelProvider::new(
+    let router = router::RouterModelProvider::new(
         primary_name,
         model_providers,
         routes,
         default_model.to_string(),
-    )))
+    );
+    let resolver = router.route_resolver();
+    Ok((Box::new(router), resolver))
 }
 
 /// Information about a supported model model_provider for display purposes.
@@ -3423,6 +3483,115 @@ mod tests {
             .take()
             .expect("server should capture request");
         assert_eq!(model, "new-model");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn routed_nested_alias_pins_the_selected_model_entry() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{
+            CustomModelProviderConfig, ModelEntryConfig, ModelProviderConfig, ModelRouteConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        type Capture = Arc<Mutex<Option<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            *capture.lock().expect("capture lock poisoned") = body
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat_request))
+            .with_state(capture.clone());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "source".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-source".to_string()),
+                    model: Some("source-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.custom.insert(
+            "primary".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-route".to_string()),
+                    uri: Some(format!("http://{addr}/v1")),
+                    model: Some("legacy-profile-model".to_string()),
+                    models: std::collections::HashMap::from([(
+                        "fast".to_string(),
+                        ModelEntryConfig {
+                            id: Some("nested-fast-model".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
+        );
+        let routes = [ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: "custom.primary.fast".to_string(),
+            model: "nested-fast-model".to_string(),
+            api_key: None,
+        }];
+        let provider = create_routed_model_provider_with_options(
+            &config,
+            "openai.source",
+            Some("sk-source"),
+            None,
+            &config.reliability,
+            &routes,
+            "source-model",
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("routed provider should build");
+        let messages = vec![ChatMessage::user("hello")];
+
+        provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "hint:fast",
+                None,
+            )
+            .await
+            .expect("routed chat should succeed");
+
+        assert_eq!(
+            capture.lock().expect("capture lock poisoned").as_deref(),
+            Some("nested-fast-model"),
+            "the routed provider must pin the nested entry, not the legacy profile model"
+        );
         server.abort();
     }
 
@@ -4771,6 +4940,41 @@ mod tests {
         };
         config.agents.insert("test_agent".to_string(), agent);
         config
+    }
+
+    #[test]
+    fn routed_model_provider_omits_incomplete_staged_routes() {
+        let config = config_with_openai_alias();
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        let routes = [
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "staged".into(),
+                model_provider: String::new(),
+                model: String::new(),
+                api_key: None,
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "ready".into(),
+                model_provider: "openai.alias".into(),
+                model: "gpt-4o".into(),
+                api_key: None,
+            },
+        ];
+
+        let (_, resolver) = create_routed_model_provider_with_options_and_resolver(
+            &config,
+            "openai.alias",
+            Some("fallback-key"),
+            None,
+            &reliability,
+            &routes,
+            "gpt-4o",
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("an incomplete staged route must not poison ready routes");
+
+        assert!(!resolver.has_hint("staged"));
+        assert!(resolver.has_hint("ready"));
     }
 
     #[test]
