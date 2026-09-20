@@ -4792,8 +4792,15 @@ impl Config {
         let selection = self.resolve_model_selection(model_provider_ref);
         let selected_model = selected_model.trim();
         let configured_window = selection.and_then(|selection| {
-            let resolved_model = selection.model_id.as_deref().map(str::trim);
-            if selected_model.is_empty() || resolved_model == Some(selected_model) {
+            let resolved_model = selection
+                .model_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty());
+            if selected_model.is_empty()
+                || resolved_model.is_none()
+                || resolved_model == Some(selected_model)
+            {
                 return selection
                     .model_entry
                     .and_then(|entry| entry.context_window)
@@ -5043,8 +5050,8 @@ impl Config {
     #[must_use]
     pub fn model_provider_for_agent(&self, agent_alias: &str) -> Option<&ModelProviderConfig> {
         let agent = self.agents.get(agent_alias)?;
-        let (type_key, alias_key) = provider_profile_ref(&agent.model_provider)?;
-        self.providers.models.find(type_key, alias_key)
+        self.resolve_model_selection(&agent.model_provider)
+            .map(|selection| selection.entry)
     }
 
     /// Resolve `(provider_type, provider_alias, &ModelProviderConfig)` for an
@@ -5060,19 +5067,18 @@ impl Config {
         agent_alias: &str,
     ) -> Option<(&'static str, &str, &ModelProviderConfig)> {
         let agent = self.agents.get(agent_alias)?;
-        let (type_key, alias_key) = provider_profile_ref(&agent.model_provider)?;
-        self.providers
-            .models
-            .iter_entries()
-            .find(|(ty, al, _)| *ty == type_key && *al == alias_key)
+        self.resolve_model_selection(&agent.model_provider)
+            .map(|selection| (selection.family, selection.alias, selection.entry))
     }
 
     /// Resolve a model_provider reference into its provider profile, the
     /// selected model entry (if any), and the provider-local model id to send.
     ///
     /// Accepts two reference shapes:
-    /// - Three segments `<family>.<alias>.<model_alias>` — selects the named
-    ///   entry under the provider profile's `models` map.
+    /// - Three or more segments first resolve the longest configured provider
+    ///   alias. An exact alias wins; otherwise the remaining suffix selects a
+    ///   named entry under the provider profile's `models` map. This preserves
+    ///   legacy aliases containing dots while supporting nested model refs.
     /// - Two segments `<family>.<alias>` — selects a model entry by these
     ///   rules, in order: the entry named `default`; else, when exactly one
     ///   entry exists, that sole entry; else the provider profile's own `model`
@@ -5090,17 +5096,30 @@ impl Config {
         &'a self,
         model_provider_ref: &str,
     ) -> Option<ModelSelection<'a>> {
-        let mut parts = model_provider_ref.splitn(3, '.');
-        let family = parts.next()?;
-        let alias = parts.next()?;
-        let model_alias = parts.next();
+        let (family, tail) = model_provider_ref.split_once('.')?;
+        if family.is_empty() || tail.is_empty() {
+            return None;
+        }
 
-        let entry = self.providers.models.find(family, alias)?;
-        let (family_key, alias_str, _) = self
+        // Provider aliases historically may contain dots. Match the longest
+        // configured alias prefix so an exact legacy alias wins over treating
+        // its final segment as a nested model selector.
+        let (family_key, alias_str, entry) = self
             .providers
             .models
             .iter_entries()
-            .find(|(ty, al, _)| *ty == family && *al == alias)?;
+            .filter(|(ty, alias, _)| {
+                *ty == family
+                    && (tail == *alias
+                        || tail
+                            .strip_prefix(*alias)
+                            .is_some_and(|suffix| suffix.starts_with('.') && suffix.len() > 1))
+            })
+            .max_by_key(|(_, alias, _)| alias.len())?;
+        let model_alias = tail
+            .strip_prefix(alias_str)?
+            .strip_prefix('.')
+            .filter(|model_alias| !model_alias.is_empty());
 
         let model_entry: Option<(&str, &ModelEntryConfig)> = match model_alias {
             // Three-segment ref: the named entry must exist.
@@ -27230,6 +27249,24 @@ mod tests {
         );
         assert_eq!(unknown_override.context_token_budget, 28_800);
 
+        // A fallback alias may deliberately leave `model` unset so it can
+        // serve the model requested from the primary while retaining its own
+        // endpoint metadata. Its capacity still belongs to that accepted
+        // alias and must not degrade to the compatibility fallback.
+        cfg.providers.models.custom.insert(
+            "backup".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    context_window: Some(8_000),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let unpinned_fallback =
+            cfg.resolved_context_limits_for_route("coder", "custom.backup", "large-model");
+        assert_eq!(unpinned_fallback.model_context_window, 8_000);
+        assert_eq!(unpinned_fallback.context_token_budget, 7_200);
+
         cfg.providers.models.custom.insert(
             "multi".to_string(),
             CustomModelProviderConfig {
@@ -47129,7 +47166,24 @@ id = "claude-sonnet-4-5"
 [providers.models.groq.legacy]
 model = "llama-3.3-70b"
 "#;
-        let config: Config = toml::from_str(raw).unwrap();
+        let mut config: Config = toml::from_str(raw).unwrap();
+
+        // Existing provider aliases may contain dots. An exact configured
+        // alias takes precedence over interpreting its suffix as a nested
+        // model selector.
+        let dotted = config
+            .providers
+            .models
+            .ensure("openrouter", "glm-5.2")
+            .expect("known provider family");
+        dotted.model = Some("glm-5.2".to_string());
+        dotted.context_window = Some(1_000_000);
+        let sel = config
+            .resolve_model_selection("openrouter.glm-5.2")
+            .expect("exact dotted alias resolves");
+        assert_eq!(sel.alias, "glm-5.2");
+        assert_eq!(sel.model_alias, None);
+        assert_eq!(sel.model_id.as_deref(), Some("glm-5.2"));
 
         // Three-segment: selects the named entry and its id.
         let sel = config.resolve_model_selection("openai.gw.fast").unwrap();
