@@ -871,6 +871,31 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn powershell_hidden_redirected_output_decodes_stdout_and_stderr_as_utf8() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = ShellTool::new(security, runtime);
+        let command = "[Console]::Write('标准输出'); $bytes = [Text.Encoding]::UTF8.GetBytes('标准错误'); [Console]::OpenStandardError().Write($bytes, 0, $bytes.Length)";
+
+        let result = tool
+            .execute(json!({"command": command, "approved": true}))
+            .await
+            .expect("PowerShell execution should return a result");
+
+        assert!(result.success, "PowerShell command failed: {result:?}");
+        assert_eq!(result.output, "标准输出");
+        assert_eq!(result.error.as_deref(), Some("标准错误"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn shell_executes_windows_nul_redirect_through_cmd_exe() {
         // Native-Windows runtime boundary through the FULLY WRAPPED production
         // shape (`RateLimitedTool<ShellTool>`). `test_runtime()` is
