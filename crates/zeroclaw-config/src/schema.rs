@@ -4879,33 +4879,19 @@ impl Config {
     /// of the agent-alias variant when the live provider identity is
     /// known (e.g., from `Agent.attribution_fields().1` or
     /// `SessionOverrides.model_provider`). Returns `None` when the
-    /// ref is unparseable, the entry has no `context_window`, or the
-    /// served model does not match the entry's configured primary
-    /// `model`, so the wire omission path preserves absence (no 32k
-    /// stub leak) and fallback/vision/override models never borrow
-    /// another model's capacity.
+    /// ref is unparseable, the selected profile or nested entry has no
+    /// `context_window`, or the served model cannot be matched to that
+    /// selection, so the wire omission path preserves absence (no 32k stub
+    /// leak) and fallback/vision/override models never borrow another model's
+    /// capacity.
     #[must_use]
     pub fn model_provider_context_window_opt(
         &self,
         provider_ref: &str,
         model: &str,
     ) -> Option<usize> {
-        let (type_key, alias_key) = provider_ref.split_once('.')?;
-        let (_, _, cfg) = self
-            .providers
-            .models
-            .iter_entries()
-            .find(|(ty, al, _)| *ty == type_key && *al == alias_key)?;
-        let configured = cfg
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())?;
-        let served = model.trim();
-        if served.is_empty() || configured != served {
-            return None;
-        }
-        cfg.context_window
+        let resolved = self.resolved_model_context_window_for_route(provider_ref, model);
+        (resolved.source == ModelContextWindowSource::Configured).then_some(resolved.tokens)
     }
 
     #[must_use]
@@ -27301,6 +27287,15 @@ mod tests {
             cfg.resolved_context_limits_for_route("coder", "custom.multi", "nested-fast-model");
         assert_eq!(normalized, nested);
         assert_eq!(cfg.effective_model_context_window("coder"), 16_000);
+        assert_eq!(
+            cfg.model_provider_context_window_opt("custom.multi.fast", "nested-fast-model"),
+            Some(16_000)
+        );
+        assert_eq!(
+            cfg.model_provider_context_window_opt("custom.multi", "nested-fast-model"),
+            Some(16_000),
+            "wire attribution normalizes the provider ref but must retain nested capacity"
+        );
     }
 
     /// The whole point of splitting the accessor: an operator-facing caller

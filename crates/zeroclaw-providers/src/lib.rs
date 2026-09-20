@@ -2111,15 +2111,17 @@ pub fn create_routed_model_provider_with_options_and_resolver(
 ) -> anyhow::Result<(Box<dyn ModelProvider>, Arc<router::ModelRouteResolver>)> {
     // Config map editing creates a default route entry and then fills its
     // required fields through separate writes. Such a staged entry is not yet
-    // a routing fact: omit it from the materialized provider/resolver until all
-    // three identity fields are present. `Config::validate` remains the
-    // canonical persisted-config gate and still rejects incomplete routes.
+    // a routing fact: omit it from the materialized provider/resolver until the
+    // hint, provider ref, and effective model are present. The effective model
+    // may come from a three-segment provider ref when `model` is omitted.
+    // `Config::validate` remains the canonical persisted-config gate and still
+    // rejects incomplete routes.
     let materialized_routes: Vec<_> = model_routes
         .iter()
         .filter(|route| {
             !route.hint.trim().is_empty()
                 && !route.model_provider.trim().is_empty()
-                && !route.model.trim().is_empty()
+                && !route.effective_model(config).trim().is_empty()
         })
         .collect();
 
@@ -3487,7 +3489,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routed_nested_alias_pins_the_selected_model_entry() {
+    async fn routed_nested_alias_with_implicit_model_pins_the_selected_entry() {
         use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
         use serde_json::{Value, json};
         use std::sync::{Arc, Mutex};
@@ -3558,7 +3560,7 @@ mod tests {
         let routes = [ModelRouteConfig {
             hint: "fast".to_string(),
             model_provider: "custom.primary.fast".to_string(),
-            model: "nested-fast-model".to_string(),
+            model: String::new(),
             api_key: None,
         }];
         let provider = create_routed_model_provider_with_options(
