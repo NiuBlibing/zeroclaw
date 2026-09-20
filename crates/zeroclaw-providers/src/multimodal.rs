@@ -2191,15 +2191,15 @@ async fn normalize_local_image_cached(
     };
     let cache_len = if is_immutable { 0 } else { file_len };
 
-    if let Some(cached) = cache.get(source, cache_len, mtime) {
-        return Ok(cached.to_string());
-    }
-
     validate_size(
         source,
         usize::try_from(file_len).unwrap_or(usize::MAX),
         max_bytes,
     )?;
+
+    if let Some(cached) = cache.get(source, cache_len, mtime) {
+        return Ok(cached.to_string());
+    }
 
     let bytes = tokio::fs::read(path)
         .await
@@ -3722,6 +3722,35 @@ mod tests {
             .unwrap();
         assert!(!missing_again.contains_images);
         assert_eq!(cache.reported_failures.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_local_image_honors_the_current_size_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("cached.png");
+        let image = valid_png();
+        std::fs::write(&image_path, &image).unwrap();
+        let reference = image_path.to_string_lossy().to_string();
+        let mut cache = LocalImageCache::new();
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+
+        normalize_local_image_cached(&reference, image.len(), &mut cache, &mut budget)
+            .await
+            .expect("the initial request should populate the cache");
+
+        let error =
+            normalize_local_image_cached(&reference, image.len() - 1, &mut cache, &mut budget)
+                .await
+                .expect_err("a lowered live limit must still reject the cached image");
+
+        assert!(matches!(
+            error.downcast_ref::<MultimodalError>(),
+            Some(MultimodalError::ImageTooLarge {
+                size_bytes,
+                max_bytes,
+                ..
+            }) if *size_bytes == image.len() && *max_bytes == image.len() - 1
+        ));
     }
 
     /// Canonical 1x1 PNG payload: 68 characters, a multiple of four, standard
