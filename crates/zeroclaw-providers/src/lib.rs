@@ -120,12 +120,13 @@ impl Drop for RuntimeProxyTestGuard {
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
-    ProviderCapabilityError, ToolCall, ToolResultMessage,
+    ProviderCapabilityError, ToolCall, ToolResultMessage, durable_chat_messages,
 };
 
 use reliable::{ReliableModelProvider, ReliableModelProviderEntry};
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const MAX_API_ERROR_CHARS: usize = 500;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
@@ -716,6 +717,11 @@ pub struct ModelProviderRuntimeOptions {
     /// message) into request bodies and capture gateway-reported cache
     /// usage. Propagated from `ModelProviderConfig::cache_passthrough`.
     pub cache_passthrough: bool,
+    /// Prompt-cache entry lifetime for providers that place Anthropic
+    /// cache markers (native Anthropic; compatible ones behind
+    /// `cache_passthrough`). `None` keeps the 5-minute default.
+    /// Propagated from `ModelProviderConfig::cache_ttl`.
+    pub cache_ttl: Option<zeroclaw_config::schema::CacheTtl>,
     /// When set, the provider is asked to use its native tool-calling
     /// schema instead of OpenAI-compat tool calls. Generic across families.
     pub native_tools: Option<bool>,
@@ -771,6 +777,7 @@ impl Default for ModelProviderRuntimeOptions {
             provider_extra: None,
             replay_assistant_reasoning: None,
             cache_passthrough: false,
+            cache_ttl: None,
             native_tools: None,
             wire_api: None,
             think: None,
@@ -837,6 +844,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
         cache_passthrough: entry.is_some_and(|e| e.cache_passthrough),
+        cache_ttl: entry.and_then(|e| e.cache_ttl),
         native_tools: entry.and_then(|e| e.native_tools),
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
@@ -914,6 +922,12 @@ pub fn options_for_provider_ref(
             // fallback family must use its own default rather than inherit
             // the previous provider alias's policy.
             options.tool_result_image_policy = Default::default();
+            // Cache settings are provider-entry opt-ins: `cache_ttl` is a
+            // paid lifetime choice and `cache_passthrough` gates marker
+            // injection, so a bare family ref must not inherit another
+            // alias's cache opt-ins (there is no entry to turn them off on).
+            options.cache_ttl = None;
+            options.cache_passthrough = false;
             // `multimodal` is deliberately NOT reset: it is the root
             // `[multimodal]` section, identical for every alias, so a bare
             // family ref inherits the same operator policy rather than
@@ -2020,8 +2034,48 @@ pub fn create_routed_model_provider_with_options(
     default_model: &str,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
-    if model_routes.is_empty() {
-        return create_resilient_model_provider_from_ref_with_model_override(
+    create_routed_model_provider_with_options_and_resolver(
+        config,
+        primary_name,
+        api_key,
+        api_url,
+        reliability,
+        model_routes,
+        default_model,
+        options,
+    )
+    .map(|(provider, _)| provider)
+}
+
+/// Build the routed provider together with the exact immutable route resolver
+/// it uses. Agent turn metadata can therefore resolve the serving profile and
+/// model without maintaining a second hint table.
+pub fn create_routed_model_provider_with_options_and_resolver(
+    config: &zeroclaw_config::schema::Config,
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
+    default_model: &str,
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<(Box<dyn ModelProvider>, Arc<router::ModelRouteResolver>)> {
+    // Config map editing creates a default route entry and then fills its
+    // required fields through separate writes. Such a staged entry is not yet
+    // a routing fact: omit it from the materialized provider/resolver until all
+    // three identity fields are present. `Config::validate` remains the
+    // canonical persisted-config gate and still rejects incomplete routes.
+    let materialized_routes: Vec<_> = model_routes
+        .iter()
+        .filter(|route| {
+            !route.hint.trim().is_empty()
+                && !route.model_provider.trim().is_empty()
+                && !route.model.trim().is_empty()
+        })
+        .collect();
+
+    if materialized_routes.is_empty() {
+        let provider = create_resilient_model_provider_from_ref_with_model_override(
             config,
             primary_name,
             api_key,
@@ -2029,12 +2083,18 @@ pub fn create_routed_model_provider_with_options(
             reliability,
             options,
             Some(default_model),
-        );
+        )?;
+        let resolver = Arc::new(router::ModelRouteResolver::new(
+            Vec::new(),
+            primary_name.to_string(),
+            default_model.to_string(),
+        ));
+        return Ok((provider, resolver));
     }
 
     // Collect unique model_provider names needed
     let mut needed: Vec<String> = vec![primary_name.to_string()];
-    for route in model_routes {
+    for route in &materialized_routes {
         if !needed.iter().any(|n| n == &route.model_provider) {
             needed.push(route.model_provider.clone());
         }
@@ -2047,7 +2107,7 @@ pub fn create_routed_model_provider_with_options(
     let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
     for name in &needed {
         let is_primary = name == primary_name;
-        let routed_credential = model_routes
+        let routed_credential = materialized_routes
             .iter()
             .find(|r| &r.model_provider == name)
             .and_then(|r| {
@@ -2096,7 +2156,7 @@ pub fn create_routed_model_provider_with_options(
     }
 
     // Build route table
-    let routes: Vec<(String, router::Route)> = model_routes
+    let routes: Vec<(String, router::Route)> = materialized_routes
         .iter()
         .map(|r| {
             (
@@ -2109,12 +2169,14 @@ pub fn create_routed_model_provider_with_options(
         })
         .collect();
 
-    Ok(Box::new(router::RouterModelProvider::new(
+    let router = router::RouterModelProvider::new(
         primary_name,
         model_providers,
         routes,
         default_model.to_string(),
-    )))
+    );
+    let resolver = router.route_resolver();
+    Ok((Box::new(router), resolver))
 }
 
 /// Information about a supported model model_provider for display purposes.
@@ -2992,6 +3054,66 @@ mod tests {
         // `[multimodal]` is root-scoped, so unlike the provider-specific
         // `tool_result_image_policy` it must survive a bare family ref.
         assert_eq!(options.multimodal.max_images, 1);
+    }
+
+    #[test]
+    fn cache_ttl_config_field_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{CacheTtl, Config, ModelProviderConfig};
+        let entry = ModelProviderConfig {
+            cache_ttl: Some(CacheTtl::OneHour),
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert_eq!(opts.cache_ttl, Some(CacheTtl::OneHour));
+        let defaults =
+            model_provider_runtime_options_from_model_provider_entry(&Config::default(), None);
+        assert_eq!(defaults.cache_ttl, None);
+    }
+
+    #[test]
+    fn bare_family_provider_ref_does_not_inherit_cache_settings() {
+        use zeroclaw_config::schema::{
+            AnthropicModelProviderConfig, CacheTtl, Config, ModelProviderConfig,
+        };
+        let mut config = Config::default();
+        config.multimodal.max_images = 1;
+        // The fallback alias opted into paid caching; a bare family ref has
+        // no entry that could hold (or turn off) those settings, so it must
+        // not inherit them.
+        let fallback = model_provider_runtime_options_from_model_provider_entry(
+            &config,
+            Some(&ModelProviderConfig {
+                cache_ttl: Some(CacheTtl::OneHour),
+                cache_passthrough: true,
+                ..Default::default()
+            }),
+        );
+
+        let options = options_for_provider_ref(&config, "anthropic", &fallback);
+        assert_eq!(options.cache_ttl, None);
+        assert!(!options.cache_passthrough);
+        // Root-scoped `[multimodal]` keeps its bare-ref inheritance.
+        assert_eq!(options.multimodal.max_images, 1);
+
+        // Dotted control: an explicit alias entry still resolves with its
+        // own cache settings, not the fallback alias's.
+        config.providers.models.anthropic.insert(
+            "direct".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    cache_ttl: Some(CacheTtl::FiveMinutes),
+                    cache_passthrough: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let dotted = options_for_provider_ref(&config, "anthropic.direct", &fallback);
+        assert_eq!(dotted.cache_ttl, Some(CacheTtl::FiveMinutes));
+        assert!(!dotted.cache_passthrough);
     }
 
     #[test]
@@ -4695,6 +4817,41 @@ mod tests {
         };
         config.agents.insert("test_agent".to_string(), agent);
         config
+    }
+
+    #[test]
+    fn routed_model_provider_omits_incomplete_staged_routes() {
+        let config = config_with_openai_alias();
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        let routes = [
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "staged".into(),
+                model_provider: String::new(),
+                model: String::new(),
+                api_key: None,
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "ready".into(),
+                model_provider: "openai.alias".into(),
+                model: "gpt-4o".into(),
+                api_key: None,
+            },
+        ];
+
+        let (_, resolver) = create_routed_model_provider_with_options_and_resolver(
+            &config,
+            "openai.alias",
+            Some("fallback-key"),
+            None,
+            &reliability,
+            &routes,
+            "gpt-4o",
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("an incomplete staged route must not poison ready routes");
+
+        assert!(!resolver.has_hint("staged"));
+        assert!(resolver.has_hint("ready"));
     }
 
     #[test]

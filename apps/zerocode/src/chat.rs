@@ -510,6 +510,18 @@ struct PromptCompletion {
     transport_closed: bool,
 }
 
+/// Map a wire `token_source` value ("provider"/"estimate"/"calibrated") to the
+/// Fluent key whose localized label describes that provenance. Unknown values
+/// (older or future daemons) fall back to a label-less render.
+fn token_source_fluent_key(source: &str) -> String {
+    match source {
+        "provider" => "zc-chat-history-trimmed-token-source-provider".to_string(),
+        "estimate" => "zc-chat-history-trimmed-token-source-estimate".to_string(),
+        "calibrated" => "zc-chat-history-trimmed-token-source-calibrated".to_string(),
+        other => format!("zc-chat-history-trimmed-token-source-{other}"),
+    }
+}
+
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
     matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
 }
@@ -4553,10 +4565,15 @@ impl Chat {
         }
     }
 
-    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>) {
+    /// Returns `(input_tokens, trim_budget, model_window)` for the context bar.
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
         match &self.phase {
-            ChatPhase::Active(s) => (s.context_input_tokens, s.context_max_tokens),
-            _ => (None, None),
+            ChatPhase::Active(s) => (
+                s.context_input_tokens,
+                s.context_max_tokens,
+                s.context_model_window,
+            ),
+            _ => (None, None, None),
         }
     }
 
@@ -7823,8 +7840,11 @@ pub struct ChatState {
     /// provider (input + cached + output) is added on arrival. Cleared on
     /// session reset only.
     pub context_input_tokens: Option<u64>,
-    /// Configured context limit for this session's model.
+    /// Preemptive-trim budget for this session (the bar fills toward this).
     pub context_max_tokens: Option<u64>,
+    /// Model's full context window; when present, the bar denominator so the
+    /// trim budget shows as a marker rather than the 100% point.
+    pub context_model_window: Option<u64>,
     /// Outbound message queue; the front dispatches when the session is free.
     message_queue: VecDeque<QueuedMessage>,
     /// Monotonic id source for queued messages.
@@ -7937,6 +7957,7 @@ impl ChatState {
             cached_total_rows: 0,
             context_input_tokens: None,
             context_max_tokens: None,
+            context_model_window: None,
             message_queue: VecDeque::new(),
             next_queue_id: 0,
             queue_paused: false,
@@ -9326,30 +9347,90 @@ impl ChatState {
                 model_context_window,
                 ..
             } => {
-                // input_tokens=None on the accepted Usage means "unknown" for this
-                // route; don't carry a stale value from a previous route.
                 self.context_input_tokens = input_tokens;
-                // Use model_context_window for display (actual model window),
-                // fall back to max_context_tokens (trim budget) if not provided.
-                if model_context_window.is_some() {
-                    self.context_max_tokens = model_context_window;
-                } else if max_context_tokens.is_some() {
-                    self.context_max_tokens = max_context_tokens;
-                }
+                // Budget and capacity are one authoritative per-call snapshot.
+                // In particular, `None` capacity is meaningful: compatibility
+                // fallback routes omit it and must clear a prior configured
+                // route's denominator instead of retaining stale state.
+                self.context_max_tokens = max_context_tokens;
+                self.context_model_window = model_context_window;
             }
             SessionUpdate::HistoryTrimmed {
                 dropped_messages,
                 kept_turns,
                 reason,
+                token_budget,
+                tokens_before,
+                tokens_after,
+                tokens_before_source,
+                tokens_after_source,
+                unsatisfiable_floor,
                 ..
             } => {
                 self.freeze_prompt_settled_stream();
                 let dropped = dropped_messages.to_string();
                 let kept = kept_turns.to_string();
-                let notice = crate::i18n::t_args(
-                    "zc-chat-history-trimmed",
-                    &[("reason", &reason), ("dropped", &dropped), ("kept", &kept)],
-                );
+                // The unsatisfiable newest-turn/schema floor is flagged
+                // explicitly by the runtime: the retained request cannot fit
+                // the configured budget even though history MAY have been
+                // trimmed on the way to that floor, so the notice must not
+                // claim a successful trim.
+                let at_floor = unsatisfiable_floor == Some(true);
+                let notice = if at_floor {
+                    crate::i18n::t_args(
+                        "zc-chat-history-trimmed-floor",
+                        &[
+                            ("reason", &reason),
+                            ("after", &tokens_after.unwrap_or_default().to_string()),
+                            ("budget", &token_budget.unwrap_or_default().to_string()),
+                        ],
+                    )
+                } else {
+                    match (tokens_before, tokens_after) {
+                        (Some(before), Some(after)) => {
+                            let mut notice = crate::i18n::t_args(
+                                "zc-chat-history-trimmed-tokens",
+                                &[
+                                    ("reason", &reason),
+                                    ("before", &before.to_string()),
+                                    ("after", &after.to_string()),
+                                    ("dropped", &dropped),
+                                    ("kept", &kept),
+                                ],
+                            );
+                            // The configured budget is context, never the trim
+                            // target: recovery trims toward a provider-overflow
+                            // target, so the notice must not present the
+                            // configured limit as governing the trim.
+                            if let Some(budget) = token_budget {
+                                notice.push_str(&crate::i18n::t_args(
+                                    "zc-chat-history-trimmed-token-budget-clause",
+                                    &[("budget", &budget.to_string())],
+                                ));
+                            }
+                            let before_label = tokens_before_source.as_deref().and_then(|source| {
+                                crate::i18n::try_t(&token_source_fluent_key(source))
+                            });
+                            let after_label = tokens_after_source.as_deref().and_then(|source| {
+                                crate::i18n::try_t(&token_source_fluent_key(source))
+                            });
+                            if let (Some(before_label), Some(after_label)) =
+                                (before_label, after_label)
+                            {
+                                notice.push(' ');
+                                notice.push_str(&crate::i18n::t_args(
+                                    "zc-chat-history-trimmed-token-sources",
+                                    &[("before", &before_label), ("after", &after_label)],
+                                ));
+                            }
+                            notice
+                        }
+                        _ => crate::i18n::t_args(
+                            "zc-chat-history-trimmed",
+                            &[("reason", &reason), ("dropped", &dropped), ("kept", &kept)],
+                        ),
+                    }
+                };
                 self.entries
                     .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
                 self.mark_dirty_append();
@@ -10243,6 +10324,7 @@ impl ChatState {
         // ContextUsage event.
         self.context_input_tokens = None;
         self.context_max_tokens = None;
+        self.context_model_window = None;
         // The TodoWrite plan is per-session; drop it (and its show/hide state)
         // so a switched-to session doesn't inherit the previous plan's tasks.
         // Rebuilding from freshly resolved settings also applies any Config-pane
@@ -10400,6 +10482,32 @@ mod tests {
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    #[test]
+    fn context_usage_clears_stale_capacity_when_next_route_omits_it() {
+        let mut state = state();
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(100_000),
+            max_context_tokens: Some(180_000),
+            model_context_window: Some(200_000),
+        });
+        assert_eq!(state.context_max_tokens, Some(180_000));
+        assert_eq!(state.context_model_window, Some(200_000));
+
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(12_000),
+            max_context_tokens: Some(32_000),
+            model_context_window: None,
+        });
+        assert_eq!(state.context_input_tokens, Some(12_000));
+        assert_eq!(state.context_max_tokens, Some(32_000));
+        assert_eq!(
+            state.context_model_window, None,
+            "a compatibility-fallback frame must clear the prior route's capacity"
+        );
     }
 
     fn resume_entry(session_id: &str, agent_alias: &str, was_focused: bool) -> ResumeEntry {
@@ -11723,48 +11831,6 @@ mod tests {
         let (_body, tracker) = carve_todo_area(&t, full);
         let tracker = tracker.expect("side panel visible");
         assert!(tracker.width <= full.width / 2, "clamped to <= 50% width");
-    }
-
-    #[test]
-    fn context_usage_client_prefers_model_window_then_falls_back() {
-        let mut s = state();
-        s.context_max_tokens = None;
-        s.context_input_tokens = None;
-
-        s.apply_update(SessionUpdate::ContextUsage {
-            session_id: "sess-1".into(),
-            input_tokens: Some(100),
-            max_context_tokens: Some(800_000),
-            model_context_window: Some(1_000_000),
-        });
-        assert_eq!(
-            s.context_max_tokens,
-            Some(1_000_000),
-            "client must prefer model_context_window (provider capacity) for the meter ceiling"
-        );
-        assert_eq!(
-            s.context_input_tokens,
-            Some(100),
-            "input_tokens must be reported as-is"
-        );
-
-        s.context_max_tokens = None;
-        s.apply_update(SessionUpdate::ContextUsage {
-            session_id: "sess-1".into(),
-            input_tokens: Some(250),
-            max_context_tokens: Some(800_000),
-            model_context_window: None,
-        });
-        assert_eq!(
-            s.context_max_tokens,
-            Some(800_000),
-            "legacy payload (no model_context_window) must fall back to max_context_tokens"
-        );
-        assert_eq!(
-            s.context_input_tokens,
-            Some(250),
-            "input_tokens must be updated on the legacy payload too"
-        );
     }
 
     async fn next_rpc_request(rx: &mut mpsc::Receiver<String>, reason: &str) -> serde_json::Value {
@@ -17614,6 +17680,12 @@ mod tests {
             dropped_messages: 12,
             kept_turns: 3,
             reason: "history message limit exceeded".to_string(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
         });
 
         assert!(matches!(
@@ -17622,6 +17694,203 @@ mod tests {
                 if text.contains("history message limit exceeded")
                     && text.contains("12")
                     && text.contains("3")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_token_accounting_renders_in_notice() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 12,
+            kept_turns: 33,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(500_000),
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("configured token budget: 500000")
+                    && text.contains("context token budget exceeded")
+                    && text.contains("12")
+                    && text.contains("33")
+                    && text.contains("provider")
+                    && text.contains("estimate")
+                    && text.contains("before")
+                    && text.contains("after")
+                    && !text.contains("against a")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_recovery_below_configured_budget_does_not_claim_budget_governed() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 4,
+            kept_turns: 2,
+            reason: "context window overflow recovery".to_string(),
+            token_budget: Some(500_000),
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("context window overflow recovery")
+                    && text.contains("configured token budget: 500000")
+                    && !text.contains("against a")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_recovery_with_enforcement_disabled_renders_valid_counts() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 4,
+            kept_turns: 2,
+            reason: "context window overflow recovery".to_string(),
+            token_budget: None,
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("context window overflow recovery")
+                    && !text.contains("budget")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_untrimmable_floor_does_not_claim_history_changed() {
+        // The unsatisfiable newest-turn/schema floor carries the explicit
+        // `unsatisfiable_floor` flag while the projected `tokens_after`
+        // still exceeds the configured budget. The notice must not claim
+        // history was trimmed.
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 0,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(100_000),
+            tokens_before: Some(117_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("calibrated".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: Some(true),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("could not be trimmed below the configured token budget")
+                    && text.contains("117000")
+                    && text.contains("configured budget: 100000")
+                    && !text.contains("was trimmed:")
+                    && !text.contains("messages dropped")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_floor_with_real_drops_reports_both_facts() {
+        // A breadcrumb-induced floor after real turns were removed carries
+        // BOTH the honest drop count and the unsatisfiable flag; the notice
+        // must use the floor wording, not claim an ordinary successful trim.
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(100_000),
+            tokens_before: Some(200_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: Some(true),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("could not be trimmed below the configured token budget")
+                    && text.contains("configured budget: 100000")
+                    && !text.contains("Earlier conversation history was trimmed")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_without_flag_keeps_trimmed_wording_when_over_budget() {
+        // Older daemons never emit the flag; their events must keep rendering
+        // through the ordinary wording paths even when counts exceed the
+        // budget, so the flag alone drives the floor discriminator.
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 1,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(100_000),
+            tokens_before: Some(200_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("Earlier conversation history was trimmed")
+                    && !text.contains("could not be trimmed")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_estimated_sources_render_estimate_label() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(10_000),
+            tokens_before: Some(12_000),
+            tokens_after: Some(6_000),
+            tokens_before_source: Some("estimate".to_string()),
+            tokens_after_source: Some("estimate".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("estimated")
+                    && text.contains("estimated before")
+                    && text.contains("estimated after")
         ));
     }
 
