@@ -504,6 +504,13 @@ enum LiveSessionRefreshScope {
         old_ref: String,
         new_ref: String,
     },
+    /// A nested model alias rename within one provider profile. Persistent
+    /// referrers are rewritten by the config cascade, while transient session
+    /// overrides must be migrated here before their provider view is rebuilt.
+    ModelAliasRename {
+        old_ref: String,
+        new_ref: String,
+    },
 }
 
 impl LiveSessionRefreshScope {
@@ -577,8 +584,15 @@ impl LiveSessionRefreshScope {
                 // from config; a session carrying an explicit override still
                 // reads `old_ref`. Both name the same profile across the
                 // rename, so both rebuild against the new reference.
-                if effective_ref == old_ref || effective_ref == new_ref {
-                    return Ok(Some(new_ref.clone()));
+                if profile_ref_of(effective_ref) == *old_ref {
+                    let suffix = effective_ref
+                        .trim()
+                        .strip_prefix(old_ref)
+                        .unwrap_or_default();
+                    return Ok(Some(format!("{new_ref}{suffix}")));
+                }
+                if profile_ref_of(effective_ref) == *new_ref {
+                    return Ok(Some(effective_ref.to_string()));
                 }
                 // Otherwise the session keeps its own provider, but a route
                 // table that materializes the renamed alias still binds it
@@ -588,6 +602,26 @@ impl LiveSessionRefreshScope {
                     .iter()
                     .any(|route| model_route_materializes_provider(route, config, new_ref));
                 Ok(materialized_route_uses_target.then(|| effective_ref.to_string()))
+            }
+            Self::ModelAliasRename { old_ref, new_ref } => {
+                let effective_ref = overrides
+                    .model_provider
+                    .as_deref()
+                    .or_else(|| {
+                        config
+                            .agent(session_agent)
+                            .map(|agent| agent.model_provider.as_str())
+                    })
+                    .ok_or_else(|| format!("agent `{session_agent}` is not configured"))?;
+                if effective_ref == old_ref || effective_ref == new_ref {
+                    return Ok(Some(new_ref.clone()));
+                }
+                let route_uses_renamed_model = config.model_routes.iter().any(|route| {
+                    !route.hint.trim().is_empty()
+                        && route.model_provider.trim() == new_ref
+                        && !route.effective_model(config).trim().is_empty()
+                });
+                Ok(route_uses_renamed_model.then(|| effective_ref.to_string()))
             }
         }
     }
@@ -4571,6 +4605,14 @@ impl RpcDispatcher {
                     LiveSessionRefreshScope::ProviderAliasRename { old_ref, new_ref } => overrides
                         .model_provider
                         .as_deref()
+                        .filter(|current| profile_ref_of(current) == *old_ref)
+                        .map(|current| {
+                            let suffix = current.trim().strip_prefix(old_ref).unwrap_or_default();
+                            format!("{new_ref}{suffix}")
+                        }),
+                    LiveSessionRefreshScope::ModelAliasRename { old_ref, new_ref } => overrides
+                        .model_provider
+                        .as_deref()
                         .is_some_and(|current| current == old_ref)
                         .then(|| new_ref.clone()),
                     _ => None,
@@ -4821,7 +4863,7 @@ impl RpcDispatcher {
                     zeroclaw_config::alias_refs::AliasKind::Provider {
                         category: zeroclaw_config::alias_refs::ProviderCategory::Models,
                         ..
-                    }
+                    } | zeroclaw_config::alias_refs::AliasKind::ModelAlias { .. }
                 )
             });
 
@@ -4969,11 +5011,21 @@ impl RpcDispatcher {
             // `from` must be rebuilt against `to` on the same generation as
             // the config commit, the same as a `providers.models.*` field
             // edit already does.
-            let model_provider_family = match &kind {
+            let model_refresh_scope = match &kind {
                 zeroclaw_config::alias_refs::AliasKind::Provider {
                     category: zeroclaw_config::alias_refs::ProviderCategory::Models,
                     family,
-                } => Some(family.clone()),
+                } => Some(LiveSessionRefreshScope::ProviderAliasRename {
+                    old_ref: format!("{family}.{}", req.from),
+                    new_ref: format!("{family}.{}", req.to),
+                }),
+                zeroclaw_config::alias_refs::AliasKind::ModelAlias {
+                    family,
+                    profile_alias,
+                } => Some(LiveSessionRefreshScope::ModelAliasRename {
+                    old_ref: format!("{family}.{profile_alias}.{}", req.from),
+                    new_ref: format!("{family}.{profile_alias}.{}", req.to),
+                }),
                 _ => None,
             };
             if is_agent {
@@ -5019,14 +5071,11 @@ impl RpcDispatcher {
                 for path in &report.dirty_paths {
                     working.mark_dirty(path);
                 }
-                if let Some(family) = model_provider_family.as_ref() {
+                if let Some(scope) = model_refresh_scope.as_ref() {
                     Box::pin(self.commit_config_with_live_session_refresh(
                         working.clone(),
                         &config_write_guard,
-                        &LiveSessionRefreshScope::ProviderAliasRename {
-                            old_ref: format!("{family}.{}", req.from),
-                            new_ref: format!("{family}.{}", req.to),
-                        },
+                        scope,
                     ))
                     .await?;
                 } else {
@@ -15883,6 +15932,236 @@ mod tests {
             120_000,
             "reported capacity must come from the renamed alias on the same \
              generation that dispatch uses"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_preserves_nested_selection_in_live_and_saved_refs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let profile = config
+            .providers
+            .models
+            .ensure("openai", "nested_provider")
+            .expect("nested provider slot exists");
+        profile.api_key = Some("nested-key".into());
+        profile.uri = Some("http://127.0.0.1:1".into());
+        profile.models.insert(
+            "fast".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("nested-fast-model".into()),
+                ..Default::default()
+            },
+        );
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.nested_provider.fast".into();
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "model_provider": "openai.nested_provider.fast" }
+            }))
+            .await
+            .expect("nested session override must be accepted");
+
+        dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "providers.models.openai",
+                "from": "nested_provider",
+                "to": "nested_renamed"
+            }))
+            .await
+            .expect("provider alias rename must preserve the nested selection");
+
+        assert_eq!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|o| o.model_provider)
+                .as_deref(),
+            Some("openai.nested_renamed.fast")
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "nested-fast-model"
+        );
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .agent("test-agent")
+                .expect("agent survives rename")
+                .model_provider
+                .as_str(),
+            "openai.nested_renamed.fast"
+        );
+        let saved = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("renamed config must be saved");
+        let reloaded: zeroclaw_config::schema::Config =
+            toml::from_str(&saved).expect("saved config must reload");
+        assert_eq!(
+            reloaded
+                .agent("test-agent")
+                .expect("saved agent survives rename")
+                .model_provider
+                .as_str(),
+            "openai.nested_renamed.fast"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_model_alias_rename_migrates_live_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let profile = config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("test provider exists");
+        profile.models.insert(
+            "fast".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("nested-fast-model".into()),
+                ..Default::default()
+            },
+        );
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.test-provider.fast".into();
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "model_provider": "openai.test-provider.fast" }
+            }))
+            .await
+            .expect("nested session override must be accepted");
+
+        dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "providers.models.openai.test-provider.models",
+                "from": "fast",
+                "to": "quick"
+            }))
+            .await
+            .expect("nested model rename must refresh live sessions");
+
+        assert_eq!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|o| o.model_provider)
+                .as_deref(),
+            Some("openai.test-provider.quick")
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "nested-fast-model"
+        );
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .agent("test-agent")
+                .expect("agent survives nested rename")
+                .model_provider
+                .as_str(),
+            "openai.test-provider.quick"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_model_delete_refuses_persisted_agent_reference() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("test provider exists")
+            .models
+            .insert(
+                "fast".into(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("nested-fast-model".into()),
+                    ..Default::default()
+                },
+            );
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.test-provider.fast".into();
+        config.save().await.expect("save baseline config");
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "nested-fast-model"
+        );
+        let err = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "providers.models.openai.test-provider.models",
+                "key": "fast"
+            }))
+            .await
+            .expect_err("a referenced nested model must not be deleted");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .providers
+                .models
+                .find("openai", "test-provider")
+                .expect("profile remains live")
+                .models
+                .contains_key("fast")
+        );
+        let saved = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("baseline config remains saved");
+        let reloaded: zeroclaw_config::schema::Config =
+            toml::from_str(&saved).expect("saved config must reload");
+        assert!(
+            reloaded
+                .providers
+                .models
+                .find("openai", "test-provider")
+                .expect("saved profile remains")
+                .models
+                .contains_key("fast")
+        );
+        assert_eq!(
+            reloaded
+                .agent("test-agent")
+                .expect("saved agent remains")
+                .model_provider
+                .as_str(),
+            "openai.test-provider.fast"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "nested-fast-model",
+            "the refused delete must leave the live session on its original model"
         );
     }
 
