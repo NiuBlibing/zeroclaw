@@ -1453,7 +1453,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 ),
             ));
         }
-        if route.model.is_empty() {
+        if route.effective_model(config).trim().is_empty() {
             items.push(DiagItem::warn(
                 cat,
                 format!("model route \"{}\" has empty model", route.hint),
@@ -3058,6 +3058,40 @@ mod tests {
         let route_item = items.iter().find(|i| i.message.contains("empty model"));
         assert!(route_item.is_some());
         assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_accepts_implicit_nested_model_route() {
+        let mut config = Config::default();
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "default")
+            .expect("known model provider");
+        provider.models.insert(
+            "fast".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("gpt-4o-mini".into()),
+                ..Default::default()
+            },
+        );
+        config
+            .model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "fast".into(),
+                model_provider: "openai.default.fast".into(),
+                model: String::new(),
+                api_key: None,
+            });
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        assert!(
+            !items.iter().any(|item| item
+                .message
+                .contains("model route \"fast\" has empty model")),
+            "a route with an effective nested model must not be reported as empty"
+        );
     }
 
     #[test]

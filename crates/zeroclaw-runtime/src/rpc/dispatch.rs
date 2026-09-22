@@ -415,6 +415,17 @@ fn touches_model_routes(prop: &str) -> bool {
     prop == "model_routes" || prop.starts_with("model_routes.") || prop.starts_with("model_routes[")
 }
 
+fn model_route_materializes_provider(
+    route: &zeroclaw_config::schema::ModelRouteConfig,
+    config: &Config,
+    target_ref: &str,
+) -> bool {
+    !route.hint.trim().is_empty()
+        && !route.model_provider.trim().is_empty()
+        && profile_ref_of(&route.model_provider) == target_ref
+        && !route.effective_model(config).trim().is_empty()
+}
+
 /// Extract the agent alias from an `agents.<alias>.model_provider` prop path.
 /// A live change to an agent's bound provider must rebuild that agent's live
 /// session boxes the same way a `providers.models.*` edit does, so any
@@ -516,11 +527,10 @@ impl LiveSessionRefreshScope {
                         .agent(session_agent)
                         .map(|agent| agent.model_provider.as_str())
                 });
-                let materialized_route_uses_target = config.model_routes.iter().any(|route| {
-                    !route.hint.trim().is_empty()
-                        && !route.model.trim().is_empty()
-                        && route.model_provider.trim() == target_ref
-                });
+                let materialized_route_uses_target = config
+                    .model_routes
+                    .iter()
+                    .any(|route| model_route_materializes_provider(route, config, target_ref));
                 if materialized_route_uses_target {
                     return effective_ref
                         .map(str::to_string)
@@ -573,11 +583,10 @@ impl LiveSessionRefreshScope {
                 // Otherwise the session keeps its own provider, but a route
                 // table that materializes the renamed alias still binds it
                 // into this session's resolver.
-                let materialized_route_uses_target = config.model_routes.iter().any(|route| {
-                    !route.hint.trim().is_empty()
-                        && !route.model.trim().is_empty()
-                        && route.model_provider.trim() == new_ref
-                });
+                let materialized_route_uses_target = config
+                    .model_routes
+                    .iter()
+                    .any(|route| model_route_materializes_provider(route, config, new_ref));
                 Ok(materialized_route_uses_target.then(|| effective_ref.to_string()))
             }
         }
@@ -14727,6 +14736,95 @@ mod tests {
             limits.model_context_window, 8_000,
             "reported limits must come from the SAME refreshed generation as the dispatched route, \
              not the stale large-provider capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_provider_refreshes_implicit_nested_route_model() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+        let provider = cfg
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("openai provider exists");
+        provider.model = None;
+        provider.models.insert(
+            "default".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("default-model".into()),
+                ..Default::default()
+            },
+        );
+        provider.models.insert(
+            "fast".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("fast-v1".into()),
+                context_window: Some(8_000),
+                ..Default::default()
+            },
+        );
+        cfg.model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "reasoning".into(),
+                model_provider: "openai.test-provider.fast".into(),
+                model: String::new(),
+                api_key: None,
+            });
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        {
+            let agent = dispatcher
+                .ctx
+                .sessions
+                .get_agent(&session_id)
+                .await
+                .expect("session agent exists");
+            let agent = agent.lock().await;
+            let route = agent.resolved_route_for_test("hint:reasoning");
+            assert_eq!(route.model, "fast-v1");
+            assert_eq!(
+                agent
+                    .context_limits_for_route(&route.provider_name, &route.model)
+                    .model_context_window,
+                8_000
+            );
+        }
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.models.fast.id",
+                "value": "fast-v2"
+            }))
+            .await
+            .expect("editing the nested provider entry must succeed");
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.models.fast.context_window",
+                "value": 16000
+            }))
+            .await
+            .expect("editing the nested context window must succeed");
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let agent = agent.lock().await;
+        let route = agent.resolved_route_for_test("hint:reasoning");
+        assert_eq!(
+            route.model, "fast-v2",
+            "an implicit route model must refresh when its nested provider entry changes"
+        );
+        assert_eq!(
+            agent
+                .context_limits_for_route(&route.provider_name, &route.model)
+                .model_context_window,
+            16_000,
+            "context limits must come from the same refreshed nested model generation"
         );
     }
 

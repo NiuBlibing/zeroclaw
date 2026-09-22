@@ -4570,6 +4570,8 @@ mod tests {
             assert_eq!(body["model"], "target-model");
             assert_eq!(body["max_tokens"], 123);
         }
+    }
+
     /// Regression: trim write-back must never persist the provider-only
     /// recalled-memory preamble the turn engine injects onto the last user
     /// message. `replay_loop_messages` feeds every durable-history write-back
