@@ -6375,7 +6375,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         ] {
             let messages = history_with_tool_result(&format!("screenshot {marker}"));
 
-            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let (_, native_msgs) =
+                AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
             let tool_result = first_tool_result_on_the_wire(&native_msgs);
 
             let text = tool_result["content"]
