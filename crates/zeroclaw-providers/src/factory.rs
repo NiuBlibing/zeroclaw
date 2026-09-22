@@ -300,6 +300,9 @@ pub fn apply_compat_options(
     if let Some(ref effort) = opts.reasoning_effort {
         b = b.reasoning_effort(Some(effort.clone()));
     }
+    if opts.reasoning_effort_passthrough {
+        b = b.with_reasoning_effort_passthrough();
+    }
     if !opts.extra_headers.is_empty() {
         b = b.extra_headers(opts.extra_headers.clone());
     }
@@ -2412,6 +2415,12 @@ mod tests {
     fn grok_cli_factory_enables_explicit_vision_override() {
         let working_directory = tempfile::tempdir().expect("temporary working directory");
         let config = GrokCliModelProviderConfig {
+            binary_path: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
             working_directory: working_directory.path().display().to_string(),
             ..Default::default()
         };
