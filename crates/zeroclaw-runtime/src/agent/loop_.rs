@@ -19422,12 +19422,10 @@ Let me check the result."#;
 
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
-        // PNG signature plus filler bytes so the base64-expanded payload is
-        // large enough to dwarf the raw `[IMAGE:...]` marker text — the
-        // exact mismatch the gate's heuristic must not misattribute after
-        // the carrying turn is dropped.
-        let mut image_bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        image_bytes.extend(std::iter::repeat_n(0u8, 3_000));
+        // Use a fully decodable image: the multimodal boundary intentionally
+        // rejects files that merely carry a valid signature.
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let image_bytes = STANDARD.decode(PNG_B64).expect("valid PNG fixture");
         std::fs::write(&image_path, &image_bytes).unwrap();
         let marker = format!("[IMAGE:{}]", image_path.display());
 
