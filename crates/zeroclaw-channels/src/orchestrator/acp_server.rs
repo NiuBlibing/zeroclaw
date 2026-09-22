@@ -672,18 +672,19 @@ impl AcpServer {
         // default — the default session agent's model — falling back to the
         // install-wide first configured model when no default agent can be
         // inferred (e.g. agent-less onboarding configs).
-        let default_model = self
-            .default_session_agent_alias(&config)
-            .and_then(|alias| config.resolved_model_provider_for_agent(&alias))
-            .and_then(|(_, _, entry)| {
-                entry
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|model| !model.is_empty())
-                    .map(ToString::to_string)
-            })
-            .or_else(|| config.resolve_default_model());
+        let default_model = match self.default_session_agent_alias(&config) {
+            Some(alias) => Self::alias_if_dispatchable(&config, &alias)
+                .and_then(|alias| config.resolved_model_provider_for_agent(&alias))
+                .and_then(|(_, _, entry)| {
+                    entry
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|model| !model.is_empty())
+                        .map(ToString::to_string)
+                }),
+            None => config.resolve_default_model(),
+        };
 
         let mut zeroclaw_meta = serde_json::json!({
             "maxSessions": self.acp_config.max_sessions,
@@ -5606,6 +5607,55 @@ mod tests {
             result["_meta"]["zeroclaw"]["defaultModel"], "default-agent-model",
             "defaultModel must follow [acp].default_agent's entry, not the install-wide \
              first entry"
+        );
+    }
+
+    #[test]
+    fn handle_initialize_omits_default_model_for_unknown_connection_default() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "install".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("install-wide-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let server = AcpServer::new(config, AcpServerConfig::default())
+            .with_connection_default_agent(Some("missing-agent".to_string()));
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert!(
+            result["_meta"]["zeroclaw"].get("defaultModel").is_none(),
+            "an unknown connection default must not advertise the unrelated install-wide model"
+        );
+    }
+
+    #[test]
+    fn handle_initialize_omits_default_model_for_disabled_config_default() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "install".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("install-wide-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let mut disabled = dispatchable_test_agent("openai.install");
+        disabled.enabled = false;
+        config.agents.insert("disabled".to_string(), disabled);
+        config.acp.default_agent = Some("disabled".to_string());
+
+        let server = AcpServer::new(config, AcpServerConfig::default());
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert!(
+            result["_meta"]["zeroclaw"].get("defaultModel").is_none(),
+            "a disabled configured default must not advertise a model it cannot dispatch"
         );
     }
 
