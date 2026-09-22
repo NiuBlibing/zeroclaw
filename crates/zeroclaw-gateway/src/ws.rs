@@ -270,7 +270,7 @@ fn ws_consolidation_model(
         .providers
         .models
         .find(provider_type, provider_alias)?;
-    let (provider, _, resolved_model) =
+    let (provider, _, resolved_model, _) =
         zeroclaw_runtime::agent::agent::build_session_model_provider(
             config,
             provider_ref,
