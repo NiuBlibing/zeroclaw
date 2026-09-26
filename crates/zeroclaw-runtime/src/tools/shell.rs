@@ -658,7 +658,11 @@ mod tests {
     }
 
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {
-        Arc::new(NativeRuntime::new())
+        #[cfg(windows)]
+        let runtime = NativeRuntime::with_shell("cmd.exe".into());
+        #[cfg(not(windows))]
+        let runtime = NativeRuntime::new();
+        Arc::new(runtime)
     }
 
     #[cfg(windows)]
