@@ -19950,8 +19950,11 @@ Let me check the result."#;
     async fn prepared_image_capacity_is_enforced_with_soft_trimming_disabled() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
-        let mut image_bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        image_bytes.extend(std::iter::repeat_n(0u8, 3_000));
+        // Use a fully decodable image: the multimodal boundary intentionally
+        // rejects files that merely carry a valid signature, and the
+        // capacity estimate charges a fixed per-image cost regardless of size.
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let image_bytes = STANDARD.decode(PNG_B64).expect("valid PNG fixture");
         std::fs::write(&image_path, image_bytes).unwrap();
         let history = vec![
             ChatMessage::system("text prompt"),
