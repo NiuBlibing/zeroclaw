@@ -38,7 +38,7 @@ RUN <<-EOF
 EOF
 
 # ── Stage: nodejs (reference for Node.js toolchain) ──────────
-FROM docker.io/stagex/pallet-nodejs@sha256:5c96b25c18713976497a21c770057f2179c5014c5a025a02d2df9041d8f861f6 AS nodejs
+FROM docker.io/stagex/pallet-nodejs@sha256:2298914fdcffacb4662a8d629545c6c8823cb657cb57983f2b8eb5803636589b AS nodejs
 
 # ── Stage: web-build (web dashboard via xtask + npm build) ──
 FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS web-build
