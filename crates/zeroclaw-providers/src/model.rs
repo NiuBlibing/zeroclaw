@@ -30,6 +30,7 @@ pub fn build_model(
     model_provider_ref: &str,
     model_override: Option<&str>,
 ) -> anyhow::Result<BuiltModel> {
+    crate::ensure_known_model_entry_ref(config, model_provider_ref)?;
     // A two- or three-segment ref names a profile; a third segment selects a
     // model entry under the profile's `models` map. A bare family inherits
     // the agent selection's model and connection, with runtime options

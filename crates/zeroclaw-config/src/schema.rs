@@ -5038,8 +5038,22 @@ impl Config {
         model_provider_ref: &str,
         selected_model: &str,
     ) -> ResolvedContextLimits {
+        // Legacy bare-family overrides inherit the agent's selected model and
+        // tuning. Recover that source at use time, while keeping the physical
+        // provider/billing family independent. Explicit different model IDs
+        // must not borrow the inherited model's capacity.
+        let capacity_ref = self
+            .agent(agent_alias)
+            .filter(|_| !model_provider_ref.contains('.'))
+            .filter(|agent| {
+                self.resolve_model_selection(&agent.model_provider)
+                    .is_some_and(|selection| {
+                        selection.model_id.as_deref().map(str::trim) == Some(selected_model.trim())
+                    })
+            })
+            .map_or(model_provider_ref, |agent| agent.model_provider.as_str());
         let model_context_window =
-            self.resolved_model_context_window_for_route(model_provider_ref, selected_model);
+            self.resolved_model_context_window_for_route(capacity_ref, selected_model);
         let mut runtime = ResolvedRuntime {
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
             model_context_window: model_context_window.tokens,

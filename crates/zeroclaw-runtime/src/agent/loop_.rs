@@ -2361,17 +2361,36 @@ pub async fn run(
                     // internally when the provider call or its output is
                     // unusable. Default path stays the deterministic generator.
                     let creation_result = if config.skills.skill_creation.reflection_enabled {
+                        let temperature_input =
+                            zeroclaw_providers::temperature::Temperature::from(temperature);
+                        let sampling_ref = config
+                            .agent(agent_alias)
+                            .filter(|_| !provider_name.contains('.'))
+                            .map_or(capacity_ref.as_str(), |agent| agent.model_provider.as_str());
+                        let access = ResolvedModelAccess {
+                            model_provider: model_provider.as_ref(),
+                            provider_name: &provider_name,
+                            model: &model_name,
+                            dispatch_model: &model_name,
+                            // Scalar fallback for a bare family; configured retry
+                            // candidates still resolve their own scoped defaults.
+                            temperature: temperature_input
+                                .resolve(Some(&config), sampling_ref)
+                                .into(),
+                        };
                         TOOL_LOOP_COST_TRACKING_CONTEXT
                             .scope(
                                 cost_tracking_context.clone(),
-                                creator.create_from_execution_reflected(
-                                    &msg,
-                                    &tool_calls,
-                                    &response,
-                                    None,
-                                    &provider_name,
-                                    model_provider.as_ref(),
-                                    &model_name,
+                                zeroclaw_providers::temperature::with_temperature(
+                                    Some(&config),
+                                    temperature_input,
+                                    creator.create_from_execution_reflected(
+                                        &msg,
+                                        &tool_calls,
+                                        &response,
+                                        None,
+                                        access,
+                                    ),
                                 ),
                             )
                             .await
@@ -18919,9 +18938,13 @@ Let me check the result."#;
                     &tool_calls,
                     "All tests passed.",
                     None,
-                    "mock-provider",
-                    &model_provider,
-                    "mock-model",
+                    ResolvedModelAccess {
+                        model_provider: &model_provider,
+                        provider_name: "mock-provider",
+                        model: "mock-model",
+                        dispatch_model: "mock-model",
+                        temperature: None.into(),
+                    },
                 ),
             )
             .await
@@ -22617,6 +22640,110 @@ Let me check the result."#;
             ..Config::default()
         };
         (tmp, config)
+    }
+
+    #[tokio::test]
+    async fn run_skill_reflection_inherits_selected_temperature_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig, RiskProfileConfig};
+
+        for (configured_temperature, invocation_temperature, expected) in [
+            (Some(0.2), None, 0.2),
+            (None, None, 0.9),
+            (Some(0.2), Some(0.6), 0.6),
+        ] {
+            let server = MockServer::start().await;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let response_calls = Arc::clone(&calls);
+            Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                let call = response_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let message = match call {
+                    0 => serde_json::json!({"content": null, "tool_calls": [
+                        {"id": "read-first", "type": "function", "function": {
+                            "name": "file_read", "arguments": "{\"path\":\"first.txt\"}"
+                        }},
+                        {"id": "read-second", "type": "function", "function": {
+                            "name": "file_read", "arguments": "{\"path\":\"second.txt\"}"
+                        }}
+                    ]}),
+                    1 => serde_json::json!({"content": "done"}),
+                    _ => serde_json::json!({"content": "---\nname: read-files\ndescription: Read two files.\n---\n\nRead the requested files."}),
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": message}]
+                }))
+            })
+            .mount(&server)
+            .await;
+            let (temp, mut config) = isolated_run_test_config();
+            let workspace = temp.path().join("workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("first.txt"), "first fixture").unwrap();
+            std::fs::write(workspace.join("second.txt"), "second fixture").unwrap();
+            config.memory.backend = "none".into();
+            config.skills.skill_creation.enabled = true;
+            config.skills.skill_creation.reflection_enabled = true;
+            let profile = config.providers.models.ensure("custom", "gw").unwrap();
+            profile.uri = Some(server.uri());
+            profile.native_tools = Some(true);
+            profile.temperature = Some(0.9);
+            profile.models.insert(
+                "selected".into(),
+                ModelEntryConfig {
+                    id: Some("reflection-id".into()),
+                    temperature: configured_temperature,
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "worker".into(),
+                AliasedAgentConfig {
+                    model_provider: "custom.gw.selected".into(),
+                    risk_profile: "default".into(),
+                    workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                        path: Some(workspace),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            config
+                .risk_profiles
+                .insert("default".into(), RiskProfileConfig::default());
+            let result = super::run(
+                config,
+                "worker",
+                Some("Read both files".into()),
+                None,
+                None,
+                invocation_temperature,
+                Vec::new(),
+                false,
+                None,
+                None,
+                TurnOrigin::SubTurn,
+                super::AgentRunOverrides::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, "done");
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len(),
+                3,
+                "the third request must be post-turn reflection"
+            );
+            let body: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+            assert_eq!(body["model"], "reflection-id");
+            assert_eq!(body["temperature"], expected);
+            assert!(
+                body["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("reusable agent skill")
+            );
+        }
     }
 
     #[tokio::test]

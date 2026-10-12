@@ -5381,6 +5381,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bare_family_turn_capacity_inherits_selection_without_changing_billing() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["stream"] == true {
+                    ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": "done"}}]
+                    }))
+                }
+            }).mount(&server).await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "gw").unwrap();
+        profile.uri = Some(server.uri());
+        profile.context_window = Some(128_000);
+        profile.models.insert(
+            "selected".into(),
+            ModelEntryConfig {
+                id: Some("selected-id".into()),
+                temperature: Some(0.2),
+                context_window: Some(8_000),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.gw.selected".into(),
+                ..Default::default()
+            },
+        );
+        for override_model in [None, Some("different-id")] {
+            for streamed in [false, true] {
+                let limits_config = config.clone();
+                let mut agent = Agent::builder()
+                    .agent_alias("worker".into())
+                    .model_runtime(
+                        build_model(&config, "worker", "custom", override_model).unwrap(),
+                    )
+                    .context_limits_resolver(Arc::new(move |provider, model| {
+                        limits_config.resolved_context_limits_for_route("worker", provider, model)
+                    }))
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        Vec::new(),
+                    ))
+                    .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                    .observer(Arc::new(crate::observability::NoopObserver))
+                    .provider_switch_config(ProviderSwitchConfig {
+                        config: Some(Arc::new(config.clone())),
+                        live_config: None,
+                        live: None,
+                    })
+                    .build()
+                    .unwrap();
+                let expected_window = if override_model.is_none() {
+                    8_000
+                } else {
+                    zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+                };
+                assert_eq!(agent.context_limits().model_context_window, expected_window);
+                assert_eq!(agent.attribution_fields().1, "custom");
+                if streamed {
+                    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                    let outcome = agent
+                        .turn_streamed_with_steering_state("hello", tx, None, None)
+                        .await
+                        .unwrap();
+                    assert_eq!(outcome.response, "done");
+                    assert_eq!(
+                        outcome.final_context_limits.unwrap().model_context_window,
+                        expected_window
+                    );
+                } else {
+                    assert_eq!(agent.turn("hello").await.unwrap(), "done");
+                }
+                assert_eq!(agent.context_limits().model_context_window, expected_window);
+            }
+        }
+        // Capacity follows the canonical selection after a config edit too.
+        config
+            .providers
+            .models
+            .ensure("custom", "gw")
+            .unwrap()
+            .models
+            .get_mut("selected")
+            .unwrap()
+            .context_window = Some(16_000);
+        assert_eq!(
+            config
+                .resolved_context_limits_for_route("worker", "custom", "selected-id")
+                .model_context_window,
+            16_000
+        );
+    }
+
+    #[tokio::test]
     async fn selected_temperature_follows_hint_fallback_and_explicit_override_on_wire() {
         use wiremock::{
             Mock, MockServer, ResponseTemplate,

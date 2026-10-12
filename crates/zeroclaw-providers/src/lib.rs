@@ -1899,6 +1899,15 @@ fn append_fallback_chain(
             );
             continue;
         };
+        if ensure_known_model_entry_ref(config, raw).is_err() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"fallback": raw})),
+                "fallback model entry does not resolve; skipping"
+            );
+            continue;
+        }
         let resolved = format!("{family}.{alias}");
         if visited.iter().any(|v| v == &resolved) {
             ::zeroclaw_log::record!(
@@ -2029,6 +2038,7 @@ pub fn create_model_provider_from_ref_with_model(
     config: &zeroclaw_config::schema::Config,
     name: &str,
 ) -> anyhow::Result<ResolvedModelProviderRef> {
+    ensure_known_model_entry_ref(config, name)?;
     // A dotted `<family>.<alias>` that names a REAL configured entry resolves
     // through the alias factory (honoring the alias's `vision` override, endpoint
     // URI and credentials). Two exclusions keep the intact name flowing to the
@@ -2119,6 +2129,7 @@ fn create_resilient_model_provider_from_ref_with_model_override(
     options: &ModelProviderRuntimeOptions,
     primary_model_override: Option<&str>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
+    ensure_known_model_entry_ref(config, name)?;
     match config.providers.models.profile_ref(name) {
         Some((family, alias)) => create_resilient_model_provider_for_alias_with_model_override(
             config,
@@ -2139,6 +2150,23 @@ fn create_resilient_model_provider_from_ref_with_model_override(
             options,
         ),
     }
+}
+
+/// A configured profile may have a dotted alias, but any suffix beyond that
+/// alias selects a model entry. Never turn a missing entry into a profile call.
+pub(crate) fn ensure_known_model_entry_ref(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
+) -> anyhow::Result<()> {
+    if let Some((family, alias)) = config.providers.models.profile_ref(name)
+        && !family.contains(':')
+        && config.providers.models.find(family, alias).is_some()
+        && name.trim() != format!("{family}.{alias}")
+        && config.resolve_model_selection(name.trim()).is_none()
+    {
+        anyhow::bail!("model_provider `{name}` names an unknown model entry");
+    }
+    Ok(())
 }
 
 pub fn create_routed_model_provider_with_options(
@@ -4533,6 +4561,74 @@ mod tests {
         );
         // Same fail-closed behavior as the legacy factory the vision route used.
         assert!(create_model_provider("llamacpp.typo", None).is_err());
+    }
+
+    #[test]
+    fn model_factories_reject_missing_nested_entry_without_rejecting_dotted_profiles() {
+        use zeroclaw_config::schema::{Config, ModelEntryConfig};
+        let mut config = Config::default();
+        for alias in ["gw", "gw.v2"] {
+            let profile = config.providers.models.ensure("custom", alias).unwrap();
+            profile.uri = Some("http://127.0.0.1:9999/v1".into());
+            profile.model = Some("legacy-id".into());
+            profile.models.insert(
+                "selected".into(),
+                ModelEntryConfig {
+                    id: Some("selected-id".into()),
+                    ..Default::default()
+                },
+            );
+            let reference = format!("custom.{alias}.typo");
+            assert!(crate::model::build_model(&config, "worker", &reference, None).is_err());
+            assert!(
+                crate::model::build_model(&config, "worker", &reference, Some("explicit-id"))
+                    .is_err()
+            );
+            assert!(create_model_provider_from_ref_with_model(&config, &reference).is_err());
+            assert!(
+                create_resilient_model_provider_from_ref(
+                    &config,
+                    &reference,
+                    None,
+                    None,
+                    &config.reliability,
+                    &ModelProviderRuntimeOptions::default(),
+                )
+                .is_err()
+            );
+            assert!(
+                crate::model::build_model(&config, "worker", &format!("custom.{alias}"), None)
+                    .is_ok()
+            );
+            assert!(
+                crate::model::build_model(
+                    &config,
+                    "worker",
+                    &format!("custom.{alias}.selected"),
+                    None
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_nested_fallback_is_pruned_instead_of_using_the_profile_model() {
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        let primary = config.providers.models.ensure("custom", "primary").unwrap();
+        primary.uri = Some("http://127.0.0.1:9999/v1".into());
+        primary.model = Some("primary-id".into());
+        primary.fallback = vec!["custom.target.typo".into()];
+        let target = config.providers.models.ensure("custom", "target").unwrap();
+        target.uri = Some("http://127.0.0.1:9999/v1".into());
+        target.model = Some("legacy-id".into());
+        target.api_key = Some("fixture-key".into());
+        let binding = crate::model::build_model(&config, "worker", "custom.primary", None).unwrap();
+        assert!(
+            binding.provider.has_stable_request_identity("primary-id"),
+            "a dangling nested fallback must not materialize another physical candidate"
+        );
     }
 
     #[test]
