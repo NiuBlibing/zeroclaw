@@ -1931,6 +1931,9 @@ pub(crate) struct ReliableModelProviderEntry {
     /// provider family and model while still being distinct fallback candidates.
     candidate_name: String,
     cooldown_key: String,
+    /// Construction selection (including a nested entry), distinct from billing
+    /// and cooldown identity. Sampling is resolved from Config at attempt time.
+    selection_ref: Option<String>,
     provider: ReliableModelProviderEntryProvider,
 }
 
@@ -1945,6 +1948,7 @@ impl ReliableModelProviderEntry {
             candidate_name: display_name.clone(),
             display_name,
             cooldown_key: cooldown_key.into(),
+            selection_ref: None,
             provider: ReliableModelProviderEntryProvider::Direct(provider),
         }
     }
@@ -1959,6 +1963,7 @@ impl ReliableModelProviderEntry {
             display_name: display_name.into(),
             candidate_name: candidate_name.into(),
             cooldown_key: cooldown_key.into(),
+            selection_ref: None,
             provider: ReliableModelProviderEntryProvider::Direct(provider),
         }
     }
@@ -1979,6 +1984,7 @@ impl ReliableModelProviderEntry {
             display_name: display_name.into(),
             candidate_name: cooldown_key.clone(),
             cooldown_key,
+            selection_ref: None,
             provider: ReliableModelProviderEntryProvider::Pinned(
                 crate::model_pin::ModelPinnedProvider::builder(alias)
                     .pinned_model(pinned_model)
@@ -2001,6 +2007,7 @@ impl ReliableModelProviderEntry {
             display_name: display_name.into(),
             candidate_name: cooldown_key.clone(),
             cooldown_key,
+            selection_ref: None,
             provider: ReliableModelProviderEntryProvider::DispatchObservedPinned {
                 pinned_model: pinned_model.into(),
                 provider,
@@ -2012,6 +2019,20 @@ impl ReliableModelProviderEntry {
     /// the entry is model-pinned, otherwise the requested model unchanged.
     fn served_model<'a>(&'a self, requested_model: &'a str) -> &'a str {
         self.provider.served_model(requested_model)
+    }
+
+    pub(crate) fn with_selection_ref(mut self, selection_ref: &str) -> Self {
+        self.selection_ref = Some(selection_ref.to_string());
+        self
+    }
+
+    fn temperature(&self, fallback: Option<f64>) -> Option<f64> {
+        crate::temperature::temperature_for_attempt(
+            self.selection_ref
+                .as_deref()
+                .unwrap_or(&self.candidate_name),
+            fallback,
+        )
     }
 
     fn candidate_name(&self) -> &str {
@@ -2512,7 +2533,7 @@ impl ModelProvider for ReliableModelProvider {
                             system_prompt,
                             message,
                             current_model,
-                            temperature,
+                            entry.temperature(temperature),
                         ),
                     )
                     .await
@@ -2804,7 +2825,7 @@ impl ModelProvider for ReliableModelProvider {
                         ProviderDispatch::from_ref(entry.provider()).chat_with_history(
                             &effective_messages,
                             current_model,
-                            temperature,
+                            entry.temperature(temperature),
                         ),
                     )
                     .await
@@ -3215,7 +3236,7 @@ impl ModelProvider for ReliableModelProvider {
                             &effective_messages,
                             tools,
                             current_model,
-                            temperature,
+                            entry.temperature(temperature),
                         ),
                     )
                     .await
@@ -3571,7 +3592,7 @@ impl ModelProvider for ReliableModelProvider {
                         ProviderDispatch::from_ref(entry.provider()).chat(
                             req,
                             current_model,
-                            temperature,
+                            entry.temperature(temperature),
                         ),
                     )
                     .await
@@ -3928,7 +3949,7 @@ impl ModelProvider for ReliableModelProvider {
                 ProviderDispatch::from_ref(model_provider).stream_chat(
                     req,
                     &served_model,
-                    temperature,
+                    entry.temperature(temperature),
                     options,
                 ),
             );
@@ -4027,7 +4048,7 @@ impl ModelProvider for ReliableModelProvider {
                     system_prompt,
                     message,
                     &served_model,
-                    temperature,
+                    entry.temperature(temperature),
                     options,
                 ),
             );
@@ -4108,7 +4129,7 @@ impl ModelProvider for ReliableModelProvider {
                 ProviderDispatch::from_ref(model_provider).stream_chat_with_history(
                     messages,
                     &served_model,
-                    temperature,
+                    entry.temperature(temperature),
                     options,
                 ),
             );

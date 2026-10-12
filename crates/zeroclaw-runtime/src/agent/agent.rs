@@ -47,32 +47,18 @@ pub fn build_session_model_provider(
         )));
     }
     let rt = build_model(config, agent_alias, model_provider_ref, model_override)?;
-    Ok((rt.provider, rt.provider_name, rt.model_name))
+    Ok((
+        rt.model.provider,
+        rt.model.provider_name,
+        rt.model.model_name,
+    ))
 }
 
 /// The complete model runtime produced by one [`build_model`] call — ready to
 /// commit wholesale, nothing here needs per-call-site post-processing.
 pub struct ModelRuntime {
-    pub provider: Box<dyn ModelProvider>,
-    /// Normalised two-segment `<family>.<alias>` name — the key
-    /// `provider_pricing` bills by.
-    pub provider_name: String,
-    pub model_name: String,
-    /// `entry ∨ profile`, purely config-derived. Explicit per-invocation
-    /// temperatures (CLI flag, session override) are caller-side modifiers,
-    /// overlaid with a single `.or()` at their existing sites — they are not
-    /// properties of the model.
-    pub temperature: Option<f64>,
-    /// `entry ∨ profile ∨ UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`, resolved —
-    /// history-trim budgets must follow the model that is actually running.
-    pub context_window: usize,
+    pub model: zeroclaw_providers::model::BuiltModel,
     pub tool_dispatcher: Box<dyn ToolDispatcher>,
-    /// Identity of the resolved selection — the "did the model change" key.
-    pub identity: zeroclaw_config::schema::ModelIdentity,
-    /// Route table constructed with the same provider set. It must be
-    /// published atomically with `provider` so hint routing cannot observe a
-    /// mixed generation.
-    pub model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
 }
 
 /// Adapt the providers-owned model construction to the agent's existing
@@ -95,14 +81,8 @@ pub fn build_model(
     let tool_dispatcher =
         tool_dispatcher_for_provider(&agent_cfg, model.provider.as_ref(), &model.model_name);
     Ok(ModelRuntime {
-        provider: model.provider,
-        provider_name: model.provider_name,
-        model_name: model.model_name,
-        temperature: model.temperature,
-        context_window: model.context_window,
+        model,
         tool_dispatcher,
-        identity: model.identity,
-        model_route_resolver: model.model_route_resolver,
     })
 }
 
@@ -970,6 +950,28 @@ impl AgentBuilder {
         self
     }
 
+    /// Install one factory-produced model binding during construction.
+    pub fn model_runtime(mut self, runtime: ModelRuntime) -> Self {
+        let ModelRuntime {
+            model,
+            tool_dispatcher,
+        } = runtime;
+        let zeroclaw_providers::model::BuiltModel {
+            provider,
+            provider_name,
+            model_name,
+            identity,
+            model_route_resolver,
+        } = model;
+        self.model_provider = Some(provider);
+        self.model_provider_name = Some(provider_name);
+        self.model_name = Some(model_name);
+        self.model_identity = Some(identity);
+        self.model_route_resolver = Some(model_route_resolver);
+        self.tool_dispatcher = Some(tool_dispatcher);
+        self
+    }
+
     pub fn temperature(mut self, temperature: Option<f64>) -> Self {
         self.temperature = temperature;
         self
@@ -1821,7 +1823,7 @@ impl Agent {
         // Bypass the cache when a per-turn memory preamble the key cannot see
         // will be injected downstream (see `memory_injection_active`), or when
         // hooks/tools can change the final provider request after this point.
-        if self.temperature != Some(0.0)
+        if self.effective_temperature() != Some(0.0)
             || self.response_cache.is_none()
             || self.memory_injection_active()
             || zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -1907,6 +1909,33 @@ impl Agent {
         self.memory_session_id = session_id;
     }
 
+    /// Replace the complete binding under the owner's existing Agent lock.
+    pub fn install_model_runtime(&mut self, runtime: ModelRuntime) {
+        let ModelRuntime {
+            model,
+            tool_dispatcher,
+        } = runtime;
+        let zeroclaw_providers::model::BuiltModel {
+            provider,
+            provider_name,
+            model_name,
+            identity,
+            model_route_resolver,
+        } = model;
+        self.model_provider = provider;
+        self.model_provider_name = provider_name;
+        self.model_name = model_name;
+        self.model_identity = Some(identity);
+        self.model_route_resolver = model_route_resolver;
+        self.tool_dispatcher = tool_dispatcher;
+    }
+
+    fn effective_temperature(&self) -> Option<f64> {
+        let selected = self.model_route_resolver.resolve(&self.model_name);
+        zeroclaw_providers::temperature::Temperature::from(self.temperature)
+            .resolve(self.full_config(), &selected.provider_name)
+    }
+
     pub fn set_temperature(&mut self, temperature: Option<f64>) {
         self.temperature = temperature;
     }
@@ -1924,7 +1953,7 @@ impl Agent {
 
     #[cfg(test)]
     pub fn temperature_for_test(&self) -> Option<f64> {
-        self.temperature
+        self.effective_temperature()
     }
 
     #[cfg(test)]
@@ -3141,14 +3170,13 @@ impl Agent {
         #[cfg(test)]
         let builder = builder.delegate_tool(built_delegate_tool);
         let mut builder = builder
-            .model_provider(entry_rt.provider)
+            .model_runtime(entry_rt)
             .allowed_tools(principal_allowed_tools)
             .tools(tools)
             .memory(memory.clone())
             .memory_security(Arc::clone(&security))
             .observer(observer)
             .response_cache(response_cache)
-            .tool_dispatcher(entry_rt.tool_dispatcher)
             .memory_inject_cfg(
                 crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                     &config.memory,
@@ -3166,14 +3194,9 @@ impl Agent {
             .context_limits_resolver(context_limits_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
-            .model_name(entry_rt.model_name)
-            .model_provider_name(entry_rt.provider_name)
-            .model_identity(entry_rt.identity)
-            .temperature(entry_rt.temperature)
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
             .classification_config(config.query_classification.clone())
-            .model_route_resolver(entry_rt.model_route_resolver)
             .identity_config(agent_cfg.identity.clone())
             .skills(skills)
             .skills_prompt_mode(config.effective_skills_prompt_mode(agent_alias))
@@ -3601,15 +3624,9 @@ impl Agent {
             Some(&new_model),
         ) {
             Ok(rt) => {
-                // Commit state only after the runtime was built successfully.
-                self.model_provider = rt.provider;
-                self.model_route_resolver = rt.model_route_resolver;
-                self.model_provider_name = rt.provider_name;
-                self.model_name = rt.model_name.clone();
-                self.temperature = rt.temperature;
-                self.tool_dispatcher = rt.tool_dispatcher;
-                self.model_identity = Some(rt.identity);
-                Some(rt.model_name)
+                let model_name = rt.model.model_name.clone();
+                self.install_model_runtime(rt);
+                Some(model_name)
             }
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -4020,7 +4037,7 @@ impl Agent {
                                 provider_name: &selected_route.provider_name,
                                 model: &selected_route.model,
                                 dispatch_model: &effective_model,
-                                temperature: self.temperature,
+                                temperature: self.temperature.into(),
                             },
                             crate::agent::loop_::ResolvedIo {
                                 tools_registry: &self.tools,
@@ -4623,7 +4640,7 @@ impl Agent {
                                     provider_name: &selected_route.provider_name,
                                     model: &selected_route.model,
                                     dispatch_model: &effective_model,
-                                    temperature: self.temperature,
+                                    temperature: self.temperature.into(),
                                 },
                                 crate::agent::loop_::ResolvedIo {
                                     tools_registry: &self.tools,
@@ -5136,22 +5153,13 @@ pub async fn run(
             agent_cfg.model_provider = p.as_str().into();
         }
     }
-    // Apply model/temperature overrides to the agent's resolved provider entry.
-    if let Some(agent_cfg) = effective_config.agents.get(agent_alias)
-        && let Some((fam, ali)) = effective_config
-            .providers
-            .models
-            .profile_ref(agent_cfg.model_provider.as_str())
-            .map(|(family, alias)| (family.to_string(), alias.to_string()))
-        && let Some(entry) = effective_config.providers.models.ensure(&fam, &ali)
-    {
-        if let Some(m) = model_override {
-            entry.model = Some(m);
-        }
-        entry.temperature = temperature;
-    }
-
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
+    if let Some(model) = model_override.as_deref() {
+        let provider_ref = agent.selected_model_provider_ref();
+        let runtime = build_model(&effective_config, agent_alias, &provider_ref, Some(model))?;
+        agent.install_model_runtime(runtime);
+    }
+    agent.set_temperature(temperature);
 
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;
@@ -5241,11 +5249,18 @@ mod tests {
         entry.uri = Some(selected.uri());
         entry.model = Some("dotted-model".into());
         let runtime = build_model(&config, "worker", "custom.edge.v2", None).unwrap();
-        assert_eq!(runtime.provider_name, "custom.edge.v2");
-        let response = zeroclaw_providers::ProviderDispatch::from_ref(runtime.provider.as_ref())
-            .simple_chat("hello", &runtime.model_name, runtime.temperature)
-            .await
-            .unwrap();
+        assert_eq!(runtime.model.provider_name, "custom.edge.v2");
+        let response =
+            zeroclaw_providers::ProviderDispatch::from_ref(runtime.model.provider.as_ref())
+                .simple_chat(
+                    "hello",
+                    &runtime.model.model_name,
+                    config
+                        .resolve_model_selection(&runtime.model.identity.provider_ref())
+                        .and_then(|s| s.temperature()),
+                )
+                .await
+                .unwrap();
         assert_eq!(response, "dotted response");
         assert_eq!(selected.received_requests().await.unwrap().len(), 1);
         assert!(sibling.received_requests().await.unwrap().is_empty());
@@ -5317,10 +5332,17 @@ mod tests {
             [(None, "nested-id"), (Some("explicit-id"), "explicit-id")]
         {
             let runtime = build_model(&config, "worker", "openai", override_model).unwrap();
-            assert_eq!(runtime.provider_name, "openai");
-            assert_eq!(runtime.identity.provider_ref(), "openai");
-            zeroclaw_providers::ProviderDispatch::from_ref(runtime.provider.as_ref())
-                .simple_chat("hello", &runtime.model_name, runtime.temperature)
+            assert_eq!(runtime.model.provider_name, "openai");
+            assert_eq!(runtime.model.identity.provider_ref(), "openai");
+            zeroclaw_providers::ProviderDispatch::from_ref(runtime.model.provider.as_ref())
+                .simple_chat(
+                    "hello",
+                    &runtime.model.model_name,
+                    config
+                        .agent("worker")
+                        .and_then(|agent| config.resolve_model_selection(&agent.model_provider))
+                        .and_then(|s| s.temperature()),
+                )
                 .await
                 .unwrap();
             let requests = server.received_requests().await.unwrap();
@@ -5328,6 +5350,255 @@ mod tests {
                 serde_json::from_slice(&requests.last().unwrap().body).unwrap();
             assert_eq!(body["model"], expected);
             assert_eq!(body["temperature"], 0.25);
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_temperature_follows_hint_fallback_and_explicit_override_on_wire() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, method},
+        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig, ModelRouteConfig};
+        let primary = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("fixture failure"))
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(serde_json::json!({"stream": true})))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n",
+                )))
+            .mount(&target).await;
+        Mock::given(method("POST"))
+            .and(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                body["stream"] != true
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .mount(&target)
+            .await;
+        let mut config = Config::default();
+        config.reliability.provider_retries = 0;
+        let profile = config.providers.models.ensure("custom", "primary").unwrap();
+        profile.uri = Some(primary.uri());
+        profile.api_key = Some("primary-fixture-key".into());
+        profile.model = Some("primary-id".into());
+        profile.temperature = Some(0.2);
+        profile.fallback = vec!["custom.target.selected".into()];
+        let profile = config.providers.models.ensure("custom", "target").unwrap();
+        profile.uri = Some(target.uri());
+        profile.api_key = Some("target-fixture-key".into());
+        profile.temperature = Some(0.9);
+        profile.max_tokens = Some(999);
+        profile.provider_extra = Some(serde_json::json!({"profile_only": true}));
+        profile.chat_template_kwargs = Some(serde_json::json!({"profile_only": true}));
+        profile.models = HashMap::from([
+            (
+                "default".into(),
+                ModelEntryConfig {
+                    id: Some("shared-id".into()),
+                    temperature: Some(0.4),
+                    ..Default::default()
+                },
+            ),
+            (
+                "selected".into(),
+                ModelEntryConfig {
+                    id: Some("shared-id".into()),
+                    temperature: Some(0.8),
+                    max_tokens: Some(77),
+                    provider_extra: Some(serde_json::json!({"selected_only": true})),
+                    chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+                    vision: Some(false),
+                    native_tools: Some(false),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.primary".into(),
+                ..Default::default()
+            },
+        );
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "target".into(),
+            model_provider: "custom.target.selected".into(),
+            model: "shared-id".into(),
+            ..Default::default()
+        }];
+        // The explicit value deliberately equals the primary's default. Its
+        // provenance, not numerical equality, determines whether it survives.
+        for override_value in [None, Some(0.2)] {
+            for selector in ["primary-id", "hint:target"] {
+                for streamed in [false, true] {
+                    let rt = build_model(&config, "worker", "custom.primary", None).unwrap();
+                    let mut agent = Agent::builder()
+                        .model_runtime(rt)
+                        .temperature(override_value)
+                        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                            Vec::new(),
+                        ))
+                        .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                        .observer(Arc::new(crate::observability::NoopObserver))
+                        .provider_switch_config(ProviderSwitchConfig {
+                            config: Some(Arc::new(config.clone())),
+                            live_config: None,
+                            live: None,
+                        })
+                        .build()
+                        .unwrap();
+                    agent.model_name = selector.into();
+                    if streamed {
+                        let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                        let outcome = agent
+                            .turn_streamed_with_steering_state("hello", tx, None, None)
+                            .await
+                            .unwrap();
+                        assert!(outcome.response.starts_with("done"));
+                    } else {
+                        assert!(agent.turn("hello").await.unwrap().starts_with("done"));
+                    }
+                    let requests = target.received_requests().await.unwrap();
+                    let request = requests.last().unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(body["model"], "shared-id");
+                    assert_eq!(
+                        body["temperature"],
+                        override_value.unwrap_or(0.8),
+                        "{selector}, streamed={streamed}"
+                    );
+                    assert_eq!(body["max_tokens"], 77);
+                    assert_eq!(body["selected_only"], true);
+                    assert_eq!(
+                        body["chat_template_kwargs"],
+                        serde_json::json!({"enable_thinking": false})
+                    );
+                    assert!(
+                        body.get("profile_only").is_none(),
+                        "JSON fields replace the profile's field as a whole"
+                    );
+                    assert_eq!(
+                        request.headers["authorization"],
+                        "Bearer target-fixture-key"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn profiles_sharing_endpoint_keep_their_system_message_policy_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        for (alias, merge) in [("plain", false), ("merged", true)] {
+            let profile = config.providers.models.ensure("custom", alias).unwrap();
+            profile.uri = Some(server.uri());
+            profile.model = Some("fixture-model".into());
+            profile.merge_system_into_user = merge;
+        }
+        for (alias, merge) in [("plain", false), ("merged", true)] {
+            let rt = build_model(&config, "worker", &format!("custom.{alias}"), None).unwrap();
+            zeroclaw_providers::ProviderDispatch::from_ref(rt.model.provider.as_ref())
+                .chat_with_system(Some("fixture system"), "hello", &rt.model.model_name, None)
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(
+                body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["role"] == "system"),
+                !merge
+            );
+            assert!(body.to_string().contains("fixture system"));
+        }
+    }
+
+    #[tokio::test]
+    async fn model_install_preserves_override_and_unset_temperature_inherits_profile_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::ModelEntryConfig;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "gw").unwrap();
+        profile.uri = Some(server.uri());
+        profile.temperature = Some(0.9);
+        profile.models = HashMap::from([
+            (
+                "first".into(),
+                ModelEntryConfig {
+                    id: Some("first-id".into()),
+                    temperature: Some(0.2),
+                    ..Default::default()
+                },
+            ),
+            (
+                "second".into(),
+                ModelEntryConfig {
+                    id: Some("second-id".into()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        for override_value in [None, Some(0.42)] {
+            let rt = build_model(&config, "worker", "custom.gw.first", None).unwrap();
+            let mut agent = Agent::builder()
+                .model_runtime(rt)
+                .temperature(override_value)
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver))
+                .provider_switch_config(ProviderSwitchConfig {
+                    config: Some(Arc::new(config.clone())),
+                    live_config: None,
+                    live: None,
+                })
+                .build()
+                .unwrap();
+            agent.turn("hello").await.unwrap();
+            agent.install_model_runtime(
+                build_model(&config, "worker", "custom.gw.second", None).unwrap(),
+            );
+            agent.turn("hello again").await.unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let bodies: Vec<serde_json::Value> = requests
+                .iter()
+                .rev()
+                .take(2)
+                .map(|request| serde_json::from_slice(&request.body).unwrap())
+                .collect();
+            assert_eq!(bodies[1]["temperature"], override_value.unwrap_or(0.2));
+            assert_eq!(bodies[0]["temperature"], override_value.unwrap_or(0.9));
+            assert_eq!(bodies[0]["model"], "second-id");
         }
     }
 
@@ -5374,6 +5645,10 @@ mod tests {
                 ..Default::default()
             },
         );
+        assert_eq!(
+            config.configured_model_context_window("worker"),
+            Some(8_000)
+        );
         // Exercise the no-router reliable primary and the routed path, including
         // a hint back to the default entry with the identical provider-local ID.
         for routed in [false, true] {
@@ -5390,16 +5665,16 @@ mod tests {
             let rt = build_model(&config, "worker", "custom.gw.small", None).unwrap();
             let limits_config = config.clone();
             let mut agent = Agent::builder()
-                .model_provider(rt.provider)
+                .model_provider(rt.model.provider)
                 .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     Vec::new(),
                 ))
                 .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
                 .observer(Arc::new(crate::observability::NoopObserver))
-                .model_provider_name(rt.provider_name)
-                .model_name(rt.model_name)
-                .model_identity(rt.identity)
-                .model_route_resolver(rt.model_route_resolver)
+                .model_provider_name(rt.model.provider_name)
+                .model_name(rt.model.model_name)
+                .model_identity(rt.model.identity)
+                .model_route_resolver(rt.model.model_route_resolver)
                 .tool_dispatcher(rt.tool_dispatcher)
                 .context_limits_resolver(Arc::new(move |provider, model| {
                     limits_config.resolved_context_limits_for_route("worker", provider, model)
@@ -5491,16 +5766,37 @@ mod tests {
 
         // Three-segment ref: the selected entry's tuning wins.
         let rt = build_model(&config, "tester", "openai.gw.cheap", None).unwrap();
-        assert_eq!(rt.temperature, Some(0.2), "entry temperature beats profile");
         assert_eq!(
-            rt.context_window, 8_000,
+            config
+                .resolve_model_selection(&rt.model.identity.provider_ref())
+                .and_then(|s| s.temperature()),
+            Some(0.2),
+            "entry temperature beats profile"
+        );
+        assert_eq!(
+            config.effective_model_context_window_for_route(
+                &rt.model.identity.provider_ref(),
+                &rt.model.model_name
+            ),
+            8_000,
             "entry context window beats profile"
         );
 
         // Two-segment ref: the profile's values (default entry sets none).
         let rt = build_model(&config, "tester", "openai.gw", None).unwrap();
-        assert_eq!(rt.temperature, Some(0.9));
-        assert_eq!(rt.context_window, 100_000);
+        assert_eq!(
+            config
+                .resolve_model_selection(&rt.model.identity.provider_ref())
+                .and_then(|s| s.temperature()),
+            Some(0.9)
+        );
+        assert_eq!(
+            config.effective_model_context_window_for_route(
+                &rt.model.identity.provider_ref(),
+                &rt.model.model_name
+            ),
+            100_000
+        );
 
         // Unconfigured window falls back to the shared stub.
         let mut bare = Config::default();
@@ -5515,7 +5811,10 @@ mod tests {
         );
         let rt = build_model(&bare, "tester", "openai.minimal", None).unwrap();
         assert_eq!(
-            rt.context_window,
+            bare.effective_model_context_window_for_route(
+                &rt.model.identity.provider_ref(),
+                &rt.model.model_name
+            ),
             zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
         );
     }
@@ -5563,10 +5862,13 @@ mod tests {
 
         let rt = build_model(&config, "tester", "openai.gw.cheap", None).unwrap();
 
-        assert_eq!(rt.provider_name, "openai.gw");
-        assert_eq!(rt.model_name, "gpt-4o-mini");
+        assert_eq!(rt.model.provider_name, "openai.gw");
+        assert_eq!(rt.model.model_name, "gpt-4o-mini");
         assert!(
-            rt.provider.capabilities_for_model(&rt.model_name).vision,
+            rt.model
+                .provider
+                .capabilities_for_model(&rt.model.model_name)
+                .vision,
             "the selected entry's vision tuning must survive construction; a clobber by \
              `models.default` (vision=false) means the raw ref did not reach the providers chain"
         );
@@ -5627,8 +5929,14 @@ mod tests {
 
         let rt = build_model(&config, "tester", "custom.target.cheap", None)
             .expect("target profile builds");
-        let response = zeroclaw_providers::ProviderDispatch::from_ref(rt.provider.as_ref())
-            .simple_chat("hello", &rt.model_name, rt.temperature)
+        let response = zeroclaw_providers::ProviderDispatch::from_ref(rt.model.provider.as_ref())
+            .simple_chat(
+                "hello",
+                &rt.model.model_name,
+                config
+                    .resolve_model_selection(&rt.model.identity.provider_ref())
+                    .and_then(|s| s.temperature()),
+            )
             .await
             .expect("target profile responds");
         assert_eq!(response, "from target");
@@ -5641,11 +5949,13 @@ mod tests {
             .api_key = None;
         let keyless_rt = build_model(&config, "tester", "custom.target.cheap", None)
             .expect("keyless target profile builds");
-        zeroclaw_providers::ProviderDispatch::from_ref(keyless_rt.provider.as_ref())
+        zeroclaw_providers::ProviderDispatch::from_ref(keyless_rt.model.provider.as_ref())
             .simple_chat(
                 "hello again",
-                &keyless_rt.model_name,
-                keyless_rt.temperature,
+                &keyless_rt.model.model_name,
+                config
+                    .resolve_model_selection(&keyless_rt.model.identity.provider_ref())
+                    .and_then(|s| s.temperature()),
             )
             .await
             .expect("keyless target profile responds");
@@ -18108,7 +18418,7 @@ model_provider = "custom.only"
             "the committed name is the normalised two-segment billing key"
         );
         assert_eq!(
-            agent.temperature,
+            agent.effective_temperature(),
             Some(0.4),
             "the selected entry's temperature moves with the switch"
         );
@@ -18752,7 +19062,7 @@ model_provider = "custom.only"
             "turn_streamed must commit the switched model after the tool result"
         );
         assert_eq!(
-            agent.temperature,
+            agent.effective_temperature(),
             Some(0.55),
             "turn_streamed must move the temperature to the switched profile's — \
              this value is what the post-switch request in the same turn sends"

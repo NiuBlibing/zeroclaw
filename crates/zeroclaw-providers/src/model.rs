@@ -9,8 +9,6 @@ pub struct BuiltModel {
     pub provider: Box<dyn ModelProvider>,
     pub provider_name: String,
     pub model_name: String,
-    pub temperature: Option<f64>,
-    pub context_window: usize,
     pub identity: zeroclaw_config::schema::ModelIdentity,
     pub model_route_resolver: Arc<crate::router::ModelRouteResolver>,
 }
@@ -123,23 +121,6 @@ pub fn build_model(
             &runtime_options,
         )?;
 
-    // `entry ∨ profile` for the temperature; the same shape as
-    // `Config::effective_model_context_window` for the window, but resolved
-    // from THIS ref so a switch moves the trim budget with the model.
-    let temperature = selection.as_ref().and_then(|s| {
-        s.model_entry
-            .and_then(|e| e.temperature)
-            .or(s.entry.temperature)
-    });
-    let context_window = selection
-        .as_ref()
-        .and_then(|s| {
-            s.model_entry
-                .and_then(|e| e.context_window)
-                .or(s.entry.context_window)
-        })
-        .unwrap_or(zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK);
-
     Ok(BuiltModel {
         provider,
         // A bare family name stays as-is (billing falls back through
@@ -151,8 +132,6 @@ pub fn build_model(
             format!("{model_provider_name}.{model_provider_alias}")
         },
         model_name,
-        temperature,
-        context_window,
         identity,
         model_route_resolver,
     })

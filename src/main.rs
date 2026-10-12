@@ -6264,12 +6264,9 @@ fn build_kernel_agent_model(
         .unwrap_or_else(|| "default".to_string());
     let temperature = temperature_override
         .or_else(|| {
-            selection.as_ref().and_then(|selected| {
-                selected
-                    .model_entry
-                    .and_then(|model_entry| model_entry.temperature)
-                    .or(selected.entry.temperature)
-            })
+            selection
+                .as_ref()
+                .and_then(|selection| selection.temperature())
         })
         .unwrap_or(0.7);
     Ok((provider, model, temperature))
@@ -12993,12 +12990,7 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
                     .and_then(|selection| selection.model_id.clone())
                     .or_else(|| entry.model.clone())
                     .unwrap_or_else(|| "default".to_string());
-                let temperature = selection.as_ref().and_then(|selection| {
-                    selection
-                        .model_entry
-                        .and_then(|model_entry| model_entry.temperature)
-                        .or(selection.entry.temperature)
-                });
+                let temperature = selection.as_ref().and_then(|selection| selection.temperature());
                 Some(std::sync::Arc::new(
                     zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
                         std::sync::Arc::from(provider),

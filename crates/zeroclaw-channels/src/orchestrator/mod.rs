@@ -2633,14 +2633,12 @@ struct ChannelThinkingResolution {
     effective_content: String,
     level: ThinkingLevel,
     params: zeroclaw_runtime::agent::thinking::ThinkingParams,
-    effective_temperature: Option<f64>,
 }
 
 fn resolve_channel_thinking(
     content: &str,
     session_override: Option<ThinkingLevel>,
     config: &ThinkingConfig,
-    base_temperature: Option<f64>,
 ) -> ChannelThinkingResolution {
     let (directive, effective_content) =
         match zeroclaw_runtime::agent::thinking::parse_thinking_directive(content) {
@@ -2653,17 +2651,10 @@ fn resolve_channel_thinking(
         config,
     );
     let params = zeroclaw_runtime::agent::thinking::apply_thinking_level_with_config(level, config);
-    let effective_temperature = base_temperature.map(|temperature| {
-        zeroclaw_runtime::agent::thinking::clamp_temperature(
-            temperature + params.temperature_adjustment,
-        )
-    });
-
     ChannelThinkingResolution {
         effective_content,
         level,
         params,
-        effective_temperature,
     }
 }
 
@@ -2905,7 +2896,7 @@ fn runtime_defaults_from_config(
         })?;
     let temperature = selection
         .as_ref()
-        .and_then(|s| s.model_entry.and_then(|m| m.temperature))
+        .and_then(|s| s.temperature())
         .or(entry.temperature);
     Ok(ChannelRuntimeDefaults {
         default_model_provider,
@@ -5635,7 +5626,7 @@ async fn resolve_classifier_route(
         .unwrap_or_default();
     let temperature = selection
         .as_ref()
-        .and_then(|s| s.model_entry.and_then(|m| m.temperature))
+        .and_then(|s| s.temperature())
         .or(model_cfg.temperature);
     if model.is_empty() {
         ::zeroclaw_log::record!(
@@ -9113,7 +9104,6 @@ async fn process_channel_message_body(
         &msg.content,
         thinking_override,
         &ctx.agent_cfg.resolved.thinking,
-        runtime_defaults_snapshot(ctx.as_ref()).defaults.temperature,
     );
     if thinking.effective_content != msg.content {
         ::zeroclaw_log::record!(
@@ -10073,7 +10063,7 @@ async fn process_channel_message_body(
                         provider_name: route.model_provider.as_str(),
                         model: route.model.as_str(),
                         dispatch_model: route.model.as_str(),
-                        temperature: thinking.effective_temperature,
+                        temperature: zeroclaw_providers::temperature::Temperature::adjusted(None, thinking.params.temperature_adjustment),
                     },
                     ResolvedIo {
                         tools_registry: ctx.tools_registry.as_ref(),
@@ -10086,9 +10076,9 @@ async fn process_channel_message_body(
                         multimodal_config: &ctx.multimodal,
                         // Full config for the vision route to resolve the
                         // configured `vision_model_provider`'s alias options - the
-                        // same canonical `prompt_config` snapshot this path already
-                        // uses for provider construction.
-                        config: Some(ctx.prompt_config.as_ref()),
+                        // same generation used for this route's provider cache,
+                        // including a hot-reloaded model profile.
+                        config: Some(runtime_defaults.config.as_ref()),
                         hooks: ctx.hooks.as_deref(),
                         activated_tools: ctx.activated_tools.as_ref(),
                         model_switch_callback: None,
@@ -44041,16 +44031,20 @@ BTC is currently around $65,000 based on latest tool output."#
             default_level: ThinkingLevel::Low,
             ..ThinkingConfig::default()
         };
-        let resolved = resolve_channel_thinking(
-            "explain the tradeoff",
-            Some(ThinkingLevel::High),
-            &config,
-            Some(0.5),
-        );
+        let resolved =
+            resolve_channel_thinking("explain the tradeoff", Some(ThinkingLevel::High), &config);
 
         assert_eq!(resolved.effective_content, "explain the tradeoff");
         assert_eq!(resolved.level, ThinkingLevel::High);
-        assert!(resolved.effective_temperature.unwrap() > 0.5);
+        assert!(
+            zeroclaw_providers::temperature::Temperature::adjusted(
+                Some(0.5),
+                resolved.params.temperature_adjustment
+            )
+            .resolve(None, "test")
+            .unwrap()
+                > 0.5
+        );
     }
 
     #[test]
@@ -44063,12 +44057,19 @@ BTC is currently around $65,000 based on latest tool output."#
             "/think:off explain briefly",
             Some(ThinkingLevel::Max),
             &config,
-            Some(0.5),
         );
 
         assert_eq!(resolved.effective_content, "explain briefly");
         assert_eq!(resolved.level, ThinkingLevel::Off);
-        assert!(resolved.effective_temperature.unwrap() < 0.5);
+        assert!(
+            zeroclaw_providers::temperature::Temperature::adjusted(
+                Some(0.5),
+                resolved.params.temperature_adjustment
+            )
+            .resolve(None, "test")
+            .unwrap()
+                < 0.5
+        );
     }
 
     #[test]
@@ -44077,12 +44078,8 @@ BTC is currently around $65,000 based on latest tool output."#
             default_level: ThinkingLevel::Low,
             ..ThinkingConfig::default()
         };
-        let resolved = resolve_channel_thinking(
-            "/think:max summarize https://example.com",
-            None,
-            &config,
-            Some(0.5),
-        );
+        let resolved =
+            resolve_channel_thinking("/think:max summarize https://example.com", None, &config);
 
         assert_eq!(resolved.effective_content, "summarize https://example.com");
         assert_eq!(resolved.level, ThinkingLevel::Max);

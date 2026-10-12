@@ -1374,15 +1374,10 @@ impl SessionStore {
             }
         };
         let mut guard = agent.lock().await;
-        guard.set_model_provider(rt.provider);
-        guard.set_model_provider_name(rt.provider_name);
-        guard.set_model_name(rt.model_name);
-        guard.set_model_identity(rt.identity);
-        guard.set_model_route_resolver(rt.model_route_resolver);
-        guard.set_tool_dispatcher(rt.tool_dispatcher);
+        guard.install_model_runtime(rt);
         guard.set_multimodal_config(config_generation.multimodal.clone());
         guard.set_config_generation(config_generation);
-        guard.set_temperature(temperature_override.or(rt.temperature));
+        guard.set_temperature(temperature_override);
         self.signal_test_gate_done(done);
         true
     }
@@ -3421,23 +3416,25 @@ mod tests {
         model_name: &str,
     ) -> crate::agent::agent::ModelRuntime {
         crate::agent::agent::ModelRuntime {
-            provider: Box::new(StubProvider),
-            provider_name: provider_name.to_string(),
-            model_name: model_name.to_string(),
-            temperature: None,
-            context_window: 32_000,
             tool_dispatcher: Box::new(NativeToolDispatcher),
-            identity: zeroclaw_config::schema::ModelIdentity {
-                family: "test".to_string(),
-                alias: provider_name.to_string(),
-                entry_alias: None,
-                model_id: model_name.to_string(),
+            model: zeroclaw_providers::model::BuiltModel {
+                provider: Box::new(StubProvider),
+                provider_name: provider_name.to_string(),
+                model_name: model_name.to_string(),
+                identity: zeroclaw_config::schema::ModelIdentity {
+                    family: "test".to_string(),
+                    alias: provider_name.to_string(),
+                    entry_alias: None,
+                    model_id: model_name.to_string(),
+                },
+                model_route_resolver: Arc::new(
+                    zeroclaw_providers::router::ModelRouteResolver::new(
+                        Vec::new(),
+                        provider_name.to_string(),
+                        model_name.to_string(),
+                    ),
+                ),
             },
-            model_route_resolver: Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
-                Vec::new(),
-                provider_name.to_string(),
-                model_name.to_string(),
-            )),
         }
     }
 

@@ -206,7 +206,7 @@ impl SkillCreator {
             provider_name,
             model,
             dispatch_model: model,
-            temperature: None,
+            temperature: None.into(),
         };
         // Skill reflection is not part of any gateway turn ledger, so its
         // settled-attempt summaries are intentionally discarded.

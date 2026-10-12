@@ -1209,7 +1209,7 @@ impl DelegateTool {
                 model.provider,
                 model.identity.provider_ref(),
                 model.model_name,
-                model.temperature,
+                None,
             ));
         }
         let provider = zeroclaw_providers::create_model_provider_with_options(
@@ -2881,7 +2881,11 @@ impl DelegateTool {
         }
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            zeroclaw_providers::temperature::with_temperature(
+                authoritative_config.or(self.root_config.as_deref()),
+                temperature.into(),
+                dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            ),
         )
         .await;
         if let Some(sink) = self.progress.as_deref() {
@@ -4903,11 +4907,12 @@ impl DelegateTool {
                 &loop_runtime.thinking,
             )
         });
-        let effective_temperature = thinking_params.as_ref().map_or(temperature, |params| {
-            temperature.map(|value| {
-                crate::agent::thinking::clamp_temperature(value + params.temperature_adjustment)
-            })
-        });
+        let effective_temperature = zeroclaw_providers::temperature::Temperature::adjusted(
+            temperature,
+            thinking_params
+                .as_ref()
+                .map_or(0.0, |params| params.temperature_adjustment),
+        );
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so

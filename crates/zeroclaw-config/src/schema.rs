@@ -1001,6 +1001,23 @@ impl ModelIdentity {
 }
 
 impl ModelSelection<'_> {
+    /// Model-side sampling takes precedence over the enclosing profile.
+    #[must_use]
+    pub fn temperature(&self) -> Option<f64> {
+        self.model_entry
+            .and_then(|entry| entry.temperature)
+            .or(self.entry.temperature)
+    }
+
+    /// Configured capacity, preserving the distinction between unset and a
+    /// compatibility fallback used for budget arithmetic.
+    #[must_use]
+    pub fn configured_context_window(&self) -> Option<usize> {
+        self.model_entry
+            .and_then(|entry| entry.context_window)
+            .or(self.entry.context_window)
+    }
+
     /// Owned identity of this selection, for "did the model change"
     /// comparisons. `model_override` (when set) replaces the resolved model
     /// id, mirroring how callers layer an explicit model over
@@ -4901,8 +4918,9 @@ impl Config {
     #[must_use]
     pub fn configured_model_context_window(&self, agent_alias: &str) -> Option<usize> {
         // Provider config (config.toml) is the source of truth for this value.
-        self.resolved_model_provider_for_agent(agent_alias)
-            .and_then(|(_, _, provider_config)| provider_config.context_window)
+        self.agent(agent_alias)
+            .and_then(|agent| self.resolve_model_selection(&agent.model_provider))
+            .and_then(|selection| selection.configured_context_window())
     }
 
     /// Returns the model's context window size (max input tokens).
@@ -4967,10 +4985,7 @@ impl Config {
                 || resolved_model.is_none()
                 || resolved_model == Some(selected_model)
             {
-                return selection
-                    .model_entry
-                    .and_then(|entry| entry.context_window)
-                    .or(selection.entry.context_window);
+                return selection.configured_context_window();
             }
 
             // Runtime attribution intentionally normalizes a nested selection

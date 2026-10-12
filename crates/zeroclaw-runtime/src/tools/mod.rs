@@ -1531,7 +1531,7 @@ fn all_tools_with_runtime_on_thread(
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
         let llm_task_temperature = selection
             .as_ref()
-            .and_then(|s| s.model_entry.and_then(|m| m.temperature))
+            .and_then(|s| s.temperature())
             .or(entry.temperature);
         let mut llm_task_runtime_options =
             zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);

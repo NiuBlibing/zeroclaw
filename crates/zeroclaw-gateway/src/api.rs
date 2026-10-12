@@ -337,7 +337,7 @@ pub async fn handle_api_status(
                     .unwrap_or_default();
                 let temperature: Option<f64> = selection
                     .as_ref()
-                    .and_then(|s| s.model_entry.and_then(|m| m.temperature))
+                    .and_then(|s| s.temperature())
                     .or_else(|| resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature));
                 let backend_kind = agent.memory.backend;
                 let backend = serde_json::to_value(backend_kind)

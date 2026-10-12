@@ -33,6 +33,7 @@ pub mod router;
 pub mod safeguard_notice;
 pub(crate) mod stream_guard;
 pub mod telnyx;
+pub mod temperature;
 pub mod traits;
 pub mod vision_override;
 
@@ -809,31 +810,8 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
     config: &zeroclaw_config::schema::Config,
     entry: Option<&zeroclaw_config::schema::ModelProviderConfig>,
 ) -> ModelProviderRuntimeOptions {
-    // Resolve merge_system_into_user from the active model model_provider profile
-    // by matching api_url — providers.models retains all profiles. We keep
-    // this lookup based on URL match rather than identity because the entry
-    // we were given may itself originate from any of those profiles.
-    let merge_system_into_user = entry
-        .and_then(|e| e.uri.as_deref())
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .and_then(|active_uri| {
-            config
-                .providers
-                .models
-                .iter_entries()
-                .map(|(_, _, base)| base)
-                .find(|p| {
-                    p.uri
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|u: &&str| !u.is_empty())
-                        .map(|u: &str| u.trim_end_matches('/'))
-                        == Some(active_uri.trim_end_matches('/'))
-                })
-        })
-        .map(|p| p.merge_system_into_user)
-        .unwrap_or(false);
+    // The selected profile owns this policy, even when profiles share a URI.
+    let merge_system_into_user = entry.is_some_and(|entry| entry.merge_system_into_user);
 
     let tls_ca_cert_path = entry.and_then(|e| e.tls_ca_cert_path.clone());
 
@@ -883,29 +861,44 @@ pub fn apply_model_entry_options(
     options: &mut ModelProviderRuntimeOptions,
     model_entry: Option<&zeroclaw_config::schema::ModelEntryConfig>,
 ) {
-    let Some(m) = model_entry else {
+    // Exhaustive destructuring makes new model fields require an explicit
+    // inheritance decision here. Identity, temperature and capacity are
+    // resolved by ModelSelection rather than connection runtime options.
+    let Some(zeroclaw_config::schema::ModelEntryConfig {
+        id: _,
+        temperature: _,
+        context_window: _,
+        max_tokens,
+        think,
+        vision,
+        native_tools,
+        replay_assistant_reasoning,
+        provider_extra,
+        chat_template_kwargs,
+    }) = model_entry
+    else {
         return;
     };
-    if let Some(v) = m.max_tokens {
+    if let Some(v) = *max_tokens {
         options.provider_max_tokens = Some(v);
     }
-    if let Some(v) = m.think {
+    if let Some(v) = *think {
         options.think = Some(v);
     }
-    if let Some(v) = m.vision {
+    if let Some(v) = *vision {
         options.vision = Some(v);
     }
-    if let Some(v) = m.native_tools {
+    if let Some(v) = *native_tools {
         options.native_tools = Some(v);
     }
-    if let Some(v) = m.replay_assistant_reasoning {
+    if let Some(v) = *replay_assistant_reasoning {
         options.replay_assistant_reasoning = Some(v);
     }
-    if m.provider_extra.is_some() {
-        options.provider_extra = m.provider_extra.clone();
+    if provider_extra.is_some() {
+        options.provider_extra = provider_extra.clone();
     }
-    if m.chat_template_kwargs.is_some() {
-        options.chat_template_kwargs = m.chat_template_kwargs.clone();
+    if chat_template_kwargs.is_some() {
+        options.chat_template_kwargs = chat_template_kwargs.clone();
     }
 }
 
@@ -933,6 +926,15 @@ pub fn provider_runtime_options_for_agent(
         }
     }
 
+    let selection = config
+        .agent(agent_alias)
+        .and_then(|agent| config.resolve_model_selection(&agent.model_provider));
+    apply_model_entry_options(
+        &mut options,
+        selection
+            .as_ref()
+            .and_then(|selection| selection.model_entry),
+    );
     options
 }
 pub fn provider_runtime_options_for_alias(
@@ -1744,6 +1746,7 @@ pub fn create_resilient_model_provider_for_alias(
         reliability,
         options,
         None,
+        &format!("{family}.{alias}"),
     )
 }
 
@@ -1756,6 +1759,7 @@ fn create_resilient_model_provider_for_alias_with_model_override(
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     options: &ModelProviderRuntimeOptions,
     primary_model_override: Option<&str>,
+    selection_ref: &str,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let primary_model_provider =
         create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
@@ -1768,6 +1772,7 @@ fn create_resilient_model_provider_for_alias_with_model_override(
         alias,
         primary_model_provider,
         primary_model_override,
+        selection_ref,
     );
 
     let mut visited: Vec<String> = vec![format!("{family}.{alias}")];
@@ -1799,6 +1804,7 @@ fn push_pinned_entries(
     alias: &str,
     built: Box<dyn ModelProvider>,
     primary_model_override: Option<&str>,
+    selection_ref: &str,
 ) {
     let entry = config.providers.models.find(family, alias);
     let primary_model = primary_model_override
@@ -1811,34 +1817,43 @@ fn push_pinned_entries(
     let cooldown_key = format!("{family}.{alias}");
 
     let Some(primary_model) = primary_model else {
-        out.push(ReliableModelProviderEntry::new_with_candidate(
-            family,
-            cooldown_key.clone(),
-            cooldown_key,
-            built,
-        ));
+        out.push(
+            ReliableModelProviderEntry::new_with_candidate(
+                family,
+                cooldown_key.clone(),
+                cooldown_key,
+                built,
+            )
+            .with_selection_ref(selection_ref),
+        );
         return;
     };
 
     let built: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::from(built);
-    out.push(ReliableModelProviderEntry::new_pinned(
-        family,
-        cooldown_key.clone(),
-        alias,
-        primary_model,
-        Box::new(std::sync::Arc::clone(&built)),
-    ));
+    out.push(
+        ReliableModelProviderEntry::new_pinned(
+            family,
+            cooldown_key.clone(),
+            alias,
+            primary_model,
+            Box::new(std::sync::Arc::clone(&built)),
+        )
+        .with_selection_ref(selection_ref),
+    );
     for model in extra_models {
         if model.trim().is_empty() || model == primary_model {
             continue;
         }
-        out.push(ReliableModelProviderEntry::new_pinned(
-            family,
-            cooldown_key.clone(),
-            alias,
-            model,
-            Box::new(std::sync::Arc::clone(&built)),
-        ));
+        out.push(
+            ReliableModelProviderEntry::new_pinned(
+                family,
+                cooldown_key.clone(),
+                alias,
+                model,
+                Box::new(std::sync::Arc::clone(&built)),
+            )
+            .with_selection_ref(selection_ref),
+        );
     }
 }
 
@@ -1931,6 +1946,7 @@ fn append_fallback_chain(
                 &alias,
                 built,
                 model_override.as_deref(),
+                raw,
             ),
             Err(e) => {
                 let profile = format!("[providers.models.{family}.{alias}]");
@@ -2105,6 +2121,7 @@ fn create_resilient_model_provider_from_ref_with_model_override(
             reliability,
             options,
             primary_model_override,
+            name,
         ),
         None => create_resilient_model_provider_with_options(
             name,
@@ -3097,6 +3114,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn profile_policy_is_owned_by_entry_even_with_shared_or_missing_uri() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig};
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("custom", "first")
+            .unwrap()
+            .uri = Some("https://shared.invalid/v1".into());
+        let entry = ModelProviderConfig {
+            uri: Some("https://shared.invalid/v1".into()),
+            merge_system_into_user: true,
+            ..Default::default()
+        };
+        assert!(
+            model_provider_runtime_options_from_model_provider_entry(&config, Some(&entry))
+                .merge_system_into_user
+        );
+        let without_uri = ModelProviderConfig { uri: None, ..entry };
+        assert!(
+            model_provider_runtime_options_from_model_provider_entry(&config, Some(&without_uri))
+                .merge_system_into_user
+        );
+        assert!(
+            !model_provider_runtime_options_from_model_provider_entry(&config, None)
+                .merge_system_into_user
+        );
     }
 
     #[test]

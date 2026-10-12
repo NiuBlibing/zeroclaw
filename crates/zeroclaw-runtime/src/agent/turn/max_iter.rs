@@ -365,7 +365,7 @@ pub(crate) async fn finish_after_max_iterations(
                 } else {
                     &selected_model
                 },
-                temperature,
+                temperature: temperature.into(),
             };
             // Route the graceful-summary call through the metered provider seam. This
             // was the one tool-loop provider call that skipped the budget check and

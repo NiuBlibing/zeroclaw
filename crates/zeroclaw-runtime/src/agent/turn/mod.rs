@@ -1494,6 +1494,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         knobs,
     } = exec;
 
+    let temperature_input = temperature;
+    // Legacy CLI bare-family overrides inherit the configured agent selection.
+    let sampling_ref = config
+        .and_then(|config| {
+            (config.resolve_model_selection(provider_name).is_none()
+                && !provider_name.contains('.'))
+            .then(|| agent_alias.and_then(|alias| config.agent(alias)))
+            .flatten()
+            .map(|agent| agent.model_provider.as_str())
+        })
+        .unwrap_or(provider_name);
+    let temperature = temperature_input.resolve(config, sampling_ref);
+
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
     turn_state.sync_pending();
@@ -1738,42 +1751,46 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         Some(state) => (Some(&mut *state.cache), Some(&mut *state.provider_state)),
                         None => (None, None),
                     };
-                    let summary_result = finish_after_max_iterations(
-                        injected_memory_preamble,
-                        model_provider,
-                        turn_state.history,
-                        provider_name,
-                        model,
-                        dispatch_model,
-                        temperature,
-                        pacing,
-                        cancellation_token.as_ref(),
-                        max_iter::CompletionLimit::ExecutionTree,
-                        accumulated_display_text,
-                        turn_id,
-                        &final_knobs,
-                        event_tx.as_ref(),
-                        on_delta.as_ref(),
-                        turn_state.canonical.as_deref_mut(),
+                    let summary_result = zeroclaw_providers::temperature::with_temperature(
                         config,
-                        multimodal_config,
-                        security,
-                        hooks,
-                        summary_image_cache,
-                        summary_provider_image_state,
-                        |provider, selected_model| {
-                            resolve_context_limits_for_call(
-                                context_limits_resolver.as_ref(),
-                                config,
-                                agent_alias,
-                                provider,
-                                selected_model,
-                                context_limits,
-                            )
-                        },
-                        &mut turn_state.crumb_present,
-                        pending_reported_usage,
-                        observer,
+                        temperature_input,
+                        finish_after_max_iterations(
+                            injected_memory_preamble,
+                            model_provider,
+                            turn_state.history,
+                            provider_name,
+                            model,
+                            dispatch_model,
+                            temperature,
+                            pacing,
+                            cancellation_token.as_ref(),
+                            max_iter::CompletionLimit::ExecutionTree,
+                            accumulated_display_text,
+                            turn_id,
+                            &final_knobs,
+                            event_tx.as_ref(),
+                            on_delta.as_ref(),
+                            turn_state.canonical.as_deref_mut(),
+                            config,
+                            multimodal_config,
+                            security,
+                            hooks,
+                            summary_image_cache,
+                            summary_provider_image_state,
+                            |provider, selected_model| {
+                                resolve_context_limits_for_call(
+                                    context_limits_resolver.as_ref(),
+                                    config,
+                                    agent_alias,
+                                    provider,
+                                    selected_model,
+                                    context_limits,
+                                )
+                            },
+                            &mut turn_state.crumb_present,
+                            pending_reported_usage,
+                            observer,
+                        ),
                     )
                     .await;
                     *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -2394,17 +2411,21 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             streamed_protocol_suppressed,
             streamed_visible_text,
             image_recovery_succeeded,
-        } = call_provider(
-            &ctx,
-            active_model_provider,
-            active_model_provider_name,
-            provider_request_model,
-            provider_dispatch_model,
-            &provider_request_messages,
-            image_recovery_messages.as_deref(),
-            request_tools,
-            should_consume_provider_stream,
-            iteration,
+        } = zeroclaw_providers::temperature::with_temperature(
+            config,
+            temperature_input,
+            call_provider(
+                &ctx,
+                active_model_provider,
+                active_model_provider_name,
+                provider_request_model,
+                provider_dispatch_model,
+                &provider_request_messages,
+                image_recovery_messages.as_deref(),
+                request_tools,
+                should_consume_provider_stream,
+                iteration,
+            ),
         )
         .await?;
         let accepted_request_messages = if image_recovery_succeeded {
@@ -3161,7 +3182,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 provider_name,
                 model,
                 dispatch_model,
-                temperature,
+                temperature_input,
                 tools_registry,
                 observer,
                 silent,
@@ -3221,42 +3242,46 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         Some(state) => (Some(&mut *state.cache), Some(&mut *state.provider_state)),
         None => (None, None),
     };
-    let summary_result = finish_after_max_iterations(
-        injected_memory_preamble,
-        model_provider,
-        turn_state.history,
-        provider_name,
-        model,
-        dispatch_model,
-        temperature,
-        pacing,
-        cancellation_token.as_ref(),
-        max_iter::CompletionLimit::LocalIterations(max_iterations),
-        accumulated_display_text,
-        turn_id,
-        knobs,
-        event_tx.as_ref(),
-        on_delta.as_ref(),
-        turn_state.canonical.as_deref_mut(),
+    let summary_result = zeroclaw_providers::temperature::with_temperature(
         config,
-        multimodal_config,
-        security,
-        hooks,
-        summary_image_cache,
-        summary_provider_image_state,
-        |provider, selected_model| {
-            resolve_context_limits_for_call(
-                context_limits_resolver.as_ref(),
-                config,
-                agent_alias,
-                provider,
-                selected_model,
-                context_limits,
-            )
-        },
-        &mut turn_state.crumb_present,
-        pending_reported_usage,
-        observer,
+        temperature_input,
+        finish_after_max_iterations(
+            injected_memory_preamble,
+            model_provider,
+            turn_state.history,
+            provider_name,
+            model,
+            dispatch_model,
+            temperature,
+            pacing,
+            cancellation_token.as_ref(),
+            max_iter::CompletionLimit::LocalIterations(max_iterations),
+            accumulated_display_text,
+            turn_id,
+            knobs,
+            event_tx.as_ref(),
+            on_delta.as_ref(),
+            turn_state.canonical.as_deref_mut(),
+            config,
+            multimodal_config,
+            security,
+            hooks,
+            summary_image_cache,
+            summary_provider_image_state,
+            |provider, selected_model| {
+                resolve_context_limits_for_call(
+                    context_limits_resolver.as_ref(),
+                    config,
+                    agent_alias,
+                    provider,
+                    selected_model,
+                    context_limits,
+                )
+            },
+            &mut turn_state.crumb_present,
+            pending_reported_usage,
+            observer,
+        ),
     )
     .await;
     *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -3399,9 +3424,6 @@ pub(crate) struct OwnedAgentExecution {
     model_provider: Box<dyn ModelProvider>,
     provider_name: String,
     model: String,
-    /// The step agent's own configured provider temperature — the same source
-    /// the headless driver hands `crate::agent::run`.
-    temperature: Option<f64>,
     /// The step agent's sealed tool set. A [`crate::tools::scoped::ScopedToolRegistry`]
     /// so the nested loop's `ResolvedIo.tools_registry` can be fed the scoped
     /// registry directly (coerces to `&[Box<dyn Tool>]` at leaf sites via `Deref`).
@@ -3622,10 +3644,9 @@ pub(crate) async fn assemble_owned_execution_with_admission(
     };
 
     Ok(OwnedAgentExecution {
-        model_provider: model_runtime.provider,
-        provider_name: model_runtime.provider_name,
-        model: model_runtime.model_name,
-        temperature: model_runtime.temperature,
+        model_provider: model_runtime.model.provider,
+        provider_name: model_runtime.model.identity.provider_ref(),
+        model: model_runtime.model.model_name,
         tools_registry,
         approval,
         activated_tools: activated_handle,
@@ -3702,7 +3723,7 @@ async fn drive_live_sop_actions(
     provider_name: &str,
     model: &str,
     dispatch_model: &str,
-    temperature: Option<f64>,
+    temperature: zeroclaw_providers::temperature::Temperature,
     tools_registry: &crate::tools::scoped::ScopedToolRegistry,
     observer: &dyn crate::observability::Observer,
     silent: bool,
@@ -3915,6 +3936,15 @@ async fn drive_live_sop_actions(
                             .and_then(|owned| owned.execution_admission.as_ref())
                             .map(AgentExecutionAdmission::config)
                             .or(execution_config);
+                        // Cross-agent calls resolve model defaults from the same
+                        // generation that assembled the child's provider/tools.
+                        let step_config = if owned.is_some() {
+                            execution_config
+                                .as_deref()
+                                .or_else(|| sop_reassembly.as_ref().map(|handle| handle.config))
+                        } else {
+                            config
+                        };
                         let (
                             eff_model_provider,
                             eff_provider_name,
@@ -3960,7 +3990,7 @@ async fn drive_live_sop_actions(
                             eff_pacing,
                         ) = match owned {
                             Some(o) => (
-                                o.temperature,
+                                zeroclaw_providers::temperature::Temperature::default(),
                                 o.agent.resolved.max_tool_iterations,
                                 o.agent.resolved.strict_tool_parsing,
                                 o.agent.resolved.parallel_tools,
@@ -4111,8 +4141,8 @@ async fn drive_live_sop_actions(
                                                 Some(o) => Some(o.security.as_ref()),
                                                 None => security,
                                             },
-                                            multimodal_config,
-                                            config,
+                                            multimodal_config: step_config.map_or(multimodal_config, |config| &config.multimodal),
+                                            config: step_config,
                                             hooks,
                                             activated_tools: eff_activated,
                                             // Deliberately NOT the outer round's
@@ -6331,7 +6361,7 @@ vision_model_provider = "custom.vision"
                     provider_name: "custom.text",
                     model: "text-model",
                     dispatch_model: "text-model",
-                    temperature: None,
+                    temperature: None.into(),
                 },
                 ResolvedIo {
                     tools_registry: &tools_registry,
@@ -6672,9 +6702,15 @@ mod sop_step_reassembly_tests {
         let writer_names = tool_names(&writer.tools_registry);
 
         for owned in [&reader, &writer] {
-            assert_eq!(owned.provider_name, "ollama.p");
+            assert_eq!(owned.provider_name, "ollama.p.fast");
             assert_eq!(owned.model, "fast-model");
-            assert_eq!(owned.temperature, Some(0.42));
+            assert_eq!(
+                config
+                    .resolve_model_selection(&owned.provider_name)
+                    .unwrap()
+                    .temperature(),
+                Some(0.42)
+            );
         }
 
         assert!(
@@ -7248,7 +7284,7 @@ mod sop_step_reassembly_tests {
                     provider_name: "budget-test",
                     model: "budget-test-model",
                     dispatch_model: "hint:budget-test",
-                    temperature: None,
+                    temperature: None.into(),
                 },
                 ResolvedIo {
                     tools_registry: tools,
@@ -7647,16 +7683,14 @@ mod sop_step_reassembly_tests {
         tools: Vec<Box<dyn crate::tools::Tool>>,
         mcp_tool_names: std::collections::HashSet<String>,
         tool_filter_groups: Vec<zeroclaw_config::schema::ToolFilterGroup>,
-        temperature: Option<f64>,
     ) -> OwnedAgentExecution {
         let mut agent = zeroclaw_config::schema::AliasedAgentConfig::default();
         agent.resolved.tool_filter_groups = tool_filter_groups;
         agent.resolved.max_tool_iterations = 3;
         OwnedAgentExecution {
             model_provider: Box::new(CaptureProvider { requests }),
-            provider_name: "capture".into(),
+            provider_name: "custom.capture".into(),
             model: "capture-model".into(),
-            temperature,
             tools_registry: crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools),
             approval: crate::approval::ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -7793,7 +7827,7 @@ mod sop_step_reassembly_tests {
             "mock",
             "mock-model",
             "mock-model",
-            None,
+            None.into(),
             parent_tools,
             observer,
             true,
@@ -7921,7 +7955,13 @@ mod sop_step_reassembly_tests {
     #[tokio::test]
     async fn cross_agent_step_never_sends_parent_history_to_child_provider() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
-        let config = zeroclaw_config::schema::Config::default();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("custom", "capture")
+            .unwrap()
+            .temperature = Some(0.42);
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
@@ -7937,7 +7977,6 @@ mod sop_step_reassembly_tests {
                 Vec::new(),
                 std::collections::HashSet::new(),
                 Vec::new(),
-                Some(0.42),
             ),
         );
 
@@ -8051,7 +8090,7 @@ mod sop_step_reassembly_tests {
         let mut exec_cache = std::collections::HashMap::new();
         exec_cache.insert(
             "stepper".to_string(),
-            seeded_owned(Arc::clone(&requests), tools, mcp_names, groups, None),
+            seeded_owned(Arc::clone(&requests), tools, mcp_names, groups),
         );
 
         let parent_provider = TextProvider;
@@ -8137,7 +8176,6 @@ mod sop_step_reassembly_tests {
                 Vec::new(),
                 std::collections::HashSet::new(),
                 Vec::new(),
-                None,
             ),
         );
 
@@ -8587,7 +8625,6 @@ mod sop_step_reassembly_tests {
                 model_provider: Box::new(ChildSwitchProvider),
                 provider_name: "child-original-provider".into(),
                 model: "child-original-model".into(),
-                temperature: None,
                 tools_registry: crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
                     Box::new(ChildModelSwitchTool),
                 ]),
@@ -9086,7 +9123,7 @@ mod tool_lifecycle_abandonment_tests {
                     provider_name: "scripted",
                     model: "scripted-model",
                     dispatch_model: "scripted-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry,
                 observer,

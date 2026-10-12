@@ -266,11 +266,11 @@ fn ws_consolidation_model(
     String,
     Option<f64>,
 )> {
-    config.resolve_model_selection(provider_ref)?;
+    let temperature = config.resolve_model_selection(provider_ref)?.temperature();
     let runtime =
-        zeroclaw_runtime::agent::agent::build_model(config, agent_alias, provider_ref, Some(model))
+        zeroclaw_providers::model::build_model(config, agent_alias, provider_ref, Some(model))
             .ok()?;
-    Some((runtime.provider, runtime.model_name, runtime.temperature))
+    Some((runtime.provider, runtime.model_name, temperature))
 }
 
 async fn handle_ws_sop_frame<S>(
@@ -2219,14 +2219,18 @@ async fn process_chat_message(
                             );
                             return;
                         };
-                        if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                            model_provider.as_ref(),
-                            &model,
-                            temperature,
-                            mem.as_ref(),
-                            &memory_config,
-                            &user_msg,
-                            &assistant_resp,
+                        if let Err(e) = zeroclaw_providers::temperature::with_temperature(
+                            Some(&config),
+                            None.into(),
+                            zeroclaw_memory::consolidation::consolidate_turn(
+                                model_provider.as_ref(),
+                                &model,
+                                temperature,
+                                mem.as_ref(),
+                                &memory_config,
+                                &user_msg,
+                                &assistant_resp,
+                            ),
                         )
                         .await
                         {

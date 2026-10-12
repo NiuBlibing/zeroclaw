@@ -1053,7 +1053,7 @@ async fn agent_turn_with_sop_reassembly(
     observer: &dyn Observer,
     provider_name: &str,
     model: &str,
-    temperature: Option<f64>,
+    temperature: impl Into<zeroclaw_providers::temperature::Temperature>,
     silent: bool,
     channel_name: &str,
     channel_reply_target: Option<&str>,
@@ -1077,6 +1077,7 @@ async fn agent_turn_with_sop_reassembly(
     turn_id: Option<&str>,
     sop_reassembly: Option<SopStepReassembly<'_>>,
 ) -> Result<String> {
+    let temperature = temperature.into();
     let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
     let shared_budget = ExecutionTreeBudget::current()
         .map(|budget| budget.child())
@@ -1729,21 +1730,18 @@ pub async fn run(
         // Build the complete model runtime from that reference. The raw ref
         // — two- or three-segment, or a bare family for `--provider
         // <family>` — reaches the construction chain; the committed name is
-        // the normalised two-segment billing key. `model_temperature` is
-        // the config-derived base (`entry ∨ profile`); the CLI flag
-        // overlays it per request below, and a mid-run switch re-derives
-        // it.
+        // the normalised two-segment billing key. Sampling and capacity are
+        // resolved from the selected entry at the request boundary.
         let entry_rt = crate::agent::agent::build_model(
             &config,
             agent_alias,
             effective_model_ref,
             model_override.as_deref(),
         )?;
-        let mut capacity_ref = entry_rt.identity.provider_ref();
-        let mut model_provider = entry_rt.provider;
-        let mut model_temperature = entry_rt.temperature;
-        let mut model_name = entry_rt.model_name;
-        let mut provider_name = entry_rt.provider_name;
+        let mut capacity_ref = entry_rt.model.identity.provider_ref();
+        let mut model_provider = entry_rt.model.provider;
+        let mut model_name = entry_rt.model.model_name;
+        let mut provider_name = entry_rt.model.provider_name;
         let mut context_limits =
             config.resolved_context_limits_for_route(agent_alias, &capacity_ref, &model_name);
 
@@ -2025,17 +2023,12 @@ pub async fn run(
                 thinking_level,
                 &agent.resolved.thinking,
             );
-            // The CLI flag is an explicit per-invocation override; the model
-            // runtime's config-derived temperature (`entry ∨ profile`) is the
-            // base. The flag wins when both are set, matching the session
-            // override semantics on the RPC side. Mutable: a mid-run switch
-            // re-derives it from the new model below.
-            let mut effective_temperature: Option<f64> =
-                temperature.or(model_temperature).map(|t| {
-                    crate::agent::thinking::clamp_temperature(
-                        t + thinking_params.temperature_adjustment,
-                    )
-                });
+            // Keep invocation input separate: each attempt resolves the selected
+            // model's default, then applies the turn's thinking adjustment.
+            let effective_temperature = zeroclaw_providers::temperature::Temperature::adjusted(
+                temperature,
+                thinking_params.temperature_adjustment,
+            );
 
             // Compute per-turn excluded MCP tools from tool_filter_groups before
             // building the turn prompt so tool availability matches the specs
@@ -2331,20 +2324,10 @@ pub async fn run(
                                 &new_model_provider,
                                 Some(&new_model),
                             )?;
-                            capacity_ref = rt.identity.provider_ref();
-                            model_provider = rt.provider;
-                            provider_name = rt.provider_name;
-                            model_name = rt.model_name;
-                            model_temperature = rt.temperature;
-                            // The retry below re-reads `effective_temperature`
-                            // when rebuilding the model access — re-derive it
-                            // from the switched model so the retry (and every
-                            // later turn) runs at the new model's temperature.
-                            effective_temperature = temperature.or(model_temperature).map(|t| {
-                                crate::agent::thinking::clamp_temperature(
-                                    t + thinking_params.temperature_adjustment,
-                                )
-                            });
+                            capacity_ref = rt.model.identity.provider_ref();
+                            model_provider = rt.model.provider;
+                            provider_name = rt.model.provider_name;
+                            model_name = rt.model.model_name;
                             context_limits = config.resolved_context_limits_for_route(
                                 agent_alias,
                                 &capacity_ref,
@@ -2615,13 +2598,12 @@ pub async fn run(
                 );
                 // Same composition as the first message: explicit CLI flag
                 // over the model runtime's config-derived temperature. Before
-                // this, interactive turns dropped the entry-level temperature
-                // entirely — only the CLI param was consulted.
-                let turn_temperature: Option<f64> = temperature.or(model_temperature).map(|t| {
-                    crate::agent::thinking::clamp_temperature(
-                        t + thinking_params.temperature_adjustment,
-                    )
-                });
+                // each attempt reads the active model's default, including a
+                // retry immediately after an interactive model switch.
+                let turn_temperature = zeroclaw_providers::temperature::Temperature::adjusted(
+                    temperature,
+                    thinking_params.temperature_adjustment,
+                );
 
                 // Compute per-turn excluded MCP tools from tool_filter_groups
                 // before the provider call; the system prompt is rebuilt from
@@ -2948,12 +2930,11 @@ pub async fn run(
                                     &new_model_provider,
                                     Some(&new_model),
                                 )?;
-                                capacity_ref = rt.identity.provider_ref();
-                            model_provider = rt.provider;
-                                provider_name = rt.provider_name;
-                                model_name = rt.model_name;
-                                model_temperature = rt.temperature;
-                                context_limits = config.resolved_context_limits_for_route(
+                                capacity_ref = rt.model.identity.provider_ref();
+                            model_provider = rt.model.provider;
+                                provider_name = rt.model.provider_name;
+                                model_name = rt.model.model_name;
+                                    context_limits = config.resolved_context_limits_for_route(
                                     agent_alias,
                                     &capacity_ref,
                                     &model_name,
@@ -3633,10 +3614,10 @@ async fn process_message_inner(
             agent.model_provider.as_str(),
             None,
         )?;
-        let model_provider = entry_rt.provider;
-        let provider_name = entry_rt.provider_name;
-        let model_provider_ref = entry_rt.identity.provider_ref();
-        let model_name = entry_rt.model_name;
+        let model_provider = entry_rt.model.provider;
+        let provider_name = entry_rt.model.provider_name;
+        let model_provider_ref = entry_rt.model.identity.provider_ref();
+        let model_name = entry_rt.model.model_name;
 
         let hardware_rag: Option<crate::rag::HardwareRag> = config
             .peripherals
@@ -3825,9 +3806,10 @@ async fn process_message_inner(
             thinking_level,
             &agent.resolved.thinking,
         );
-        let effective_temperature: Option<f64> = entry_rt.temperature.map(|t| {
-            crate::agent::thinking::clamp_temperature(t + thinking_params.temperature_adjustment)
-        });
+        let effective_temperature = zeroclaw_providers::temperature::Temperature::adjusted(
+            None,
+            thinking_params.temperature_adjustment,
+        );
 
         // Prepend thinking system prompt prefix when present.
         if let Some(ref prefix) = thinking_params.system_prompt_prefix {
@@ -5756,7 +5738,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -6003,7 +5985,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -6435,7 +6417,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -6520,7 +6502,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -6634,7 +6616,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -6804,7 +6786,7 @@ mod tests {
                         provider_name: "mock-provider",
                         model: "mock-model",
                         dispatch_model: "mock-model",
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &observer,
@@ -6902,7 +6884,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -6999,7 +6981,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7081,7 +7063,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7166,7 +7148,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7252,7 +7234,7 @@ mod tests {
                     provider_name: "scripted",
                     model: "scripted-model",
                     dispatch_model: "scripted-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7325,7 +7307,7 @@ mod tests {
                         provider_name: "scripted",
                         model: "scripted-model",
                         dispatch_model: "scripted-model",
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &observer,
@@ -7521,7 +7503,7 @@ mod tests {
                         provider_name: "scripted",
                         model: "scripted-model",
                         dispatch_model: "scripted-model",
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &observer,
@@ -7654,7 +7636,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7739,7 +7721,7 @@ mod tests {
                     provider_name: "scripted",
                     model: "scripted-model",
                     dispatch_model: "scripted-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7823,7 +7805,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -7992,7 +7974,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -8161,7 +8143,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -8296,7 +8278,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -8465,7 +8447,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -8693,7 +8675,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -8846,7 +8828,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -9026,7 +9008,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -9142,7 +9124,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -9242,7 +9224,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -9334,7 +9316,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -9434,7 +9416,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -9537,7 +9519,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -9646,7 +9628,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -9747,7 +9729,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -9932,7 +9914,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10076,7 +10058,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10190,7 +10172,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10290,7 +10272,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10394,7 +10376,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10500,7 +10482,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10592,7 +10574,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10688,7 +10670,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10779,7 +10761,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10868,7 +10850,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -10963,7 +10945,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11085,7 +11067,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11213,7 +11195,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11329,7 +11311,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11423,7 +11405,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11521,7 +11503,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11602,7 +11584,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11684,7 +11666,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11766,7 +11748,7 @@ mod tests {
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11850,7 +11832,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -11938,7 +11920,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12038,7 +12020,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12122,7 +12104,7 @@ Done."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12209,7 +12191,7 @@ Done."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12294,7 +12276,7 @@ Done."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12380,7 +12362,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12523,7 +12505,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12617,7 +12599,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12714,7 +12696,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12834,7 +12816,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -12967,7 +12949,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -13070,7 +13052,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -13184,7 +13166,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -14085,7 +14067,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -14201,7 +14183,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -14312,7 +14294,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -14423,7 +14405,7 @@ This is an example, not an invocation."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -14591,7 +14573,7 @@ This is an example, not an invocation."#;
                     provider_name: "router",
                     model: "hint:fast",
                     dispatch_model: "hint:fast",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -17532,7 +17514,7 @@ Let me check the result."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -17724,7 +17706,7 @@ Let me check the result."#;
                             provider_name: "mock-provider",
                             model: "mock-model",
                             dispatch_model: "mock-model",
-                            temperature: Some(0.0),
+                            temperature: Some(0.0).into(),
                         },
                         tools_registry:
                             &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
@@ -17852,7 +17834,7 @@ Let me check the result."#;
                             provider_name: "reliable-test",
                             model: "test-model",
                             dispatch_model: "test-model",
-                            temperature: Some(0.0),
+                            temperature: Some(0.0).into(),
                         },
                         tools_registry: &tools_registry,
                         observer: &observer,
@@ -18070,7 +18052,7 @@ Let me check the result."#;
                             provider_name: "reliable-test",
                             model: "test-model",
                             dispatch_model: "test-model",
-                            temperature: Some(0.0),
+                            temperature: Some(0.0).into(),
                         },
                         tools_registry: &tools_registry,
                         observer: &observer,
@@ -18177,7 +18159,7 @@ Let me check the result."#;
                     provider_name: "recording-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     vec![],
@@ -18305,7 +18287,7 @@ Let me check the result."#;
                             provider_name: "mock-provider",
                             model: "mock-model",
                             dispatch_model: "mock-model",
-                            temperature: Some(0.0),
+                            temperature: Some(0.0).into(),
                         },
                         tools_registry:
                             &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
@@ -18406,7 +18388,7 @@ Let me check the result."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     vec![],
@@ -18504,7 +18486,7 @@ Let me check the result."#;
                     provider_name: "anthropic.personal",
                     model: "claude-opus-4-8",
                     dispatch_model: "claude-opus-4-8",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     vec![],
@@ -20378,7 +20360,7 @@ Let me check the result."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: observer.as_ref(),
@@ -20479,7 +20461,7 @@ Let me check the result."#;
                             provider_name: "mock-provider",
                             model: "mock-model",
                             dispatch_model: "mock-model",
-                            temperature: Some(0.0),
+                            temperature: Some(0.0).into(),
                         },
                         tools_registry: &tools_registry,
                         observer: &NoopObserver,
@@ -20737,7 +20719,7 @@ Let me check the result."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     Vec::new(),
@@ -20948,7 +20930,7 @@ Let me check the result."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &tools_registry,
                 observer: &observer,
@@ -21055,7 +21037,7 @@ Let me check the result."#;
                     provider_name: "mock-provider",
                     model: "mock-model",
                     dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                     Vec::new(),
@@ -21377,7 +21359,7 @@ Let me check the result."#;
                         provider_name: "budget-provider",
                         model: first_model,
                         dispatch_model: first_model,
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &NoopObserver,
@@ -21766,7 +21748,7 @@ Let me check the result."#;
                         provider_name: "mock-provider",
                         model: "plain-model",
                         dispatch_model: "plain-model",
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &observer,
@@ -21894,7 +21876,7 @@ Let me check the result."#;
                         provider_name: "mock-provider",
                         model: "plain-model",
                         dispatch_model: "plain-model",
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &observer,
@@ -22164,7 +22146,7 @@ Let me check the result."#;
                         provider_name: "mock-provider",
                         model: "plain-model",
                         dispatch_model: "plain-model",
-                        temperature: Some(0.0),
+                        temperature: Some(0.0).into(),
                     },
                     tools_registry: &tools_registry,
                     observer: &observer,
@@ -22929,8 +22911,10 @@ Let me check the result."#;
 
         async fn respond_switch_then_done(
             State(calls): State<CallCount>,
+            Json(body): Json<serde_json::Value>,
         ) -> Json<serde_json::Value> {
             let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(body["temperature"], if call == 0 { 0.2 } else { 0.8 });
             if call == 0 {
                 Json(serde_json::json!({
                     "choices": [{
@@ -22975,6 +22959,15 @@ Let me check the result."#;
                 OllamaModelProviderConfig {
                     base: ModelProviderConfig {
                         model: Some(format!("run-lifecycle-switch-{alias}-model")),
+                        temperature: Some(0.9),
+                        models: std::collections::HashMap::from([(
+                            "default".to_string(),
+                            zeroclaw_config::schema::ModelEntryConfig {
+                                id: Some(format!("run-lifecycle-switch-{alias}-model")),
+                                temperature: Some(if alias == "default" { 0.2 } else { 0.8 }),
+                                ..Default::default()
+                            },
+                        )]),
                         timeout_secs: Some(5),
                         uri: Some(format!("http://{addr}")),
                         ..Default::default()

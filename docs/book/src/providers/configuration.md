@@ -32,6 +32,10 @@ Family-specific entries add their own typed fields on top of these shared fields
 
 A single provider entry is a connection + credential unit. To serve several models over the same endpoint and credential without duplicating the entry, add a `[providers.models.<type>.<alias>.models.<model_alias>]` subtable per model. Each subtable carries its own `id` (the model identifier sent to the provider) plus optional model-side tuning that overlays the entry-level fields: `temperature`, `max_tokens`, `context_window`, `think`, `vision`, `native_tools`, `replay_assistant_reasoning`, `provider_extra`, and `chat_template_kwargs`. Any field left unset falls back to the entry-level value. `fallback_models` and `pricing` remain profile-level concepts and are not supported per nested model entry. Model IDs in `fallback_models` use the selected entry's tuning, including its tool, thinking, token-limit, and extra request options. Use compatible fallback models. A `fallback` reference to another nested model within the same profile is treated as a cycle; use `fallback_models` for alternate model IDs on that connection.
 
+Sampling precedence is an explicit CLI/session invocation override, then the selected model entry's `temperature`, then the enclosing profile's `temperature`, then the provider's protocol default. A switch retry, hint route, or cross-profile fallback resolves the target's configured default at dispatch time; automatic cron, heartbeat, SOP and subagent execution do not turn an inherited default into an invocation override. Thinking adjustments apply after selecting the base temperature. Protocol requirements such as Anthropic's enabled-thinking temperature still apply.
+
+`provider_extra` and `chat_template_kwargs` replace the corresponding profile JSON field as a whole when set on a model entry; they do not merge individual keys with that profile field. Explicit `false` capability settings also override a profile's `true`.
+
 An agent addresses a specific model with a three-segment ref `<type>.<alias>.<model_alias>`:
 
 ```toml
