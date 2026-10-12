@@ -1751,46 +1751,43 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         Some(state) => (Some(&mut *state.cache), Some(&mut *state.provider_state)),
                         None => (None, None),
                     };
-                    let summary_result = zeroclaw_providers::temperature::with_temperature(
-                        config,
+                    let summary_result = finish_after_max_iterations(
+                        injected_memory_preamble,
+                        model_provider,
+                        turn_state.history,
+                        provider_name,
+                        model,
+                        dispatch_model,
                         temperature_input,
-                        finish_after_max_iterations(
-                            injected_memory_preamble,
-                            model_provider,
-                            turn_state.history,
-                            provider_name,
-                            model,
-                            dispatch_model,
-                            temperature,
-                            pacing,
-                            cancellation_token.as_ref(),
-                            max_iter::CompletionLimit::ExecutionTree,
-                            accumulated_display_text,
-                            turn_id,
-                            &final_knobs,
-                            event_tx.as_ref(),
-                            on_delta.as_ref(),
-                            turn_state.canonical.as_deref_mut(),
-                            config,
-                            multimodal_config,
-                            security,
-                            hooks,
-                            summary_image_cache,
-                            summary_provider_image_state,
-                            |provider, selected_model| {
-                                resolve_context_limits_for_call(
-                                    context_limits_resolver.as_ref(),
-                                    config,
-                                    agent_alias,
-                                    provider,
-                                    selected_model,
-                                    context_limits,
-                                )
-                            },
-                            &mut turn_state.crumb_present,
-                            pending_reported_usage,
-                            observer,
-                        ),
+                        temperature,
+                        pacing,
+                        cancellation_token.as_ref(),
+                        max_iter::CompletionLimit::ExecutionTree,
+                        accumulated_display_text,
+                        turn_id,
+                        &final_knobs,
+                        event_tx.as_ref(),
+                        on_delta.as_ref(),
+                        turn_state.canonical.as_deref_mut(),
+                        config,
+                        multimodal_config,
+                        security,
+                        hooks,
+                        summary_image_cache,
+                        summary_provider_image_state,
+                        |provider, selected_model| {
+                            resolve_context_limits_for_call(
+                                context_limits_resolver.as_ref(),
+                                config,
+                                agent_alias,
+                                provider,
+                                selected_model,
+                                context_limits,
+                            )
+                        },
+                        &mut turn_state.crumb_present,
+                        pending_reported_usage,
+                        observer,
                     )
                     .await;
                     *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -1987,10 +1984,18 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let model_context_window = active_context_limits.model_context_window;
         // Zero disables proactive trimming, but model capacity still applies.
         let trim_budget = dispatch_trim_budget(active_context_limits);
-        let ctx = base_ctx.for_route(
+        let mut ctx = base_ctx.for_route(
             active_model_provider_name,
             provider_request_model,
             active_context_limits,
+        );
+        ctx.temperature = temperature_input.resolve(
+            config,
+            if vision_model_provider_box.is_some() {
+                active_model_provider_name
+            } else {
+                sampling_ref
+            },
         );
         if let Some(sink) = served_route_sink.as_ref() {
             *sink.lock().expect("served-route sink lock") = Some(outcome::ServedRoute {
@@ -2452,33 +2457,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 )
             });
 
-        // A reliable fallback can serve a DIFFERENT configured alias than the
-        // one this iteration resolved limits for at dispatch time. Capacity and
-        // budget are properties of the route that actually answered, so re-key
-        // them through the same canonical resolver rather than reporting the
-        // pre-dispatch pair against a post-dispatch identity. `AcceptedRoute`
-        // deliberately carries identity only — capacity lives in config, which
-        // the provider layer must not know about — so the pair is re-resolved
-        // here instead of being threaded through dispatch.
-        //
-        // Gated on the served ROUTE differing from the dispatched one, in
-        // either component. Two distinct fallback shapes reach here:
-        //
-        //   - `fallback` (cross-alias): the accepted route names a different
-        //     configured alias, so the alias comparison catches it.
-        //   - `fallback_models` (same-alias): `push_pinned_entries` builds the
-        //     primary and every fallback under ONE alias, differing only in the
-        //     pinned model, and `served_model()` reports that pinned model. The
-        //     alias is unchanged, so only the model comparison catches it.
-        //
-        // The model comparison ignores a `hint:` selector. A direct call
-        // through a router reports an accepted route whose `model()` is the
-        // dispatch-facing wire selector, which is neither an attribution name
-        // nor a valid resolver key; comparing it raw would fire on every hinted
-        // call even though the route never changed. Pinned-fallback models from
-        // the reliable layer are never `hint:`-prefixed, so stripping the
-        // prefix keeps this branch closed for hint routing while leaving it
-        // open for a real pinned-model fallback.
+        // Resolve capacity from the accepted construction selection, while
+        // keeping physical provider/model identity for billing and telemetry.
+        // A wire model ID alone cannot distinguish nested entries. Legacy
+        // direct providers without a selection report retain route-based
+        // resolution below; a hint selector is not a capacity lookup key.
         let served_model_key = served_model
             .strip_prefix("hint:")
             .map(|_| provider_request_model)
@@ -2501,7 +2484,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     _ => false,
                 }
             });
-        let served_context_limits = if served_route_changed && !same_selected_model {
+        let accepted_selection = accepted_route
+            .as_ref()
+            .and_then(|route| route.selection_ref());
+        let served_context_limits = if let Some(selection_ref) = accepted_selection {
+            resolve_context_limits_for_call(
+                context_limits_resolver.as_ref(),
+                config,
+                agent_alias,
+                selection_ref,
+                served_model_key,
+                active_context_limits,
+            )
+        } else if served_route_changed && !same_selected_model {
             resolve_context_limits_for_call(
                 context_limits_resolver.as_ref(),
                 config,
@@ -2513,10 +2508,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             active_context_limits
         };
-        // Rebind so everything downstream of acceptance — the per-call usage
-        // frame, recovery arithmetic, and the terminal snapshot — reads limits
-        // for the route that actually answered. A no-op when the alias did not
-        // change, since `served_context_limits` is then the pair already bound.
+        // Usage frames, recovery arithmetic and the terminal snapshot all
+        // consume the accepted selection's freshly resolved limits.
         let ctx = base_ctx.for_route(&served_provider, served_model_key, served_context_limits);
 
         // Reliable providers classify this before retries and fallback. Keep
@@ -3242,46 +3235,43 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         Some(state) => (Some(&mut *state.cache), Some(&mut *state.provider_state)),
         None => (None, None),
     };
-    let summary_result = zeroclaw_providers::temperature::with_temperature(
-        config,
+    let summary_result = finish_after_max_iterations(
+        injected_memory_preamble,
+        model_provider,
+        turn_state.history,
+        provider_name,
+        model,
+        dispatch_model,
         temperature_input,
-        finish_after_max_iterations(
-            injected_memory_preamble,
-            model_provider,
-            turn_state.history,
-            provider_name,
-            model,
-            dispatch_model,
-            temperature,
-            pacing,
-            cancellation_token.as_ref(),
-            max_iter::CompletionLimit::LocalIterations(max_iterations),
-            accumulated_display_text,
-            turn_id,
-            knobs,
-            event_tx.as_ref(),
-            on_delta.as_ref(),
-            turn_state.canonical.as_deref_mut(),
-            config,
-            multimodal_config,
-            security,
-            hooks,
-            summary_image_cache,
-            summary_provider_image_state,
-            |provider, selected_model| {
-                resolve_context_limits_for_call(
-                    context_limits_resolver.as_ref(),
-                    config,
-                    agent_alias,
-                    provider,
-                    selected_model,
-                    context_limits,
-                )
-            },
-            &mut turn_state.crumb_present,
-            pending_reported_usage,
-            observer,
-        ),
+        temperature,
+        pacing,
+        cancellation_token.as_ref(),
+        max_iter::CompletionLimit::LocalIterations(max_iterations),
+        accumulated_display_text,
+        turn_id,
+        knobs,
+        event_tx.as_ref(),
+        on_delta.as_ref(),
+        turn_state.canonical.as_deref_mut(),
+        config,
+        multimodal_config,
+        security,
+        hooks,
+        summary_image_cache,
+        summary_provider_image_state,
+        |provider, selected_model| {
+            resolve_context_limits_for_call(
+                context_limits_resolver.as_ref(),
+                config,
+                agent_alias,
+                provider,
+                selected_model,
+                context_limits,
+            )
+        },
+        &mut turn_state.crumb_present,
+        pending_reported_usage,
+        observer,
     )
     .await;
     *history_has_trim_breadcrumb = turn_state.crumb_present;

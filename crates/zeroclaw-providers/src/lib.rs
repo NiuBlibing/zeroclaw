@@ -683,7 +683,7 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
     /// Explicit provider implementation from `[providers.models.<family>.<alias>].kind`.
@@ -710,6 +710,9 @@ pub struct ModelProviderRuntimeOptions {
     /// Maximum output tokens for LLM model_provider API requests.
     /// `None` uses the model_provider's built-in default.
     pub provider_max_tokens: Option<u32>,
+    /// Construction-time projection of the selected model capacity.
+    /// Config remains canonical; rebuilt bindings rematerialize this value.
+    pub provider_context_window: Option<usize>,
     /// When true, system messages are merged into the first user message before
     /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
     pub merge_system_into_user: bool,
@@ -788,6 +791,7 @@ impl Default for ModelProviderRuntimeOptions {
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
             provider_max_tokens: None,
+            provider_context_window: None,
             merge_system_into_user: false,
             provider_extra: None,
             replay_assistant_reasoning: None,
@@ -834,6 +838,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         extra_headers: entry.map(|e| e.extra_headers.clone()).unwrap_or_default(),
         api_path: None,
         provider_max_tokens: entry.and_then(|e| e.max_tokens),
+        provider_context_window: entry.and_then(|e| e.context_window),
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
@@ -862,12 +867,12 @@ pub fn apply_model_entry_options(
     model_entry: Option<&zeroclaw_config::schema::ModelEntryConfig>,
 ) {
     // Exhaustive destructuring makes new model fields require an explicit
-    // inheritance decision here. Identity, temperature and capacity are
-    // resolved by ModelSelection rather than connection runtime options.
+    // inheritance decision here. Identity and temperature are resolved by
+    // ModelSelection; capacity also feeds adapters with a local input budget.
     let Some(zeroclaw_config::schema::ModelEntryConfig {
         id: _,
         temperature: _,
-        context_window: _,
+        context_window,
         max_tokens,
         think,
         vision,
@@ -879,6 +884,9 @@ pub fn apply_model_entry_options(
     else {
         return;
     };
+    if let Some(v) = *context_window {
+        options.provider_context_window = Some(v);
+    }
     if let Some(v) = *max_tokens {
         options.provider_max_tokens = Some(v);
     }
@@ -3686,6 +3694,95 @@ mod tests {
             .take()
             .expect("server should capture request");
         assert_eq!(model, "new-model");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn hailo_nested_context_window_controls_actual_factory_request_budget() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{Config, ModelEntryConfig};
+        type Requests = Arc<Mutex<Vec<serde_json::Value>>>;
+        async fn capture(
+            State(requests): State<Requests>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            requests.lock().unwrap().push(body);
+            Json(serde_json::json!({
+                "model": "hailo-id", "message": {"role": "assistant", "content": "done"}, "done": true
+            }))
+        }
+        let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/api/chat", post(capture))
+            .with_state(Arc::clone(&requests));
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("hailo_ollama", "edge")
+            .unwrap();
+        profile.uri = Some(endpoint);
+        profile.model = Some("hailo-id".into());
+        profile.context_window = Some(64);
+        profile.models.insert(
+            "large".into(),
+            ModelEntryConfig {
+                context_window: Some(128),
+                max_tokens: Some(1),
+                ..Default::default()
+            },
+        );
+        profile.models.insert(
+            "inherited".into(),
+            ModelEntryConfig {
+                max_tokens: Some(1),
+                ..Default::default()
+            },
+        );
+        let messages = [ChatMessage::user("x".repeat(300))];
+        for reliable in [false, true] {
+            for (selection, accepted) in [("large", true), ("inherited", false)] {
+                let reference = format!("hailo_ollama.edge.{selection}");
+                let provider = if reliable {
+                    model::build_model(&config, "worker", &reference, None)
+                        .unwrap()
+                        .provider
+                } else {
+                    create_model_provider_from_ref(&config, &reference).unwrap()
+                };
+                let result = ProviderDispatch::from_ref(provider.as_ref())
+                    .chat_with_history(&messages, "hailo-id", None)
+                    .await;
+                if accepted {
+                    assert_eq!(result.unwrap(), "done");
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(
+                        format!("{error:#}").contains("local context budget"),
+                        "reliable={reliable}: {error:#}",
+                    );
+                }
+            }
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "inherited profile budget must still reject before transport"
+        );
+        for body in requests.iter() {
+            assert!(
+                body["options"].get("num_ctx").is_none(),
+                "capacity remains a local budget"
+            );
+            assert_eq!(body["options"]["num_predict"], 1);
+        }
         server.abort();
     }
 

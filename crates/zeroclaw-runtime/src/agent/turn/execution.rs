@@ -110,7 +110,14 @@ impl ResolvedModelAccess<'_> {
             .scope(with_exact_dispatch_route(
                 self.provider_name.to_string(),
                 self.model.to_string(),
-                dispatcher.chat(request, self.dispatch_model, self.temperature.override_value),
+                dispatcher.chat(
+                    request,
+                    self.dispatch_model,
+                    zeroclaw_providers::temperature::temperature_for_dispatch(
+                        self.provider_name,
+                        self.temperature.override_value,
+                    ),
+                ),
             ))
             .await;
         if result.is_ok() {

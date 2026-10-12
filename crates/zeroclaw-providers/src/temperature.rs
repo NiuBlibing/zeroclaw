@@ -74,9 +74,10 @@ where
     ))
 }
 
-/// Reliable resolves the actual configured candidate just before dispatch.
+/// Resolve the actual configured candidate just before dispatch, including
+/// direct vision and one-shot calls.
 /// Unscoped provider users retain the trait's explicit scalar semantics.
-pub(crate) fn temperature_for_attempt(selection_ref: &str, fallback: Option<f64>) -> Option<f64> {
+pub fn temperature_for_dispatch(selection_ref: &str, fallback: Option<f64>) -> Option<f64> {
     CALL_TEMPERATURE
         .try_with(|call| {
             if call
@@ -119,30 +120,30 @@ mod tests {
         ] {
             with_temperature(Some(&config), input, async {
                 assert!(
-                    (temperature_for_attempt("custom.gw.chosen", Some(0.9)).unwrap() - expected)
+                    (temperature_for_dispatch("custom.gw.chosen", Some(0.9)).unwrap() - expected)
                         .abs()
                         < 1e-9
                 );
                 assert_eq!(
-                    temperature_for_attempt("custom.unset", Some(0.9)),
+                    temperature_for_dispatch("custom.unset", Some(0.9)),
                     input.resolve(Some(&config), "custom.unset")
                 );
                 with_temperature(None, None.into(), async {
                     assert_eq!(
-                        temperature_for_attempt("custom.gw.chosen", Some(0.7)),
+                        temperature_for_dispatch("custom.gw.chosen", Some(0.7)),
                         Some(0.7)
                     );
                 })
                 .await;
                 assert!(
-                    (temperature_for_attempt("custom.gw.chosen", Some(0.9)).unwrap() - expected)
+                    (temperature_for_dispatch("custom.gw.chosen", Some(0.9)).unwrap() - expected)
                         .abs()
                         < 1e-9
                 );
             })
             .await;
             assert_eq!(
-                temperature_for_attempt("custom.gw.chosen", Some(0.7)),
+                temperature_for_dispatch("custom.gw.chosen", Some(0.7)),
                 Some(0.7)
             );
         }

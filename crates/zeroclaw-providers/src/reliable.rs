@@ -216,7 +216,8 @@ fn record_accepted_attempt(
         entry.cooldown_key.clone(),
         entry.served_model(model).to_string(),
         fallback,
-    );
+    )
+    .with_selection_ref(entry.selection_ref.as_deref());
     let _ = RELIABLE_CALL_ACCOUNTING
         .try_with(|accounting| accounting.lock().accepted_route = Some(route));
 }
@@ -2027,7 +2028,7 @@ impl ReliableModelProviderEntry {
     }
 
     fn temperature(&self, fallback: Option<f64>) -> Option<f64> {
-        crate::temperature::temperature_for_attempt(
+        crate::temperature::temperature_for_dispatch(
             self.selection_ref
                 .as_deref()
                 .unwrap_or(&self.candidate_name),
@@ -3969,7 +3970,8 @@ impl ModelProvider for ReliableModelProvider {
                 fallback_record
                     .as_ref()
                     .map(ProviderFallbackRecord::attribution),
-            );
+            )
+            .with_selection_ref(entry.selection_ref.as_deref());
             // Usage is billing metadata, not stream acceptance. A provider can
             // report usage and then fail before Final; recording the fallback
             // at Usage would leak a route that never produced an accepted
@@ -4058,7 +4060,8 @@ impl ModelProvider for ReliableModelProvider {
                 fallback_record
                     .as_ref()
                     .map(ProviderFallbackRecord::attribution),
-            );
+            )
+            .with_selection_ref(entry.selection_ref.as_deref());
 
             return stream_with_success_recording(
                 stream,
@@ -4139,7 +4142,8 @@ impl ModelProvider for ReliableModelProvider {
                 fallback_record
                     .as_ref()
                     .map(ProviderFallbackRecord::attribution),
-            );
+            )
+            .with_selection_ref(entry.selection_ref.as_deref());
 
             return stream_with_success_recording(
                 stream,

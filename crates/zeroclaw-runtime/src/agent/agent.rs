@@ -1851,14 +1851,41 @@ impl Agent {
         }
 
         let transcript = Self::encode_response_cache_transcript(messages);
+        // Resolve at use time: full selection and all provider configuration
+        // affect the request, even when two entries share a wire model ID.
+        // Hash the canonical config without persisting connection credentials.
+        // Serialization failure bypasses caching rather than reusing a weak key.
+        let selected = self.model_route_resolver.resolve(effective_model);
+        let config_fingerprint = if let Some(config) = self.full_config() {
+            use sha2::{Digest, Sha256};
+            let agent_options =
+                zeroclaw_providers::provider_runtime_options_for_agent(config, &self.agent_alias);
+            let options = zeroclaw_providers::options_for_provider_ref(
+                config,
+                &selected.provider_name,
+                &agent_options,
+            );
+            // Include shared construction defaults (reasoning, multimodal,
+            // secrets directory) through the existing options materializer.
+            let mut provider_config =
+                serde_json::to_value((&config.providers.models, options)).ok()?;
+            provider_config.sort_all_objects();
+            let bytes = serde_json::to_vec(&provider_config).ok()?;
+            format!("{:x}", Sha256::digest(bytes))
+        } else {
+            String::new()
+        };
         let provider_model_identity = format!(
-            "provider={}:{};alias={}:{};model={}:{}",
+            "provider={}:{};alias={}:{};model={}:{};selection={}:{};config={}",
             self.model_provider_name.len(),
             self.model_provider_name,
             self.model_provider.alias().len(),
             self.model_provider.alias(),
             effective_model.len(),
             effective_model,
+            selected.provider_name.len(),
+            selected.provider_name,
+            config_fingerprint,
         );
 
         Some(zeroclaw_memory::response_cache::ResponseCache::cache_key(
@@ -5407,6 +5434,7 @@ mod tests {
                 ModelEntryConfig {
                     id: Some("shared-id".into()),
                     temperature: Some(0.4),
+                    context_window: Some(128_000),
                     ..Default::default()
                 },
             ),
@@ -5415,6 +5443,7 @@ mod tests {
                 ModelEntryConfig {
                     id: Some("shared-id".into()),
                     temperature: Some(0.8),
+                    context_window: Some(8_000),
                     max_tokens: Some(77),
                     provider_extra: Some(serde_json::json!({"selected_only": true})),
                     chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
@@ -5443,8 +5472,14 @@ mod tests {
             for selector in ["primary-id", "hint:target"] {
                 for streamed in [false, true] {
                     let rt = build_model(&config, "worker", "custom.primary", None).unwrap();
+                    let limits_config = config.clone();
                     let mut agent = Agent::builder()
                         .model_runtime(rt)
+                        .agent_alias("worker".into())
+                        .context_limits_resolver(Arc::new(move |provider, model| {
+                            limits_config
+                                .resolved_context_limits_for_route("worker", provider, model)
+                        }))
                         .temperature(override_value)
                         .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                             Vec::new(),
@@ -5460,12 +5495,28 @@ mod tests {
                         .unwrap();
                     agent.model_name = selector.into();
                     if streamed {
-                        let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
                         let outcome = agent
                             .turn_streamed_with_steering_state("hello", tx, None, None)
                             .await
                             .unwrap();
                         assert!(outcome.response.starts_with("done"));
+                        assert_eq!(
+                            outcome.final_context_limits.unwrap().model_context_window,
+                            8_000
+                        );
+                        let mut reported = Vec::new();
+                        while let Ok(event) = rx.try_recv() {
+                            if let TurnEvent::Usage {
+                                model_context_window: Some(window),
+                                ..
+                            } = event
+                            {
+                                reported.push(window);
+                            }
+                        }
+                        assert!(!reported.is_empty());
+                        assert!(reported.iter().all(|window| *window == 8_000));
                     } else {
                         assert!(agent.turn("hello").await.unwrap().starts_with("done"));
                     }
@@ -5494,6 +5545,203 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn dedicated_vision_route_resolves_selected_temperature_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::ModelEntryConfig;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["stream"] == true {
+                    ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": "done"}}]
+                    }))
+                }
+            })
+            .mount(&server).await;
+        let mut config = Config::default();
+        let text = config.providers.models.ensure("custom", "text").unwrap();
+        text.uri = Some(server.uri());
+        text.model = Some("text-id".into());
+        text.temperature = Some(0.2);
+        text.vision = Some(false);
+        let vision = config.providers.models.ensure("custom", "vision").unwrap();
+        vision.uri = Some(server.uri());
+        vision.temperature = Some(0.7);
+        vision.models.insert(
+            "selected".into(),
+            ModelEntryConfig {
+                id: Some("vision-id".into()),
+                temperature: Some(0.8),
+                ..Default::default()
+            },
+        );
+        config.multimodal.vision_model_provider = Some("custom.vision.selected".into());
+        for override_value in [None, Some(0.2)] {
+            for streamed in [false, true] {
+                let mut agent = Agent::builder()
+                    .model_runtime(build_model(&config, "worker", "custom.text", None).unwrap())
+                    .temperature(override_value)
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        Vec::new(),
+                    ))
+                    .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                    .observer(Arc::new(crate::observability::NoopObserver))
+                    .multimodal_config(config.multimodal.clone())
+                    .provider_switch_config(ProviderSwitchConfig {
+                        config: Some(Arc::new(config.clone())),
+                        live_config: None,
+                        live: None,
+                    })
+                    .build()
+                    .unwrap();
+                let message = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+                if streamed {
+                    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                    assert_eq!(
+                        agent.turn_streamed(message, tx, None).await.unwrap().0,
+                        "done"
+                    );
+                } else {
+                    assert_eq!(agent.turn(message).await.unwrap(), "done");
+                }
+                let requests = server.received_requests().await.unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+                assert_eq!(body["model"], "vision-id");
+                assert_eq!(body["temperature"], override_value.unwrap_or(0.8));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_cache_separates_same_id_selections_and_reloaded_tuning_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::ModelEntryConfig;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let mut answer = format!("tokens-{}", body["max_tokens"]);
+                if let Some(effort) = body["reasoning_effort"].as_str() {
+                    answer.push_str(&format!("-{effort}"));
+                }
+                if body["stream"] == true {
+                    let event = serde_json::json!({"choices": [{"delta": {"content": answer}, "finish_reason": "stop"}]});
+                    ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                        .set_body_string(format!("data: {event}\n\ndata: [DONE]\n\n"))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": answer}}]
+                    }))
+                }
+            })
+            .mount(&server).await;
+        let temp = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(temp.path(), 60, 100).unwrap(),
+        );
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "cache").unwrap();
+        profile.uri = Some(server.uri());
+        profile.reasoning_effort_passthrough = true;
+        for (name, max_tokens) in [("first", 11), ("second", 77)] {
+            profile.models.insert(
+                name.into(),
+                ModelEntryConfig {
+                    id: Some("shared-id".into()),
+                    temperature: Some(0.0),
+                    max_tokens: Some(max_tokens),
+                    ..Default::default()
+                },
+            );
+        }
+        let build = |config: &Config, reference: &str| {
+            Agent::builder()
+                .model_runtime(build_model(config, "worker", reference, None).unwrap())
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver))
+                .response_cache(Some(Arc::clone(&cache)))
+                .workspace_dir(temp.path().to_path_buf())
+                .turn_datetime(fixed_response_cache_turn_datetime)
+                .provider_switch_config(ProviderSwitchConfig {
+                    config: Some(Arc::new(config.clone())),
+                    live_config: None,
+                    live: None,
+                })
+                .build()
+                .unwrap()
+        };
+        for streamed in [false, true] {
+            let message = format!("same cache request streamed={streamed}");
+            let before = server.received_requests().await.unwrap().len();
+            let mut current_config = config.clone();
+            let mut agent = build(&current_config, "custom.cache.first");
+            for (reference, tokens, reload, effort) in [
+                ("custom.cache.first", 11, false, None),
+                ("custom.cache.second", 77, false, None),
+                ("custom.cache.second", 77, false, None),
+                ("custom.cache.second", 99, true, None),
+                ("custom.cache.second", 99, false, None),
+                ("custom.cache.second", 99, false, Some("high")),
+                ("custom.cache.second", 99, false, Some("high")),
+            ] {
+                if reload {
+                    current_config
+                        .providers
+                        .models
+                        .ensure("custom", "cache")
+                        .unwrap()
+                        .models
+                        .get_mut("second")
+                        .unwrap()
+                        .max_tokens = Some(tokens);
+                }
+                current_config.runtime.reasoning_effort = effort.map(str::to_string);
+                agent.install_model_runtime(
+                    build_model(&current_config, "worker", reference, None).unwrap(),
+                );
+                agent.set_config_generation(Arc::new(current_config.clone()));
+                agent.history.clear();
+                let answer = if streamed {
+                    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                    agent.turn_streamed(&message, tx, None).await.unwrap().0
+                } else {
+                    agent.turn(&message).await.unwrap()
+                };
+                let expected = effort.map_or_else(
+                    || format!("tokens-{tokens}"),
+                    |value| format!("tokens-{tokens}-{value}"),
+                );
+                assert_eq!(answer, expected);
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len() - before,
+                4,
+                "unchanged selections must still reuse the cache"
+            );
+            let tokens: Vec<_> = requests[before..]
+                .iter()
+                .map(|request| {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    body["max_tokens"].as_u64().unwrap()
+                })
+                .collect();
+            assert_eq!(tokens, [11, 77, 99, 99]);
+            let final_body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(final_body["reasoning_effort"], "high");
         }
     }
 
