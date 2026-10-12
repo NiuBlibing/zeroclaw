@@ -1184,3 +1184,4 @@ cli-model-switch-entry-missing = model_provider `{ $provider_ref }` désigne le 
 cli-model-switch-model-required = Paramètre 'model' manquant pour 'set' (ou utilisez une référence model_provider `<type>.<alias>.<model>`)
 cli-doctor-nested-model = { $provider_ref } : modèle : { $model } (entrée { $model_alias })
 cli-doctor-nested-model-id-missing = { $provider_ref } : l’entrée { $model_alias } n’a pas d’ID de modèle (définissez son `id` ou le `model` du profil)
+cli-doctor-temperature-out-of-range = { $provider_ref } : la température { $temperature } est hors plage (valeur attendue : 0.0–2.0)

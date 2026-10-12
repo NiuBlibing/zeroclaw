@@ -5478,6 +5478,7 @@ impl AssistantChannelOutcome {
 }
 
 async fn classify_channel_reply_intent(
+    config: &Config,
     model_provider: &dyn ModelProvider,
     system_prompt: &str,
     history: &[ChatMessage],
@@ -5522,9 +5523,20 @@ async fn classify_channel_reply_intent(
         let _ = writeln!(convo, "[{role}] {safe_content}");
     }
 
-    let response = ProviderDispatch::from_ref(model_provider)
-        .chat_with_system(Some(system_prompt), &convo, model, temperature)
-        .await?;
+    // The scalar is a compatibility default for unconfigured/bare providers,
+    // never an invocation override. Each configured reliable candidate resolves
+    // its own temperature from this admitted generation.
+    let response = zeroclaw_providers::temperature::with_temperature(
+        Some(config),
+        None.into(),
+        ProviderDispatch::from_ref(model_provider).chat_with_system(
+            Some(system_prompt),
+            &convo,
+            model,
+            temperature,
+        ),
+    )
+    .await?;
     Ok(parse_reply_intent(&response))
 }
 
@@ -9547,17 +9559,19 @@ async fn process_channel_message_body(
                     (
                         Arc::clone(&active_model_provider),
                         route.model.clone(),
-                        None,
+                        runtime_defaults.config.resolve_model_selection(&route.model_provider)
+                            .map_or(runtime_defaults.defaults.temperature, |selection| selection.temperature()),
                     )
                 });
 
                 let started = Instant::now();
                 let precheck_future = classify_channel_reply_intent(
+                    runtime_defaults.config.as_ref(),
                     classifier_provider_arc.as_ref(),
                     history[0].content.as_str(),
                     &history,
                     classifier_model_owned.as_str(),
-                    classifier_temperature.or(runtime_defaults.defaults.temperature),
+                    classifier_temperature,
                 );
                 match tokio::time::timeout(Duration::from_secs(precheck.timeout_secs), precheck_future)
                     .await
@@ -22101,6 +22115,167 @@ temperature = 0.3
             Some(0.0),
             "alias temperature must be returned, not runtime_defaults.temperature"
         );
+    }
+
+    #[tokio::test]
+    async fn classifier_fallback_resolves_sampling_from_admitted_config() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::ModelEntryConfig;
+
+        let primary = MockServer::start().await;
+        let backup = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "NO_REPLY[INFO]: ambient chatter"}}]
+            })))
+            .mount(&backup)
+            .await;
+        let mut config = Config::default();
+        config.reliability.provider_retries = 0;
+        for (alias, server, temperature) in
+            [("classifier", &primary, 0.2), ("backup", &backup, 0.8)]
+        {
+            let profile = config.providers.models.ensure("custom", alias).unwrap();
+            profile.uri = Some(server.uri());
+            profile.temperature = Some(0.9);
+            profile.models.insert(
+                "chosen".into(),
+                ModelEntryConfig {
+                    id: Some(format!("{alias}-id")),
+                    temperature: Some(temperature),
+                    ..Default::default()
+                },
+            );
+        }
+        config
+            .providers
+            .models
+            .ensure("custom", "classifier")
+            .unwrap()
+            .fallback = vec!["custom.backup.chosen".into()];
+        let ctx = ChannelRuntimeContext {
+            prompt_config: Arc::new(config.clone()),
+            ..(*router_test_ctx()).clone()
+        };
+        let reference = "custom.classifier.chosen".into();
+        let (provider, model, temperature) =
+            resolve_classifier_route(&ctx, &reference, &runtime_defaults_snapshot(&ctx))
+                .await
+                .unwrap();
+        // Reuse the handle with another admitted generation: sampling is read
+        // at call time, rather than snapshotted during provider construction.
+        for expected in [0.8, 0.6] {
+            config
+                .providers
+                .models
+                .ensure("custom", "backup")
+                .unwrap()
+                .models
+                .get_mut("chosen")
+                .unwrap()
+                .temperature = Some(expected);
+            let outcome = classify_channel_reply_intent(
+                &config,
+                provider.as_ref(),
+                "system",
+                &[ChatMessage::user("hello")],
+                &model,
+                temperature,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                AssistantChannelOutcome::NoReply {
+                    kind: NoReplyKind::Informational,
+                    ..
+                }
+            ));
+            let requests = backup.received_requests().await.unwrap();
+            let request = requests
+                .iter()
+                .rev()
+                .find(|request| !request.body.is_empty())
+                .expect("classifier request body");
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["model"], "backup-id");
+            assert_eq!(body["temperature"], expected);
+        }
+        let requests = primary.received_requests().await.unwrap();
+        let request = requests
+            .iter()
+            .find(|request| !request.body.is_empty())
+            .expect("primary classifier request body");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["temperature"], 0.2);
+    }
+
+    #[tokio::test]
+    async fn classifier_without_temperature_does_not_inherit_main_agent_sampling() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::ModelEntryConfig;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "NO_REPLY[INFO]: ambient chatter"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("custom", "classifier")
+            .unwrap();
+        profile.uri = Some(server.uri());
+        profile.models.insert(
+            "chosen".into(),
+            ModelEntryConfig {
+                id: Some("classifier-id".into()),
+                ..Default::default()
+            },
+        );
+        let channel = Arc::new(RecordingChannel::default());
+        let agent = zeroclaw_config::schema::AliasedAgentConfig {
+            classifier_provider: "custom.classifier.chosen".into(),
+            precheck: zeroclaw_config::scattered_types::ChannelPrecheckConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel.clone(),
+            Arc::new(DummyModelProvider),
+            config,
+            agent,
+            "test-provider",
+            None,
+        );
+        Arc::get_mut(&mut ctx).unwrap().temperature = Some(0.9);
+        process_channel_message(
+            ctx,
+            channel_message("test-channel", None),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(channel.sent_messages.lock().await.is_empty());
+        // Provider construction may issue an empty warmup request;
+        // only the request carrying conversation JSON is a classification call.
+        let requests = server.received_requests().await.unwrap();
+        let classifier_requests: Vec<_> = requests
+            .iter()
+            .filter(|request| !request.body.is_empty())
+            .collect();
+        assert_eq!(classifier_requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&classifier_requests[0].body).unwrap();
+        assert_eq!(body["model"], "classifier-id");
+        assert!(body.get("temperature").is_none(), "{body}");
     }
 
     #[test]

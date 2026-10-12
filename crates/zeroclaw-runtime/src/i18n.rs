@@ -1249,6 +1249,30 @@ mod tests {
     }
 
     #[test]
+    fn nested_model_doctor_temperature_formats_in_all_locales() {
+        let key = "cli-doctor-temperature-out-of-range";
+        let args = [("provider_ref", "custom.gw.chosen"), ("temperature", "3.0")];
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            let message = format_ftl_message(source, locale, key, &args)
+                .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+            assert!(message.contains("custom.gw.chosen"), "{locale}: {message}");
+            assert!(message.contains("3.0"), "{locale}: {message}");
+            assert!(message.contains("0.0–2.0"), "{locale}: {message}");
+            assert!(!message.contains('{'), "{locale}: {message}");
+        }
+        assert_eq!(
+            get_english_cli_string_with_args(key, &args),
+            "custom.gw.chosen: temperature 3.0 is out of range (expected 0.0–2.0)"
+        );
+    }
+
+    #[test]
     fn daemon_startup_cli_strings_format_in_all_locales() {
         let url = "http://127.0.0.1:42617";
         let path = "/tmp/zeroclaw-test/daemon.sock";

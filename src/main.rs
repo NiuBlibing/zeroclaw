@@ -6227,49 +6227,52 @@ fn async_main(command: clap::Command) -> Result<()> {
 fn build_kernel_agent_model(
     config: &Config,
     agent_alias: &str,
-    temperature_override: Option<f64>,
-) -> Result<(Box<dyn zeroclaw_providers::ModelProvider>, String, f64)> {
+    provider_override: Option<&str>,
+    model_override: Option<&str>,
+) -> Result<zeroclaw_providers::model::BuiltModel> {
     let agent = config
         .agents
         .get(agent_alias)
         .ok_or_else(|| anyhow::Error::msg(format!("Agent `{agent_alias}` is not configured")))?;
-    let provider_ref = agent.model_provider.as_str();
-    let (family, alias, entry) = config
-        .resolved_model_provider_for_agent(agent_alias)
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "No model model_provider configured for agent {agent_alias}. Pass --model-provider \
-                 <type> or run `zeroclaw quickstart` to configure one."
-            ))
-        })?;
-    let selection = config.resolve_model_selection(provider_ref);
-    let mut options =
-        zeroclaw::providers::provider_runtime_options_for_alias(config, family, alias);
-    zeroclaw::providers::apply_model_entry_options(
-        &mut options,
-        selection.as_ref().and_then(|selected| selected.model_entry),
-    );
-    let provider = zeroclaw::providers::create_model_provider_for_alias_with_url(
+    zeroclaw_providers::model::build_model(
         config,
-        family,
-        alias,
-        entry.api_key.as_deref(),
-        entry.uri.as_deref(),
-        &options,
-    )?;
-    let model = selection
-        .as_ref()
-        .and_then(|selected| selected.model_id.clone())
-        .or_else(|| entry.model.clone())
-        .unwrap_or_else(|| "default".to_string());
-    let temperature = temperature_override
-        .or_else(|| {
-            selection
-                .as_ref()
-                .and_then(|selection| selection.temperature())
-        })
-        .unwrap_or(0.7);
-    Ok((provider, model, temperature))
+        agent_alias,
+        provider_override.unwrap_or(agent.model_provider.as_str()),
+        model_override,
+    )
+}
+
+#[cfg(not(feature = "agent-runtime"))]
+async fn kernel_agent_chat(
+    config: &Config,
+    agent_alias: &str,
+    model: &zeroclaw_providers::model::BuiltModel,
+    temperature_override: Option<f64>,
+    message: &str,
+) -> Result<String> {
+    let provider_ref = model.identity.provider_ref();
+    // Bare-family overrides inherit the configured agent selection. Keep that
+    // derived scalar separate from invocation input so fallbacks resolve their
+    // own sampling policy from Config.
+    let selection_ref = if model.identity.alias.is_empty() {
+        config
+            .agent(agent_alias)
+            .map_or(provider_ref.as_str(), |agent| agent.model_provider.as_str())
+    } else {
+        provider_ref.as_str()
+    };
+    let input = zeroclaw_providers::temperature::Temperature::from(temperature_override);
+    let temperature = input.resolve(Some(config), selection_ref);
+    zeroclaw_providers::temperature::with_temperature(
+        Some(config),
+        input,
+        zeroclaw_providers::ProviderDispatch::from_ref(model.provider.as_ref()).simple_chat(
+            message,
+            &model.model_name,
+            temperature,
+        ),
+    )
+    .await
 }
 
 /// True when a desktop entry's `Name` deliberately identifies ZeroClaw: it is
@@ -7065,7 +7068,10 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     };
 
     // All other commands need config loaded first
+    #[cfg(feature = "agent-runtime")]
     let mut config = Box::pin(Config::load_or_init()).await?;
+    #[cfg(not(feature = "agent-runtime"))]
+    let config = Box::pin(Config::load_or_init()).await?;
     #[cfg(feature = "agent-runtime")]
     if let Some((expected_data_dir, _)) = daemon_ownership.as_ref() {
         anyhow::ensure!(
@@ -7217,76 +7223,22 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         "`zeroclaw agent --agent {agent_alias}` is not configured (no [agents.{agent_alias}] entry)"
                     );
                 }
-                if let Some(p) = &model_provider {
-                    // Parse --model-provider as "type.alias", bare "type" (use
-                    // the agent alias as the alias), or "type.alias.model" (a
-                    // nested model entry under that profile).
-                    let mut parts = p.splitn(3, '.');
-                    let type_key = parts.next().unwrap_or_default();
-                    let alias_key = parts.next().unwrap_or(agent_alias.as_str());
-                    let model_alias = parts.next();
-                    let entry = config
-                        .providers
-                        .models
-                        .ensure(type_key, alias_key)
-                        .ok_or_else(|| {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Reject
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"family": type_key})),
-                                "ask CLI refused: --model-provider names an unknown family"
-                            );
-                            anyhow::Error::msg(format!(
-                                "Unknown model_provider family: {type_key}. \
-                             Configure a provider via `zeroclaw quickstart` or the /config editor."
-                            ))
-                        })?;
-                    // A three-segment override writes the model and temperature
-                    // onto the nested model entry; two-segment keeps the legacy
-                    // profile-level fields.
-                    if let Some(model_alias) = model_alias {
-                        let model_entry = entry.models.entry(model_alias.to_string()).or_default();
-                        if let Some(m) = &model {
-                            model_entry.id = Some(m.clone());
-                        }
-                        if let Some(temperature) = temperature {
-                            model_entry.temperature = Some(temperature);
-                        }
-                    } else {
-                        if let Some(m) = &model {
-                            entry.model = Some(m.clone());
-                        }
-                        if let Some(temperature) = temperature {
-                            entry.temperature = Some(temperature);
-                        }
-                    }
-                    // Update the agent's model_provider to point to the override
-                    if let Some(agent_cfg) = config.agents.get_mut(&agent_alias) {
-                        agent_cfg.model_provider = match model_alias {
-                            Some(_) => p.clone(),
-                            None => format!("{type_key}.{alias_key}"),
-                        }
-                        .into();
-                    }
-                } else if config.model_provider_for_agent(&agent_alias).is_none() {
-                    anyhow::bail!(
-                        "No model model_provider configured for agent {agent_alias}. \
-                         Pass --model-provider <type> or run `zeroclaw quickstart` to configure one."
-                    );
-                }
-
-                let (model_provider, model_name, final_temperature) =
-                    build_kernel_agent_model(&config, &agent_alias, temperature)?;
+                let built_model = build_kernel_agent_model(
+                    &config,
+                    &agent_alias,
+                    model_provider.as_deref(),
+                    model.as_deref(),
+                )?;
                 match message {
                     Some(msg) => {
-                        let response =
-                            zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
-                                .simple_chat(&msg, model_name.as_str(), Some(final_temperature))
-                                .await?;
+                        let response = kernel_agent_chat(
+                            &config,
+                            &agent_alias,
+                            &built_model,
+                            temperature,
+                            &msg,
+                        )
+                        .await?;
                         println!("{response}");
                     }
                     None => {
@@ -7312,14 +7264,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                     }
                                 }
                             };
-                            let response =
-                                zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
-                                    .simple_chat(
-                                        line.trim(),
-                                        model_name.as_str(),
-                                        Some(final_temperature),
-                                    )
-                                    .await?;
+                            let response = kernel_agent_chat(
+                                &config,
+                                &agent_alias,
+                                &built_model,
+                                temperature,
+                                line.trim(),
+                            )
+                            .await?;
                             println!("{response}");
                         }
                     }
@@ -18647,13 +18599,15 @@ mod tests {
             },
         );
 
-        let (provider, model, temperature) =
-            build_kernel_agent_model(&config, "default", None).unwrap();
-        assert_eq!(model, "nested-model");
-        assert_eq!(temperature, 0.2);
-        assert!(!provider.capabilities_for_model(&model).native_tool_calling);
-        let response = zeroclaw_providers::ProviderDispatch::from_ref(provider.as_ref())
-            .simple_chat("hello", &model, Some(temperature))
+        let built = build_kernel_agent_model(&config, "default", None, None).unwrap();
+        assert_eq!(built.model_name, "nested-model");
+        assert!(
+            !built
+                .provider
+                .capabilities_for_model(&built.model_name)
+                .native_tool_calling
+        );
+        let response = kernel_agent_chat(&config, "default", &built, None, "hello")
             .await
             .unwrap();
         assert_eq!(response, "kernel response");
@@ -18669,6 +18623,188 @@ mod tests {
         assert_eq!(body["model"], "nested-model");
         assert_eq!(body["temperature"], 0.2);
         assert_eq!(body["max_tokens"], 77);
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    #[tokio::test]
+    async fn kernel_agent_overrides_preserve_nested_selection_without_mutating_config() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "ok"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        for (alias, entry_alias, temperature, limit) in
+            [("gw", "default", 0.2, 77), ("gw.v2", "fast", 0.4, 99)]
+        {
+            let profile = config.providers.models.ensure("custom", alias).unwrap();
+            profile.uri = Some(server.uri());
+            profile.model = Some("legacy-id".into());
+            profile.models.insert(
+                entry_alias.into(),
+                ModelEntryConfig {
+                    id: Some("selected-id".into()),
+                    temperature: Some(temperature),
+                    max_tokens: Some(limit),
+                    ..Default::default()
+                },
+            );
+        }
+        config.agents.insert(
+            "default".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.gw".into(),
+                ..Default::default()
+            },
+        );
+        let before = toml::to_string(&config).unwrap();
+        for (
+            provider_ref,
+            model_override,
+            temperature_override,
+            expected_model,
+            expected_temperature,
+            limit,
+        ) in [
+            (None, None, None, "selected-id", 0.2, 77),
+            (None, Some("explicit-id"), None, "explicit-id", 0.2, 77),
+            (
+                Some("custom.gw"),
+                Some("explicit-id"),
+                None,
+                "explicit-id",
+                0.2,
+                77,
+            ),
+            (
+                Some("custom.gw.v2.fast"),
+                Some("explicit-id"),
+                None,
+                "explicit-id",
+                0.4,
+                99,
+            ),
+            (
+                Some("custom.gw.v2.fast"),
+                None,
+                Some(0.6),
+                "selected-id",
+                0.6,
+                99,
+            ),
+            (Some("custom"), None, None, "selected-id", 0.2, 77),
+        ] {
+            let built =
+                build_kernel_agent_model(&config, "default", provider_ref, model_override).unwrap();
+            assert_eq!(
+                kernel_agent_chat(&config, "default", &built, temperature_override, "hello")
+                    .await
+                    .unwrap(),
+                "ok"
+            );
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(body["model"], expected_model);
+            assert_eq!(body["temperature"], expected_temperature);
+            assert_eq!(body["max_tokens"], limit);
+        }
+        for model_override in [None, Some("explicit-id")] {
+            assert!(
+                build_kernel_agent_model(
+                    &config,
+                    "default",
+                    Some("custom.gw.typo"),
+                    model_override
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(toml::to_string(&config).unwrap(), before);
+        let mut unset = config.clone();
+        unset
+            .providers
+            .models
+            .ensure("custom", "gw")
+            .unwrap()
+            .models
+            .get_mut("default")
+            .unwrap()
+            .temperature = None;
+        let built = build_kernel_agent_model(&unset, "default", None, None).unwrap();
+        kernel_agent_chat(&unset, "default", &built, None, "hello")
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        assert!(body.get("temperature").is_none(), "{body}");
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    #[tokio::test]
+    async fn kernel_agent_fallback_uses_candidate_temperature_and_invocation_override() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+
+        let primary = MockServer::start().await;
+        let backup = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "backup"}}]
+            })))
+            .mount(&backup)
+            .await;
+        let mut config = Config::default();
+        config.reliability.provider_retries = 0;
+        for (alias, server, temperature) in [("main", &primary, 0.2), ("backup", &backup, 0.8)] {
+            let profile = config.providers.models.ensure("custom", alias).unwrap();
+            profile.uri = Some(server.uri());
+            profile.models.insert(
+                "chosen".into(),
+                ModelEntryConfig {
+                    id: Some(format!("{alias}-id")),
+                    temperature: Some(temperature),
+                    ..Default::default()
+                },
+            );
+        }
+        config
+            .providers
+            .models
+            .ensure("custom", "main")
+            .unwrap()
+            .fallback = vec!["custom.backup.chosen".into()];
+        config.agents.insert(
+            "default".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.main.chosen".into(),
+                ..Default::default()
+            },
+        );
+        let built = build_kernel_agent_model(&config, "default", None, None).unwrap();
+        for (override_value, expected) in [(None, 0.8), (Some(0.5), 0.5)] {
+            assert_eq!(
+                kernel_agent_chat(&config, "default", &built, override_value, "hello")
+                    .await
+                    .unwrap(),
+                "backup"
+            );
+            let requests = backup.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(body["temperature"], expected);
+            assert_eq!(body["model"], "backup-id");
+        }
     }
 
     /// Runtime load verification for an *already installed* plugin.

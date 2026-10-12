@@ -1183,3 +1183,4 @@ cli-model-switch-entry-missing = model_provider `{ $provider_ref }` 引用了模
 cli-model-switch-model-required = 'set' 操作缺少 'model' 参数（也可使用 `<type>.<alias>.<model>` 格式的 model_provider 引用）
 cli-doctor-nested-model = { $provider_ref }：模型：{ $model }（条目 { $model_alias }）
 cli-doctor-nested-model-id-missing = { $provider_ref }：条目 { $model_alias } 缺少模型 ID（请设置其 `id` 或提供商配置的 `model`）
+cli-doctor-temperature-out-of-range = { $provider_ref }：temperature { $temperature } 超出范围（应为 0.0–2.0）

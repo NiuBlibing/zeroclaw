@@ -1306,9 +1306,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 {
                     items.push(DiagItem::error(
                         cat,
-                        format!(
-                            "{entry_label}: temperature {temperature:.1} is out of range \
-                             (expected 0.0\u{2013}2.0)"
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-doctor-temperature-out-of-range",
+                            &[
+                                ("provider_ref", &entry_label),
+                                ("temperature", &format!("{temperature:.1}")),
+                            ],
                         ),
                     ));
                 }
@@ -4201,6 +4204,16 @@ mod tests {
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let messages: Vec<&str> = items.iter().map(|i| i.message.as_str()).collect();
+        let expected_temperature_error = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-temperature-out-of-range",
+            &[("provider_ref", "openai.gw.broken"), ("temperature", "3.0")],
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message == expected_temperature_error
+                    && item.severity == Severity::Error)
+        );
 
         assert!(
             !messages.iter().any(|m| m.contains("no model configured")),

@@ -1468,3 +1468,4 @@ cli-model-switch-entry-missing = model_provider `{ $provider_ref }` names model 
 cli-model-switch-model-required = Missing 'model' parameter for 'set' action (or use a `<type>.<alias>.<model>` model_provider ref)
 cli-doctor-nested-model = { $provider_ref }: model: { $model } (entry { $model_alias })
 cli-doctor-nested-model-id-missing = { $provider_ref }: entry { $model_alias } has no model id (set its `id` or the profile `model`)
+cli-doctor-temperature-out-of-range = { $provider_ref }: temperature { $temperature } is out of range (expected 0.0–2.0)

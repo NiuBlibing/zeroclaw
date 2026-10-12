@@ -1179,3 +1179,4 @@ cli-model-switch-entry-missing = model_provider `{ $provider_ref }` はモデル
 cli-model-switch-model-required = 'set' 操作に 'model' パラメーターがありません（`<type>.<alias>.<model>` 形式の model_provider 参照も使用できます）
 cli-doctor-nested-model = { $provider_ref }: モデル: { $model }（エントリー { $model_alias }）
 cli-doctor-nested-model-id-missing = { $provider_ref }: エントリー { $model_alias } にモデル ID がありません（エントリーの `id` またはプロファイルの `model` を設定してください）
+cli-doctor-temperature-out-of-range = { $provider_ref }: temperature { $temperature } は範囲外です（有効範囲: 0.0–2.0）
