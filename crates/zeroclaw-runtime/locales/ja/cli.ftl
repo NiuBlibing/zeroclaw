@@ -1169,3 +1169,13 @@ channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
 tool-git-operations-error-docker-runtime-write-unsupported = Git の書き込みコマンドは Docker ランタイムでは利用できません。コンテナ内に閉じ込めることができないためです。
+
+# Named model selection diagnostics.
+cli-model-switch-invalid-reference = model_provider は `<type>.<alias>` または `<type>.<alias>.<model>` 形式のプロバイダープロファイル参照である必要があります。指定値: `{ $provider_ref }`
+cli-model-switch-no-profiles = 設定済みのプロバイダープロファイルはありません
+cli-model-switch-profile-missing = model_provider `{ $provider_ref }` は設定済みのプロファイルではありません。[providers.models.{ $family }.{ $alias }] を追加するか、次を使用してください: { $available }
+cli-model-switch-model-id-missing = モデルエントリー `{ $provider_ref }` に `id` がなく、プロファイルにも `model` がありません
+cli-model-switch-entry-missing = model_provider `{ $provider_ref }` はモデル `{ $model_alias }` を指定していますが、[providers.models.{ $family }.{ $alias }.models.{ $model_alias }] は設定されていません
+cli-model-switch-model-required = 'set' 操作に 'model' パラメーターがありません（`<type>.<alias>.<model>` 形式の model_provider 参照も使用できます）
+cli-doctor-nested-model = { $provider_ref }: モデル: { $model }（エントリー { $model_alias }）
+cli-doctor-nested-model-id-missing = { $provider_ref }: エントリー { $model_alias } にモデル ID がありません（エントリーの `id` またはプロファイルの `model` を設定してください）

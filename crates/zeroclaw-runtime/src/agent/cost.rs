@@ -33,9 +33,9 @@ pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     for (type_k, alias_k, profile) in config.providers.models.iter_entries() {
         let mut slot = profile.pricing.clone();
         apply_rate_sheet_pricing(config, type_k, &mut slot);
-        if !slot.is_empty() {
-            pricing.insert(format!("{type_k}.{alias_k}"), slot);
-        }
+        // Empty profiles fence dotted aliases and ambiguous bare families;
+        // otherwise a nested ref could borrow a prefix sibling's prices.
+        pricing.insert(format!("{type_k}.{alias_k}"), slot);
     }
 
     pricing
@@ -62,24 +62,33 @@ pub fn provider_pricing<'a>(
     pricing: &'a ModelProviderPricing,
     model_provider_name: &str,
 ) -> Option<&'a HashMap<String, f64>> {
-    if let Some(slot) = pricing.get(model_provider_name) {
-        return Some(slot);
-    }
+    provider_pricing_entry(pricing, model_provider_name).map(|(_, slot)| slot)
+}
 
-    // Some call sites surface only the bare provider type while the
-    // pricing view is keyed by `<type>.<alias>`. Fall back only when the
-    // type resolves to exactly one alias entry so pricing stays deterministic.
-    let prefix = format!("{model_provider_name}.");
-    let mut matches = pricing
-        .iter()
-        .filter(|(key, _)| key.starts_with(&prefix))
-        .map(|(_, slot)| slot);
-    let first = matches.next()?;
-    if matches.next().is_none() {
-        Some(first)
-    } else {
-        None
+fn provider_pricing_entry<'a>(
+    pricing: &'a ModelProviderPricing,
+    model_provider_name: &str,
+) -> Option<(&'a str, &'a HashMap<String, f64>)> {
+    if let Some((profile, slot)) = pricing.get_key_value(model_provider_name) {
+        return Some((profile.as_str(), slot));
     }
+    // This generated view includes every configured profile. Resolve the
+    // longest profile so a named model and dotted alias bill the same owner.
+    if let Some((profile, slot)) = pricing
+        .iter()
+        .filter(|(profile, _)| {
+            model_provider_name
+                .strip_prefix(profile.as_str())
+                .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+        .max_by_key(|(profile, _)| profile.len())
+    {
+        return Some((profile.as_str(), slot));
+    }
+    let prefix = format!("{model_provider_name}.");
+    let mut matches = pricing.iter().filter(|(key, _)| key.starts_with(&prefix));
+    let (profile, slot) = matches.next()?;
+    matches.next().is_none().then_some((profile.as_str(), slot))
 }
 
 fn apply_rate_sheet_pricing(config: &Config, provider_type: &str, slot: &mut HashMap<String, f64>) {
@@ -353,7 +362,9 @@ fn price_usage(
         .try_with(Clone::clone)
         .ok()
         .flatten()?;
-    let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
+    let pricing_entry = provider_pricing_entry(&ctx.model_provider_pricing, model_provider_name);
+    let pricing = pricing_entry.map(|(_, slot)| slot);
+    let billing_profile = pricing_entry.map_or(model_provider_name, |(profile, _)| profile);
     let config_rates = normalized_rates(
         pricing
             .map(|map| resolve_rates_opt(map, model))
@@ -369,7 +380,7 @@ fn price_usage(
         (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none()).then_some(live)
     } else {
         (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none())
-            .then(|| live_pricing_for(model_provider_name, model))
+            .then(|| live_pricing_for(billing_profile, model))
             .flatten()
     };
     let mut rates = normalized_rates(merge_config_and_live_rates(config_rates, live));
@@ -1261,6 +1272,50 @@ mod tests {
             missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
             "different model under same model_provider is a distinct pair"
         );
+    }
+
+    #[test]
+    fn nested_prices_do_not_borrow_an_unpriced_dotted_profile_sibling() {
+        let mut config = Config::default();
+        let prefix = config.providers.models.ensure("custom", "gw").unwrap();
+        prefix.pricing.insert("shared-id".into(), 1.0);
+        config.providers.models.ensure("custom", "gw.v2").unwrap();
+        let pricing = build_model_provider_pricing(&config);
+        assert!(
+            provider_pricing(&pricing, "custom.gw.v2.fast")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(provider_pricing(&pricing, "custom").is_none());
+        assert_eq!(
+            provider_pricing_entry(&pricing, "custom.gw.v2.fast")
+                .unwrap()
+                .0,
+            "custom.gw.v2"
+        );
+    }
+
+    #[test]
+    fn provider_pricing_nested_refs_use_longest_profile_alias() {
+        let pricing = HashMap::from([
+            (
+                "custom.gw".into(),
+                HashMap::from([("shared-id".into(), 1.0)]),
+            ),
+            (
+                "custom.gw.v2".into(),
+                HashMap::from([("shared-id".into(), 2.0)]),
+            ),
+        ]);
+        assert_eq!(
+            provider_pricing(&pricing, "custom.gw.small").unwrap()["shared-id"],
+            1.0
+        );
+        assert_eq!(
+            provider_pricing(&pricing, "custom.gw.v2.small").unwrap()["shared-id"],
+            2.0
+        );
+        assert!(provider_pricing(&pricing, "custom.gw-other.small").is_none());
     }
 
     #[test]

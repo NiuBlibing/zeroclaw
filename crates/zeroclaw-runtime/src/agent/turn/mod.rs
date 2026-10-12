@@ -2464,7 +2464,23 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .unwrap_or(served_model.as_str());
         let served_route_changed = served_provider != active_model_provider_name
             || served_model_key != provider_request_model;
-        let served_context_limits = if served_route_changed {
+        // Reliable dispatch attributes its primary to the shared profile.
+        // If only the nested suffix was normalized, the selected entry's
+        // capacity still applies; the same model ID cannot identify an entry.
+        let same_selected_model = served_model_key == provider_request_model
+            && config.is_some_and(|config| {
+                match (
+                    config
+                        .providers
+                        .models
+                        .profile_ref(active_model_provider_name),
+                    config.providers.models.profile_ref(&served_provider),
+                ) {
+                    (Some(active), Some(served)) => active == served,
+                    _ => false,
+                }
+            });
+        let served_context_limits = if served_route_changed && !same_selected_model {
             resolve_context_limits_for_call(
                 context_limits_resolver.as_ref(),
                 config,

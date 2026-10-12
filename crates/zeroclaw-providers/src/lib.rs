@@ -16,6 +16,7 @@ pub mod grok_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod hailo_ollama;
 pub mod kilocli;
+pub mod model;
 pub mod model_pin;
 pub mod models_dev;
 pub mod multimodal;

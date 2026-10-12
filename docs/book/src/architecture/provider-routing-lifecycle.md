@@ -9,7 +9,7 @@ Use this page when a change touches `model_routes`, session or in-turn model sel
 | Concern | Current owner | Contract |
 | --- | --- | --- |
 | Provider profiles and fallback graph | `zeroclaw-config` provider schema and validation | A dotted `<family>.<alias>` identifies the endpoint, credentials, optional primary model, capabilities, and ordered fallback declarations for one profile. |
-| Provider construction | `zeroclaw-providers` factory functions | Materialize each profile with its own settings, flatten configured fallback entries in order, and compose routing around reliability. |
+| Provider construction | `zeroclaw-providers` factory functions | `zeroclaw-providers::model::build_model` derives the selected model, tuning, connection and identity from config; runtime adds its tool dispatcher. Materialize each profile with its own settings, flatten configured fallback entries in order, and compose routing around reliability. |
 | Hint-based selection | `RouterModelProvider` | Resolve `hint:<name>` to a configured provider target and route model. The primary target is pinned to the active/default model. A non-primary target is pinned when its profile configures a model; otherwise its reliable entry remains unpinned and receives the route model. |
 | Retry and failover | `ReliableModelProvider` | Classify failures, retry with bounded backoff, honor rate-limit cooldowns, and advance through the materialized entries. |
 | Provider stream termination | Concrete providers and `zeroclaw-providers/src/stream_guard.rs` | Translate each provider protocol's completion semantics into `StreamEvent::Final` or a truncation error. |
@@ -106,3 +106,9 @@ For provider-routing changes, answer these before reviewer sign-off:
 - Provider stream completion guard: `crates/zeroclaw-providers/src/stream_guard.rs`
 - Runtime stream replay and partial-output handling: `crates/zeroclaw-runtime/src/agent/turn/provider_call.rs`, `crates/zeroclaw-runtime/src/agent/turn/stream_consume.rs`
 - Operator guides: [Provider configuration](../providers/configuration.md), [Routing](../providers/routing.md), [Streaming](../providers/streaming.md)
+
+### Named selections and capacity
+
+A runtime keeps the existing `ModelIdentity` as the selected entry identity. Capacity lookups use its full reference, so entries sharing the same provider-local model ID can still have different context windows. Hint routes retain their configured references. Reliable dispatch may attribute the accepted primary to the shared profile for billing; that normalization does not replace the selected entry's capacity. A fallback to another profile or model resolves its own capacity.
+
+The legacy bare-family CLI override inherits the agent's configured model (including a selected nested entry), key and endpoint; an explicit model argument replaces only the model ID. A dotted profile override instead resolves its own connection. Delegated requests derive model and temperature together from the target's selected entry for both ordinary and agentic execution.

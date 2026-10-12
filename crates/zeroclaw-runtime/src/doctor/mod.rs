@@ -1263,13 +1263,20 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                     match model_id {
                         Some(model) => items.push(DiagItem::ok(
                             cat,
-                            format!("{label}: model: {model} (entry {model_alias})"),
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-doctor-nested-model",
+                                &[
+                                    ("provider_ref", &label),
+                                    ("model", &model),
+                                    ("model_alias", model_alias),
+                                ],
+                            ),
                         )),
                         None => items.push(DiagItem::warn(
                             cat,
-                            format!(
-                                "{label}: entry {model_alias} has no model id (set its `id` or \
-                                 the profile `model`)"
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-doctor-nested-model-id-missing",
+                                &[("provider_ref", &label), ("model_alias", model_alias)],
                             ),
                         )),
                     }

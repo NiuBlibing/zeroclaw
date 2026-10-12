@@ -75,151 +75,34 @@ pub struct ModelRuntime {
     pub model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
 }
 
-/// The single model constructor: initial construction, runtime switches, live
-/// refresh, and session overrides all rebuild through here.
-///
-/// Callers supply only the ref (two- or three-segment, or a bare family name
-/// for the legacy CLI `--provider <family>` form), an optional explicit
-/// model; everything else (agent config, entry
-/// overlay, temperature, context window, dispatcher, identity) is derived
-/// from the full config. The raw ref is passed through to the providers
-/// construction chain: that chain re-resolves the model entry from the ref it
-/// is given, and feeding it a normalised two-segment ref would select
-/// `models.default` and clobber the selected entry's tuning overlay.
+/// Adapt the providers-owned model construction to the agent's existing
+/// dispatcher boundary. Selection, connection and tuning stay providers-owned.
 pub fn build_model(
     config: &Config,
     agent_alias: &str,
     model_provider_ref: &str,
     model_override: Option<&str>,
-) -> anyhow::Result<ModelRuntime> {
-    // A two- or three-segment ref names a profile; a third segment selects a
-    // model entry under the profile's `models` map. A bare family name keeps
-    // the legacy family-default construction: no profile lookup, options
-    // inherited from the agent's own profile with the provider-specific bits
-    // cleared (exactly what `options_for_provider_ref` gives a bare name).
-    // The entry itself may be absent (e.g. auth via env) — resolution stays
-    // lenient so an override can still build a provider.
-    let (model_provider_name, model_provider_alias, bare_family) =
-        match config.providers.models.profile_ref(model_provider_ref) {
-            Some((family, alias)) => (family.to_string(), alias.to_string(), false),
-            None => (model_provider_ref.to_string(), String::new(), true),
-        };
-
-    let entry = if bare_family {
-        None
-    } else {
-        config
-            .providers
-            .models
-            .find(&model_provider_name, &model_provider_alias)
-    };
-    // Rich resolution: picks the model entry (three-segment or `models.default`
-    // / sole-entry fallback) and the model id. `None` when the entry is absent
-    // or the ref names a bare family.
-    let selection = if bare_family {
-        None
-    } else {
-        config.resolve_model_selection(model_provider_ref)
-    };
-    let model_entry = selection.as_ref().and_then(|s| s.model_entry);
-
-    let model_name = model_override
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .map(str::to_string)
-        .or_else(|| selection.as_ref().and_then(|s| s.model_id.clone()))
-        .or_else(|| {
-            entry
-                .and_then(|e| e.model.as_deref())
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .map(str::to_string)
-        })
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "model_provider `{model_provider_ref}` has no `model` configured and no model \
-                 override was supplied"
-            ))
-        })?;
-
-    let identity = selection
-        .as_ref()
-        .map(|s| s.identity(model_override))
-        .unwrap_or_else(|| zeroclaw_config::schema::ModelIdentity {
-            family: model_provider_name.clone(),
-            alias: model_provider_alias.clone(),
-            entry_alias: None,
-            model_id: model_name.clone(),
-        });
-
-    let mut runtime_options = if bare_family {
-        // Bare family: inherit the agent's own profile options with the
-        // provider-specific bits cleared — the legacy `--provider <family>`
-        // semantics preserved by `options_for_provider_ref`'s bare arm.
-        let agent_options =
-            zeroclaw_providers::provider_runtime_options_for_agent(config, agent_alias);
-        zeroclaw_providers::options_for_provider_ref(config, model_provider_ref, &agent_options)
-    } else {
-        zeroclaw_providers::provider_runtime_options_for_alias(
-            config,
-            &model_provider_name,
-            &model_provider_alias,
-        )
-    };
-    zeroclaw_providers::apply_model_entry_options(&mut runtime_options, model_entry);
-
-    let (provider, model_route_resolver) =
-        zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-            config,
-            // The raw ref, deliberately: see the function-level comment.
-            model_provider_ref,
-            entry.and_then(|e| e.api_key.as_deref()),
-            entry.and_then(|e| e.uri.as_deref()),
-            &config.reliability,
-            &config.model_routes,
-            &model_name,
-            &runtime_options,
-        )?;
-
+) -> Result<ModelRuntime> {
+    let model = zeroclaw_providers::model::build_model(
+        config,
+        agent_alias,
+        model_provider_ref,
+        model_override,
+    )?;
     let agent_cfg = config
         .resolved_agent_config(agent_alias)
-        .or_else(|| config.agent(agent_alias).cloned())
         .unwrap_or_default();
-    let tool_dispatcher = tool_dispatcher_for_provider(&agent_cfg, provider.as_ref(), &model_name);
-
-    // `entry ∨ profile` for the temperature; the same shape as
-    // `Config::effective_model_context_window` for the window, but resolved
-    // from THIS ref so a switch moves the trim budget with the model.
-    let temperature = selection.as_ref().and_then(|s| {
-        s.model_entry
-            .and_then(|e| e.temperature)
-            .or(s.entry.temperature)
-    });
-    let context_window = selection
-        .as_ref()
-        .and_then(|s| {
-            s.model_entry
-                .and_then(|e| e.context_window)
-                .or(s.entry.context_window)
-        })
-        .unwrap_or(zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK);
-
+    let tool_dispatcher =
+        tool_dispatcher_for_provider(&agent_cfg, model.provider.as_ref(), &model.model_name);
     Ok(ModelRuntime {
-        provider,
-        // A bare family name stays as-is (billing falls back through
-        // `provider_pricing`'s unique-alias arm); a dotted ref commits the
-        // normalised two-segment profile name.
-        provider_name: if bare_family {
-            model_provider_ref.to_string()
-        } else {
-            format!("{model_provider_name}.{model_provider_alias}")
-        },
-        model_name,
-        temperature,
-        context_window,
+        provider: model.provider,
+        provider_name: model.provider_name,
+        model_name: model.model_name,
+        temperature: model.temperature,
+        context_window: model.context_window,
         tool_dispatcher,
-        identity,
-        model_route_resolver,
+        identity: model.identity,
+        model_route_resolver: model.model_route_resolver,
     })
 }
 
@@ -1805,13 +1688,7 @@ impl Agent {
     pub fn selected_model_provider_ref(&self) -> String {
         self.model_identity.as_ref().map_or_else(
             || self.model_provider_name.clone(),
-            |identity| {
-                let profile = format!("{}.{}", identity.family, identity.alias);
-                identity
-                    .entry_alias
-                    .as_ref()
-                    .map_or(profile.clone(), |alias| format!("{profile}.{alias}"))
-            },
+            zeroclaw_config::schema::ModelIdentity::provider_ref,
         )
     }
 
@@ -1819,7 +1696,7 @@ impl Agent {
     /// This is resolved on demand so a model/provider switch cannot leave a
     /// stale snapshot in a long-lived session.
     pub fn context_limits(&self) -> zeroclaw_config::schema::ResolvedContextLimits {
-        self.context_limits_for_route(&self.model_provider_name, &self.model_name)
+        self.context_limits_for_route(&self.selected_model_provider_ref(), &self.model_name)
     }
 
     /// Build a limits resolver bound to a config generation CELL. Kept next to
@@ -1876,7 +1753,16 @@ impl Agent {
     ) -> zeroclaw_config::schema::ResolvedContextLimits {
         self.context_limits_resolver.as_ref().map_or_else(
             || self.config.resolved.context_limits(),
-            |resolve| resolve(provider_name, model),
+            |resolve| {
+                // External reporting may pass the normalized billing name.
+                // Derive the selected reference from the existing identity;
+                // explicit hint routes continue to resolve their own entries.
+                if provider_name == self.model_provider_name && model == self.model_name {
+                    resolve(&self.selected_model_provider_ref(), model)
+                } else {
+                    resolve(provider_name, model)
+                }
+            },
         )
     }
 
@@ -5389,6 +5275,177 @@ mod tests {
 
         assert_eq!(provider_ref, "openai.fast");
         assert_eq!(model, "gpt-4o-mini");
+    }
+
+    #[tokio::test]
+    async fn bare_family_inherits_agent_model_key_and_endpoint() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method},
+        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer fixture-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("openai", "gw").unwrap();
+        profile.api_key = Some("fixture-key".into());
+        profile.uri = Some(server.uri());
+        profile.model = Some("legacy-id".into());
+        profile.models.insert(
+            "default".into(),
+            ModelEntryConfig {
+                id: Some("nested-id".into()),
+                temperature: Some(0.25),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "openai.gw".into(),
+                ..Default::default()
+            },
+        );
+        for (override_model, expected) in
+            [(None, "nested-id"), (Some("explicit-id"), "explicit-id")]
+        {
+            let runtime = build_model(&config, "worker", "openai", override_model).unwrap();
+            assert_eq!(runtime.provider_name, "openai");
+            assert_eq!(runtime.identity.provider_ref(), "openai");
+            zeroclaw_providers::ProviderDispatch::from_ref(runtime.provider.as_ref())
+                .simple_chat("hello", &runtime.model_name, runtime.temperature)
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(body["model"], expected);
+            assert_eq!(body["temperature"], 0.25);
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_same_id_capacity_survives_real_turn_and_default_route() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig, ModelRouteConfig};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":1,\"total_tokens\":5}}\n\n",
+                    "data: [DONE]\n\n",
+                )))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "gw").unwrap();
+        profile.uri = Some(server.uri());
+        profile.models = HashMap::from([
+            (
+                "default".into(),
+                ModelEntryConfig {
+                    id: Some("shared-id".into()),
+                    context_window: Some(128_000),
+                    ..Default::default()
+                },
+            ),
+            (
+                "small".into(),
+                ModelEntryConfig {
+                    id: Some("shared-id".into()),
+                    context_window: Some(8_000),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.gw.small".into(),
+                ..Default::default()
+            },
+        );
+        // Exercise the no-router reliable primary and the routed path, including
+        // a hint back to the default entry with the identical provider-local ID.
+        for routed in [false, true] {
+            config.model_routes = if routed {
+                vec![ModelRouteConfig {
+                    hint: "large".into(),
+                    model_provider: "custom.gw".into(),
+                    model: "shared-id".into(),
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
+            };
+            let rt = build_model(&config, "worker", "custom.gw.small", None).unwrap();
+            let limits_config = config.clone();
+            let mut agent = Agent::builder()
+                .model_provider(rt.provider)
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver))
+                .model_provider_name(rt.provider_name)
+                .model_name(rt.model_name)
+                .model_identity(rt.identity)
+                .model_route_resolver(rt.model_route_resolver)
+                .tool_dispatcher(rt.tool_dispatcher)
+                .context_limits_resolver(Arc::new(move |provider, model| {
+                    limits_config.resolved_context_limits_for_route("worker", provider, model)
+                }))
+                .provider_switch_config(ProviderSwitchConfig {
+                    config: Some(Arc::new(config.clone())),
+                    live_config: None,
+                    live: None,
+                })
+                .build()
+                .unwrap();
+            assert_eq!(agent.context_limits().model_context_window, 8_000);
+            for (model, expected_window) in if routed {
+                vec![("shared-id", 8_000), ("hint:large", 128_000)]
+            } else {
+                vec![("shared-id", 8_000)]
+            } {
+                agent.model_name = model.into();
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                let outcome = agent
+                    .turn_streamed_with_steering_state("hello", tx, None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome.final_context_limits.unwrap().model_context_window,
+                    expected_window
+                );
+                let mut reported = Vec::new();
+                while let Ok(event) = rx.try_recv() {
+                    if let TurnEvent::Usage {
+                        model_context_window: Some(window),
+                        ..
+                    } = event
+                    {
+                        reported.push(window);
+                    }
+                }
+                assert!(!reported.is_empty());
+                assert!(
+                    reported
+                        .iter()
+                        .all(|window| *window == expected_window as u64),
+                    "{reported:?}"
+                );
+            }
+        }
     }
 
     #[test]

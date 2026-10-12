@@ -41,6 +41,8 @@ use zeroclaw_tools::memory_purge::MemoryPurgeTool;
 use zeroclaw_tools::memory_recall::MemoryRecallTool;
 use zeroclaw_tools::memory_store::MemoryStoreTool;
 
+type BuiltDelegateProvider = (Box<dyn ModelProvider>, String, String, Option<f64>);
+
 fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
 }
@@ -1199,22 +1201,24 @@ impl DelegateTool {
         model_provider: &str,
         provider_type: &str,
         credential: Option<&str>,
-    ) -> anyhow::Result<(Box<dyn ModelProvider>, String, String)> {
+    ) -> anyhow::Result<BuiltDelegateProvider> {
         if let Some(config) = config.or(self.root_config.as_deref()) {
-            return crate::agent::agent::build_session_model_provider(
-                config,
-                target_alias,
-                model_provider,
-                None,
-            );
+            let model =
+                zeroclaw_providers::model::build_model(config, target_alias, model_provider, None)?;
+            return Ok((
+                model.provider,
+                model.identity.provider_ref(),
+                model.model_name,
+                model.temperature,
+            ));
         }
         let provider = zeroclaw_providers::create_model_provider_with_options(
             provider_type,
             credential,
             &self.provider_runtime_options,
         )?;
-        let (_, _, model, _) = self.resolve_brain(model_provider);
-        Ok((provider, provider_type.to_string(), model))
+        let (_, _, model, temperature) = self.resolve_brain(model_provider);
+        Ok((provider, provider_type.to_string(), model, temperature))
     }
 
     async fn memory_for_target_agent(
@@ -1426,45 +1430,6 @@ impl DelegateTool {
             self.global_credential.clone(),
             String::new(),
             None,
-        )
-    }
-
-    fn resolve_brain_from_config(
-        &self,
-        config: Option<&Config>,
-        model_provider: &str,
-    ) -> (String, Option<String>, String, Option<f64>) {
-        let Some(config) = config else {
-            return self.resolve_brain(model_provider);
-        };
-        let Some((provider_type, provider_alias)) = model_provider.split_once('.') else {
-            return (
-                model_provider.to_string(),
-                self.global_credential.clone(),
-                String::new(),
-                None,
-            );
-        };
-        let Some(provider) = config.providers.models.find(provider_type, provider_alias) else {
-            return (
-                provider_type.to_string(),
-                self.global_credential.clone(),
-                String::new(),
-                None,
-            );
-        };
-        (
-            provider_type.to_string(),
-            if provider.requires_openai_auth {
-                provider.api_key.clone()
-            } else {
-                provider
-                    .api_key
-                    .clone()
-                    .or_else(|| self.global_credential.clone())
-            },
-            provider.model.clone().unwrap_or_default(),
-            provider.temperature,
         )
     }
 
@@ -2696,8 +2661,8 @@ impl DelegateTool {
         let authoritative_config = admitted_config.as_deref();
         let max_depth = self
             .effective_max_depth_from_config(authoritative_config, &agent_config.runtime_profile);
-        let (legacy_provider_type, credential, _, temperature) =
-            self.resolve_brain_from_config(authoritative_config, &agent_config.model_provider);
+        let (legacy_provider_type, credential, _, _) =
+            self.resolve_brain(&agent_config.model_provider);
         let agentic =
             self.resolve_agentic_from_config(authoritative_config, &agent_config.runtime_profile);
 
@@ -2804,7 +2769,6 @@ impl DelegateTool {
                 context,
                 &legacy_provider_type,
                 credential.as_deref(),
-                temperature,
                 agentic,
                 admission,
             )),
@@ -2826,12 +2790,11 @@ impl DelegateTool {
         context: &str,
         legacy_provider_type: &str,
         credential: Option<&str>,
-        temperature: Option<f64>,
         agentic: bool,
         admission: DelegateAdmission,
     ) -> anyhow::Result<ToolResult> {
         // Create model_provider for this agent
-        let (model_provider, provider_type, model) = match self.build_target_provider(
+        let (model_provider, provider_type, model, temperature) = match self.build_target_provider(
             agent_name,
             authoritative_config,
             &agent_config.model_provider,
@@ -17600,6 +17563,90 @@ command = "rm independent-delegate-marker"
             "target policy should have filtered out file_write, but got: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn nested_delegate_temperature_reaches_both_dispatch_paths() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{ModelEntryConfig, RuntimeProfileConfig};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .expect(4)
+            .mount(&server)
+            .await;
+        for agentic in [false, true] {
+            for reference in ["custom.gw.fast", "custom.gw"] {
+                let mut config = Config::default();
+                let profile = config.providers.models.ensure("custom", "gw").unwrap();
+                profile.uri = Some(server.uri());
+                profile.temperature = Some(0.9);
+                profile.models.insert(
+                    "default".into(),
+                    ModelEntryConfig {
+                        id: Some("default-id".into()),
+                        temperature: Some(0.3),
+                        ..Default::default()
+                    },
+                );
+                profile.models.insert(
+                    "fast".into(),
+                    ModelEntryConfig {
+                        id: Some("fast-id".into()),
+                        temperature: Some(0.2),
+                        ..Default::default()
+                    },
+                );
+                config.runtime_profiles.insert(
+                    "target".into(),
+                    RuntimeProfileConfig {
+                        agentic,
+                        ..Default::default()
+                    },
+                );
+                config
+                    .risk_profiles
+                    .insert("target".into(), Default::default());
+                let target = AliasedAgentConfig {
+                    risk_profile: "target".into(),
+                    model_provider: reference.into(),
+                    runtime_profile: "target".into(),
+                    ..Default::default()
+                };
+                config.agents.insert("target".into(), target.clone());
+                let config = Arc::new(config);
+                let tool = DelegateTool::new(config.agents.clone(), None, test_security())
+                    .with_root_config(Arc::clone(&config))
+                    .with_runtime(Arc::new(DelegateTestRuntime));
+                let result = tool
+                    .execute_sync_dispatched(
+                        "target",
+                        &target,
+                        Some(&config),
+                        "hello",
+                        "",
+                        "custom",
+                        None,
+                        agentic,
+                        DelegateAdmission::Prevalidated,
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{:?}", result.error);
+                let requests = server.received_requests().await.unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+                let (expected_model, expected_temperature) = if reference.ends_with("fast") {
+                    ("fast-id", 0.2)
+                } else {
+                    ("default-id", 0.3)
+                };
+                assert_eq!(body["model"], expected_model);
+                assert_eq!(body["temperature"], expected_temperature);
+            }
+        }
     }
 
     #[test]

@@ -1460,6 +1460,51 @@ mod tests {
     }
 
     #[test]
+    fn nested_model_diagnostics_format_in_every_builtin_locale() {
+        let args = [
+            ("provider_ref", "openai.fixture.fast"),
+            ("family", "openai"),
+            ("alias", "fixture"),
+            ("model_alias", "fast"),
+            ("model", "fixture-model"),
+            ("available", "openai.fixture"),
+        ];
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for key in [
+                "cli-model-switch-invalid-reference",
+                "cli-model-switch-no-profiles",
+                "cli-model-switch-profile-missing",
+                "cli-model-switch-model-id-missing",
+                "cli-model-switch-entry-missing",
+                "cli-model-switch-model-required",
+                "cli-doctor-nested-model",
+                "cli-doctor-nested-model-id-missing",
+            ] {
+                let value = format_ftl_message(source, locale, key, &args)
+                    .unwrap_or_else(|| panic!("{key} must format in {locale}"));
+                assert!(!value.is_empty());
+                assert!(!value.contains("{ $"), "unformatted value: {value}");
+                if key == "cli-doctor-nested-model" {
+                    assert!(value.contains("fixture-model"));
+                    assert!(value.contains("openai.fixture.fast"));
+                }
+                if locale != "en" {
+                    let english =
+                        format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, &args)
+                            .unwrap();
+                    assert_ne!(value, english, "{key} should be translated in {locale}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn plugin_config_entry_key_formats_in_every_builtin_locale() {
         let args = [("capability", "Tool"), ("key", "zpi1_fixture")];
         for (source, locale) in [

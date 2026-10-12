@@ -52,9 +52,12 @@ fn resolve_model_provider_profile_ref(
     raw: &str,
 ) -> Result<(String, Option<String>), String> {
     let raw = raw.trim();
-    let (family, alias) = config.providers.models.profile_ref(raw).ok_or_else(|| format!(
-        "model_provider must be a dotted `<type>.<alias>` or `<type>.<alias>.<model>` provider profile reference, got `{raw}`"
-    ))?;
+    let (family, alias) = config.providers.models.profile_ref(raw).ok_or_else(|| {
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-model-switch-invalid-reference",
+            &[("provider_ref", raw)],
+        )
+    })?;
     let profile_ref = format!("{family}.{alias}");
     let model_alias = raw
         .strip_prefix(&profile_ref)
@@ -63,32 +66,55 @@ fn resolve_model_provider_profile_ref(
     if config.providers.models.find(family, alias).is_none() {
         let available = configured_model_provider_profiles(config);
         let available = if available.is_empty() {
-            "no configured provider profiles".to_string()
+            crate::i18n::get_required_cli_string("cli-model-switch-no-profiles")
         } else {
             available.join(", ")
         };
-        return Err(format!(
-            "model_provider `{raw}` is not a configured provider profile. Add a [providers.models.{family}.{alias}] entry or use one of: {available}"
+        return Err(crate::i18n::get_required_cli_string_with_args(
+            "cli-model-switch-profile-missing",
+            &[
+                ("provider_ref", raw),
+                ("family", family),
+                ("alias", alias),
+                ("available", &available),
+            ],
         ));
     }
 
     // Three-segment ref: the model entry must exist; derive its id.
     let derived_model = if let Some(model_alias) = model_alias {
-        match config.providers.models.find_model(family, alias, model_alias) {
+        match config
+            .providers
+            .models
+            .find_model(family, alias, model_alias)
+        {
             Some(entry) => Some(
                 entry
                     .id
                     .clone()
-                    .or_else(|| config.providers.models.find(family, alias).and_then(|p| p.model.clone()))
+                    .or_else(|| {
+                        config
+                            .providers
+                            .models
+                            .find(family, alias)
+                            .and_then(|p| p.model.clone())
+                    })
                     .ok_or_else(|| {
-                        format!(
-                            "model entry `{raw}` has no `id` and its provider profile has no `model`"
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-model-switch-model-id-missing",
+                            &[("provider_ref", raw)],
                         )
                     })?,
             ),
             None => {
-                return Err(format!(
-                    "model_provider `{raw}` names model `{model_alias}` but [providers.models.{family}.{alias}.models.{model_alias}] is not configured"
+                return Err(crate::i18n::get_required_cli_string_with_args(
+                    "cli-model-switch-entry-missing",
+                    &[
+                        ("provider_ref", raw),
+                        ("model_alias", model_alias),
+                        ("family", family),
+                        ("alias", alias),
+                    ],
                 ));
             }
         }
@@ -250,11 +276,9 @@ impl ModelSwitchTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(
-                        "Missing 'model' parameter for 'set' action (or use a \
-                         `<type>.<alias>.<model>` model_provider ref)"
-                            .to_string(),
-                    ),
+                    error: Some(crate::i18n::get_required_cli_string(
+                        "cli-model-switch-model-required",
+                    )),
                 });
             }
         };

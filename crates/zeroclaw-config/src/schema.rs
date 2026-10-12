@@ -986,6 +986,20 @@ pub struct ModelIdentity {
     pub model_id: String,
 }
 
+impl ModelIdentity {
+    /// Reference retaining the selected entry, including dotted profile aliases.
+    #[must_use]
+    pub fn provider_ref(&self) -> String {
+        if self.alias.is_empty() {
+            return self.family.clone();
+        }
+        let profile = format!("{}.{}", self.family, self.alias);
+        self.entry_alias
+            .as_ref()
+            .map_or(profile.clone(), |alias| format!("{profile}.{alias}"))
+    }
+}
+
 impl ModelSelection<'_> {
     /// Owned identity of this selection, for "did the model change"
     /// comparisons. `model_override` (when set) replaces the resolved model

@@ -1174,3 +1174,13 @@ channel-approval-opt-allow-always = Toujours autoriser
 channel-approval-opt-reject = Rejeter
 channel-approval-opt-reject-with-edit = Rejeter avec modification
 tool-git-operations-error-docker-runtime-write-unsupported = Les commandes d’écriture Git ne sont pas disponibles avec l’environnement d’exécution Docker, car elles ne peuvent pas être confinées à son conteneur.
+
+# Named model selection diagnostics.
+cli-model-switch-invalid-reference = model_provider doit être une référence `<type>.<alias>` ou `<type>.<alias>.<model>` ; valeur reçue : `{ $provider_ref }`
+cli-model-switch-no-profiles = aucun profil de fournisseur configuré
+cli-model-switch-profile-missing = model_provider `{ $provider_ref }` ne correspond à aucun profil configuré. Ajoutez [providers.models.{ $family }.{ $alias }] ou utilisez : { $available }
+cli-model-switch-model-id-missing = L’entrée `{ $provider_ref }` n’a pas d’`id` et son profil n’a pas de `model`
+cli-model-switch-entry-missing = model_provider `{ $provider_ref }` désigne le modèle `{ $model_alias }`, mais [providers.models.{ $family }.{ $alias }.models.{ $model_alias }] n’est pas configuré
+cli-model-switch-model-required = Paramètre 'model' manquant pour 'set' (ou utilisez une référence model_provider `<type>.<alias>.<model>`)
+cli-doctor-nested-model = { $provider_ref } : modèle : { $model } (entrée { $model_alias })
+cli-doctor-nested-model-id-missing = { $provider_ref } : l’entrée { $model_alias } n’a pas d’ID de modèle (définissez son `id` ou le `model` du profil)

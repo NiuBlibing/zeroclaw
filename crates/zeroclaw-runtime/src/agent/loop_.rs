@@ -1739,12 +1739,13 @@ pub async fn run(
             effective_model_ref,
             model_override.as_deref(),
         )?;
+        let mut capacity_ref = entry_rt.identity.provider_ref();
         let mut model_provider = entry_rt.provider;
         let mut model_temperature = entry_rt.temperature;
         let mut model_name = entry_rt.model_name;
         let mut provider_name = entry_rt.provider_name;
         let mut context_limits =
-            config.resolved_context_limits_for_route(agent_alias, &provider_name, &model_name);
+            config.resolved_context_limits_for_route(agent_alias, &capacity_ref, &model_name);
 
         {
             let span = zeroclaw_log::Span::current();
@@ -2222,7 +2223,7 @@ pub async fn run(
                                                                 exec: ResolvedAgentExecution::resolve(
                                     ResolvedModelAccess {
                                         model_provider: model_provider.as_ref(),
-                                        provider_name: &provider_name,
+                                        provider_name: &capacity_ref,
                                         model: &model_name,
                                         dispatch_model: &model_name,
                                         temperature: effective_temperature,
@@ -2330,6 +2331,7 @@ pub async fn run(
                                 &new_model_provider,
                                 Some(&new_model),
                             )?;
+                            capacity_ref = rt.identity.provider_ref();
                             model_provider = rt.provider;
                             provider_name = rt.provider_name;
                             model_name = rt.model_name;
@@ -2345,7 +2347,7 @@ pub async fn run(
                             });
                             context_limits = config.resolved_context_limits_for_route(
                                 agent_alias,
-                                &provider_name,
+                                &capacity_ref,
                                 &model_name,
                             );
 
@@ -2833,7 +2835,7 @@ pub async fn run(
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: model_provider.as_ref(),
-                                            provider_name: &provider_name,
+                                            provider_name: &capacity_ref,
                                             model: &model_name,
                                             dispatch_model: &model_name,
                                             temperature: turn_temperature,
@@ -2946,13 +2948,14 @@ pub async fn run(
                                     &new_model_provider,
                                     Some(&new_model),
                                 )?;
-                                model_provider = rt.provider;
+                                capacity_ref = rt.identity.provider_ref();
+                            model_provider = rt.provider;
                                 provider_name = rt.provider_name;
                                 model_name = rt.model_name;
                                 model_temperature = rt.temperature;
                                 context_limits = config.resolved_context_limits_for_route(
                                     agent_alias,
-                                    &provider_name,
+                                    &capacity_ref,
                                     &model_name,
                                 );
 
@@ -3632,7 +3635,7 @@ async fn process_message_inner(
         )?;
         let model_provider = entry_rt.provider;
         let provider_name = entry_rt.provider_name;
-        let model_provider_ref = provider_name.clone();
+        let model_provider_ref = entry_rt.identity.provider_ref();
         let model_name = entry_rt.model_name;
 
         let hardware_rag: Option<crate::rag::HardwareRag> = config
