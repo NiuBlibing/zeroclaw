@@ -14,8 +14,7 @@
 
 use std::process::Command;
 
-const CONFIG_WITH_DEFAULT: &str = r#"schema_version = 5
-
+const CONFIG_WITH_DEFAULT: &str = r#"
 [providers.models.openai.gw]
 uri = "http://127.0.0.1:1"
 api_key = "test-key"
@@ -27,8 +26,7 @@ id = "gpt-4.1"
 id = "gpt-4o-mini"
 "#;
 
-const CONFIG_NO_DEFAULT: &str = r#"schema_version = 5
-
+const CONFIG_NO_DEFAULT: &str = r#"
 [providers.models.openai.gw]
 uri = "http://127.0.0.1:1"
 api_key = "test-key"
@@ -43,6 +41,7 @@ id = "gpt-4o"
 fn run(config_dir: &std::path::Path, args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
         .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env("LANG", "en_US.UTF-8")
         .args(args)
         .output()
         .unwrap_or_else(|e| panic!("run zeroclaw {:?}: {e}", args));
@@ -63,7 +62,15 @@ fn run(config_dir: &std::path::Path, args: &[&str]) -> String {
 #[test]
 fn models_status_prefers_the_default_entry_of_a_nested_profile() {
     let dir = tempfile::TempDir::new().expect("temp config dir");
-    std::fs::write(dir.path().join("config.toml"), CONFIG_WITH_DEFAULT).expect("write config.toml");
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "schema_version = {}\n{}",
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+            CONFIG_WITH_DEFAULT
+        ),
+    )
+    .expect("write config.toml");
 
     let stdout = run(dir.path(), &["models", "status"]);
     assert!(
@@ -79,7 +86,15 @@ fn models_status_prefers_the_default_entry_of_a_nested_profile() {
 #[test]
 fn models_status_reports_a_nested_only_profile_without_a_default() {
     let dir = tempfile::TempDir::new().expect("temp config dir");
-    std::fs::write(dir.path().join("config.toml"), CONFIG_NO_DEFAULT).expect("write config.toml");
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "schema_version = {}\n{}",
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+            CONFIG_NO_DEFAULT
+        ),
+    )
+    .expect("write config.toml");
 
     // No `models.default` and multiple entries: the first enumerated entry
     // (deterministic sorted order → `big`) is reported. The claim under test
@@ -94,7 +109,15 @@ fn models_status_reports_a_nested_only_profile_without_a_default() {
 #[test]
 fn zeroclaw_status_lists_each_nested_model_entry() {
     let dir = tempfile::TempDir::new().expect("temp config dir");
-    std::fs::write(dir.path().join("config.toml"), CONFIG_NO_DEFAULT).expect("write config.toml");
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "schema_version = {}\n{}",
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+            CONFIG_NO_DEFAULT
+        ),
+    )
+    .expect("write config.toml");
 
     let stdout = run(dir.path(), &["status"]);
     assert!(

@@ -55,6 +55,28 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+/// The complete provider-facing request cannot fit the active model's capacity.
+#[derive(Debug)]
+pub struct ContextWindowExceeded {
+    pub estimated_tokens: usize,
+    pub model_context_window: usize,
+}
+
+impl std::fmt::Display for ContextWindowExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::i18n::get_required_cli_string(
+            "turn-context-window-exceeded-error",
+        ))
+    }
+}
+
+impl std::error::Error for ContextWindowExceeded {}
+
+pub fn context_window_exceeded_from_error(err: &anyhow::Error) -> Option<&ContextWindowExceeded> {
+    err.chain()
+        .find_map(|source| source.downcast_ref::<ContextWindowExceeded>())
+}
+
 #[derive(Debug)]
 pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) partial_text: String,
@@ -72,28 +94,6 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
 impl std::error::Error for StreamInterruptedAfterOutput {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.cause)
-    }
-}
-
-/// A transport stream failure before user-visible output. The cumulative usage
-/// snapshot is retained so Reliable recovery can bill the exact selected
-/// stream attempt once.
-#[derive(Debug)]
-pub(crate) struct StreamErrorWithUsage {
-    pub(crate) message: String,
-    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
-    pub(crate) source: zeroclaw_api::model_provider::StreamError,
-}
-
-impl std::fmt::Display for StreamErrorWithUsage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for StreamErrorWithUsage {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
     }
 }
 
@@ -248,6 +248,9 @@ fn terminal_completion_error_message_with_renderer(
     agent_name: Option<&str>,
     render: CliStringRenderer,
 ) -> Option<String> {
+    if context_window_exceeded_from_error(err).is_some() {
+        return Some(render("turn-context-window-exceeded-error", &[]));
+    }
     // A refusal that is still the final cause sits beneath Reliable's
     // envelopes; it needs safety-specific guidance rather than the generic
     // provider-failure projection. A later non-refusal failure replaces it as
@@ -273,7 +276,7 @@ fn terminal_completion_error_message_with_renderer(
 }
 
 #[cfg(test)]
-fn terminal_completion_error_message_in_english(
+pub(crate) fn terminal_completion_error_message_in_english(
     err: &anyhow::Error,
     agent_name: Option<&str>,
 ) -> Option<String> {
@@ -406,6 +409,32 @@ pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_window_error_preserves_its_typed_cause_and_localized_projection() {
+        let error = anyhow::Error::new(ContextWindowExceeded {
+            estimated_tokens: 40_000,
+            model_context_window: 32_768,
+        })
+        .context("private prompt and provider diagnostics");
+        let exceeded = context_window_exceeded_from_error(&error).expect("typed inner cause");
+        assert_eq!(exceeded.estimated_tokens, 40_000);
+        assert_eq!(exceeded.model_context_window, 32_768);
+        assert_eq!(
+            exceeded.to_string(),
+            crate::i18n::get_required_cli_string("turn-context-window-exceeded-error"),
+        );
+        let delivered = terminal_completion_error_message(&error, Some("delegate-a"))
+            .expect("typed capacity failure must have a safe terminal projection");
+        assert_eq!(
+            delivered,
+            crate::i18n::get_required_cli_string("turn-context-window-exceeded-error")
+        );
+        assert!(!delivered.contains("private prompt"));
+        let untyped = anyhow::Error::msg("context window exceeded");
+        assert!(context_window_exceeded_from_error(&untyped).is_none());
+        assert!(terminal_completion_error_message(&untyped, None).is_none());
+    }
 
     #[test]
     fn tool_loop_cancelled_display() {
@@ -740,13 +769,9 @@ mod tests {
 
     #[test]
     fn streamed_refusal_cause_projects_safety_guidance() {
-        let error = anyhow::Error::new(StreamErrorWithUsage {
-            message: "model_provider stream error: refusal".to_string(),
-            usage: None,
-            source: zeroclaw_api::model_provider::StreamError::ModelRefusal(Box::new(
-                private_refusal(),
-            )),
-        });
+        let error = anyhow::Error::new(zeroclaw_api::model_provider::StreamError::ModelRefusal(
+            Box::new(private_refusal()),
+        ));
 
         let message = terminal_completion_error_message_in_english(&error, None)
             .expect("a streamed refusal must project a user-facing message");
