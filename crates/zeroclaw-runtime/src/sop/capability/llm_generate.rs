@@ -24,8 +24,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Map, Value, json};
-use zeroclaw_api::model_provider::{ChatResponse, ModelProvider};
+use zeroclaw_api::model_provider::ChatResponse;
+use zeroclaw_config::schema::Config;
 use zeroclaw_providers::ProviderDispatch;
+use zeroclaw_providers::model::BuiltModel;
+use zeroclaw_providers::temperature::{Temperature, with_temperature};
 
 use super::types::{CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability};
 
@@ -209,21 +212,25 @@ impl SopCapability for LlmGenerateCapability {
     }
 }
 
-/// [`LlmGenerateAdapter`] over a configured [`ModelProvider`]: one
-/// `chat_with_system` call, run on a dedicated bridge thread (see
-/// `super::bridge::run_bridged` for why the host runtime must not be used).
+type ModelResolver = dyn Fn() -> Result<(Config, BuiltModel)> + Send + Sync;
+
+/// One bounded model call on the dedicated SOP bridge thread.
+///
+/// The resolver reads canonical live config and uses the shared model builder
+/// on each call. The config and derived provider live only for that call,
+/// including its retries and fallbacks; the adapter caches no model policy.
 pub struct ProviderLlmAdapter {
-    provider: Arc<dyn ModelProvider>,
-    model: String,
-    temperature: Option<f64>,
+    resolver: Arc<ModelResolver>,
 }
 
 impl ProviderLlmAdapter {
-    pub fn new(provider: Arc<dyn ModelProvider>, model: String, temperature: Option<f64>) -> Self {
+    /// Resolve one config generation and its model through the shared builder
+    /// at call time. Resolver errors propagate without dispatching an old model.
+    pub fn new(
+        resolver: impl Fn() -> Result<(Config, BuiltModel)> + Send + Sync + 'static,
+    ) -> Self {
         Self {
-            provider,
-            model,
-            temperature,
+            resolver: Arc::new(resolver),
         }
     }
 }
@@ -235,16 +242,25 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
     }
 
     fn generate_typed(&self, system: Option<&str>, prompt: &str) -> Result<String> {
-        let provider = Arc::clone(&self.provider);
-        let model = self.model.clone();
-        let temperature = self.temperature;
+        let resolver = Arc::clone(&self.resolver);
         let system = system.map(str::to_string);
         let prompt = prompt.to_string();
         super::bridge::run_bridged_anyhow(
             async move {
-                ProviderDispatch::new(provider)
-                    .chat_with_system(system.as_deref(), &prompt, &model, temperature)
-                    .await
+                let (config, built) = resolver()?;
+                let temperature =
+                    Temperature::default().resolve(Some(&config), &built.identity.provider_ref());
+                with_temperature(Some(&config), None.into(), async {
+                    ProviderDispatch::new(Arc::from(built.provider))
+                        .chat_with_system(
+                            system.as_deref(),
+                            &prompt,
+                            &built.model_name,
+                            temperature,
+                        )
+                        .await
+                })
+                .await
             },
             GENERATE_TIMEOUT,
             "model call",
@@ -257,6 +273,28 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::ModelProvider;
+    use zeroclaw_config::schema::{ModelEntryConfig, ModelIdentity};
+    use zeroclaw_providers::router::ModelRouteResolver;
+
+    fn test_built_model(provider: Box<dyn ModelProvider>) -> BuiltModel {
+        BuiltModel {
+            provider,
+            provider_name: "custom.gw".into(),
+            model_name: "test".into(),
+            identity: ModelIdentity {
+                family: "custom".into(),
+                alias: "gw".into(),
+                entry_alias: Some("chosen".into()),
+                model_id: "test".into(),
+            },
+            model_route_resolver: Arc::new(ModelRouteResolver::new(
+                Vec::new(),
+                "custom.gw.chosen".into(),
+                "test".into(),
+            )),
+        }
+    }
 
     struct RecordingLlm {
         calls: Mutex<Vec<(Option<String>, String)>>,
@@ -607,7 +645,12 @@ mod tests {
 
     #[test]
     fn provider_adapter_bridge_preserves_terminal_error_type() {
-        let adapter = ProviderLlmAdapter::new(Arc::new(SemanticEmptyProvider), "test".into(), None);
+        let adapter = ProviderLlmAdapter::new(|| {
+            Ok((
+                Config::default(),
+                test_built_model(Box::new(SemanticEmptyProvider)),
+            ))
+        });
         let error = adapter
             .generate_typed(None, "prompt")
             .expect_err("the provider's typed terminal error must survive the bridge");
@@ -620,10 +663,29 @@ mod tests {
     #[test]
     fn provider_adapter_forwards_configured_temperature() {
         let temperatures = Arc::new(Mutex::new(Vec::new()));
-        let provider = TemperatureRecordingProvider {
-            temperatures: Arc::clone(&temperatures),
-        };
-        let adapter = ProviderLlmAdapter::new(Arc::new(provider), "test".into(), Some(0.25));
+        let recorded = Arc::clone(&temperatures);
+        let adapter = ProviderLlmAdapter::new(move || {
+            let mut config = Config::default();
+            config
+                .providers
+                .models
+                .ensure("custom", "gw")
+                .unwrap()
+                .models
+                .insert(
+                    "chosen".into(),
+                    ModelEntryConfig {
+                        temperature: Some(0.25),
+                        ..Default::default()
+                    },
+                );
+            Ok((
+                config,
+                test_built_model(Box::new(TemperatureRecordingProvider {
+                    temperatures: Arc::clone(&recorded),
+                })),
+            ))
+        });
 
         assert_eq!(adapter.generate_typed(None, "prompt").unwrap(), "ok");
         assert_eq!(*temperatures.lock().unwrap(), vec![Some(0.25)]);
