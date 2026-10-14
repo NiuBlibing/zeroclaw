@@ -25,14 +25,7 @@ Use the narrowest current authority available:
    OpenAPI subset implemented by that build. They do not yet enumerate every
    live route. A matching source checkout's gateway router is the authority
    for the complete route inventory.
-5. For concepts and workflows not established above, use documentation that
-   matches the installed build. Run `zeroclaw --version`. For release
-   `X.Y.Z`, prefer `https://docs.zeroclawlabs.ai/vX.Y.Z/en/`. Use
-   `https://docs.zeroclawlabs.ai/master/en/` only for a verified source build
-   from master. The documentation root follows the current stable release and
-   is not automatically a version match. Prefer local `docs/book/src` only
-   when that checkout produced the running build. If exact documentation is
-   unavailable, disclose the mismatch and keep conclusions bounded.
+5. For concepts and workflows not established above, use documentation that matches the installed build. Run `zeroclaw --version`. For release `X.Y.Z`, prefer `https://docs.zeroclaw.com/vX.Y.Z/en/`. Use `https://docs.zeroclaw.com/master/en/` only for a verified source build from master. The documentation root follows the current stable release and is not automatically a version match. Prefer local `docs/book/src` only when that checkout produced the running build. If exact documentation is unavailable, disclose the mismatch and keep conclusions bounded.
 
 Do not infer current support from model memory, a fixed feature inventory,
 search snippets, issues, comments, or documentation for a different release.

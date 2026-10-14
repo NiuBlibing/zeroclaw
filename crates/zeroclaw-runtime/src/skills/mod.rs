@@ -1716,10 +1716,11 @@ fn display_skill_location(path: &Path) -> String {
 /// Build the available-skills prompt when no tool-availability context exists.
 /// Full mode is the safe fallback because compact mode requires `read_skill`.
 pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
-    skills_to_prompt_with_mode(
+    skills_to_prompt_with_mode_and_availability(
         skills,
         workspace_dir,
         zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        |name| name != "read_skill",
     )
 }
 
@@ -1781,7 +1782,9 @@ pub(crate) fn skills_to_prompt_with_mode_and_availability(
         return String::new();
     }
 
-    let has_on_demand_skill = skills.iter().any(skill_loads_on_demand);
+    let read_skill_available = is_tool_available("read_skill");
+    let mode = skills_prompt_mode_with_loader_fallback(mode, read_skill_available);
+    let has_on_demand_skill = read_skill_available && skills.iter().any(skill_loads_on_demand);
     let mut prompt = match (mode, has_on_demand_skill) {
         (zeroclaw_config::schema::SkillsPromptInjectionMode::Full, false) => String::from(
             "## Available Skills\n\n\
@@ -1791,7 +1794,7 @@ pub(crate) fn skills_to_prompt_with_mode_and_availability(
         ),
         (zeroclaw_config::schema::SkillsPromptInjectionMode::Full, true) => String::from(
             "## Available Skills\n\n\
-             Most skill instructions and all tool metadata are preloaded below.\n\
+             Skill instructions and tool metadata are preloaded below, except for skills marked `<loading>on-demand</loading>`.\n\
              For a skill marked `<loading>on-demand</loading>`, call `read_skill(name)` with its `<name>` before following its instructions.\n\n\
              <available_skills>\n",
         ),
@@ -1806,7 +1809,8 @@ pub(crate) fn skills_to_prompt_with_mode_and_availability(
     };
 
     for skill in skills {
-        let loads_on_demand = !skill.always
+        let loads_on_demand = read_skill_available
+            && !skill.always
             && (matches!(
                 mode,
                 zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
@@ -2037,9 +2041,20 @@ pub(crate) fn skills_to_tools_with_context_and_runtime_optional_nat64(
                         tools.push(t);
                     }
                 }
-                // `is_registered_skill_tool_kind` above admits only the kinds
-                // dispatched here, so any other kind was already skipped.
-                other => unreachable!("registered skill kind '{other}' not dispatched"),
+                // Keep this fail-closed if the admission list and dispatcher
+                // ever drift apart: an unsupported tool is safer skipped than
+                // allowed to abort agent startup.
+                other => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "Registered skill tool kind '{other}' for {}.{} has no dispatcher, skipping",
+                            skill.name, tool.name
+                        )
+                    );
+                }
             }
         }
     }
@@ -2557,7 +2572,10 @@ pub fn install_local_skill_source(
 #[cfg(test)]
 mod copy_tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
+    #[cfg(unix)]
+    use std::cell::Cell;
+    use std::cell::RefCell;
+    #[cfg(unix)]
     use std::rc::Rc;
 
     type Swap = Box<dyn Fn(&Path)>;
@@ -2594,8 +2612,10 @@ mod copy_tests {
         });
     }
 
+    #[cfg(unix)]
     struct EntrySwapGuard;
 
+    #[cfg(unix)]
     impl EntrySwapGuard {
         fn install(swap: impl Fn(&Path) + 'static) -> Self {
             ENTRY_SWAP.with(|slot| *slot.borrow_mut() = Some(Box::new(swap)));
@@ -2603,14 +2623,17 @@ mod copy_tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for EntrySwapGuard {
         fn drop(&mut self) {
             ENTRY_SWAP.with(|slot| *slot.borrow_mut() = None);
         }
     }
 
+    #[cfg(unix)]
     struct SourceOpenGuard;
 
+    #[cfg(unix)]
     impl SourceOpenGuard {
         fn install(swap: impl Fn() + 'static) -> Self {
             SOURCE_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(swap)));
@@ -2618,14 +2641,17 @@ mod copy_tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for SourceOpenGuard {
         fn drop(&mut self) {
             SOURCE_OPEN.with(|slot| *slot.borrow_mut() = None);
         }
     }
 
+    #[cfg(unix)]
     pub(super) struct SelectedSourceGuard;
 
+    #[cfg(unix)]
     impl SelectedSourceGuard {
         pub(super) fn install(swap: impl Fn() + 'static) -> Self {
             SELECTED_SOURCE.with(|slot| *slot.borrow_mut() = Some(Box::new(swap)));
@@ -2633,6 +2659,7 @@ mod copy_tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for SelectedSourceGuard {
         fn drop(&mut self) {
             SELECTED_SOURCE.with(|slot| *slot.borrow_mut() = None);
@@ -5440,8 +5467,9 @@ mod builtin_skill_tests {
             )),
         };
 
+        let skills = [builtin, operator_skill];
         let prompt = skills_to_prompt_with_mode(
-            &[builtin, operator_skill],
+            &skills,
             Path::new("/tmp/workspace"),
             zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
         );
@@ -5449,6 +5477,21 @@ mod builtin_skill_tests {
         assert!(prompt.contains("<loading>on-demand</loading>"));
         assert!(!prompt.contains("# ZeroClaw self-knowledge and operation"));
         assert!(prompt.contains("Keep this instruction inline."));
+
+        let fallback = skills_to_prompt_with_mode_and_availability(
+            &skills,
+            Path::new("/tmp/workspace"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            |_| false,
+        );
+        assert!(!fallback.contains("<loading>on-demand</loading>"));
+        assert!(!fallback.contains("read_skill(name)"));
+        assert!(fallback.contains("# ZeroClaw self-knowledge and operation"));
+        assert!(fallback.contains("Keep this instruction inline."));
+
+        let context_free = skills_to_prompt(&skills, Path::new("/tmp/workspace"));
+        assert!(!context_free.contains("<loading>on-demand</loading>"));
+        assert!(context_free.contains("# ZeroClaw self-knowledge and operation"));
     }
 
     #[test]

@@ -2,9 +2,8 @@
 
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{
-    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamErrorWithUsage,
-    StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
-    StreamSemanticEmptyCompletion,
+    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamInterruptedAfterOutput,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion,
 };
 use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
@@ -15,6 +14,32 @@ use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::model_provider::StreamEvent;
 use zeroclaw_config::schema::StreamReasoningMode;
 use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
+
+#[derive(Debug, thiserror::Error)]
+#[error("model_provider stream error: {source}")]
+pub(crate) struct StreamProviderFailure {
+    #[source]
+    source: zeroclaw_api::model_provider::StreamError,
+    usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    replay_safe: bool,
+}
+
+impl StreamProviderFailure {
+    pub(crate) fn usage(&self) -> Option<zeroclaw_providers::traits::TokenUsage> {
+        self.usage.clone()
+    }
+
+    pub(crate) fn replay_safe(&self) -> bool {
+        self.replay_safe
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self.source,
+            zeroclaw_api::model_provider::StreamError::Terminal(_)
+        )
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamedChatOutcome {
@@ -72,6 +97,7 @@ pub(crate) async fn consume_provider_streaming_response(
     // surfaces, so a non-streaming retry after a stream error overwrites
     // rather than duplicates.
     let mut visible_event_output = false;
+    let mut replay_blocking_activity = false;
     let mut forwarded_text = String::new();
 
     macro_rules! forward_visible {
@@ -150,25 +176,37 @@ pub(crate) async fn consume_provider_streaming_response(
                     "model_provider stream emitted an error event"
                 );
                 let message = format!("model_provider stream error: {err}");
-                let provider_error = anyhow::Error::msg(message.clone());
                 if visible_event_output {
+                    let provider_error = anyhow::Error::msg(message.clone());
                     // Persist only what the consumer actually saw
                     // (`forwarded_text`), never the raw accumulated text —
                     // that includes guard-withheld protocol fragments and
                     // suppression-buffered output nobody received.
+                    let mut usage = outcome.usage;
+                    if usage.is_none()
+                        && let zeroclaw_api::model_provider::StreamError::ModelRefusal(refusal) =
+                            &err
+                    {
+                        usage = refusal.usage.as_deref().cloned();
+                    }
+                    let cause = zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
+                        &provider_error,
+                    )
+                    .with_terminal_cause(anyhow::Error::new(err));
                     return Err(StreamInterruptedAfterOutput {
                         partial_text: forwarded_text,
                         message,
-                        usage: outcome.usage,
-                        cause: zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
-                            &provider_error,
-                        ),
+                        usage,
+                        cause,
                     }
                     .into());
                 }
-                return Err(StreamErrorWithUsage {
-                    message,
+                return Err(StreamProviderFailure {
+                    source: err,
                     usage: outcome.usage,
+                    // Mutable drafts allow the original request's fallback, but
+                    // image-free recovery requires no output on either sink.
+                    replay_safe: !replay_blocking_activity && !outcome.forwarded_live_deltas,
                 }
                 .into());
             }
@@ -179,6 +217,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 outcome.usage = Some(usage);
             }
             StreamEvent::ToolCall(tool_call) => {
+                replay_blocking_activity = true;
                 outcome.tool_calls.push(tool_call);
             }
             // Transient, human-readable thinking progress. Surfaced via
@@ -190,6 +229,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 if delta.is_empty() {
                     continue;
                 }
+                replay_blocking_activity = true;
                 if draft_reasoning == StreamReasoningMode::Full
                     && let Some(tx) = on_delta
                 {
@@ -204,12 +244,14 @@ pub(crate) async fn consume_provider_streaming_response(
             // reasoning_content for history reconstruction and never
             // surfaced as user-visible progress.
             StreamEvent::ReasoningFinalized(payload) => {
+                replay_blocking_activity = true;
                 outcome.reasoning_content.push_str(&payload);
             }
             // Pre-executed tool events are for observability only: they are
             // relayed as TurnEvents but do not affect the agent's tool
             // dispatch loop.
             StreamEvent::PreExecutedToolCall { name, args } => {
+                replay_blocking_activity = true;
                 outcome.saw_pre_executed_tool_activity = true;
                 let id = Uuid::new_v4().to_string();
                 pre_executed_ids
@@ -228,6 +270,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 }
             }
             StreamEvent::PreExecutedToolResult { name, output } => {
+                replay_blocking_activity = true;
                 outcome.saw_pre_executed_tool_activity = true;
                 let id = pre_executed_ids
                     .get_mut(&name)
@@ -331,6 +374,23 @@ pub(crate) async fn consume_provider_streaming_response(
     // Final forward may null delta_sender on send failure; mark it read.
     let _ = delta_sender;
     outcome.suppressed_protocol = text_guard.suppressed_protocol;
+    if text_guard.suppressed_protocol
+        && let Some(diagnostic) = text_guard.suppression
+    {
+        // Attributes carry only the detector and the candidate offset so a
+        // false positive can be diagnosed without logging the withheld text.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(serde_json::json!({
+                    "detector": diagnostic.detector,
+                    "candidate_offset": diagnostic.candidate_offset,
+                })),
+            "streaming text guard suppressed protocol candidate"
+        );
+    }
 
     if outcome.response_text.trim().is_empty() && outcome.tool_calls.is_empty() {
         ::zeroclaw_log::record!(
@@ -1509,5 +1569,139 @@ mod tests {
             outcome.response_text, "A large answer",
             "the final accumulated response strips the terminal marker"
         );
+    }
+
+    struct VisibleOutputThenRefusalProvider {
+        refusal: zeroclaw_api::model_provider::ModelRefusalError,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for VisibleOutputThenRefusalProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Anthropic,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "VisibleOutputThenRefusalProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for VisibleOutputThenRefusalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let refusal = self.refusal.clone();
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                    "Visible partial text before refusal",
+                ))),
+                Err(zeroclaw_api::model_provider::StreamError::ModelRefusal(
+                    Box::new(refusal),
+                )),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn visible_output_refusal_preserves_usage_and_retains_typed_cause() {
+        let refusal_usage = TokenUsage {
+            input_tokens: Some(412),
+            output_tokens: Some(15),
+            cached_input_tokens: Some(50),
+            cache_creation_input_tokens: None,
+        };
+        let provider = VisibleOutputThenRefusalProvider {
+            refusal: zeroclaw_api::model_provider::ModelRefusalError {
+                requested_model: "claude-sonnet-4-6".to_string(),
+                category: Some("hate".to_string()),
+                usage: Some(Box::new(refusal_usage)),
+                attempted_candidate: None,
+                attempted_candidate_index: None,
+            },
+        };
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let result = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "claude-sonnet-4-6",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await;
+
+        let err = result.expect_err("stream must fail with interruption after visible text");
+        let interrupted = err
+            .downcast_ref::<StreamInterruptedAfterOutput>()
+            .expect("must produce StreamInterruptedAfterOutput");
+        assert_eq!(
+            interrupted.partial_text,
+            "Visible partial text before refusal"
+        );
+        let usage = interrupted
+            .usage
+            .as_ref()
+            .expect("refusal usage must be carried through StreamInterruptedAfterOutput");
+        assert_eq!(usage.input_tokens, Some(412));
+        assert_eq!(usage.output_tokens, Some(15));
+        assert_eq!(usage.cached_input_tokens, Some(50));
+        let cause_err = interrupted
+            .cause
+            .terminal_cause()
+            .expect("typed terminal cause must be retained");
+        let refusal = cause_err
+            .downcast_ref::<zeroclaw_api::model_provider::StreamError>()
+            .and_then(|e| match e {
+                zeroclaw_api::model_provider::StreamError::ModelRefusal(r) => Some(r),
+                _ => None,
+            })
+            .expect("terminal cause must contain the typed ModelRefusal");
+        assert_eq!(refusal.category.as_deref(), Some("hate"));
+        assert_eq!(refusal.requested_model, "claude-sonnet-4-6");
+
+        // Drain the event channel and ensure the visible chunk was received before error
+        let mut chunks = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event {
+                chunks.push(delta);
+            }
+        }
+        assert_eq!(chunks, vec!["Visible partial text before refusal"]);
     }
 }

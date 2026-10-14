@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::attribution::ToolProvenance;
 use zeroclaw_api::hook::ToolCallHookContext;
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_tool_call_parser::{ParsedToolCall, canonicalize_json_for_tool_signature};
 
 pub(crate) struct PreparedToolCalls {
@@ -78,6 +79,7 @@ async fn record_duplicate_tool_call(
     }
     ToolExecutionOutcome {
         output: duplicate.clone(),
+        attachments: Vec::new(),
         success: false,
         error_reason: Some(duplicate),
         duration: Duration::ZERO,
@@ -194,6 +196,7 @@ pub(crate) async fn prepare_tool_calls(
                     }
                     let outcome = ToolExecutionOutcome {
                         output: cancelled,
+                        attachments: Vec::new(),
                         success: false,
                         error_reason: Some(reason),
                         duration: Duration::ZERO,
@@ -234,8 +237,13 @@ pub(crate) async fn prepare_tool_calls(
             .unwrap_or(false);
         let reentrant_agent_tool =
             crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
+        // Signature this call holds in the turn-scoped guard while its
+        // approval is pending. It is released once the operator approves, so
+        // an identical rerun later in the turn asks again instead of aborting.
+        let mut pending_prompt_signature: Option<(String, String)> = None;
         if requires_prompt && tool_name == "shell" && !reentrant_agent_tool {
             let prompt_signature = tool_call_signature(&tool_name, &tool_args);
+            pending_prompt_signature = Some(prompt_signature.clone());
             if !prompt_approval_tool_signatures_this_round.insert(prompt_signature.clone()) {
                 let duplicate =
                     record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
@@ -277,7 +285,9 @@ pub(crate) async fn prepare_tool_calls(
                     abandon_prepared_context(ctx, retained_context, retained_tool).await;
                 }
                 abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                anyhow::bail!("{repeated}");
+                return Err(
+                    TurnStop::close_out(TurnStopCode::PromptRequiredRepeat, repeated).into(),
+                );
             }
         }
 
@@ -316,7 +326,25 @@ pub(crate) async fn prepare_tool_calls(
                     return Err(ToolLoopCancelled.into());
                 }
             };
-        crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, approved);
+        // An approved call is not an approval loop: drop its signature from
+        // the turn-scoped guard so a later identical call (a rerun the user
+        // asked for, a re-check after an edit) gets a fresh approval prompt.
+        // A denied or unanswered call keeps its signature, so repeating it
+        // still aborts the turn before the operator is asked again. The
+        // same-round set keeps its entry, so an identical call in this same
+        // batch is still deduplicated instead of prompting twice.
+        if approved && let Some(signature) = pending_prompt_signature.as_ref() {
+            prompt_approval_tool_signatures.remove(signature);
+        }
+        let runtime_command_approved = approved
+            && ctx
+                .approval
+                .is_none_or(crate::approval::ApprovalManager::propagates_runtime_command_approval);
+        crate::agent::set_runtime_approved_arg(
+            &tool_name,
+            &mut tool_args,
+            runtime_command_approved,
+        );
 
         let signature = tool_call_signature(&tool_name, &tool_args);
         let dedup_exempt =
@@ -471,6 +499,7 @@ mod tests {
             observer,
             provider_name: "test",
             model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: None,
             channel_name: "test",
@@ -487,6 +516,8 @@ mod tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         }
     }
 
@@ -525,6 +556,7 @@ mod tests {
             &prepared.stream_calls,
             vec![ToolExecutionOutcome {
                 output: "ok".to_string(),
+                attachments: Vec::new(),
                 output_data: None,
                 success: true,
                 error_reason: None,
@@ -779,6 +811,7 @@ mod tests {
             &prepared.stream_calls,
             vec![ToolExecutionOutcome {
                 output: "ok".to_string(),
+                attachments: Vec::new(),
                 output_data: None,
                 success: true,
                 error_reason: None,
@@ -937,6 +970,57 @@ mod tests {
             ],
             "a denial that prevents execution abandons the context instead of leaving it pending"
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_tool_approval_never_becomes_runtime_command_approval() {
+        use zeroclaw_config::autonomy::AutonomyLevel;
+        use zeroclaw_config::schema::RiskProfileConfig;
+
+        let full_profile = RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            ..RiskProfileConfig::default()
+        };
+        let bounded = crate::approval::ApprovalManager::for_bounded_non_interactive(&full_profile);
+        let explicit_profile = RiskProfileConfig {
+            auto_approve: vec!["*".to_string()],
+            ..RiskProfileConfig::default()
+        };
+        let derived = bounded.derive_for_risk_profile(&explicit_profile);
+
+        for (case, approval) in [("full", &bounded), ("auto_approve", &derived)] {
+            for tool_name in ["shell", "schedule", "cron_add", "cron_update", "cron_run"] {
+                let observer = NoopObserver;
+                let pacing = PacingConfig::default();
+                let (tx, _rx) = mpsc::channel(8);
+                let ctx = lifecycle_ctx(&observer, &pacing, &tx, Some(approval), None);
+                let tool_calls = [parsed_call(
+                    tool_name,
+                    serde_json::json!({"approved": true}),
+                    "call-1",
+                )];
+                let mut seen = HashSet::new();
+                let mut prompt_seen = HashSet::new();
+                let prepared = prepare_tool_calls(
+                    &ctx,
+                    &[],
+                    None,
+                    &tool_calls,
+                    &mut seen,
+                    &mut prompt_seen,
+                    0,
+                    false,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{case}/{tool_name} preparation failed: {error}"));
+
+                assert_eq!(prepared.executable_calls.len(), 1, "{case}/{tool_name}");
+                assert_eq!(
+                    prepared.executable_calls[0].arguments["approved"], false,
+                    "{case}/{tool_name} target policy may approve tool dispatch but not the caller-owned command"
+                );
+            }
+        }
     }
 
     /// Channel that answers every approval request with a DenyWithEdit

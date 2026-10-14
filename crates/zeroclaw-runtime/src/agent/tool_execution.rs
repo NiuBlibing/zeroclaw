@@ -16,6 +16,30 @@ use zeroclaw_api::attribution::Attributable;
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
 use super::turn::{ModelSwitchCallback, TurnMeta, scope_model_switch_state};
 
+tokio::task_local! {
+    /// The running turn's cancellation token, scoped around each tool's
+    /// `execute`. A tool that starts work its own future does not own (the
+    /// delegate fan-out spawns children) reads it to bind that work to the
+    /// turn, so aborting the turn reaches what the turn started.
+    static TURN_CANCELLATION: CancellationToken;
+}
+
+/// The cancellation token of the turn executing the current tool, when a
+/// turn is executing one. `None` outside a tool execution or when the turn
+/// runs without a token.
+pub(crate) fn current_turn_cancellation() -> Option<CancellationToken> {
+    TURN_CANCELLATION.try_with(Clone::clone).ok()
+}
+
+/// Scope `future` as running under `token`'s turn, so tools it executes see
+/// it through [`current_turn_cancellation`].
+pub(crate) async fn scope_turn_cancellation<F: std::future::Future>(
+    token: CancellationToken,
+    future: F,
+) -> F::Output {
+    TURN_CANCELLATION.scope(token, future).await
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// If a just-completed tool call was a successful `TodoWrite`, build the
@@ -105,6 +129,7 @@ fn unavailable_tool_outcome(
         duration,
         receipt: None,
         output_data: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -116,6 +141,10 @@ pub struct ToolExecutionOutcome {
     /// fold a tool's detailed error body (which can reflect a token or signed
     /// URL) into this text and credential-scrub it before storing it here.
     pub output: String,
+    /// Attachments the tool declared for this result (`ToolOutput::attachments`).
+    /// They reach history through the carrier grammar and are never recovered
+    /// by scanning `output`.
+    pub attachments: Vec<zeroclaw_api::media::RenderedMarker>,
     /// Structured output when the tool declared one (`ToolOutput::data`).
     /// Feeds SOP step capture and data-flow surfaces; the LLM sees only
     /// `output`. Stored raw — consumers scrub at their own rendering boundary.
@@ -223,6 +252,7 @@ pub(crate) async fn execute_one_tool(
             duration,
             receipt: None,
             output_data: None,
+            attachments: Vec::new(),
         });
     };
 
@@ -286,7 +316,7 @@ pub(crate) async fn execute_one_tool(
         if let Some(token) = cancellation_token {
             tokio::select! {
                 () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
-                result = tool_future => Ok(result),
+                result = scope_turn_cancellation(token.clone(), tool_future) => Ok(result),
             }
         } else {
             Ok(tool_future.await)
@@ -361,6 +391,7 @@ pub(crate) async fn execute_one_tool(
                     });
                     Ok(ToolExecutionOutcome {
                         output: normalized_output.to_string(),
+                        attachments: r.output.attachments().to_vec(),
                         output_data: r.output.into_data(),
                         success: true,
                         error_reason: None,
@@ -378,6 +409,7 @@ pub(crate) async fn execute_one_tool(
                     // it. Tools that already put everything into `error` and
                     // leave `output` empty (the common case) are unaffected.
                     let output_text = r.output.as_str().to_string();
+                    let attachments = r.output.attachments().to_vec();
                     let output_data = r.output.into_data();
                     let reason = r.error.unwrap_or_else(|| output_text.clone());
                     let full_output = if !output_text.is_empty() && output_text != reason {
@@ -414,6 +446,7 @@ pub(crate) async fn execute_one_tool(
                         error_reason: Some(reason),
                         duration,
                         receipt: None,
+                        attachments,
                         output_data,
                     })
                 }
@@ -460,6 +493,7 @@ pub(crate) async fn execute_one_tool(
                     duration,
                     receipt: None,
                     output_data: None,
+                    attachments: Vec::new(),
                 })
             }
         }
@@ -509,6 +543,25 @@ pub fn should_execute_tools_in_parallel(
     // race condition where the tool lookup happens before activation completes.
     // Force sequential execution whenever tool_search is in the batch.
     if tool_calls.iter().any(|call| call.name == "tool_search") {
+        return false;
+    }
+
+    // file_edit is a read-modify-write operation. If another file mutation in
+    // the same prepared batch runs concurrently, either call can overwrite a
+    // result computed from stale contents. Preserve model order for the whole
+    // batch whenever at least one edit shares the batch with another edit or
+    // full-file write. Two file_write calls remain parallel-eligible because
+    // their atomic replacement already has sequential-equivalent
+    // last-writer-wins semantics.
+    let file_edit_count = tool_calls
+        .iter()
+        .filter(|call| call.name == "file_edit")
+        .count();
+    let file_mutation_count = tool_calls
+        .iter()
+        .filter(|call| matches!(call.name.as_str(), "file_edit" | "file_write"))
+        .count();
+    if file_edit_count > 0 && file_mutation_count > 1 {
         return false;
     }
 
@@ -580,11 +633,37 @@ pub(crate) async fn execute_tools_sequential(
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
             break;
         }
+        // Re-derive the active SOP step's tool scope against the CURRENT
+        // callable set, per call rather than per response. `dispatch` carries
+        // the exclusion snapshot taken before the batch; a `tool_search` earlier
+        // in this same response can activate a deferred tool the step denies,
+        // and that snapshot does not know about it. Without this, the denied
+        // tool executes and the step's boundary is only re-derived in time for
+        // the NEXT provider request — one call too late.
+        let rescoped_exclusions: Option<Vec<String>> =
+            crate::sop::active_scope::active_headless_step_scope().map(|scope| {
+                let mut merged = dispatch.excluded_tools.to_vec();
+                crate::agent::loop_::merge_sop_step_exclusions(
+                    &mut merged,
+                    dispatch.tools_registry,
+                    dispatch.activated_tools,
+                    Some(&scope),
+                );
+                merged
+            });
+        let call_dispatch = ToolDispatchContext {
+            tools_registry: dispatch.tools_registry,
+            activated_tools: dispatch.activated_tools,
+            excluded_tools: rescoped_exclusions
+                .as_deref()
+                .unwrap_or(dispatch.excluded_tools),
+            model_switch_callback: dispatch.model_switch_callback,
+        };
         let outcome = match execute_one_tool(
             &call.name,
             call.arguments.clone(),
             call.tool_call_id.as_deref(),
-            dispatch,
+            call_dispatch,
             meta,
             observer,
             cancellation_token,
@@ -755,6 +834,125 @@ mod tests {
             invocations.load(Ordering::SeqCst),
             1,
             "recovered activated tool should have been invoked exactly once"
+        );
+    }
+
+    /// Stands in for `tool_search`: activates a deferred tool part-way through a
+    /// response, so the call after it attempts something the active step denies.
+    struct ActivatingTool {
+        activated: Arc<Mutex<ActivatedToolSet>>,
+        activates: String,
+        target: Arc<dyn Tool>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for ActivatingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-activating-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ActivatingTool {
+        fn name(&self) -> &str {
+            "activator"
+        }
+
+        fn description(&self) -> &str {
+            "Activates a deferred tool, as tool_search does"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+            match self.activated.lock() {
+                Ok(mut set) => set.activate(self.activates.clone(), Arc::clone(&self.target)),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .activate(self.activates.clone(), Arc::clone(&self.target)),
+            }
+            Ok(zeroclaw_api::tool::ToolResult {
+                success: true,
+                output: String::from("activated").into(),
+                error: None,
+            })
+        }
+    }
+
+    /// The dispatch context is built once for a whole response, so the exclusion
+    /// slice it carries predates anything that response activates. A step that
+    /// denies `sop_execute` — every step does, it is a SOP control tool — must
+    /// still refuse it when an earlier call in the SAME response activated it;
+    /// re-deriving only for the next provider request is one call too late.
+    #[tokio::test]
+    async fn a_tool_activated_mid_response_cannot_escape_the_step_scope() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let denied_calls = Arc::new(AtomicUsize::new(0));
+        let denied: Arc<dyn Tool> =
+            Arc::new(CountingTool::new("sop_execute", Arc::clone(&denied_calls)));
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(ActivatingTool {
+            activated: Arc::clone(&activated),
+            activates: "sop_execute".to_string(),
+            target: Arc::clone(&denied),
+        })];
+
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        let calls = vec![
+            parsed_tool_call("activator"),
+            parsed_tool_call("sop_execute"),
+        ];
+        let scope = crate::sop::active_scope::HeadlessStepScope {
+            run_id: "run-1".into(),
+            step: crate::sop::types::SopStep::default(),
+            config: zeroclaw_config::schema::SopConfig::default(),
+        };
+        let excluded: Vec<String> = Vec::new();
+
+        let outcomes = crate::sop::active_scope::with_active_headless_step_scope(scope, async {
+            super::execute_tools_sequential(
+                &calls,
+                ToolDispatchContext {
+                    tools_registry: &registry,
+                    activated_tools: Some(&activated),
+                    excluded_tools: &excluded,
+                    model_switch_callback: None,
+                },
+                &meta,
+                &NoopObserver,
+                None,
+                None,
+                None,
+            )
+            .await
+        })
+        .await
+        .expect("sequential dispatch completes");
+
+        assert_eq!(
+            denied_calls.load(Ordering::SeqCst),
+            0,
+            "a tool the step denies must not execute, even when a call earlier in \
+             the same response activated it"
+        );
+        let second = outcomes[1]
+            .as_ref()
+            .expect("the second call produced an outcome");
+        assert!(
+            !second.success,
+            "the denied tool must be refused, got: {}",
+            second.output
         );
     }
 
@@ -2010,6 +2208,7 @@ mod tests {
     async fn failed_tool_credential_is_scrubbed_in_provider_history() {
         use crate::agent::loop_detector::{LoopDetector, LoopDetectorConfig};
         use crate::agent::turn::history_append::append_tool_round_to_history;
+        use crate::agent::turn::results_collect::ToolRoundResult;
         use crate::agent::turn::results_collect::collect_tool_results;
         use std::collections::HashSet;
         use zeroclaw_providers::ChatMessage;
@@ -2078,10 +2277,11 @@ mod tests {
             "prompt-mode <tool_result> block must be scrubbed: {}",
             collected.tool_results
         );
-        for (_, result) in &collected.individual_results {
+        for result in &collected.individual_results {
             assert!(
-                !result.contains(secret) && result.contains("[REDACTED]"),
-                "native role=tool content must be scrubbed: {result}"
+                !result.output.contains(secret) && result.output.contains("[REDACTED]"),
+                "native role=tool content must be scrubbed: {}",
+                result.output
             );
         }
 
@@ -2106,7 +2306,11 @@ mod tests {
             "the native tool-result message must carry the scrubbed body"
         );
 
-        let prompt_results = vec![(None, collected.individual_results[0].1.clone())];
+        let prompt_results = vec![ToolRoundResult {
+            tool_call_id: None,
+            output: collected.individual_results[0].output.clone(),
+            attachments: Vec::new(),
+        }];
         let mut prompt_history: Vec<ChatMessage> = Vec::new();
         append_tool_round_to_history(
             &mut prompt_history,
@@ -2196,6 +2400,52 @@ mod tests {
         assert!(
             should_execute_tools_in_parallel(&calls, None),
             "non-tool_search, non-approval batch must remain parallel-eligible (default branch)"
+        );
+    }
+
+    #[test]
+    fn two_file_edits_force_sequential_execution() {
+        let calls = vec![parsed_tool_call("file_edit"), parsed_tool_call("file_edit")];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, None),
+            "concurrent read-modify-write calls can silently lose one edit"
+        );
+    }
+
+    #[test]
+    fn file_edit_and_file_write_force_sequential_execution() {
+        let calls = vec![
+            parsed_tool_call("file_edit"),
+            parsed_tool_call("file_write"),
+        ];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, None),
+            "a full-file write must not race an edit computed from stale contents"
+        );
+    }
+
+    #[test]
+    fn file_edit_and_non_mutating_tool_remain_parallel_eligible() {
+        let calls = vec![parsed_tool_call("file_edit"), parsed_tool_call("file_read")];
+
+        assert!(
+            should_execute_tools_in_parallel(&calls, None),
+            "one file mutation does not create a same-batch lost-update hazard"
+        );
+    }
+
+    #[test]
+    fn two_atomic_file_writes_remain_parallel_eligible() {
+        let calls = vec![
+            parsed_tool_call("file_write"),
+            parsed_tool_call("file_write"),
+        ];
+
+        assert!(
+            should_execute_tools_in_parallel(&calls, None),
+            "atomic full replacements retain last-writer-wins semantics"
         );
     }
 
@@ -2348,5 +2598,92 @@ mod tests {
                 _ => panic!("expected an empty Plan event (clear)"),
             }
         }
+    }
+
+    struct TurnTokenProbe {
+        saw_turn_token: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for TurnTokenProbe {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-turn-token-probe"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TurnTokenProbe {
+        fn name(&self) -> &str {
+            "turn_token_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Records whether the running turn's cancellation token is visible"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}, "required": []})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            *self.saw_turn_token.lock().unwrap() =
+                Some(super::current_turn_cancellation().is_some());
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: crate::tools::ToolOutput::from("probed"),
+                error: None,
+            })
+        }
+    }
+
+    async fn probe_turn_token(token: Option<&tokio_util::sync::CancellationToken>) -> bool {
+        let saw = Arc::new(Mutex::new(None));
+        let probe: Box<dyn Tool> = Box::new(TurnTokenProbe {
+            saw_turn_token: Arc::clone(&saw),
+        });
+        let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![probe]);
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        let outcome = execute_one_tool(
+            "turn_token_probe",
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            token,
+            None,
+            None,
+        )
+        .await
+        .expect("probe executes");
+        assert!(outcome.success);
+        let seen = saw.lock().unwrap();
+        seen.expect("the probe ran")
+    }
+
+    #[tokio::test]
+    async fn tools_see_the_running_turn_token_only_while_the_turn_runs_with_one() {
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(probe_turn_token(Some(&token)).await);
+        assert!(!probe_turn_token(None).await);
+        assert!(
+            super::current_turn_cancellation().is_none(),
+            "the token must not leak past the tool execution"
+        );
     }
 }

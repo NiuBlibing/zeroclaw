@@ -1,22 +1,16 @@
 use crate::agent::history_pruner::remove_orphaned_tool_messages;
 use anyhow::Result;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::LazyLock;
 use zeroclaw_providers::ChatMessage;
+use zeroclaw_providers::multimodal::ImageMarkerDisposition;
+use zeroclaw_providers::multimodal::image_marker_dispositions;
+use zeroclaw_providers::multimodal::message_image_summary;
 
-/// Default trigger for auto-compaction when non-system message count exceeds this threshold.
-/// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
-/// used when callers omit the parameter.
+/// Default complete-turn retention limit. Prefer passing the config-driven
+/// value via `run_tool_call_loop`; this constant is only used when callers omit
+/// the parameter. The name is retained for config compatibility.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
-
-static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?:[A-Za-z]:[\\/]|\\\\[^\s<>'"`\]\)/\\]+[\\/]|/)[^\s<>'"`\]\)]+?\.(?i:png|jpe?g|webp|gif|bmp)"#,
-    )
-    .expect("valid image path regex")
-});
 
 /// Returns the largest UTF-8 character boundary at or before `index`.
 ///
@@ -157,140 +151,6 @@ pub fn truncate_tool_result(output: &str, max_chars: usize) -> String {
     truncate_tool_result_with_metadata(output, max_chars).output
 }
 
-fn is_existing_local_image_path(path: &str) -> bool {
-    let candidate = Path::new(path);
-    candidate.is_absolute()
-        && candidate.is_file()
-        && candidate
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| {
-                matches!(
-                    ext.to_ascii_lowercase().as_str(),
-                    "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
-                )
-            })
-}
-
-fn existing_marker_payloads(output: &str) -> std::collections::HashSet<&str> {
-    const OPEN: &str = "[IMAGE:";
-    let mut set = std::collections::HashSet::new();
-    let mut from = 0usize;
-    while let Some(rel) = output[from..].find(OPEN) {
-        let inner_start = from + rel + OPEN.len();
-        let Some(rel_end) = output[inner_start..].find(']') else {
-            break;
-        };
-        let inner_end = inner_start + rel_end;
-        set.insert(output[inner_start..inner_end].trim());
-        from = inner_end + 1;
-    }
-    set
-}
-
-/// Maximum number of bare image paths a single tool result may have promoted
-/// into `[IMAGE:...]` markers.
-///
-/// A tool that genuinely produces images emits a handful of them. A directory
-/// listing or a recursive find over a workspace emits hundreds, and promoting
-/// those uploads unrelated local files to the provider and can push the request
-/// past the model's context window. Beyond this bound the result is treated as
-/// a listing and nothing is promoted.
-///
-/// This is the content-based half of the rule in
-/// `docs/book/src/architecture/memory-payload-lifecycle.md`: "image-path
-/// promotion must only happen for producing tools, not path-listing tools".
-/// [`is_path_listing_tool`] covers the tools we can name; this covers the
-/// generic ones we cannot, such as a shell tool running `find`.
-const MAX_PROMOTED_TOOL_RESULT_IMAGES: usize = 8;
-
-/// Rewrite real local image file paths in tool output into `[IMAGE:...]`
-/// markers so the multimodal pipeline can normalize them before the next
-/// provider call. This targets shell/skill outputs that print filesystem
-/// paths directly rather than returning explicit media markers.
-///
-/// A result carrying more than `MAX_PROMOTED_TOOL_RESULT_IMAGES` promotable
-/// paths is treated as a path listing: nothing is promoted and every path
-/// survives as ordinary text, so the model still sees the listing. Explicit
-/// `[IMAGE:...]` markers already present in the output are never affected —
-/// a producing tool keeps working even when its output also lists files.
-pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
-    let existing_markers = existing_marker_payloads(output);
-
-    // Resolve the promotable spans before rewriting anything, so the count is
-    // known before the decision. Collection stops as soon as the bound is
-    // exceeded, which also spares an enormous listing one filesystem probe per
-    // entry.
-    let mut promotable: Vec<(usize, usize)> = Vec::new();
-    for mat in LOCAL_IMAGE_PATH_RE.find_iter(output) {
-        let start = mat.start();
-        let end = mat.end();
-        let path = &output[start..end];
-
-        // Skip paths that are already part of an explicit media marker.
-        if output[..start].ends_with("[IMAGE:") {
-            continue;
-        }
-
-        // Skip a bare path that already appears inside an explicit marker
-        // elsewhere in the same output — promoting it would double-count the
-        // image (see `existing_marker_payloads`).
-        if existing_markers.contains(path) {
-            continue;
-        }
-
-        if !is_existing_local_image_path(path) {
-            continue;
-        }
-
-        if promotable.len() == MAX_PROMOTED_TOOL_RESULT_IMAGES {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "max_promoted_images": MAX_PROMOTED_TOOL_RESULT_IMAGES,
-                    })),
-                "tool result looks like a path listing; leaving image paths as text"
-            );
-            return output.to_string();
-        }
-
-        promotable.push((start, end));
-    }
-
-    if promotable.is_empty() {
-        return output.to_string();
-    }
-
-    let mut rewritten = String::with_capacity(output.len());
-    let mut cursor = 0usize;
-    for (start, end) in promotable {
-        rewritten.push_str(&output[cursor..start]);
-        rewritten.push_str("[IMAGE:");
-        rewritten.push_str(&output[start..end]);
-        rewritten.push(']');
-        cursor = end;
-    }
-
-    rewritten.push_str(&output[cursor..]);
-    rewritten
-}
-
-fn is_path_listing_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name.to_ascii_lowercase().as_str(),
-        "content_search" | "glob_search"
-    )
-}
-
-pub fn canonicalize_tool_result_media_markers_for(tool_name: &str, output: &str) -> String {
-    if is_path_listing_tool(tool_name) {
-        output.to_string()
-    } else {
-        canonicalize_tool_result_media_markers(output)
-    }
-}
-
 /// Truncate a tool message's content, preserving JSON structure when the
 /// message stores `tool_call_id` alongside `content` (native tool-call
 /// format). Without this, `truncate_tool_result` destroys the JSON envelope
@@ -311,24 +171,95 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
     truncate_tool_result(msg_content, max_chars)
 }
 
-/// Estimate the token cost of a single message using the ~4 chars/token
-/// heuristic plus ~4 framing tokens (role, delimiters). Single-sourced so the
-/// history and system-floor estimates stay in lock-step.
-fn estimate_message_tokens(message: &ChatMessage) -> usize {
-    message.content.len().div_ceil(4) + 4
+/// Fixed per-image charge in the history estimate, applied to the images
+/// preparation dispatches: the markers it lifts from user messages and the
+/// attachments a tool-result carrier declares. Approximates the
+/// standard-tier Anthropic maximum (1,568 tokens for an image
+/// at the 1568px downscale). High-resolution tiers and some models bill more
+/// (Anthropic high-res up to 4,784; GPT-4o-mini base 2,833; Qwen-VL ~4k per
+/// A4 page): this is a heuristic for trimming, not a ceiling, and
+/// provider-reported usage corrects it after the first successful response.
+pub const IMAGE_TOKEN_ESTIMATE: usize = 1_600;
+
+/// Estimate the token cost of a single message: the ~4 chars/token heuristic
+/// plus ~4 framing tokens (role, delimiters). Images follow preparation
+/// ([`message_image_summary`]): a tool-result carrier is charged for the
+/// attachments it declared, with marker syntax in its body counted as text,
+/// and a user message is charged for the loadable `[IMAGE:...]` markers
+/// preparation lifts. The per-image charge applies only when preparation
+/// dispatches the images ([`ImageMarkerDisposition::Normalized`]); stale
+/// tool-result carriers are priced as their bytes (the same formula as
+/// literal text; see the arm below), and system or assistant content
+/// stays literal text. A message whose markers are all
+/// placeholders keeps the plain-text formula. Single-sourced so the history
+/// and system-floor estimates stay in lock-step.
+fn estimate_message_tokens(message: &ChatMessage, disposition: ImageMarkerDisposition) -> usize {
+    let text_estimate = message.content.len().div_ceil(4) + 4;
+    if disposition == ImageMarkerDisposition::Literal {
+        return text_estimate;
+    }
+    // The summary cannot be skipped on a marker-free fast path: a declared
+    // native carrier carries its images as JSON attachments with no marker
+    // syntax in the content at all.
+    let summary = message_image_summary(message);
+    match disposition {
+        ImageMarkerDisposition::Normalized => {
+            summary.text_bytes.div_ceil(4) + summary.image_refs * IMAGE_TOKEN_ESTIMATE + 4
+        }
+        // A stale carrier is priced as its bytes: the replay delivers a
+        // legacy carrier verbatim and re-declares a declared one without
+        // touching its body, so the full content length is the price. (A
+        // stale declared envelope still carries its original attachment
+        // list in these bytes; that overcount is the accepted, conservative
+        // known limit.)
+        ImageMarkerDisposition::Stripped => text_estimate,
+        // Unreachable after the guard; keeps the arm total.
+        ImageMarkerDisposition::Literal => text_estimate,
+    }
 }
 
-/// Estimate token count for a message history using ~4 chars/token heuristic.
-/// Includes a small overhead per message for role/framing tokens.
+/// Estimate token count for a message history using the ~4 chars/token
+/// heuristic plus ~4 framing tokens per message. Images are charged per
+/// image only where preparation dispatches them: the markers lifted from
+/// user turns and the attachments declared by the tool-result carriers of
+/// the current user turn. Stale tool-result carriers are priced as their
+/// bytes, and system or assistant content is priced
+/// as text. Trim
+/// probes estimate history suffixes that always retain the newest turn, so
+/// the current turn's tool-result carriers carry the same disposition in
+/// every probe as in the full history.
 pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
-    history.iter().map(estimate_message_tokens).sum()
+    let dispositions = image_marker_dispositions(history);
+    history
+        .iter()
+        .zip(dispositions)
+        .map(|(message, disposition)| estimate_message_tokens(message, disposition))
+        .sum()
+}
+
+/// Estimate the token cost of native tool definitions serialized into the
+/// provider request, using the same ~4 chars/token heuristic as messages.
+/// The OpenAI and compatible adapters serialize these schemas into the chat
+/// request, so providers that include them in `input_tokens` report a
+/// population of messages plus tool schemas, not messages alone.
+pub fn estimate_tool_schema_tokens(specs: &[crate::tools::ToolSpec]) -> usize {
+    specs
+        .iter()
+        .map(|spec| {
+            let parameters_len =
+                serde_json::to_string(&*spec.parameters).map_or(0, |serialized| serialized.len());
+            (spec.name.len() + spec.description.len() + parameters_len).div_ceil(4) + 4
+        })
+        .sum()
 }
 
 pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
+    // System content is always dispatched verbatim, so the floor always uses
+    // the literal-text formula.
     history
         .iter()
         .filter(|m| m.role == "system")
-        .map(estimate_message_tokens)
+        .map(|m| estimate_message_tokens(m, ImageMarkerDisposition::Literal))
         .sum()
 }
 
@@ -385,63 +316,28 @@ pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: i
     normalize_system_messages(history);
 }
 
-pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
-    let has_system = history.first().is_some_and(|m| m.role == "system");
-    let non_system_count = if has_system {
-        history.len() - 1
-    } else {
-        history.len()
-    };
-
-    if non_system_count <= max_history {
-        return;
-    }
-
-    let system_offset = usize::from(has_system);
-
-    // Find the first user message (the framing anchor). If `max_history` is
-    // too small to fit both the anchor and any recent context, fall back to
-    // the old tail-only behaviour rather than producing a degenerate window.
-    let anchor_idx = history
-        .iter()
-        .enumerate()
-        .skip(system_offset)
-        .find(|(_, m)| m.role == "user")
-        .map(|(i, _)| i);
-
-    let messages_before = history.len();
-
-    let dropped_range = match anchor_idx {
-        Some(anchor) if max_history >= 2 => {
-            // Reserve one slot for the anchor; keep `max_history - 1` most recent.
-            let tail_keep = max_history - 1;
-            let tail_start = history.len().saturating_sub(tail_keep);
-            // Middle range to drop: (anchor + 1) .. tail_start.
-            let drop_start = anchor + 1;
-            if tail_start <= drop_start {
-                // Anchor is already inside the tail window — nothing in the
-                // middle to drop. Fall through to plain head-drop below.
-                None
-            } else {
-                Some(drop_start..tail_start)
-            }
-        }
-        _ => None,
-    };
-
-    if let Some(range) = dropped_range {
-        history.drain(range);
-    } else {
-        // No anchor, or `max_history < 2`: original head-drop behaviour.
-        let to_remove = non_system_count - max_history;
-        history.drain(system_offset..system_offset + to_remove);
-    }
-
-    remove_orphaned_tool_messages(history);
-    normalize_system_messages(history);
-
-    let dropped = messages_before.saturating_sub(history.len());
-    if dropped > 0 {
+pub fn trim_history(
+    history: &mut Vec<ChatMessage>,
+    max_history_turns: usize,
+    history_has_trim_breadcrumb: &mut bool,
+) {
+    let result = crate::agent::history_trim::trim_to_recent_turn_count(
+        std::mem::take(history),
+        max_history_turns,
+        *history_has_trim_breadcrumb,
+    );
+    let crate::agent::history_trim::TurnCountTrimResult {
+        history: trimmed_history,
+        dropped_messages,
+        dropped_turns,
+        kept_turns,
+        trimmed,
+    } = result;
+    let messages_before = trimmed_history.len().saturating_add(dropped_messages);
+    *history = trimmed_history;
+    if trimmed {
+        remove_orphaned_tool_messages(history);
+        normalize_system_messages(history);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -449,13 +345,12 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
                 .with_attrs(::serde_json::json!({
                     "messages_before": messages_before,
                     "messages_after": history.len(),
-                    "dropped": dropped,
-                    "max_history": max_history,
-                    "kept_anchor": anchor_idx.is_some() && max_history >= 2,
+                    "dropped_messages": dropped_messages,
+                    "dropped_turns": dropped_turns,
+                    "kept_turns": kept_turns,
+                    "max_history_turns": max_history_turns,
                 })),
-            "trim_history fired: middle of conversation dropped. Raise \
-             [runtime_profiles.<name>] max_history_messages or enable \
-             compact_context to avoid silent context loss."
+            "trim_history: dropped oldest whole turns"
         );
     }
 }
@@ -464,13 +359,16 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
 pub struct InteractiveSessionState {
     pub version: u32,
     pub history: Vec<ChatMessage>,
+    #[serde(default)]
+    pub history_has_trim_breadcrumb: bool,
 }
 
 impl InteractiveSessionState {
-    fn from_history(history: &[ChatMessage]) -> Self {
+    pub fn from_history_with_crumb(history: &[ChatMessage], has_crumb: bool) -> Self {
         Self {
-            version: 1,
+            version: 2,
             history: history.to_vec(),
+            history_has_trim_breadcrumb: has_crumb,
         }
     }
 }
@@ -479,8 +377,50 @@ pub fn load_interactive_session_history(
     path: &Path,
     system_prompt: &str,
 ) -> Result<Vec<ChatMessage>> {
+    let (history, _) = load_interactive_session_history_with_crumb(path, system_prompt)?;
+    Ok(history)
+}
+
+/// Canonical breadcrumb text used for trim markers. This is the English
+/// string that has been stable across all locales; it is the locale-
+/// independent anchor for legacy migration. Injected breadcrumbs are always
+/// produced via `get_required_cli_string("history-trim-breadcrumb")`, which
+/// currently resolves to this same English text in every locale. Checking
+/// the canonical value makes restore independent of the current process
+/// locale.
+pub const HISTORY_TRIM_BREADCRUMB_CANONICAL: &str =
+    "[earlier turns omitted to fit the context window]";
+
+pub fn is_history_trim_breadcrumb_text(text: &str) -> bool {
+    if text == HISTORY_TRIM_BREADCRUMB_CANONICAL {
+        return true;
+    }
+    // Best-effort cross-locale coverage: if a future translation changes the
+    // breadcrumb in a non-English locale, a legacy v1 file trimmed in that
+    // locale will still be recognised after a restart with a different locale.
+    // v2 files carry an explicit flag and never reach this path.
+    text == crate::i18n::get_required_cli_string("history-trim-breadcrumb")
+}
+
+/// Load interactive history plus the persisted breadcrumb provenance. Legacy
+/// files without the flag are migrated by inspecting the restored history:
+/// if the first non-system message equals the breadcrumb string, the flag is
+/// recovered as true. v2 records carry an explicit
+/// `history_has_trim_breadcrumb` (true or false) so a genuine user message
+/// that collides with the breadcrumb text keeps its real turn-boundary role.
+/// Legacy v1 migration is locale-independent: it checks the canonical
+/// English breadcrumb plus the current-locale string, covering both the
+/// stable historical value and any future translated variant. A v1 file whose
+/// first user turn genuinely equals the breadcrumb text cannot be
+/// distinguished from a synthetic marker on its one-time migration; after the
+/// next persist the file becomes v2 with the (mis)classified flag, which is
+/// the documented one-time limitation for unmarked legacy state.
+pub fn load_interactive_session_history_with_crumb(
+    path: &Path,
+    system_prompt: &str,
+) -> Result<(Vec<ChatMessage>, bool)> {
     if !path.exists() {
-        return Ok(vec![ChatMessage::system(system_prompt)]);
+        return Ok((vec![ChatMessage::system(system_prompt)], false));
     }
 
     let raw = std::fs::read_to_string(path)?;
@@ -497,15 +437,45 @@ pub fn load_interactive_session_history(
 
     remove_orphaned_tool_messages(&mut state.history);
 
-    Ok(state.history)
+    // Migration: only legacy v1 files lack explicit provenance. v2 records
+    // carry an explicit `history_has_trim_breadcrumb` (true or false) — a
+    // fresh v2 session where the user legitimately sent the breadcrumb text
+    // must not be reclassified as synthetic. Infer only when the persisted
+    // version is < 2 and the flag is false.
+    let mut has_crumb = state.history_has_trim_breadcrumb;
+    if !has_crumb && state.version < 2 {
+        let leading_system = state
+            .history
+            .iter()
+            .take_while(|m| m.role == "system")
+            .count();
+        if let Some(first) = state.history.get(leading_system)
+            && first.role == "user"
+            && is_history_trim_breadcrumb_text(&first.content)
+        {
+            has_crumb = true;
+        }
+    }
+
+    Ok((state.history, has_crumb))
 }
 
 pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Result<()> {
+    save_interactive_session_history_with_crumb(path, history, false)
+}
+
+pub fn save_interactive_session_history_with_crumb(
+    path: &Path,
+    history: &[ChatMessage],
+    has_crumb: bool,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
+    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history_with_crumb(
+        history, has_crumb,
+    ))?;
     std::fs::write(path, payload)?;
     Ok(())
 }
@@ -544,6 +514,192 @@ mod tests {
     }
 
     #[test]
+    fn image_path_marker_is_charged_per_image_not_per_byte() {
+        // The marker is 18 bytes of text: bytes/4 would price it at ~9
+        // tokens against the ~1.5k the provider bills after downscale.
+        let message = ChatMessage::user("[IMAGE:/tmp/a.png]");
+
+        assert_eq!(
+            estimate_history_tokens(&[message]),
+            IMAGE_TOKEN_ESTIMATE + 4
+        );
+    }
+
+    #[test]
+    fn image_data_uri_marker_is_charged_per_image_not_per_byte() {
+        // ~600 KB of base64 would price at ~150k tokens under the text
+        // heuristic, against ~1.5k billed.
+        let payload = format!("data:image/png;base64,{}", "A".repeat(600_000));
+        let message = ChatMessage::user(format!("[IMAGE:{payload}]"));
+
+        assert_eq!(
+            estimate_history_tokens(&[message]),
+            IMAGE_TOKEN_ESTIMATE + 4
+        );
+    }
+
+    #[test]
+    fn path_and_data_uri_forms_estimate_identically() {
+        // Invariant 2: the same image costs the same however it is
+        // referenced, so the raw-history estimate bounds the prepared
+        // payload from above.
+        let via_path = ChatMessage::user("[IMAGE:/tmp/scene.png]");
+        let payload = format!("data:image/png;base64,{}", "B".repeat(600_000));
+        let via_data_uri = ChatMessage::user(format!("[IMAGE:{payload}]"));
+
+        let path_estimate = estimate_history_tokens(&[via_path]);
+        assert_eq!(path_estimate, estimate_history_tokens(&[via_data_uri]));
+        assert_eq!(path_estimate, IMAGE_TOKEN_ESTIMATE + 4);
+    }
+
+    #[test]
+    fn placeholder_marker_stays_text() {
+        // `parse_image_markers` keeps placeholder markers in the text, so
+        // they retain the plain-text pricing.
+        for placeholder in ["[IMAGE:...]", "[IMAGE:<path>]"] {
+            let message = ChatMessage::user(placeholder);
+
+            assert_eq!(
+                estimate_history_tokens(&[message]),
+                placeholder.len().div_ceil(4) + 4
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_text_and_images_sum() {
+        let content = "see [IMAGE:/a.png] and [IMAGE:/b.png] ok";
+        let message = ChatMessage::user(content);
+
+        let (text, refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(text, "see  and  ok");
+
+        let expected = text.len().div_ceil(4) + 2 * IMAGE_TOKEN_ESTIMATE + 4;
+        assert_eq!(estimate_history_tokens(&[message]), expected);
+    }
+
+    #[test]
+    fn system_and_assistant_markers_stay_text() {
+        // System and assistant content is dispatched verbatim, so a 16 KB data
+        // URI marker must estimate as its full text, not as one image.
+        let payload = format!("data:image/png;base64,{}", "A".repeat(16_000));
+        let system_marker = ChatMessage::system(format!("[IMAGE:{payload}]"));
+        let system_len = system_marker.content.len();
+        assert_eq!(
+            estimate_history_tokens(&[system_marker]),
+            system_len.div_ceil(4) + 4
+        );
+
+        let assistant_marker = ChatMessage::assistant("[IMAGE:/tmp/a.png]");
+        let assistant_len = assistant_marker.content.len();
+        assert_eq!(
+            estimate_history_tokens(&[assistant_marker]),
+            assistant_len.div_ceil(4) + 4
+        );
+
+        // Twenty short markers in one system message must stay far under the
+        // default 32,000-token floor warning they used to trip.
+        let twenty = (0..20)
+            .map(|index| format!("[IMAGE:/tmp/s-{index}.png]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let system_history = vec![ChatMessage::system(twenty)];
+        let floor = estimate_system_floor_tokens(&system_history);
+        assert_eq!(floor, system_history[0].content.len().div_ceil(4) + 4);
+        assert!(floor < 32_000);
+    }
+
+    #[test]
+    fn placeholder_with_padding_is_byte_identical_to_master() {
+        // Parsing trims the padding around a placeholder, but a message with
+        // no loadable references keeps the plain-text formula.
+        let padded = "    [IMAGE:...]    ";
+        let message = ChatMessage::user(padded);
+
+        assert_eq!(
+            estimate_history_tokens(&[message]),
+            padded.len().div_ceil(4) + 4
+        );
+    }
+
+    /// A native tool-result carrier in the shape the runtime writes: call
+    /// id, verbatim body, and the attachments array at the fixed position.
+    fn native_image_carrier(body: &str, images: &[&str]) -> ChatMessage {
+        let attachments: Vec<_> = images
+            .iter()
+            .map(|target| zeroclaw_api::media::RenderedMarker {
+                target: (*target).to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Image,
+            })
+            .collect();
+        ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call-1",
+                "content": body,
+                "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn declared_tool_attachments_are_charged_not_body_markers() {
+        // A declared carrier in the current turn: one image attachment, a
+        // body quoting two markers. The markers are text; the attachment is
+        // the only image. The expected numbers are computed by hand from the
+        // fixture strings, not by a second estimate call.
+        let body = "see [IMAGE:/x.png] and [IMAGE:/y.png]";
+        let tool = native_image_carrier(body, &["/tmp/declared.png"]);
+        let history = vec![ChatMessage::user("u"), ChatMessage::assistant("c"), tool];
+        let expected = "u".len().div_ceil(4)
+            + 4
+            + "c".len().div_ceil(4)
+            + 4
+            + body.len().div_ceil(4)
+            + IMAGE_TOKEN_ESTIMATE
+            + 4;
+        assert_eq!(
+            estimate_history_tokens(&history),
+            expected,
+            "one declared attachment plus text, never the two body markers"
+        );
+
+        // A legacy carrier in the same position: two body markers, no
+        // declaration, so preparation promotes nothing and the charge is
+        // text only.
+        let legacy_body = "got [IMAGE:/a.png] plus [IMAGE:/b.png] done";
+        let legacy = ChatMessage::tool(legacy_body);
+        let history = vec![ChatMessage::user("u"), ChatMessage::assistant("c"), legacy];
+        let expected = "u".len().div_ceil(4)
+            + 4
+            + "c".len().div_ceil(4)
+            + 4
+            + legacy_body.len().div_ceil(4)
+            + 4;
+        assert_eq!(
+            estimate_history_tokens(&history),
+            expected,
+            "a legacy carrier's body markers are text, never images"
+        );
+    }
+
+    #[test]
+    fn estimate_tool_schema_tokens_counts_name_description_and_parameters() {
+        let spec = crate::tools::ToolSpec::new(
+            "search",
+            "search the corpus",
+            serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+        );
+        let tokens = estimate_tool_schema_tokens(&[spec]);
+        assert!(tokens > 0, "a tool schema must contribute tokens");
+        assert!(
+            estimate_tool_schema_tokens(&[]) == 0,
+            "no tools means no schema tokens"
+        );
+    }
+
+    #[test]
     fn context_floor_remediation_names_budget_floor_and_runtime_profile_surface() {
         let msg = context_floor_remediation(2000, 100);
         // Names the resolved budget N the runtime actually used ...
@@ -565,161 +721,6 @@ mod tests {
         assert!(
             !msg.contains("agent.max_context_tokens"),
             "remediation must not reference the inert agent.max_context_tokens: {msg}"
-        );
-    }
-
-    #[test]
-    fn canonicalize_tool_result_media_markers_wraps_existing_local_image_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let image = dir.path().join("generated.png");
-        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
-
-        let input = format!(
-            "Image generated successfully.\nFile: {}",
-            image.display().to_string()
-        );
-        let output = canonicalize_tool_result_media_markers(&input);
-
-        assert!(output.contains("[IMAGE:"));
-        assert!(output.contains(&format!("[IMAGE:{}]", image.display().to_string())));
-    }
-
-    #[test]
-    fn canonicalize_tool_result_media_markers_ignores_missing_paths() {
-        let input = "File: /tmp/definitely-missing-zeroclaw-image.png";
-        let output = canonicalize_tool_result_media_markers(input);
-        assert_eq!(output, input);
-    }
-
-    #[test]
-    fn canonicalize_tool_result_media_markers_preserves_existing_markers() {
-        let input = "Already tagged [IMAGE:/tmp/already-tagged.png]";
-        let output = canonicalize_tool_result_media_markers(input);
-        assert_eq!(output, input);
-    }
-
-    /// Write `count` real PNG files and return a newline-joined listing of
-    /// their absolute paths, shaped like `find`/`fd`/`ls` output.
-    fn image_path_listing(dir: &Path, count: usize) -> String {
-        let mut lines = Vec::with_capacity(count);
-        for index in 0..count {
-            let image = dir.join(format!("asset-{index}.png"));
-            std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
-            lines.push(image.display().to_string());
-        }
-        lines.join("\n")
-    }
-
-    #[test]
-    fn canonicalize_promotes_up_to_the_listing_bound() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = image_path_listing(dir.path(), MAX_PROMOTED_TOOL_RESULT_IMAGES);
-
-        let output = canonicalize_tool_result_media_markers(&input);
-
-        assert_eq!(
-            output.matches("[IMAGE:").count(),
-            MAX_PROMOTED_TOOL_RESULT_IMAGES,
-            "a producing tool emitting up to the bound keeps every promotion"
-        );
-    }
-
-    #[test]
-    fn canonicalize_leaves_path_listings_as_text() {
-        // The regression: a recursive find over a workspace prints real image
-        // paths, and promoting them base64-inlines unrelated local files into
-        // the next provider request.
-        let dir = tempfile::tempdir().unwrap();
-        let input = image_path_listing(dir.path(), MAX_PROMOTED_TOOL_RESULT_IMAGES + 1);
-
-        let output = canonicalize_tool_result_media_markers(&input);
-
-        assert_eq!(
-            output, input,
-            "a result over the bound is a listing: nothing is promoted and the \
-             paths stay visible to the model as text"
-        );
-    }
-
-    #[test]
-    fn canonicalize_for_generic_shell_tool_leaves_path_listings_as_text() {
-        // `is_path_listing_tool` only names dedicated search tools, so the
-        // generic shell tool has to be covered by the content bound.
-        let dir = tempfile::tempdir().unwrap();
-        let input = image_path_listing(dir.path(), MAX_PROMOTED_TOOL_RESULT_IMAGES + 1);
-
-        let output = canonicalize_tool_result_media_markers_for("shell", &input);
-
-        assert_eq!(output, input);
-    }
-
-    #[test]
-    fn canonicalize_listing_still_preserves_an_explicit_marker() {
-        // Suppression must not strip a marker a producing tool emitted
-        // deliberately, even when the same output also lists files.
-        let dir = tempfile::tempdir().unwrap();
-        let listing = image_path_listing(dir.path(), MAX_PROMOTED_TOOL_RESULT_IMAGES + 1);
-        let input = format!("[IMAGE:/tmp/deliberate.png]\n{listing}");
-
-        let output = canonicalize_tool_result_media_markers(&input);
-
-        assert_eq!(output, input);
-        assert!(output.contains("[IMAGE:/tmp/deliberate.png]"));
-        assert_eq!(
-            output.matches("[IMAGE:").count(),
-            1,
-            "only the explicit marker survives; no listing path is promoted"
-        );
-    }
-
-    #[test]
-    fn canonicalize_for_skips_path_listing_tools() {
-        // A search/listing tool that surfaces a real image path must be left
-        // untouched - promoting it to [IMAGE:...] would falsely trigger vision
-        // routing
-        let dir = tempfile::tempdir().unwrap();
-        let image = dir.path().join("hit.png");
-        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
-        let input = format!("match: {}", image.display());
-
-        for tool in ["content_search", "glob_search", "GLOB_SEARCH"] {
-            let output = canonicalize_tool_result_media_markers_for(tool, &input);
-            assert_eq!(output, input, "{tool} output must be left untouched");
-            assert!(!output.contains("[IMAGE:"));
-        }
-    }
-
-    #[test]
-    fn canonicalize_for_wraps_image_producing_and_fetching_tools() {
-        // Default-allow: image_gen (produces) and file_download (fetches) keep
-        // canonicalization so a genuinely produced/fetched image still routes.
-        let dir = tempfile::tempdir().unwrap();
-        let image = dir.path().join("generated.png");
-        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
-        let input = format!("Saved to {}", image.display());
-        let expected = format!("[IMAGE:{}]", image.display());
-
-        for tool in ["image_gen", "file_download", "some_future_tool"] {
-            let output = canonicalize_tool_result_media_markers_for(tool, &input);
-            assert!(
-                output.contains(&expected),
-                "{tool} output should be canonicalized into a marker"
-            );
-        }
-    }
-
-    #[test]
-    fn canonicalize_tool_result_media_markers_dedups_path_already_in_marker() {
-        let input = "File: /tmp/pic.png\nFormat: png\n[IMAGE:/tmp/pic.png]";
-        let output = canonicalize_tool_result_media_markers(input);
-        assert_eq!(
-            output, input,
-            "bare path duplicating an existing marker must not be promoted"
-        );
-        assert_eq!(
-            output.matches("[IMAGE:").count(),
-            1,
-            "exactly one image marker expected, got: {output}"
         );
     }
 

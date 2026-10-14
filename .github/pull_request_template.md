@@ -7,9 +7,10 @@
 - **Linked issue(s):** Use plain text outside backticks. Use `Closes #`,
   `Fixes #`, or `Resolves #` only for issues this PR fully resolves. Use
   `Related #`, `Depends on #`, or `Supersedes #` for non-closing relationships.
-- **Labels:** Snapshot the current GitHub labels after labels are applied, for
-  example `type:docs`, `risk:low`, `size:S`, `docs`. During label-spelling
-  migration, copy the exact live label spelling from the GitHub UI.
+
+### What this does, simply
+
+Explain the change for someone unfamiliar with this part of ZeroClaw: what it is for, what was missing or wrong, and what this PR changes. Include important limits or unchanged behavior where relevant. Use ordinary language and enough context to tell the story, rather than repeating the technical summary.
 
 ## Testing (required)
 
