@@ -27,7 +27,9 @@ impl Tool for ReadSkillTool {
     }
 
     fn description(&self) -> &str {
-        "Read the full source file for an available skill by name. Use this when its prompt entry says the instructions load on demand."
+        crate::i18n::get_tool_description(self.name()).unwrap_or(
+            "Read the full source file for an available skill by name. Use this when its prompt entry says the instructions load on demand.",
+        )
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

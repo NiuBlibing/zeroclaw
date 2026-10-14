@@ -1865,7 +1865,9 @@ pub async fn run(
         if crate::skills::skills_require_read_tool(&skills, eff_prompt_injection_mode) {
             tool_descs.push((
                 "read_skill",
-                "Load the full source for an available skill by name. Use when: its prompt entry marks the instructions as on-demand.",
+                crate::i18n::get_tool_description("read_skill").unwrap_or(
+                    "Load the full source for an available skill by name. Use when: its prompt entry marks the instructions as on-demand.",
+                ),
             ));
         }
         tool_descs.push((

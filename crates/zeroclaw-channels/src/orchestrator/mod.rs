@@ -16748,7 +16748,9 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         ) {
             tool_descs.push((
                 "read_skill",
-                "Load the full source for an available skill by name. Use when: its prompt entry marks the instructions as on-demand.",
+                zeroclaw_runtime::i18n::get_tool_description("read_skill").unwrap_or(
+                    "Load the full source for an available skill by name. Use when: its prompt entry marks the instructions as on-demand.",
+                ),
             ));
         }
         if config.browser.enabled {
