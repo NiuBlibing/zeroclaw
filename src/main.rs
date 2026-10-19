@@ -20377,7 +20377,7 @@ mod tests {
             assert_eq!(supervisor.drivers.lock().unwrap().len(), 1);
             let teardown = supervisor.shutdown().await;
             assert!(teardown.still_running.is_empty());
-            assert!(teardown.unsettled_runs.is_empty());
+            assert_eq!(teardown.unsettled_runs, Vec::<String>::new());
             assert_eq!(store.claim_counts(name).unwrap().0, 1);
 
             let reopened =
@@ -25821,7 +25821,7 @@ maxLength = 1
         )
         .expect("staging must succeed");
         assert_eq!(staged.granted, canonical);
-        assert!(staged.withheld.is_empty());
+        assert_eq!(staged.withheld, Vec::<String>::new());
         let ceremony = egress_grant_ceremony_lines(
             egress_command_config_dir(&config),
             "weather-tool",
@@ -26761,7 +26761,7 @@ hosts = ["api.example.com", "api2.example.com"]
         .await
         .expect("existing row needs no persistence")
         .expect("rows");
-        assert!(rows.created.is_empty());
+        assert_eq!(rows.created, Vec::<&String>::new());
         assert_eq!(rows.existing.len(), first_entries.len());
         assert_eq!(config.dirty_paths, before.dirty_paths);
         assert_eq!(
@@ -27496,7 +27496,10 @@ type = "integer"
         config.plugins.entries[0]
             .config
             .insert("retries".to_string(), "3".to_string());
-        assert!(plugin_config_rejections(&config, &manifest).is_empty());
+        assert_eq!(
+            plugin_config_rejections(&config, &manifest),
+            Vec::<(String, String)>::new()
+        );
     }
 
     /// An update to a lower version says so instead of reading as a normal
