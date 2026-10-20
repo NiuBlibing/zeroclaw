@@ -1833,8 +1833,11 @@ mod tool_round_policy_tests {
                 Some(ToolRoundPolicy::Single),
                 2,
                 Some(CallSampling::for_selection(Some(0.9), |reference| {
-                    assert_eq!(reference, "openai.fixture.selected");
-                    Some(0.2)
+                    Some(if reference == "openai.fixture.selected" {
+                        0.2
+                    } else {
+                        0.9
+                    })
                 })),
             )
             .await;

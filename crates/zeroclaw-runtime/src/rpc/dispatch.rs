@@ -3371,7 +3371,6 @@ impl RpcDispatcher {
                 Self::apply_prepared_live_sessions_refresh(
                     Arc::clone(&ctx),
                     effects.prepared_sessions,
-                    Arc::clone(&accepted),
                     Some(revision),
                 )
                 .await;
@@ -9919,7 +9918,6 @@ impl RpcDispatcher {
     async fn apply_prepared_live_sessions_refresh(
         ctx: Arc<RpcContext>,
         prepared: Vec<PreparedLiveSessionRefresh>,
-        _accepted: Arc<Config>,
         revision: Option<zeroclaw_config::live::ConfigRevision>,
     ) {
         for refresh in prepared {
@@ -9979,7 +9977,7 @@ impl RpcDispatcher {
             &LiveSessionRefreshScope::Agent(agent_alias.to_string()),
         )
         .await?;
-        Self::apply_prepared_live_sessions_refresh(ctx, prepared, Arc::new(config), None).await;
+        Self::apply_prepared_live_sessions_refresh(ctx, prepared, None).await;
         Ok(())
     }
 
