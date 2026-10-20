@@ -105,6 +105,13 @@ pub fn diagnose(config: &Config) -> Vec<DiagResult> {
     items.into_iter().map(DiagItem::into_result).collect()
 }
 
+/// Run synchronous diagnostics outside the async executor. Provider validation
+/// can perform a blocking OAuth exchange while materializing a configured slot.
+pub async fn diagnose_nonblocking(config: &Config) -> Result<Vec<DiagResult>> {
+    let config = config.clone();
+    Ok(tokio::task::spawn_blocking(move || diagnose(&config)).await?)
+}
+
 /// Outcome of probing one configured provider entry's live catalog.
 #[derive(Clone, PartialEq)]
 enum ModelProbe {
@@ -236,11 +243,11 @@ async fn check_codex_auth_wiring(config: &Config) -> Vec<DiagResult> {
 }
 
 /// Run the full Doctor suite and return the structured result used by CLI and RPC.
-pub async fn run_structured(config: &Config) -> Vec<DiagResult> {
-    let mut results = diagnose(config);
+pub async fn run_structured(config: &Config) -> Result<Vec<DiagResult>> {
+    let mut results = diagnose_nonblocking(config).await?;
     results.extend(check_codex_auth_wiring(config).await);
     results.extend(probe_models(config).await);
-    results
+    Ok(results)
 }
 
 /// Run Doctor with a per-phase timeout for the network-dependent probe phase.
@@ -253,7 +260,7 @@ pub async fn run_structured(config: &Config) -> Vec<DiagResult> {
 pub async fn run_structured_with_timeout(
     config: &Config,
     probe_timeout: std::time::Duration,
-) -> (Vec<DiagResult>, Option<String>) {
+) -> Result<(Vec<DiagResult>, Option<String>)> {
     run_structured_with_probe(config, probe_timeout, Box::pin(probe_models(config))).await
 }
 
@@ -265,8 +272,8 @@ pub(crate) async fn run_structured_with_probe(
     config: &Config,
     probe_timeout: std::time::Duration,
     probe: std::pin::Pin<Box<dyn std::future::Future<Output = Vec<DiagResult>> + Send + '_>>,
-) -> (Vec<DiagResult>, Option<String>) {
-    let mut results = diagnose(config);
+) -> Result<(Vec<DiagResult>, Option<String>)> {
+    let mut results = diagnose_nonblocking(config).await?;
     results.extend(check_codex_auth_wiring(config).await);
 
     let (probe_results, timed_out) = match tokio::time::timeout(probe_timeout, probe).await {
@@ -282,12 +289,12 @@ pub(crate) async fn run_structured_with_probe(
         }
     };
     results.extend(probe_results);
-    (results, timed_out)
+    Ok((results, timed_out))
 }
 
 /// Run diagnostics and print human-readable report to stdout.
 pub async fn run(config: &Config) -> Result<()> {
-    let results = run_structured(config).await;
+    let results = run_structured(config).await?;
 
     println!("🩺 ZeroClaw Doctor (enhanced)");
     println!();
@@ -415,42 +422,30 @@ fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec
         .collect()
 }
 
-fn configured_model_provider_api_key<'a>(
-    config: &'a Config,
-    provider_name: &str,
-) -> Option<&'a str> {
-    let (family, alias) = config
-        .providers
-        .models
-        .profile_ref(provider_name)
-        .unwrap_or((provider_name, "default"));
-
-    config
-        .providers
-        .models
-        .find(family, alias)
-        .and_then(|entry| entry.api_key.as_deref())
-}
-
 fn create_doctor_model_provider(
     config: &Config,
     provider_name: &str,
 ) -> anyhow::Result<Box<dyn zeroclaw_api::model_provider::ModelProvider>> {
-    let api_key = configured_model_provider_api_key(config, provider_name);
-    let options = zeroclaw_providers::options_for_provider_ref(
+    let provider_name = provider_name.trim();
+    let default_ref;
+    let reference = if !provider_name.contains(['.', ':'])
+        && config
+            .providers
+            .models
+            .find(provider_name, "default")
+            .is_some()
+    {
+        default_ref = format!("{provider_name}.default");
+        default_ref.as_str()
+    } else {
+        provider_name
+    };
+    zeroclaw_providers::model::build_raw_provider(
         config,
-        provider_name,
-        &zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-    );
-
-    match config.providers.models.profile_ref(provider_name) {
-        Some((family, alias)) => zeroclaw_providers::create_model_provider_for_alias(
-            config, family, alias, api_key, &options,
-        ),
-        None => {
-            zeroclaw_providers::create_model_provider_with_options(provider_name, api_key, &options)
-        }
-    }
+        reference,
+        zeroclaw_providers::model::ProviderOverrides::default(),
+    )
+    .map(|resolved| resolved.provider)
 }
 
 /// Persist the fetched model catalog to the shared cache location so that
@@ -971,7 +966,12 @@ pub async fn update_context_windows(
 /// --check` (configured-model verification) and future interactive flows (the
 /// `quickstart` model picker, which also wants pricing) share one fetch path.
 pub async fn fetch_provider_catalog(config: &Config, provider_ref: &str) -> Result<Vec<String>> {
-    let provider = create_doctor_model_provider(config, provider_ref)?;
+    let config = config.clone();
+    let provider_ref = provider_ref.to_string();
+    let provider = zeroclaw_providers::model::build_nonblocking(move || {
+        create_doctor_model_provider(&config, &provider_ref)
+    })
+    .await?;
     zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
         .list_models()
         .await
@@ -2658,21 +2658,102 @@ mod tests {
         );
     }
 
-    #[test]
-    fn configured_model_provider_api_key_uses_alias_profile() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn doctor_catalog_uses_model_less_profile_connection() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer catalog-test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "catalog-model"}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
         let mut config = Config::default();
-        config
+        let profile = config
             .providers
             .models
             .ensure("custom", "local")
-            .expect("known model_provider type")
-            .api_key = Some("redacted-test-key".to_string());
+            .expect("known model_provider type");
+        profile.api_key = Some("catalog-test-key".into());
+        profile.uri = Some(format!("{}/v1", server.uri()));
 
         assert_eq!(
-            configured_model_provider_api_key(&config, "custom.local"),
-            Some("redacted-test-key")
+            fetch_provider_catalog(&config, "custom.local")
+                .await
+                .unwrap(),
+            vec!["catalog-model"]
         );
-        assert_eq!(configured_model_provider_api_key(&config, "custom"), None);
+        let profile = config.providers.models.custom.remove("local").unwrap();
+        config
+            .providers
+            .models
+            .custom
+            .insert("default".into(), profile);
+        assert_eq!(
+            fetch_provider_catalog(&config, "custom").await.unwrap(),
+            vec!["catalog-model"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn doctor_catalog_and_diagnostics_construct_oauth_off_runtime() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::QwenModelProviderConfig;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "catalog-test-access-token",
+                "refresh_token": "catalog-test-refresh-token",
+                "expires_in": 3600,
+                "resource_url": format!("{}/v1", server.uri())
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer catalog-test-access-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "qwen-catalog-model"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // This is the only endpoint override in the runtime test binary.
+        let _endpoint = scopeguard::guard((), |_| {
+            zeroclaw_providers::set_qwen_oauth_endpoint_for_test(None);
+        });
+        zeroclaw_providers::set_qwen_oauth_endpoint_for_test(Some(format!(
+            "{}/oauth2/token",
+            server.uri()
+        )));
+        let mut config = Config::default();
+        config.providers.models.qwen.insert(
+            "oauth".into(),
+            QwenModelProviderConfig {
+                oauth_refresh_token: Some("catalog-test-refresh-token".into()),
+                oauth_resource_url: Some(format!("{}/v1", server.uri())),
+                ..Default::default()
+            },
+        );
+
+        let diagnostics = diagnose_nonblocking(&config).await.unwrap();
+        assert!(diagnostics.iter().any(|item| {
+            item.message == "model_provider \"qwen.oauth\" is valid"
+                && item.severity == Severity::Ok
+        }));
+        assert_eq!(
+            fetch_provider_catalog(&config, "qwen.oauth").await.unwrap(),
+            vec!["qwen-catalog-model"]
+        );
     }
 
     #[test]
@@ -2709,7 +2790,7 @@ mod tests {
                 .any(|item| item.category == "providers.models")
         );
 
-        let full = run_structured(&config).await;
+        let full = run_structured(&config).await.unwrap();
         assert!(
             full.iter().any(|item| item.category == "providers.models"),
             "shared structured runner should include the same model probe rows as the CLI"
@@ -2915,7 +2996,8 @@ mod tests {
             Duration::from_millis(100),
             Box::pin(std::future::pending::<Vec<DiagResult>>()),
         )
-        .await;
+        .await
+        .unwrap();
 
         // Pre-probe diagnostics (config, workspace, daemon, environment, CLI tools)
         // must survive the timeout.
@@ -2990,7 +3072,8 @@ mod tests {
             Duration::from_secs(5),
             Box::pin(async move { vec![probe_result] }),
         )
-        .await;
+        .await
+        .unwrap();
 
         // The probe result must survive to the output.
         assert!(

@@ -75,6 +75,20 @@ impl ResolvedModelAccess<'_> {
         request: ChatRequest<'_>,
         settled_out: &mut Vec<SettledAttemptSummary>,
     ) -> anyhow::Result<ChatResponse> {
+        self.run_model_query_with_sampling(
+            request,
+            settled_out,
+            self.temperature.resolve(None, self.provider_name).into(),
+        )
+        .await
+    }
+
+    pub async fn run_model_query_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        settled_out: &mut Vec<SettledAttemptSummary>,
+        sampling: zeroclaw_api::model_provider::CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
         crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
@@ -110,13 +124,10 @@ impl ResolvedModelAccess<'_> {
             .scope(with_exact_dispatch_route(
                 self.provider_name.to_string(),
                 self.model.to_string(),
-                dispatcher.chat(
+                dispatcher.chat_with_sampling(
                     request,
                     self.dispatch_model,
-                    zeroclaw_providers::temperature::temperature_for_dispatch(
-                        self.provider_name,
-                        self.temperature.override_value,
-                    ),
+                    sampling,
                 ),
             ))
             .await;

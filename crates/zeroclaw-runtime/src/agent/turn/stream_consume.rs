@@ -61,14 +61,14 @@ pub(crate) async fn consume_provider_streaming_response(
     messages: &[ChatMessage],
     request_tools: Option<&[crate::tools::ToolSpec]>,
     model: &str,
-    temperature: Option<f64>,
+    temperature: impl Into<zeroclaw_api::model_provider::CallSampling> + Send,
     cancellation_token: Option<&CancellationToken>,
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     strict_tool_parsing: bool,
     draft_reasoning: StreamReasoningMode,
 ) -> Result<StreamedChatOutcome> {
-    let mut provider_stream = ProviderDispatch::from_ref(model_provider).stream_chat(
+    let mut provider_stream = ProviderDispatch::from_ref(model_provider).stream_chat_with_sampling(
         ChatRequest {
             messages,
             tools: request_tools,
@@ -78,7 +78,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 .flatten(),
         },
         model,
-        temperature,
+        temperature.into(),
         zeroclaw_providers::traits::StreamOptions::new(true),
     );
     let mut outcome = StreamedChatOutcome::default();

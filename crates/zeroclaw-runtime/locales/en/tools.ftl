@@ -173,6 +173,7 @@ tool-memory-store = Store a fact, preference, or note in long-term memory. Use c
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
 tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
+tool-model-routing-config-write-busy = Another configuration update is in progress. Retry this change after it finishes.
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 
@@ -236,6 +237,10 @@ tool-web-search-tool-error-searxng-not-configured = SearXNG instance URL not con
 tool-web-search-tool-note-truncated-results = (further results omitted)
 
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
+
+tool-llm-task-agent-missing = Unknown model_provider agent: { $agent }
+tool-llm-task-provider-invalid = Invalid model_provider reference: { $provider }
+tool-llm-task-model-missing = No model configured for model_provider: { $provider }
 
 tool-weather = Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0-3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required.
 

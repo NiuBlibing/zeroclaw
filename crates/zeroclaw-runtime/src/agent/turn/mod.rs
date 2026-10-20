@@ -1506,6 +1506,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         })
         .unwrap_or(provider_name);
     let temperature = temperature_input.resolve(config, sampling_ref);
+    // Admit one generation for this turn; retries and streams share the Arc.
+    let sampling_config = config.map(|config| Arc::new(config.clone()));
 
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
@@ -1640,7 +1642,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         provider_name,
         model,
         context_limits,
-        temperature,
+        temperature: temperature_input.for_call(sampling_config.clone(), sampling_ref),
         approval,
         channel_name,
         channel_reply_target,
@@ -1989,8 +1991,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             provider_request_model,
             active_context_limits,
         );
-        ctx.temperature = temperature_input.resolve(
-            config,
+        ctx.temperature = temperature_input.for_call(
+            sampling_config.clone(),
             if vision_model_provider_box.is_some() {
                 active_model_provider_name
             } else {
@@ -2416,21 +2418,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             streamed_protocol_suppressed,
             streamed_visible_text,
             image_recovery_succeeded,
-        } = zeroclaw_providers::temperature::with_temperature(
-            config,
-            temperature_input,
-            call_provider(
-                &ctx,
-                active_model_provider,
-                active_model_provider_name,
-                provider_request_model,
-                provider_dispatch_model,
-                &provider_request_messages,
-                image_recovery_messages.as_deref(),
-                request_tools,
-                should_consume_provider_stream,
-                iteration,
-            ),
+        } = call_provider(
+            &ctx,
+            active_model_provider,
+            active_model_provider_name,
+            provider_request_model,
+            provider_dispatch_model,
+            &provider_request_messages,
+            image_recovery_messages.as_deref(),
+            request_tools,
+            should_consume_provider_stream,
+            iteration,
         )
         .await?;
         let accepted_request_messages = if image_recovery_succeeded {
@@ -3005,6 +3003,21 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     .await
                 }
             });
+        // Parallel tool calls are joined in this task. Registry, pipeline, and
+        // nested skill calls therefore share this admission without a live read.
+        let execution = async {
+            match (sampling_config.as_ref(), agent_alias) {
+                (Some(config), Some(alias)) => {
+                    zeroclaw_tools::llm_task::scope_model_config(
+                        Arc::clone(config),
+                        alias,
+                        execution,
+                    )
+                    .await
+                }
+                _ => execution.await,
+            }
+        };
         let execution_result = match shared_budget.clone() {
             Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
             None => execution.await,
@@ -3621,9 +3634,15 @@ pub(crate) async fn assemble_owned_execution_with_admission(
     // Stays sealed into `OwnedAgentExecution.tools_registry` (a `ScopedToolRegistry`).
     let tools_registry = registry;
 
-    let model_runtime =
-        crate::agent::agent::build_model(config, alias, agent.model_provider.as_str(), None)
-            .with_context(|| format!("SOP step agent '{alias}' has no resolved model provider"))?;
+    let model_binding = zeroclaw_providers::model::build_model_nonblocking(
+        Arc::new(config.clone()),
+        alias,
+        agent.model_provider.as_str(),
+        None,
+    )
+    .await
+    .with_context(|| format!("SOP step agent '{alias}' has no resolved model provider"))?;
+    let (model_provider, identity, _) = model_binding.into_parts();
 
     // The step agent's risk profile under the PARENT surface's interactivity
     // mode: an operator approval route available to the outer turn stays
@@ -3634,9 +3653,9 @@ pub(crate) async fn assemble_owned_execution_with_admission(
     };
 
     Ok(OwnedAgentExecution {
-        model_provider: model_runtime.model.provider,
-        provider_name: model_runtime.model.identity.provider_ref(),
-        model: model_runtime.model.model_name,
+        model_provider,
+        provider_name: identity.provider_ref(),
+        model: identity.model_id,
         tools_registry,
         approval,
         activated_tools: activated_handle,
@@ -5974,7 +5993,7 @@ mod active_route_context_tests {
             provider_name: "custom.text",
             model: "text-model",
             context_limits: text_limits,
-            temperature: None,
+            temperature: None.into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,

@@ -97,6 +97,7 @@ pub(crate) async fn finish_after_max_iterations(
     observer: &dyn crate::observability::Observer,
 ) -> Result<String> {
     let temperature = temperature.into();
+    let sampling_config = config.map(|config| std::sync::Arc::new(config.clone()));
     let exhaustion = limit.explanation();
     ::zeroclaw_log::record!(
         WARN,
@@ -367,9 +368,6 @@ pub(crate) async fn finish_after_max_iterations(
                 } else {
                     &selected_model
                 },
-                // Only unconfigured routes use the admitted entrance scalar.
-                // The call scope retains original invocation provenance for
-                // every configured leaf, including a direct vision provider.
                 temperature: fallback_temperature.into(),
             };
             // Route the graceful-summary call through the metered provider seam. This
@@ -377,12 +375,17 @@ pub(crate) async fn finish_after_max_iterations(
             // recorded no cost; through the seam it now fails closed when the turn's
             // budget is exhausted and its token usage is charged like any in-loop
             // call. Metering is a no-op when the turn is unscoped.
-            zeroclaw_providers::temperature::with_temperature(
-                config,
-                temperature,
-                access.run_model_query(summary_request, &mut summary_attempts),
-            )
-            .await
+            access
+                .run_model_query_with_sampling(
+                    summary_request,
+                    &mut summary_attempts,
+                    temperature.for_call_with_fallback(
+                        sampling_config.clone(),
+                        provider_name,
+                        fallback_temperature,
+                    ),
+                )
+                .await
         };
         match pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
@@ -677,6 +680,61 @@ mod graceful_summary_metering_tests {
             assert_eq!(body["model"], "vision-id");
             assert!((body["temperature"].as_f64().unwrap() - expected).abs() < 1e-9);
         }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_preserves_bare_family_admitted_temperature() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::Config;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "summary"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "primary").unwrap();
+        profile.uri = Some(server.uri());
+        profile.model = Some("model-id".into());
+        let provider =
+            zeroclaw_providers::create_model_provider_from_ref(&config, "custom.primary").unwrap();
+        let output = finish_after_max_iterations(
+            &mut None,
+            provider.as_ref(),
+            &mut vec![ChatMessage::user("finish")],
+            "custom",
+            "model-id",
+            "model-id",
+            zeroclaw_providers::temperature::Temperature::adjusted(None, 0.1),
+            Some(0.7),
+            &PacingConfig::default(),
+            None,
+            CompletionLimit::LocalIterations(2),
+            String::new(),
+            "bare-family-summary",
+            &LoopKnobs::default(),
+            None,
+            None,
+            None,
+            Some(&config),
+            &config.multimodal,
+            None,
+            None,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .unwrap();
+        assert!(output.contains("summary"));
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["temperature"], 0.7);
     }
 
     async fn run_summary_with_events(

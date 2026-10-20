@@ -7,6 +7,7 @@ use super::traits::{
 };
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
+use zeroclaw_api::model_provider::CallSampling;
 
 pub struct ModelPinnedProvider {
     alias: String,
@@ -158,9 +159,25 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            _model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    async fn chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        _model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
-            .chat_with_system(system_prompt, message, &self.pinned_model, temperature)
+            .chat_with_system_with_sampling(system_prompt, message, &self.pinned_model, temperature)
             .await
     }
 
@@ -170,9 +187,19 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_history_with_sampling(messages, _model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    async fn chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        _model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
-            .chat_with_history(messages, &self.pinned_model, temperature)
+            .chat_with_history_with_sampling(messages, &self.pinned_model, temperature)
             .await
     }
 
@@ -182,9 +209,19 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling(request, _model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    async fn chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
-            .chat(request, &self.pinned_model, temperature)
+            .chat_with_sampling(request, &self.pinned_model, temperature)
             .await
     }
 
@@ -195,9 +232,25 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tools_with_sampling(
+            messages,
+            tools,
+            _model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    async fn chat_with_tools_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        _model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
-            .chat_with_tools(messages, tools, &self.pinned_model, temperature)
+            .chat_with_tools_with_sampling(messages, tools, &self.pinned_model, temperature)
             .await
     }
 
@@ -209,8 +262,25 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        self.stream_chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            _model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    fn stream_chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        _model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         stream_as_dispatch_composite(
-            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_system(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_system_with_sampling(
                 system_prompt,
                 message,
                 &self.pinned_model,
@@ -227,8 +297,23 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        self.stream_chat_with_history_with_sampling(
+            messages,
+            _model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    fn stream_chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        _model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         stream_as_dispatch_composite(
-            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_history(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_history_with_sampling(
                 messages,
                 &self.pinned_model,
                 temperature,
@@ -244,12 +329,29 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-        stream_as_dispatch_composite(ProviderDispatch::from_ref(&*self.inner).stream_chat(
+        self.stream_chat_with_sampling(
             request,
-            &self.pinned_model,
-            temperature,
+            _model,
+            CallSampling::Explicit(temperature),
             options,
-        ))
+        )
+    }
+
+    fn stream_chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_sampling(
+                request,
+                &self.pinned_model,
+                temperature,
+                options,
+            ),
+        )
     }
 }
 

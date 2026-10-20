@@ -6,6 +6,7 @@ use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
+use zeroclaw_tools::llm_task::ModelConfigResolver;
 
 #[cfg(test)]
 type ModelCatalogResolver = std::sync::Arc<
@@ -127,7 +128,7 @@ fn resolve_model_provider_profile_ref(
 
 pub struct ModelSwitchTool {
     security: Arc<SecurityPolicy>,
-    config: Arc<Config>,
+    config: ModelConfigResolver,
     #[cfg(test)]
     catalog_resolver: Option<ModelCatalogResolver>,
 }
@@ -138,6 +139,13 @@ impl ModelSwitchTool {
     pub const NAME: &'static str = "model_switch";
 
     pub fn new(security: Arc<SecurityPolicy>, config: Arc<Config>) -> Self {
+        Self::with_config_resolver(security, Arc::new(move || Arc::clone(&config)))
+    }
+
+    pub fn with_config_resolver(
+        security: Arc<SecurityPolicy>,
+        config: ModelConfigResolver,
+    ) -> Self {
         Self {
             security,
             config,
@@ -229,6 +237,7 @@ impl ModelSwitchTool {
     }
 
     fn handle_set(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let config = (self.config)();
         let model_provider = args.get("model_provider").and_then(|v| v.as_str());
 
         let model_provider = match model_provider {
@@ -245,13 +254,13 @@ impl ModelSwitchTool {
         let model = args.get("model").and_then(|v| v.as_str());
 
         let (model_provider, derived_model) = match resolve_model_provider_profile_ref(
-            &self.config,
+            &config,
             model_provider,
         ) {
             Ok(resolved) => resolved,
             Err(error) => {
                 let known_model_providers = zeroclaw_providers::list_model_providers();
-                let configured_profiles = configured_model_provider_profiles(&self.config);
+                let configured_profiles = configured_model_provider_profiles(&config);
                 return Ok(ToolResult {
                         success: false,
                         output: serde_json::to_string_pretty(&json!({
@@ -314,7 +323,7 @@ impl ModelSwitchTool {
 
     fn handle_list_providers(&self) -> anyhow::Result<ToolResult> {
         let providers_list = zeroclaw_providers::list_model_providers();
-        let configured_profiles = configured_model_provider_profiles(&self.config);
+        let configured_profiles = configured_model_provider_profiles(&(self.config)());
         let configured_count = configured_profiles.len();
 
         let model_providers: Vec<serde_json::Value> = providers_list
@@ -342,7 +351,11 @@ impl ModelSwitchTool {
         })
     }
 
-    async fn resolve_catalog(&self, provider_ref: &str) -> anyhow::Result<Vec<String>> {
+    async fn resolve_catalog(
+        &self,
+        config: Arc<Config>,
+        provider_ref: &str,
+    ) -> anyhow::Result<Vec<String>> {
         #[cfg(test)]
         if let Some(resolver) = &self.catalog_resolver {
             return resolver(provider_ref.to_string()).await;
@@ -351,8 +364,11 @@ impl ModelSwitchTool {
         let family = provider_ref
             .split_once('.')
             .map_or(provider_ref, |(family, _)| family);
-        let provider =
-            zeroclaw_providers::create_model_provider_from_ref(&self.config, provider_ref)?;
+        let reference = provider_ref.to_owned();
+        let provider = zeroclaw_providers::model::build_nonblocking(move || {
+            zeroclaw_providers::create_model_provider_from_ref(&config, &reference)
+        })
+        .await?;
         let live_result = zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
             .list_models()
             .await;
@@ -363,6 +379,7 @@ impl ModelSwitchTool {
     }
 
     async fn handle_list_models(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let config = (self.config)();
         let model_provider = args.get("model_provider").and_then(|v| v.as_str());
 
         let model_provider = match model_provider {
@@ -378,16 +395,16 @@ impl ModelSwitchTool {
             }
         };
 
-        let model_provider = match resolve_model_provider_profile_ref(&self.config, model_provider)
-        {
+        let model_provider = match resolve_model_provider_profile_ref(&config, model_provider) {
             Ok((model_provider, _derived_model)) => model_provider,
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
                     output: serde_json::to_string_pretty(&json!({
                         "provider_ref_shape": "<type>.<alias> or <type>.<alias>.<model>",
-                        "configured_provider_profiles": configured_model_provider_profiles(&self.config)
-                    }))?.into(),
+                        "configured_provider_profiles": configured_model_provider_profiles(&config)
+                    }))?
+                    .into(),
                     error: Some(error),
                 });
             }
@@ -398,7 +415,10 @@ impl ModelSwitchTool {
             .unwrap_or(model_provider.as_str());
         let provider_family = provider_family.to_lowercase();
 
-        let models: Vec<String> = match self.resolve_catalog(&model_provider).await {
+        let models: Vec<String> = match self
+            .resolve_catalog(Arc::clone(&config), &model_provider)
+            .await
+        {
             Ok(live) => live,
             Err(error) => {
                 let error = zeroclaw_providers::sanitize_api_error(&error.to_string());
@@ -417,15 +437,12 @@ impl ModelSwitchTool {
                     success: false,
                     output: serde_json::to_string_pretty(&json!({
                         "model_provider": model_provider,
-                        "configured_provider_profiles": configured_model_provider_profiles(&self.config),
+                        "configured_provider_profiles": configured_model_provider_profiles(&config),
                     }))?
                     .into(),
                     error: Some(crate::i18n::get_required_cli_string_with_args(
                         "model-switch-catalog-failed",
-                        &[
-                            ("provider", &model_provider),
-                            ("error", &error),
-                        ],
+                        &[("provider", &model_provider), ("error", &error)],
                     )),
                 });
             }
@@ -488,6 +505,45 @@ mod tests {
 
     fn pending_switch(state: &ModelSwitchCallback) -> Option<(String, String)> {
         state.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn set_uses_the_admitted_model_generation() {
+        let generation = Arc::new(parking_lot::RwLock::new(Arc::new(test_config())));
+        let source = Arc::clone(&generation);
+        let tool = ModelSwitchTool::with_config_resolver(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(move || Arc::clone(&source.read())),
+        );
+        let mut next = (**generation.read()).clone();
+        next.providers
+            .models
+            .ensure("custom", "added")
+            .unwrap()
+            .models
+            .insert(
+                "selected".into(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("new-model".into()),
+                    ..Default::default()
+                },
+            );
+        *generation.write() = Arc::new(next);
+        let state = Arc::new(std::sync::Mutex::new(None));
+        scope_model_switch_state(Arc::clone(&state), async {
+            let result = tool
+                .execute(json!({
+                    "action": "set", "model_provider": "custom.added.selected"
+                }))
+                .await
+                .unwrap();
+            assert!(result.success, "{:?}", result.error);
+        })
+        .await;
+        assert_eq!(
+            pending_switch(&state),
+            Some(("custom.added.selected".into(), "new-model".into()))
+        );
     }
 
     async fn with_switch_state<T>(f: impl FnOnce(ModelSwitchCallback) -> T) -> T {

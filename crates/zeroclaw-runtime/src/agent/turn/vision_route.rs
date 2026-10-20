@@ -73,38 +73,38 @@ pub(crate) async fn resolve_vision_provider(
         && !model_provider.capabilities_for_model(dispatch_model).vision
     {
         if let Some(ref vp) = multimodal_config.vision_model_provider {
-            // Resolve the configured vision provider through the alias-aware
-            // factory so its per-alias `vision` override and typed config
-            // (endpoint URI, credentials) are honored - the legacy
-            // `create_model_provider(vp, None)` passed `config = None` and could
-            // not see them, so a text-family alias forced to `vision = true`
-            // for this route would have been ignored. `config` is `None` only on
-            // configless (test-builder) agents - every production agent/loop path
-            // threads `Some`; that fallback keeps the prior legacy behavior.
-            let (vp_instance, alias_model) = match config {
-                Some(config) => {
-                    zeroclaw_providers::create_model_provider_from_ref_with_model(config, vp)
-                        .map(|resolved| (resolved.provider, resolved.model))
-                }
-                None => zeroclaw_providers::create_model_provider(vp, None)
-                    .map(|provider| (provider, None)),
-            }
-            .map_err(|error| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Provider)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "vision_provider": vp,
-                            "error": format!("{error}"),
-                        })),
-                    "vision model_provider construction failed"
-                );
-                anyhow::Error::msg(format!(
-                    "failed to create vision model_provider '{vp}': {error}"
-                ))
-            })?;
+            // Raw vision routing retains alias options without adding retries.
+            // OAuth credential refresh must run outside the async executor.
+            let admitted_config = config.cloned();
+            let reference = vp.clone();
+            let (vp_instance, alias_model) =
+                zeroclaw_providers::model::build_nonblocking(move || match admitted_config {
+                    Some(config) => zeroclaw_providers::model::build_raw_provider(
+                        &config,
+                        &reference,
+                        Default::default(),
+                    )
+                    .map(|resolved| (resolved.provider, resolved.model)),
+                    None => zeroclaw_providers::create_model_provider(&reference, None)
+                        .map(|provider| (provider, None)),
+                })
+                .await
+                .map_err(|error| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "vision_provider": vp,
+                                "error": format!("{error}"),
+                            })),
+                        "vision model_provider construction failed"
+                    );
+                    anyhow::Error::msg(format!(
+                        "failed to create vision model_provider '{vp}': {error}"
+                    ))
+                })?;
             let vision_model = multimodal_config
                 .vision_model
                 .as_deref()

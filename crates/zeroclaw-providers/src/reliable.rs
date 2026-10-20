@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use zeroclaw_api::model_provider::CallSampling;
 use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode, tag, turn_stop};
 
 /// Info about a model_provider fallback that occurred during a request.
@@ -2027,13 +2028,12 @@ impl ReliableModelProviderEntry {
         self
     }
 
-    fn temperature(&self, fallback: Option<f64>) -> Option<f64> {
-        crate::temperature::temperature_for_dispatch(
+    fn temperature(&self, sampling: &CallSampling) -> Option<f64> {
+        sampling.resolve_for(Some(
             self.selection_ref
                 .as_deref()
                 .unwrap_or(&self.candidate_name),
-            fallback,
-        )
+        ))
     }
 
     fn candidate_name(&self) -> &str {
@@ -2494,6 +2494,22 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    async fn chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         mark_current_dispatch_composite();
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
@@ -2534,7 +2550,7 @@ impl ModelProvider for ReliableModelProvider {
                             system_prompt,
                             message,
                             current_model,
-                            entry.temperature(temperature),
+                            entry.temperature(&temperature),
                         ),
                     )
                     .await
@@ -2789,6 +2805,16 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_history_with_sampling(messages, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    async fn chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         mark_current_dispatch_composite();
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
@@ -2826,7 +2852,7 @@ impl ModelProvider for ReliableModelProvider {
                         ProviderDispatch::from_ref(entry.provider()).chat_with_history(
                             &effective_messages,
                             current_model,
-                            entry.temperature(temperature),
+                            entry.temperature(&temperature),
                         ),
                     )
                     .await
@@ -3191,6 +3217,22 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tools_with_sampling(
+            messages,
+            tools,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    async fn chat_with_tools_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
@@ -3237,7 +3279,7 @@ impl ModelProvider for ReliableModelProvider {
                             &effective_messages,
                             tools,
                             current_model,
-                            entry.temperature(temperature),
+                            entry.temperature(&temperature),
                         ),
                     )
                     .await
@@ -3514,6 +3556,16 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling(request, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    async fn chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
@@ -3593,7 +3645,7 @@ impl ModelProvider for ReliableModelProvider {
                         ProviderDispatch::from_ref(entry.provider()).chat(
                             req,
                             current_model,
-                            entry.temperature(temperature),
+                            entry.temperature(&temperature),
                         ),
                     )
                     .await
@@ -3896,6 +3948,16 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_sampling(request, model, CallSampling::Explicit(temperature), options)
+    }
+
+    fn stream_chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         mark_current_dispatch_composite();
         commit_safeguard_fallback(None);
         let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
@@ -3950,7 +4012,7 @@ impl ModelProvider for ReliableModelProvider {
                 ProviderDispatch::from_ref(model_provider).stream_chat(
                     req,
                     &served_model,
-                    entry.temperature(temperature),
+                    entry.temperature(&temperature),
                     options,
                 ),
             );
@@ -4003,6 +4065,23 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        self.stream_chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    fn stream_chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         mark_current_dispatch_composite();
         // Try each model_provider/model combination for streaming
         // For streaming, we use the first model_provider that supports it and has streaming enabled
@@ -4050,7 +4129,7 @@ impl ModelProvider for ReliableModelProvider {
                     system_prompt,
                     message,
                     &served_model,
-                    entry.temperature(temperature),
+                    entry.temperature(&temperature),
                     options,
                 ),
             );
@@ -4087,6 +4166,21 @@ impl ModelProvider for ReliableModelProvider {
         messages: &[ChatMessage],
         model: &str,
         temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        self.stream_chat_with_history_with_sampling(
+            messages,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    fn stream_chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: CallSampling,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         mark_current_dispatch_composite();
@@ -4132,7 +4226,7 @@ impl ModelProvider for ReliableModelProvider {
                 ProviderDispatch::from_ref(model_provider).stream_chat_with_history(
                     messages,
                     &served_model,
-                    entry.temperature(temperature),
+                    entry.temperature(&temperature),
                     options,
                 ),
             );

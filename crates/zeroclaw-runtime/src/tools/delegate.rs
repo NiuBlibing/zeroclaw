@@ -41,7 +41,12 @@ use zeroclaw_tools::memory_purge::MemoryPurgeTool;
 use zeroclaw_tools::memory_recall::MemoryRecallTool;
 use zeroclaw_tools::memory_store::MemoryStoreTool;
 
-type BuiltDelegateProvider = (Box<dyn ModelProvider>, String, String, Option<f64>);
+struct BuiltDelegateProvider {
+    provider: Box<dyn ModelProvider>,
+    provider_ref: String,
+    model: String,
+    temperature: Option<f64>,
+}
 
 fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
@@ -267,6 +272,15 @@ impl BackgroundResultState {
     }
 }
 
+pub struct DelegateBuildContext {
+    pub parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
+    pub runtime: Arc<dyn crate::platform::RuntimeAdapter>,
+    pub workspace_dir: PathBuf,
+    pub memory: Arc<dyn Memory>,
+    pub live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    pub execution_capability: Option<AgentExecutionCapability>,
+}
+
 pub struct DelegateTool {
     agents: Arc<HashMap<String, AliasedAgentConfig>>,
     security: Arc<SecurityPolicy>,
@@ -444,6 +458,25 @@ pub(crate) struct IndependentTargetTools {
 }
 
 impl DelegateTool {
+    /// Config remains canonical; the empty maps belong only to standalone adapters.
+    pub fn from_config(
+        config: Arc<Config>,
+        caller_alias: &str,
+        security: Arc<SecurityPolicy>,
+        context: DelegateBuildContext,
+    ) -> Self {
+        let mut tool = Self::new(HashMap::new(), None, security);
+        tool.root_config = Some(config);
+        tool.caller_alias = caller_alias.to_owned();
+        tool.parent_tools = context.parent_tools;
+        tool.runtime = Some(context.runtime);
+        tool.workspace_dir = context.workspace_dir;
+        tool.memory = Some(context.memory);
+        tool.live_config = context.live_config;
+        tool.execution_capability = context.execution_capability;
+        tool
+    }
+
     /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
     /// rename cannot desync the two.
     pub const NAME: &'static str = "delegate";
@@ -1194,31 +1227,49 @@ impl DelegateTool {
         })
     }
 
-    fn build_target_provider(
+    async fn build_target_provider(
         &self,
         target_alias: &str,
         config: Option<&Config>,
         model_provider: &str,
-        provider_type: &str,
-        credential: Option<&str>,
     ) -> anyhow::Result<BuiltDelegateProvider> {
         if let Some(config) = config.or(self.root_config.as_deref()) {
-            let model =
-                zeroclaw_providers::model::build_model(config, target_alias, model_provider, None)?;
-            return Ok((
-                model.provider,
-                model.identity.provider_ref(),
-                model.model_name,
-                None,
-            ));
+            let config = config.clone();
+            let target_alias = target_alias.to_string();
+            let model_provider = model_provider.to_string();
+            return zeroclaw_providers::model::build_nonblocking(move || {
+                let model = zeroclaw_providers::model::build_model(
+                    &config,
+                    &target_alias,
+                    &model_provider,
+                    None,
+                )?;
+                let (provider, identity, _) = model.into_parts();
+                Ok(BuiltDelegateProvider {
+                    provider,
+                    provider_ref: identity.provider_ref(),
+                    model: identity.model_id,
+                    temperature: None,
+                })
+            })
+            .await;
         }
-        let provider = zeroclaw_providers::create_model_provider_with_options(
-            provider_type,
-            credential,
-            &self.provider_runtime_options,
-        )?;
-        let (_, _, model, temperature) = self.resolve_brain(model_provider);
-        Ok((provider, provider_type.to_string(), model, temperature))
+        let (provider_type, credential, model, temperature) = self.resolve_brain(model_provider);
+        let options = self.provider_runtime_options.clone();
+        zeroclaw_providers::model::build_nonblocking(move || {
+            let provider = zeroclaw_providers::create_model_provider_with_options(
+                &provider_type,
+                credential.as_deref(),
+                &options,
+            )?;
+            Ok(BuiltDelegateProvider {
+                provider,
+                provider_ref: provider_type,
+                model,
+                temperature,
+            })
+        })
+        .await
     }
 
     async fn memory_for_target_agent(
@@ -2555,6 +2606,11 @@ impl DelegateTool {
                 })
             })
             .unwrap_or_else(|| {
+                if let Some(config) = self.root_config.as_deref() {
+                    return config.agents.get(agent_name).is_some_and(|agent| {
+                        self.resolve_agentic_from_config(Some(config), &agent.runtime_profile)
+                    });
+                }
                 self.agents
                     .get(agent_name)
                     .is_some_and(|config| self.resolve_agentic(&config.runtime_profile))
@@ -2630,7 +2686,8 @@ impl DelegateTool {
         // Look up agent config
         let admitted_config = execution_admission
             .as_ref()
-            .map(|admission| admission.config());
+            .map(|admission| admission.config())
+            .or_else(|| self.root_config.clone());
         let agent_config = match if let Some(config) = admitted_config.as_deref() {
             config.agents.get(agent_name)
         } else {
@@ -2661,8 +2718,6 @@ impl DelegateTool {
         let authoritative_config = admitted_config.as_deref();
         let max_depth = self
             .effective_max_depth_from_config(authoritative_config, &agent_config.runtime_profile);
-        let (legacy_provider_type, credential, _, _) =
-            self.resolve_brain(&agent_config.model_provider);
         let agentic =
             self.resolve_agentic_from_config(authoritative_config, &agent_config.runtime_profile);
 
@@ -2767,8 +2822,6 @@ impl DelegateTool {
                 authoritative_config,
                 prompt,
                 context,
-                &legacy_provider_type,
-                credential.as_deref(),
                 agentic,
                 admission,
             )),
@@ -2788,26 +2841,31 @@ impl DelegateTool {
         authoritative_config: Option<&Config>,
         prompt: &str,
         context: &str,
-        legacy_provider_type: &str,
-        credential: Option<&str>,
         agentic: bool,
         admission: DelegateAdmission,
     ) -> anyhow::Result<ToolResult> {
         // Create model_provider for this agent
-        let (model_provider, provider_type, model, temperature) = match self.build_target_provider(
-            agent_name,
-            authoritative_config,
-            &agent_config.model_provider,
-            legacy_provider_type,
-            credential,
-        ) {
+        let BuiltDelegateProvider {
+            provider: model_provider,
+            provider_ref: provider_type,
+            model,
+            temperature,
+        } = match self
+            .build_target_provider(
+                agent_name,
+                authoritative_config,
+                &agent_config.model_provider,
+            )
+            .await
+        {
             Ok(provider) => provider,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!(
-                        "Failed to create model_provider '{legacy_provider_type}' for agent '{agent_name}': {e}"
+                        "Failed to create model_provider '{}' for agent '{agent_name}': {e}",
+                        agent_config.model_provider
                     )),
                 });
             }
@@ -2881,10 +2939,16 @@ impl DelegateTool {
         }
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            zeroclaw_providers::temperature::with_temperature(
-                authoritative_config.or(self.root_config.as_deref()),
-                temperature.into(),
-                dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            dispatcher.chat_with_system_with_sampling(
+                system_prompt_ref,
+                &full_prompt,
+                &model,
+                zeroclaw_providers::temperature::Temperature::from(temperature).for_call(
+                    authoritative_config
+                        .map(|config| Arc::new(config.clone()))
+                        .or_else(|| self.root_config.clone()),
+                    &provider_type,
+                ),
             ),
         )
         .await;
@@ -2965,7 +3029,8 @@ impl DelegateTool {
             .transpose()?;
         let admitted_config = execution_admission
             .as_ref()
-            .map(|admission| admission.config());
+            .map(|admission| admission.config())
+            .or_else(|| self.root_config.clone());
 
         // Validate agent exists and check depth/security before spawning.
         let agent_config = match if let Some(config) = admitted_config.as_deref() {
@@ -3300,7 +3365,7 @@ impl DelegateTool {
         );
         let progress_flusher = zeroclaw_spawn::spawn!(progress_flusher);
 
-        zeroclaw_spawn::spawn!(
+        let background = zeroclaw_tools::llm_task::inherit_model_config_scope(
             TOOL_LOOP_THREAD_ID.scope(
                 parent_thread_id,
                 scope_delegate_session_key(
@@ -3443,6 +3508,7 @@ impl DelegateTool {
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
             ))
         );
+        zeroclaw_spawn::spawn!(background);
 
         Ok(ToolResult {
             success: true,
@@ -3531,7 +3597,8 @@ impl DelegateTool {
         for (name, execution_admission) in agent_names.iter().zip(&execution_admissions) {
             let admitted_config = execution_admission
                 .as_ref()
-                .map(|admission| admission.config());
+                .map(|admission| admission.config())
+                .or_else(|| self.root_config.clone());
             let exists = admitted_config.as_deref().map_or_else(
                 || self.agents.contains_key(name),
                 |config| config.agents.contains_key(name),
@@ -3671,7 +3738,7 @@ impl DelegateTool {
                 )
                 .map(|ctx| (agent_name.clone(), ctx));
 
-            handles.push(zeroclaw_spawn::spawn!(
+            let worker = zeroclaw_tools::llm_task::inherit_model_config_scope(
                 async move {
                     let inner = DelegateTool {
                         agents,
@@ -3741,8 +3808,9 @@ impl DelegateTool {
                 }
                 .instrument(::zeroclaw_log::attribution_span!(
                     &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
-                ))
-            ));
+                )),
+            );
+            handles.push(zeroclaw_spawn::spawn!(worker));
         }
 
         // Collect all results
@@ -4579,6 +4647,7 @@ impl DelegateTool {
         admission: DelegateAdmission,
         target_config: Option<&Config>,
     ) -> anyhow::Result<ToolResult> {
+        let target_config = target_config.or(self.root_config.as_deref());
         let Some(tool_policy) =
             self.resolve_tool_policy_from_config(target_config, &agent_config.risk_profile)
         else {
@@ -5051,7 +5120,7 @@ impl DelegateTool {
                         max_tool_result_chars: loop_runtime.max_tool_result_chars,
                         // Resolve from the target's provider alias and model, not the
                         // delegating agent's route.
-                        context_limits: self.root_config.as_deref().map_or_else(
+                        context_limits: target_config.or(self.root_config.as_deref()).map_or_else(
                             || loop_runtime.context_limits(),
                             |config| {
                                 config.resolved_context_limits_for_route(
@@ -13100,6 +13169,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_delegate_uses_target_generation_capacity_without_projection_maps() {
+        let mut startup = (*config_with_two_agents("caller", 5, "target", 5)).clone();
+        startup
+            .risk_profiles
+            .get_mut("narrow")
+            .unwrap()
+            .allowed_tools = vec!["echo_tool".into()];
+        startup
+            .providers
+            .models
+            .ensure("ollama", "target")
+            .unwrap()
+            .model = Some("test-model".into());
+        startup
+            .providers
+            .models
+            .ensure("ollama", "target")
+            .unwrap()
+            .context_window = Some(1024);
+        let mut target = startup.clone();
+        target
+            .providers
+            .models
+            .ensure("ollama", "target")
+            .unwrap()
+            .context_window = Some(100_000);
+        let target_agent = target.agents["target"].clone();
+        let security = Arc::new(SecurityPolicy::for_agent(&startup, "caller").unwrap());
+        let tool = DelegateTool::from_config(
+            Arc::new(startup),
+            "caller",
+            security,
+            DelegateBuildContext {
+                parent_tools: Arc::new(RwLock::new(Vec::new())),
+                runtime: Arc::new(NativeRuntime::new()),
+                workspace_dir: PathBuf::new(),
+                memory: Arc::new(zeroclaw_memory::NoneMemory::new("test")),
+                live_config: None,
+                execution_capability: None,
+            },
+        );
+        let prompt = "capacity regression input ".repeat(2000);
+        let provider = ToolCountModelProvider { expected_tools: 0 };
+        let result = Box::pin(tool.execute_agentic_with_admission(
+            "target",
+            &target_agent,
+            "ollama",
+            "test-model",
+            &provider,
+            &prompt,
+            None,
+            DelegateAdmission::Prevalidated,
+            Some(&target),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            result.success,
+            "admitted capacity must allow the input: {:?}",
+            result.error
+        );
+        let stale = Box::pin(tool.execute_agentic_with_admission(
+            "target",
+            &target_agent,
+            "ollama",
+            "test-model",
+            &provider,
+            &prompt,
+            None,
+            DelegateAdmission::Prevalidated,
+            tool.root_config.as_deref(),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            !stale.success,
+            "startup capacity cannot hold the same input"
+        );
+    }
+
     fn config_with_two_agents(
         caller_alias: &str,
         caller_max_actions: u32,
@@ -17632,8 +17783,6 @@ command = "rm independent-delegate-marker"
                         Some(&config),
                         "hello",
                         "",
-                        "custom",
-                        None,
                         agentic,
                         DelegateAdmission::Prevalidated,
                     )

@@ -987,13 +987,23 @@ pub struct ModelIdentity {
 }
 
 impl ModelIdentity {
+    /// Profile identity used for credentials, billing, and cooldowns.
+    #[must_use]
+    pub fn profile_ref(&self) -> String {
+        if self.alias.is_empty() {
+            self.family.clone()
+        } else {
+            format!("{}.{}", self.family, self.alias)
+        }
+    }
+
     /// Reference retaining the selected entry, including dotted profile aliases.
     #[must_use]
     pub fn provider_ref(&self) -> String {
         if self.alias.is_empty() {
             return self.family.clone();
         }
-        let profile = format!("{}.{}", self.family, self.alias);
+        let profile = self.profile_ref();
         self.entry_alias
             .as_ref()
             .map_or(profile.clone(), |alias| format!("{profile}.{alias}"))

@@ -446,6 +446,13 @@ pub fn dispatch_family_factory(
             .unwrap_or(&default_cfg);
         return cfg.create_provider(alias, key, api_url, opts);
     }
+    if family == "qwen" {
+        let default_cfg = qwen_missing_entry_fallback_config();
+        let cfg = config
+            .and_then(|c| c.providers.models.qwen.get(alias))
+            .unwrap_or(&default_cfg);
+        return cfg.create_provider(alias, key, api_url, opts);
+    }
     macro_rules! emit_dispatch {
         ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
             match family {
@@ -1588,6 +1595,15 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
     }
 }
 
+/// Bare Qwen dispatch historically uses the CN region. Persisted profiles keep
+/// their configured endpoint, whose schema default for new entries is Intl.
+fn qwen_missing_entry_fallback_config() -> QwenModelProviderConfig {
+    QwenModelProviderConfig {
+        endpoint: zeroclaw_config::schema::QwenEndpoint::Cn,
+        ..Default::default()
+    }
+}
+
 impl FamilyProviderFactory for QwenModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
 
@@ -1598,6 +1614,8 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
+        use zeroclaw_config::schema::ModelEndpoint;
+
         let alias_oauth: Option<crate::QwenOauthCredentials> = self
             .oauth_refresh_token
             .as_deref()
@@ -1636,7 +1654,7 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
         let base_url = api_url
             .map(ToString::to_string)
             .or_else(|| oauth_context.base_url.clone())
-            .unwrap_or_else(|| crate::QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
+            .unwrap_or_else(|| self.endpoint.uri().to_string());
         let b = if oauth_context.credential.is_some() {
             OpenAiCompatibleModelProvider::builder(alias)
                 .display_name("Qwen Code")
@@ -2727,6 +2745,19 @@ mod tests {
         .expect("persisted openai dispatch should build");
         assert_eq!(provider.default_wire_api(), "responses");
         assert!(provider.capabilities().native_tool_calling);
+    }
+
+    #[test]
+    fn qwen_missing_entry_preserves_cn_without_overriding_dynamic_transport() {
+        use zeroclaw_config::schema::QwenEndpoint;
+
+        let missing_entry = qwen_missing_entry_fallback_config();
+        assert_eq!(missing_entry.endpoint, QwenEndpoint::Cn);
+        assert_eq!(missing_entry.base.uri, None);
+        assert_eq!(
+            QwenModelProviderConfig::default().endpoint,
+            QwenEndpoint::Intl
+        );
     }
 
     #[tokio::test]

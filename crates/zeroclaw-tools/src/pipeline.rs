@@ -207,10 +207,10 @@ impl PipelineTool {
             let tool_arc = self.tools.iter().find(|t| t.name() == tool.name()).cloned();
 
             if let Some(tool_arc) = tool_arc {
-                join_set.spawn(async move {
+                join_set.spawn(crate::llm_task::inherit_model_config_scope(async move {
                     let result = tool_arc.execute(args).await;
                     (i, tool_name, result)
-                });
+                }));
             }
         }
 

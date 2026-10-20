@@ -6224,7 +6224,7 @@ fn async_main(command: clap::Command) -> Result<()> {
 }
 
 #[cfg(not(feature = "agent-runtime"))]
-fn build_kernel_agent_model(
+async fn build_kernel_agent_model(
     config: &Config,
     agent_alias: &str,
     provider_override: Option<&str>,
@@ -6234,12 +6234,13 @@ fn build_kernel_agent_model(
         .agents
         .get(agent_alias)
         .ok_or_else(|| anyhow::Error::msg(format!("Agent `{agent_alias}` is not configured")))?;
-    zeroclaw_providers::model::build_model(
-        config,
+    zeroclaw_providers::model::build_model_nonblocking(
+        std::sync::Arc::new(config.clone()),
         agent_alias,
         provider_override.unwrap_or(agent.model_provider.as_str()),
         model_override,
     )
+    .await
 }
 
 #[cfg(not(feature = "agent-runtime"))]
@@ -6250,11 +6251,11 @@ async fn kernel_agent_chat(
     temperature_override: Option<f64>,
     message: &str,
 ) -> Result<String> {
-    let provider_ref = model.identity.provider_ref();
+    let provider_ref = model.identity().provider_ref();
     // Bare-family overrides inherit the configured agent selection. Keep that
     // derived scalar separate from invocation input so fallbacks resolve their
     // own sampling policy from Config.
-    let selection_ref = if model.identity.alias.is_empty() {
+    let selection_ref = if model.identity().alias.is_empty() {
         config
             .agent(agent_alias)
             .map_or(provider_ref.as_str(), |agent| agent.model_provider.as_str())
@@ -6262,17 +6263,14 @@ async fn kernel_agent_chat(
         provider_ref.as_str()
     };
     let input = zeroclaw_providers::temperature::Temperature::from(temperature_override);
-    let temperature = input.resolve(Some(config), selection_ref);
-    zeroclaw_providers::temperature::with_temperature(
-        Some(config),
-        input,
-        zeroclaw_providers::ProviderDispatch::from_ref(model.provider.as_ref()).simple_chat(
+    zeroclaw_providers::ProviderDispatch::from_ref(model.provider())
+        .chat_with_system_with_sampling(
+            None,
             message,
-            &model.model_name,
-            temperature,
-        ),
-    )
-    .await
+            model.model_name(),
+            input.for_call(Some(std::sync::Arc::new(config.clone())), selection_ref),
+        )
+        .await
 }
 
 /// True when a desktop entry's `Name` deliberately identifies ZeroClaw: it is
@@ -7228,7 +7226,8 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     &agent_alias,
                     model_provider.as_deref(),
                     model.as_deref(),
-                )?;
+                )
+                .await?;
                 match message {
                     Some(msg) => {
                         let response = kernel_agent_chat(
@@ -7382,25 +7381,28 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 zeroclaw_channels::orchestrator::build_channel_map(config)
             }));
 
-            Box::pin(agent::run(
-                config,
-                &agent_alias,
-                message,
-                model_provider,
-                model,
-                final_temperature,
-                peripheral,
-                true,
-                session_state_file,
-                None,
-                zeroclaw_api::ingress::TurnOrigin::Interactive,
+            agent::run_with_request(
+                Arc::new(config),
+                agent::AgentRunRequest {
+                    message,
+                    model: zeroclaw_runtime::agent::agent::ModelOverrides {
+                        provider: model_provider.as_deref(),
+                        model: model.as_deref(),
+                        temperature: final_temperature,
+                    },
+                    peripheral_overrides: peripheral,
+                    interactive: true,
+                    session_state_file,
+                    origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
+                    ..agent::AgentRunRequest::new(&agent_alias)
+                },
                 zeroclaw_runtime::agent::loop_::AgentRunOverrides {
                     execution_capability: standalone_authority
                         .as_ref()
                         .map(|authority| authority.execution_capability()),
                     ..Default::default()
                 },
-            ))
+            )
             .await
             .map(|_| ())
         }
@@ -12894,20 +12896,7 @@ fn build_sop_adapters(
     // `llm.generate` runs against the DEFAULT agent's current model selection.
     // Resolve it at call time through the canonical builder so model-entry
     // options, credentials, endpoints and future fields stay in one place.
-    let resolver = move || {
-        let current = live_config.snapshot();
-        let model_ref = current
-            .agent("default")
-            .map(|agent| agent.model_provider.as_str())
-            .ok_or_else(|| {
-                anyhow::Error::msg(zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-                    "cli-skills-agent-not-configured",
-                    &[("alias", "default")],
-                ))
-            })?;
-        let built = zeroclaw_providers::model::build_model(&current, "default", model_ref, None)?;
-        Ok((current, built))
-    };
+    let resolver = move || Ok(live_config.snapshot());
     let llm = Some(
         std::sync::Arc::new(zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
             resolver,
@@ -18561,12 +18550,14 @@ mod tests {
             },
         );
 
-        let built = build_kernel_agent_model(&config, "default", None, None).unwrap();
-        assert_eq!(built.model_name, "nested-model");
+        let built = build_kernel_agent_model(&config, "default", None, None)
+            .await
+            .unwrap();
+        assert_eq!(built.model_name(), "nested-model");
         assert!(
             !built
-                .provider
-                .capabilities_for_model(&built.model_name)
+                .provider()
+                .capabilities_for_model(built.model_name())
                 .native_tool_calling
         );
         let response = kernel_agent_chat(&config, "default", &built, None, "hello")
@@ -18897,8 +18888,9 @@ mod tests {
             ),
             (Some("custom"), None, None, "selected-id", 0.2, 77),
         ] {
-            let built =
-                build_kernel_agent_model(&config, "default", provider_ref, model_override).unwrap();
+            let built = build_kernel_agent_model(&config, "default", provider_ref, model_override)
+                .await
+                .unwrap();
             assert_eq!(
                 kernel_agent_chat(&config, "default", &built, temperature_override, "hello")
                     .await
@@ -18920,6 +18912,7 @@ mod tests {
                     Some("custom.gw.typo"),
                     model_override
                 )
+                .await
                 .is_err()
             );
         }
@@ -18934,7 +18927,9 @@ mod tests {
             .get_mut("default")
             .unwrap()
             .temperature = None;
-        let built = build_kernel_agent_model(&unset, "default", None, None).unwrap();
+        let built = build_kernel_agent_model(&unset, "default", None, None)
+            .await
+            .unwrap();
         kernel_agent_chat(&unset, "default", &built, None, "hello")
             .await
             .unwrap();
@@ -18989,7 +18984,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        let built = build_kernel_agent_model(&config, "default", None, None).unwrap();
+        let built = build_kernel_agent_model(&config, "default", None, None)
+            .await
+            .unwrap();
         for (override_value, expected) in [(None, 0.8), (Some(0.5), 0.5)] {
             assert_eq!(
                 kernel_agent_chat(&config, "default", &built, override_value, "hello")

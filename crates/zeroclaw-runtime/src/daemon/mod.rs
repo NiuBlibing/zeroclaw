@@ -2475,18 +2475,17 @@ async fn run_heartbeat_worker(
                 "[Heartbeat Task | decision] {}",
                 HeartbeatEngine::build_decision_prompt(&tasks),
             );
-            let phase1_fut = Box::pin(crate::agent::run(
-                config.clone(),
-                &agent_alias,
-                Some(decision_prompt),
-                None,
-                None,
-                Some(0.0),
-                vec![],
-                false,
-                None,
-                None,
-                zeroclaw_api::ingress::TurnOrigin::Daemon,
+            let phase1_fut = crate::agent::run_with_request(
+                Arc::new(config.clone()),
+                crate::agent::AgentRunRequest {
+                    message: Some(decision_prompt),
+                    model: crate::agent::agent::ModelOverrides {
+                        temperature: Some(0.0),
+                        ..Default::default()
+                    },
+                    origin: zeroclaw_api::ingress::TurnOrigin::Daemon,
+                    ..crate::agent::AgentRunRequest::new(&agent_alias)
+                },
                 crate::agent::loop_::AgentRunOverrides {
                     mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
                     execution_capability: Some(execution_capability.clone()),
@@ -2495,7 +2494,7 @@ async fn run_heartbeat_worker(
                     }),
                     ..crate::agent::loop_::AgentRunOverrides::default()
                 },
-            ));
+            );
             let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
                     Duration::from_secs(config.heartbeat.task_timeout_secs),
@@ -2598,18 +2597,13 @@ async fn run_heartbeat_worker(
                 None => task_prompt,
             };
 
-            let phase2_fut = Box::pin(crate::agent::run(
-                config.clone(),
-                &agent_alias,
-                Some(prompt),
-                None,
-                None,
-                None,
-                vec![],
-                false,
-                None,
-                None,
-                zeroclaw_api::ingress::TurnOrigin::Daemon,
+            let phase2_fut = crate::agent::run_with_request(
+                Arc::new(config.clone()),
+                crate::agent::AgentRunRequest {
+                    message: Some(prompt),
+                    origin: zeroclaw_api::ingress::TurnOrigin::Daemon,
+                    ..crate::agent::AgentRunRequest::new(&agent_alias)
+                },
                 crate::agent::loop_::AgentRunOverrides {
                     mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
                     execution_capability: Some(execution_capability.clone()),
@@ -2621,7 +2615,7 @@ async fn run_heartbeat_worker(
                     }),
                     ..crate::agent::loop_::AgentRunOverrides::default()
                 },
-            ));
+            );
             let phase2_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
                     Duration::from_secs(config.heartbeat.task_timeout_secs),

@@ -28,7 +28,7 @@ use zeroclaw_api::model_provider::ChatResponse;
 use zeroclaw_config::schema::Config;
 use zeroclaw_providers::ProviderDispatch;
 use zeroclaw_providers::model::BuiltModel;
-use zeroclaw_providers::temperature::{Temperature, with_temperature};
+use zeroclaw_providers::temperature::Temperature;
 
 use super::types::{CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability};
 
@@ -212,7 +212,7 @@ impl SopCapability for LlmGenerateCapability {
     }
 }
 
-type ModelResolver = dyn Fn() -> Result<(Config, BuiltModel)> + Send + Sync;
+type ConfigResolver = dyn Fn() -> Result<Config> + Send + Sync;
 
 /// One bounded model call on the dedicated SOP bridge thread.
 ///
@@ -220,18 +220,43 @@ type ModelResolver = dyn Fn() -> Result<(Config, BuiltModel)> + Send + Sync;
 /// on each call. The config and derived provider live only for that call,
 /// including its retries and fallbacks; the adapter caches no model policy.
 pub struct ProviderLlmAdapter {
-    resolver: Arc<ModelResolver>,
+    resolver: Arc<ConfigResolver>,
 }
 
 impl ProviderLlmAdapter {
     /// Resolve one config generation and its model through the shared builder
     /// at call time. Resolver errors propagate without dispatching an old model.
-    pub fn new(
-        resolver: impl Fn() -> Result<(Config, BuiltModel)> + Send + Sync + 'static,
-    ) -> Self {
+    pub fn new(resolver: impl Fn() -> Result<Config> + Send + Sync + 'static) -> Self {
         Self {
             resolver: Arc::new(resolver),
         }
+    }
+
+    fn generate_resolved(
+        resolve: impl FnOnce() -> Result<(Config, BuiltModel)> + Send + 'static,
+        system: Option<&str>,
+        prompt: &str,
+    ) -> Result<String> {
+        let system = system.map(str::to_string);
+        let prompt = prompt.to_string();
+        super::bridge::run_bridged_anyhow(
+            async move {
+                let (config, built) = zeroclaw_providers::model::build_nonblocking(resolve).await?;
+                let sampling = Temperature::default()
+                    .for_call(Some(Arc::new(config)), &built.identity().provider_ref());
+                let (provider, identity, _) = built.into_parts();
+                ProviderDispatch::new(Arc::from(provider))
+                    .chat_with_system_with_sampling(
+                        system.as_deref(),
+                        &prompt,
+                        &identity.model_id,
+                        sampling,
+                    )
+                    .await
+            },
+            GENERATE_TIMEOUT,
+            "model call",
+        )
     }
 }
 
@@ -243,27 +268,24 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
 
     fn generate_typed(&self, system: Option<&str>, prompt: &str) -> Result<String> {
         let resolver = Arc::clone(&self.resolver);
-        let system = system.map(str::to_string);
-        let prompt = prompt.to_string();
-        super::bridge::run_bridged_anyhow(
-            async move {
-                let (config, built) = resolver()?;
-                let temperature =
-                    Temperature::default().resolve(Some(&config), &built.identity.provider_ref());
-                with_temperature(Some(&config), None.into(), async {
-                    ProviderDispatch::new(Arc::from(built.provider))
-                        .chat_with_system(
-                            system.as_deref(),
-                            &prompt,
-                            &built.model_name,
-                            temperature,
-                        )
-                        .await
-                })
-                .await
+        Self::generate_resolved(
+            move || {
+                let config = resolver()?;
+                let model_ref = config
+                    .agent("default")
+                    .map(|agent| agent.model_provider.as_str())
+                    .ok_or_else(|| {
+                        anyhow::Error::msg(crate::i18n::get_required_cli_string_with_args(
+                            "cli-skills-agent-not-configured",
+                            &[("alias", "default")],
+                        ))
+                    })?;
+                let built =
+                    zeroclaw_providers::model::build_model(&config, "default", model_ref, None)?;
+                Ok((config, built))
             },
-            GENERATE_TIMEOUT,
-            "model call",
+            system,
+            prompt,
         )
     }
 }
@@ -275,25 +297,17 @@ mod tests {
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::ModelProvider;
     use zeroclaw_config::schema::{ModelEntryConfig, ModelIdentity};
-    use zeroclaw_providers::router::ModelRouteResolver;
 
     fn test_built_model(provider: Box<dyn ModelProvider>) -> BuiltModel {
-        BuiltModel {
+        BuiltModel::from_provider(
             provider,
-            provider_name: "custom.gw".into(),
-            model_name: "test".into(),
-            identity: ModelIdentity {
+            ModelIdentity {
                 family: "custom".into(),
                 alias: "gw".into(),
                 entry_alias: Some("chosen".into()),
                 model_id: "test".into(),
             },
-            model_route_resolver: Arc::new(ModelRouteResolver::new(
-                Vec::new(),
-                "custom.gw.chosen".into(),
-                "test".into(),
-            )),
-        }
+        )
     }
 
     struct RecordingLlm {
@@ -645,15 +659,17 @@ mod tests {
 
     #[test]
     fn provider_adapter_bridge_preserves_terminal_error_type() {
-        let adapter = ProviderLlmAdapter::new(|| {
-            Ok((
-                Config::default(),
-                test_built_model(Box::new(SemanticEmptyProvider)),
-            ))
-        });
-        let error = adapter
-            .generate_typed(None, "prompt")
-            .expect_err("the provider's typed terminal error must survive the bridge");
+        let error = ProviderLlmAdapter::generate_resolved(
+            || {
+                Ok((
+                    Config::default(),
+                    test_built_model(Box::new(SemanticEmptyProvider)),
+                ))
+            },
+            None,
+            "prompt",
+        )
+        .expect_err("the provider's typed terminal error must survive the bridge");
 
         assert!(error.chain().any(|cause| {
             cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
@@ -664,7 +680,7 @@ mod tests {
     fn provider_adapter_forwards_configured_temperature() {
         let temperatures = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&temperatures);
-        let adapter = ProviderLlmAdapter::new(move || {
+        let resolve = move || {
             let mut config = Config::default();
             config
                 .providers
@@ -685,9 +701,150 @@ mod tests {
                     temperatures: Arc::clone(&recorded),
                 })),
             ))
+        };
+
+        assert_eq!(
+            ProviderLlmAdapter::generate_resolved(resolve, None, "prompt").unwrap(),
+            "ok"
+        );
+        assert_eq!(*temperatures.lock().unwrap(), vec![Some(0.25)]);
+    }
+
+    #[test]
+    fn provider_adapter_construction_allows_blocking_oauth_clients() {
+        let response = ProviderLlmAdapter::generate_resolved(
+            || {
+                // OAuth-enabled factories construct this client synchronously.
+                let client = reqwest::blocking::Client::new();
+                drop(client);
+                Ok((
+                    Config::default(),
+                    test_built_model(Box::new(TemperatureRecordingProvider {
+                        temperatures: Arc::new(Mutex::new(Vec::new())),
+                    })),
+                ))
+            },
+            None,
+            "prompt",
+        )
+        .unwrap();
+        assert_eq!(response, "ok");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_adapter_rebuilds_each_published_generation_and_fails_closed() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::live::LiveConfig;
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        fn generation(endpoint: String, label: &str, temperature: f64, max_tokens: u32) -> Config {
+            let mut config = Config::default();
+            config.reliability.provider_retries = 0;
+            let profile = config.providers.models.ensure("custom", "sop").unwrap();
+            profile.uri = Some(endpoint);
+            profile.api_key = Some(format!("{label}-test-key"));
+            profile.model = Some("profile-model-must-not-be-used".into());
+            profile.max_tokens = Some(7);
+            profile.models.insert(
+                "chosen".into(),
+                ModelEntryConfig {
+                    id: Some(format!("{label}-model")),
+                    temperature: Some(temperature),
+                    max_tokens: Some(max_tokens),
+                    provider_extra: Some(json!({"generation": label})),
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "default".into(),
+                AliasedAgentConfig {
+                    model_provider: "custom.sop.chosen".into(),
+                    ..Default::default()
+                },
+            );
+            config
+        }
+
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        for (server, label, temperature, max_tokens) in
+            [(&first, "first", 0.2, 128), (&second, "second", 0.6, 256)]
+        {
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .and(header("authorization", format!("Bearer {label}-test-key")))
+                .and(body_partial_json(json!({
+                    "model": format!("{label}-model"),
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "generation": label,
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": format!("{label}-response")},
+                        "finish_reason": "stop"
+                    }]
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+
+        let live = LiveConfig::new(generation(
+            format!("{}/v1/chat/completions", first.uri()),
+            "first",
+            0.2,
+            128,
+        ));
+        let source = live.handle();
+        let fail_resolver = Arc::new(AtomicBool::new(false));
+        let failure = Arc::clone(&fail_resolver);
+        let adapter = ProviderLlmAdapter::new(move || {
+            if failure.load(Ordering::SeqCst) {
+                anyhow::bail!("config resolver unavailable");
+            }
+            // This public resolver runs outside the bridge's async worker,
+            // just like synchronous OAuth client construction in the factory.
+            drop(reqwest::blocking::Client::new());
+            Ok(source.snapshot())
         });
 
-        assert_eq!(adapter.generate_typed(None, "prompt").unwrap(), "ok");
-        assert_eq!(*temperatures.lock().unwrap(), vec![Some(0.25)]);
+        // Keep the host's only runtime thread blocked during both sync calls.
+        assert_eq!(
+            adapter.generate_typed(Some("system"), "prompt").unwrap(),
+            "first-response"
+        );
+        live.publish(
+            live.next_revision().unwrap(),
+            generation(
+                format!("{}/v1/chat/completions", second.uri()),
+                "second",
+                0.6,
+                256,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            adapter.generate_typed(Some("system"), "prompt").unwrap(),
+            "second-response"
+        );
+
+        let mut invalid = live.snapshot();
+        invalid.agents.get_mut("default").unwrap().model_provider = "custom.sop.missing".into();
+        live.publish(live.next_revision().unwrap(), invalid)
+            .unwrap();
+        assert!(adapter.generate_typed(None, "prompt").is_err());
+        fail_resolver.store(true, Ordering::SeqCst);
+        assert_eq!(
+            adapter
+                .generate_typed(None, "prompt")
+                .unwrap_err()
+                .to_string(),
+            "config resolver unavailable"
+        );
+        assert_eq!(first.received_requests().await.unwrap().len(), 1);
+        assert_eq!(second.received_requests().await.unwrap().len(), 1);
     }
 }

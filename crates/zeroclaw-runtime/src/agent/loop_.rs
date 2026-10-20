@@ -1418,10 +1418,38 @@ fn project_cli_terminal_completion_error(error: anyhow::Error) -> anyhow::Error 
     anyhow::Error::msg(user_message)
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-pub async fn run(
-    mut config: Config,
-    agent_alias: &str,
+/// Invocation data; configured defaults remain in the admitted Config.
+pub struct AgentRunRequest<'a> {
+    pub agent_alias: &'a str,
+    pub message: Option<String>,
+    pub model: crate::agent::agent::ModelOverrides<'a>,
+    pub peripheral_overrides: Vec<String>,
+    pub interactive: bool,
+    pub session_state_file: Option<PathBuf>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub origin: TurnOrigin,
+}
+
+impl<'a> AgentRunRequest<'a> {
+    pub fn new(agent_alias: &'a str) -> Self {
+        Self {
+            agent_alias,
+            message: None,
+            model: Default::default(),
+            peripheral_overrides: Vec::new(),
+            interactive: false,
+            session_state_file: None,
+            allowed_tools: None,
+            origin: TurnOrigin::SubTurn,
+        }
+    }
+}
+
+/// Compatibility adapter. New callers should use the named request entry.
+#[allow(clippy::too_many_arguments)]
+pub fn run<'a>(
+    config: Config,
+    agent_alias: &'a str,
     message: Option<String>,
     provider_override: Option<String>,
     model_override: Option<String>,
@@ -1431,9 +1459,61 @@ pub async fn run(
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
+    overrides: AgentRunOverrides,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    let config = Arc::new(config);
+    Box::pin(async move {
+        run_with_request(
+            config,
+            AgentRunRequest {
+                agent_alias,
+                message,
+                model: crate::agent::agent::ModelOverrides {
+                    provider: provider_override.as_deref(),
+                    model: model_override.as_deref(),
+                    temperature,
+                },
+                peripheral_overrides,
+                interactive,
+                session_state_file,
+                allowed_tools,
+                origin,
+            },
+            overrides,
+        )
+        .await
+    })
+}
+
+/// Store the runner on the heap before composing caller scopes. Polling stays
+/// in the caller task, preserving attribution, admission and cancellation.
+pub fn run_with_request<'a>(
+    config: Arc<Config>,
+    request: AgentRunRequest<'a>,
+    overrides: AgentRunOverrides,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    Box::pin(run_inner(config, request, overrides))
+}
+
+async fn run_inner(
+    mut config: Arc<Config>,
+    request: AgentRunRequest<'_>,
     mut overrides: AgentRunOverrides,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
+    let AgentRunRequest {
+        agent_alias,
+        message,
+        model,
+        peripheral_overrides,
+        interactive,
+        session_state_file,
+        allowed_tools,
+        origin,
+    } = request;
+    let provider_override = model.provider.map(str::to_owned);
+    let model_override = model.model.map(str::to_owned);
+    let temperature = model.temperature;
     let execution_admission = if let Some(admission) = overrides.execution_admission.take() {
         Some(admission)
     } else if let Some(capability) = overrides.execution_capability.as_ref() {
@@ -1451,10 +1531,10 @@ pub async fn run(
             admission.alias() == agent_alias,
             "agent execution admission alias changed during construction"
         );
-        config = admission.config().as_ref().clone();
+        config = admission.config();
     }
     if overrides.suppress_memory_auto_save {
-        config.memory.auto_save = false;
+        Arc::make_mut(&mut config).memory.auto_save = false;
     }
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
@@ -1605,7 +1685,7 @@ pub async fn run(
         };
 
         let all_tools_result = tools::all_tools_with_runtime_and_execution_capability(
-            Arc::new(config.clone()),
+            Arc::clone(&config),
             &security,
             &risk_profile,
             agent_alias,
@@ -1732,16 +1812,17 @@ pub async fn run(
         // <family>` — reaches the construction chain; the committed name is
         // the normalised two-segment billing key. Sampling and capacity are
         // resolved from the selected entry at the request boundary.
-        let entry_rt = crate::agent::agent::build_model(
-            &config,
+        let entry_model = zeroclaw_providers::model::build_model_nonblocking(
+            Arc::clone(&config),
             agent_alias,
             effective_model_ref,
             model_override.as_deref(),
-        )?;
-        let mut capacity_ref = entry_rt.model.identity.provider_ref();
-        let mut model_provider = entry_rt.model.provider;
-        let mut model_name = entry_rt.model.model_name;
-        let mut provider_name = entry_rt.model.provider_name;
+        )
+        .await?;
+        let mut provider_name = entry_model.provider_name();
+        let (mut model_provider, identity, _) = entry_model.into_parts();
+        let mut capacity_ref = identity.provider_ref();
+        let mut model_name = identity.model_id;
         let mut context_limits =
             config.resolved_context_limits_for_route(agent_alias, &capacity_ref, &model_name);
 
@@ -2318,16 +2399,18 @@ pub async fn run(
                             // reaches the construction chain, and the derived
                             // values (temperature, billing name) move with the
                             // new model.
-                            let rt = crate::agent::agent::build_model(
-                                &config,
+                            let model = zeroclaw_providers::model::build_model_nonblocking(
+                                Arc::clone(&config),
                                 agent_alias,
                                 &new_model_provider,
                                 Some(&new_model),
-                            )?;
-                            capacity_ref = rt.model.identity.provider_ref();
-                            model_provider = rt.model.provider;
-                            provider_name = rt.model.provider_name;
-                            model_name = rt.model.model_name;
+                            )
+                            .await?;
+                            provider_name = model.provider_name();
+                            let (provider, identity, _) = model.into_parts();
+                            capacity_ref = identity.provider_ref();
+                            model_provider = provider;
+                            model_name = identity.model_id;
                             context_limits = config.resolved_context_limits_for_route(
                                 agent_alias,
                                 &capacity_ref,
@@ -2372,25 +2455,19 @@ pub async fn run(
                             provider_name: &provider_name,
                             model: &model_name,
                             dispatch_model: &model_name,
-                            // Scalar fallback for a bare family; configured retry
-                            // candidates still resolve their own scoped defaults.
-                            temperature: temperature_input
-                                .resolve(Some(&config), sampling_ref)
-                                .into(),
+                            temperature: temperature_input,
                         };
                         TOOL_LOOP_COST_TRACKING_CONTEXT
                             .scope(
                                 cost_tracking_context.clone(),
-                                zeroclaw_providers::temperature::with_temperature(
-                                    Some(&config),
-                                    temperature_input,
-                                    creator.create_from_execution_reflected(
-                                        &msg,
-                                        &tool_calls,
-                                        &response,
-                                        None,
-                                        access,
-                                    ),
+                                creator.create_from_execution_reflected(
+                                    &msg,
+                                    &tool_calls,
+                                    &response,
+                                    None,
+                                    access,
+                                    temperature_input
+                                        .for_call(Some(Arc::clone(&config)), sampling_ref),
                                 ),
                             )
                             .await
@@ -2943,16 +3020,18 @@ pub async fn run(
 
                                 // Same rebuild as the one-shot path above —
                                 // one construction site for both loops.
-                                let rt = crate::agent::agent::build_model(
-                                    &config,
+                                let model = zeroclaw_providers::model::build_model_nonblocking(
+                                    Arc::clone(&config),
                                     agent_alias,
                                     &new_model_provider,
                                     Some(&new_model),
-                                )?;
-                                capacity_ref = rt.model.identity.provider_ref();
-                            model_provider = rt.model.provider;
-                                provider_name = rt.model.provider_name;
-                                model_name = rt.model.model_name;
+                                )
+                                .await?;
+                                provider_name = model.provider_name();
+                                let (provider, identity, _) = model.into_parts();
+                                capacity_ref = identity.provider_ref();
+                                model_provider = provider;
+                                model_name = identity.model_id;
                                     context_limits = config.resolved_context_limits_for_route(
                                     agent_alias,
                                     &capacity_ref,
@@ -3184,7 +3263,7 @@ pub async fn run(
 
         Ok(final_output)
     };
-    __zc_body
+    Box::pin(__zc_body)
         .instrument(__zc_scope_span)
         .instrument(__zc_attribution_span)
         .await
@@ -3627,16 +3706,17 @@ async fn process_message_inner(
         // carries the selected entry's tuning, and the raw ref reaches the
         // construction chain (a normalised two-segment ref would clobber the
         // selected entry's overlay with `models.default`'s).
-        let entry_rt = crate::agent::agent::build_model(
-            &config,
+        let entry_model = zeroclaw_providers::model::build_model_nonblocking(
+            Arc::clone(&config),
             agent_alias,
             agent.model_provider.as_str(),
             None,
-        )?;
-        let model_provider = entry_rt.model.provider;
-        let provider_name = entry_rt.model.provider_name;
-        let model_provider_ref = entry_rt.model.identity.provider_ref();
-        let model_name = entry_rt.model.model_name;
+        )
+        .await?;
+        let provider_name = entry_model.provider_name();
+        let (model_provider, identity, _) = entry_model.into_parts();
+        let model_provider_ref = identity.provider_ref();
+        let model_name = identity.model_id;
 
         let hardware_rag: Option<crate::rag::HardwareRag> = config
             .peripherals
@@ -18945,6 +19025,7 @@ Let me check the result."#;
                         dispatch_model: "mock-model",
                         temperature: None.into(),
                     },
+                    None.into(),
                 ),
             )
             .await
@@ -22711,7 +22792,7 @@ Let me check the result."#;
             config
                 .risk_profiles
                 .insert("default".into(), RiskProfileConfig::default());
-            let result = super::run(
+            let run = super::run(
                 config,
                 "worker",
                 Some("Read both files".into()),
@@ -22724,9 +22805,8 @@ Let me check the result."#;
                 None,
                 TurnOrigin::SubTurn,
                 super::AgentRunOverrides::default(),
-            )
-            .await
-            .unwrap();
+            );
+            let result = run.await.unwrap();
             assert_eq!(result, "done");
             let requests = server.received_requests().await.unwrap();
             assert_eq!(

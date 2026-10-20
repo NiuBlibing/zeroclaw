@@ -7,6 +7,7 @@ use super::traits::{
 };
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
+use zeroclaw_api::model_provider::CallSampling;
 use zeroclaw_api::model_provider::ModelInfo;
 
 /// Transparent decorator for factory-owned provider metadata.
@@ -166,9 +167,25 @@ impl ModelProvider for VisionOverrideProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    async fn chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
-            .chat_with_system(system_prompt, message, model, temperature)
+            .chat_with_system_with_sampling(system_prompt, message, model, temperature)
             .await
     }
 
@@ -178,9 +195,19 @@ impl ModelProvider for VisionOverrideProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_history_with_sampling(messages, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    async fn chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
-            .chat_with_history(messages, model, temperature)
+            .chat_with_history_with_sampling(messages, model, temperature)
             .await
     }
 
@@ -190,9 +217,19 @@ impl ModelProvider for VisionOverrideProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling(request, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    async fn chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
-            .chat(request, model, temperature)
+            .chat_with_sampling(request, model, temperature)
             .await
     }
 
@@ -203,9 +240,25 @@ impl ModelProvider for VisionOverrideProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tools_with_sampling(
+            messages,
+            tools,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    async fn chat_with_tools_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
-            .chat_with_tools(messages, tools, model, temperature)
+            .chat_with_tools_with_sampling(messages, tools, model, temperature)
             .await
     }
 
@@ -217,8 +270,25 @@ impl ModelProvider for VisionOverrideProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        self.stream_chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    fn stream_chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         stream_as_dispatch_composite(
-            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_system(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_system_with_sampling(
                 system_prompt,
                 message,
                 model,
@@ -235,8 +305,23 @@ impl ModelProvider for VisionOverrideProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        self.stream_chat_with_history_with_sampling(
+            messages,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    fn stream_chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         stream_as_dispatch_composite(
-            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_history(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_history_with_sampling(
                 messages,
                 model,
                 temperature,
@@ -252,12 +337,24 @@ impl ModelProvider for VisionOverrideProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-        stream_as_dispatch_composite(ProviderDispatch::from_ref(&*self.inner).stream_chat(
-            request,
-            model,
-            temperature,
-            options,
-        ))
+        self.stream_chat_with_sampling(request, model, CallSampling::Explicit(temperature), options)
+    }
+
+    fn stream_chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_sampling(
+                request,
+                model,
+                temperature,
+                options,
+            ),
+        )
     }
 }
 

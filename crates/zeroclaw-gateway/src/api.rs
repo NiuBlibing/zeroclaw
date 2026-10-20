@@ -1038,7 +1038,16 @@ pub async fn handle_api_doctor(
     }
 
     let config = state.config.read().clone();
-    let results = zeroclaw_runtime::doctor::diagnose(&config);
+    let results = match zeroclaw_runtime::doctor::diagnose_nonblocking(&config).await {
+        Ok(results) => results,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
 
     let ok_count = results
         .iter()

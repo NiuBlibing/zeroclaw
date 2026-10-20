@@ -276,18 +276,13 @@ impl Tool for SpawnSubagentTool {
             agent_alias: parent_alias,
             session_key: run_id,
             =>
-            crate::agent::run(
-                (*config).clone(),
-                &self.parent_alias,
-                Some(prompt),
-                None,
-                None,
-                None,
-                vec![],
-                false,
-                Some(session_path),
-                None,
-                zeroclaw_api::ingress::TurnOrigin::SubTurn,
+            crate::agent::run_with_request(
+                Arc::clone(&config),
+                crate::agent::AgentRunRequest {
+                    message: Some(prompt),
+                    session_state_file: Some(session_path),
+                    ..crate::agent::AgentRunRequest::new(&self.parent_alias)
+                },
                 run_overrides,
             )
         ))

@@ -1,7 +1,7 @@
 use crate::agent::loop_::ResolvedModelAccess;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use zeroclaw_api::model_provider::{ChatMessage, ChatRequest};
+use zeroclaw_api::model_provider::{CallSampling, ChatMessage, ChatRequest};
 use zeroclaw_config::schema::SkillCreationConfig;
 use zeroclaw_memory::embeddings::EmbeddingProvider;
 use zeroclaw_memory::vector::cosine_similarity;
@@ -81,6 +81,7 @@ impl SkillCreator {
         final_answer: &str,
         embedding_provider: Option<&dyn EmbeddingProvider>,
         access: ResolvedModelAccess<'_>,
+        sampling: CallSampling,
     ) -> Result<Option<String>> {
         let Some((slug, skill_dir)) = self
             .prepare_skill_dir(task_description, tool_calls, embedding_provider)
@@ -90,7 +91,14 @@ impl SkillCreator {
         };
 
         match self
-            .reflect_skill_md(&slug, task_description, tool_calls, final_answer, &access)
+            .reflect_skill_md(
+                &slug,
+                task_description,
+                tool_calls,
+                final_answer,
+                &access,
+                sampling,
+            )
             .await
         {
             Ok(md_content) => {
@@ -184,6 +192,7 @@ impl SkillCreator {
         tool_calls: &[ToolCallRecord],
         final_answer: &str,
         access: &ResolvedModelAccess<'_>,
+        sampling: CallSampling,
     ) -> Result<String> {
         let prompt = self.build_reflection_prompt(slug, task_description, tool_calls, final_answer);
         let messages = [
@@ -193,13 +202,14 @@ impl SkillCreator {
         // Skill reflection is not part of any gateway turn ledger, so its
         // settled-attempt summaries are intentionally discarded.
         let resp = access
-            .run_model_query(
+            .run_model_query_with_sampling(
                 ChatRequest {
                     messages: &messages,
                     tools: None,
                     thinking: None,
                 },
                 &mut Vec::new(),
+                sampling,
             )
             .await
             .context("reflection provider call failed")?;
@@ -1349,6 +1359,7 @@ tags = ["auto-generated"]
                 "All tests passed.",
                 None,
                 reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap()
@@ -1383,6 +1394,7 @@ tags = ["auto-generated"]
                 "Deployed.",
                 None,
                 reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap()
@@ -1444,6 +1456,7 @@ tags = ["auto-generated"]
                     "All tests passed.",
                     None,
                     reflection_access(&provider, "mock-model"),
+                    None.into(),
                 ),
             )
             .await
@@ -1477,6 +1490,7 @@ tags = ["auto-generated"]
                 "Done.",
                 None,
                 reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap()
@@ -1502,6 +1516,7 @@ tags = ["auto-generated"]
                 "Done.",
                 None,
                 reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap()
@@ -1531,6 +1546,7 @@ tags = ["auto-generated"]
                 "answer",
                 None,
                 reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap();
@@ -1557,6 +1573,7 @@ tags = ["auto-generated"]
                 "answer",
                 None,
                 reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap();
@@ -1705,6 +1722,7 @@ tags = ["auto-generated"]
                 &format!("Done. Authenticated with {aws_key}."),
                 None,
                 reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap()
@@ -1946,6 +1964,7 @@ tags = ["auto-generated"]
                 "answer",
                 Some(&embed),
                 reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap();

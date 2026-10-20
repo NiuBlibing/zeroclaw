@@ -846,61 +846,58 @@ impl GatewaySupervision {
     }
 }
 
-struct GatewayBootSelection<'a> {
-    family: &'static str,
-    alias: &'a str,
-    entry: Option<&'a zeroclaw_config::schema::ModelProviderConfig>,
-    model_entry: Option<&'a zeroclaw_config::schema::ModelEntryConfig>,
-    model: String,
-}
+struct GatewayBootSelection<'a>(Option<zeroclaw_config::schema::ModelSelection<'a>>);
 
 impl GatewayBootSelection<'_> {
     fn provider_ref(&self) -> String {
-        format!("{}.{}", self.family, self.alias)
+        self.0.as_ref().map_or_else(
+            || "openrouter.default".into(),
+            |selection| selection.identity(None).provider_ref(),
+        )
+    }
+
+    fn entry(&self) -> Option<&zeroclaw_config::schema::ModelProviderConfig> {
+        self.0.as_ref().map(|selection| selection.entry)
+    }
+
+    fn alias(&self) -> &str {
+        self.0
+            .as_ref()
+            .map_or("default", |selection| selection.alias)
+    }
+
+    fn model(&self) -> &str {
+        self.0
+            .as_ref()
+            .and_then(|selection| selection.model_id.as_deref())
+            .unwrap_or_default()
     }
 
     fn temperature(&self) -> Option<f64> {
-        self.model_entry
-            .and_then(|entry| entry.temperature)
-            .or_else(|| self.entry.and_then(|entry| entry.temperature))
+        self.0
+            .as_ref()
+            .and_then(|selection| selection.temperature())
     }
 }
 
 fn resolve_gateway_boot_selection(config: &Config) -> GatewayBootSelection<'_> {
-    config
-        .resolve_default_model_selection()
-        .map(|selection| GatewayBootSelection {
-            family: selection.family,
-            alias: selection.alias,
-            entry: Some(selection.entry),
-            model_entry: selection.model_entry,
-            model: selection.model_id.unwrap_or_default(),
-        })
-        .unwrap_or(GatewayBootSelection {
-            family: "openrouter",
-            alias: "default",
-            entry: None,
-            model_entry: None,
-            model: String::new(),
-        })
+    GatewayBootSelection(config.resolve_default_model_selection())
 }
 
-fn create_gateway_boot_provider(
-    config: &Config,
-    boot: &GatewayBootSelection<'_>,
+async fn create_gateway_boot_provider(
+    config: Arc<Config>,
+    provider_ref: &str,
 ) -> Result<Arc<dyn ModelProvider>> {
-    let mut options =
-        zeroclaw_providers::provider_runtime_options_for_alias(config, boot.family, boot.alias);
-    zeroclaw_providers::apply_model_entry_options(&mut options, boot.model_entry);
-    zeroclaw_providers::create_resilient_model_provider_from_ref(
-        config,
-        &boot.provider_ref(),
-        boot.entry.and_then(|entry| entry.api_key.as_deref()),
-        boot.entry.and_then(|entry| entry.uri.as_deref()),
-        &config.reliability,
-        &options,
-    )
-    .map(Arc::from)
+    let provider_ref = provider_ref.to_string();
+    zeroclaw_providers::model::build_nonblocking(move || {
+        zeroclaw_providers::model::build_reliable_provider(
+            &config,
+            &provider_ref,
+            zeroclaw_providers::model::ProviderOverrides::default(),
+        )
+        .map(|resolved| Arc::from(resolved.provider))
+    })
+    .await
 }
 
 /// The config/onboarding route group. Authentication is enforced
@@ -1172,10 +1169,10 @@ pub async fn run_gateway_with_plugin_webhooks(
     // nested-only profile from being paired with another profile's provider.
     let boot = resolve_gateway_boot_selection(&config);
     let boot_provider_ref = boot.provider_ref();
-    let fallback = boot.entry;
+    let fallback = boot.entry();
     let model_provider_name = boot_provider_ref.as_str();
     let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
-        match create_gateway_boot_provider(&config, &boot) {
+        match create_gateway_boot_provider(Arc::new(config.clone()), &boot_provider_ref).await {
             Ok(provider) => (provider, false),
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -1184,7 +1181,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
                             "model_provider": model_provider_name,
-                            "alias": boot.alias,
+                            "alias": boot.alias(),
                             "error": format!("{e}"),
                         })),
                     "Gateway: seed model_provider failed to construct; booting in \
@@ -1200,7 +1197,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         };
     let model = if boot_provider_failed {
         String::new()
-    } else if boot.model.trim().is_empty() {
+    } else if boot.model().trim().is_empty() {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1212,7 +1209,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         );
         String::new()
     } else {
-        boot.model.trim().to_string()
+        boot.model().trim().to_string()
     };
     // Preserve `Option<f64>` end-to-end. Substituting a hardcoded default
     // here would clobber the "let the provider decide" intent for models
@@ -4239,19 +4236,18 @@ async fn dispatch_gateway_turn_streaming_with_agent(
 ) -> anyhow::Result<String> {
     let config = state.config.read().clone();
     let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
-    let mut agent =
-        zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
-            state.config.clone(),
-            &agent_alias,
-            None,
-            true,
-            false,
-            false,
-            state.sop_engine.clone(),
-            state.sop_audit.clone(),
-            Some(state.canvas_store.clone()),
-        )
-        .await?;
+    let mut agent = zeroclaw_runtime::agent::Agent::from_live_config_with_context(
+        state.config.clone(),
+        &agent_alias,
+        zeroclaw_runtime::agent::AgentBuildContext {
+            approval_backchannel: true,
+            sop_engine: state.sop_engine.clone(),
+            sop_audit: state.sop_audit.clone(),
+            canvas_store: Some(state.canvas_store.clone()),
+            ..Default::default()
+        },
+    )
+    .await?;
     #[cfg(test)]
     agent.set_turn_datetime_for_test(gateway_fixture_turn_datetime);
     if let Some(session) = session_id {
@@ -6845,10 +6841,11 @@ path = "{trigger_path}"
         );
 
         let boot = resolve_gateway_boot_selection(&config);
-        assert_eq!(boot.provider_ref(), "openai.gateway");
-        assert_eq!(boot.model, "nested-boot-model");
+        assert_eq!(boot.provider_ref(), "openai.gateway.only");
+        assert_eq!(boot.model(), "nested-boot-model");
         assert_eq!(boot.temperature(), Some(0.25));
-        let provider = create_gateway_boot_provider(&config, &boot)
+        let provider = create_gateway_boot_provider(Arc::new(config.clone()), &boot.provider_ref())
+            .await
             .expect("nested-only boot provider should construct");
         let messages = [ChatMessage::user("hello")];
         provider
@@ -6858,7 +6855,7 @@ path = "{trigger_path}"
                     tools: None,
                     thinking: None,
                 },
-                &boot.model,
+                boot.model(),
                 boot.temperature(),
             )
             .await
@@ -6870,6 +6867,40 @@ path = "{trigger_path}"
             Some("nested-boot-model")
         );
         assert_eq!(body.get("temperature").and_then(Value::as_f64), Some(0.25));
+
+        let profile = config.providers.models.ensure("openai", "gateway").unwrap();
+        profile.models.insert(
+            "default".into(),
+            ModelEntryConfig {
+                id: Some("default-model-must-not-be-used".into()),
+                max_tokens: Some(64),
+                provider_extra: Some(json!({"selection": "default"})),
+                ..Default::default()
+            },
+        );
+        let selected = profile.models.get_mut("only").unwrap();
+        selected.max_tokens = Some(192);
+        selected.provider_extra = Some(json!({"selection": "non-default"}));
+        // The compatible adapter supports arbitrary request body overlays.
+        let compatible_profile = profile.clone();
+        *config.providers.models.ensure("custom", "gateway").unwrap() = compatible_profile;
+        let boot = GatewayBootSelection(config.resolve_model_selection("custom.gateway.only"));
+        assert_eq!(boot.provider_ref(), "custom.gateway.only");
+        let provider = create_gateway_boot_provider(Arc::new(config.clone()), &boot.provider_ref())
+            .await
+            .expect("a non-default nested selection should construct");
+        provider
+            .chat(
+                ChatRequest::new(&messages),
+                boot.model(),
+                boot.temperature(),
+            )
+            .await
+            .expect("the complete selected reference must reach construction");
+        let body = capture.lock().clone().expect("mock endpoint was called");
+        assert_eq!(body["model"], "nested-boot-model");
+        assert_eq!(body["max_tokens"], 192);
+        assert_eq!(body["selection"], "non-default");
         server.abort();
     }
 
