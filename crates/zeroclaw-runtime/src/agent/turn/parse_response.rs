@@ -1144,7 +1144,7 @@ mod cost_usd_regression_tests {
             provider_name,
             model,
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: None,
+            temperature: zeroclaw_api::model_provider::CallSampling::Explicit(None),
             approval: None,
             channel_name: "rpc",
             channel_reply_target: None,

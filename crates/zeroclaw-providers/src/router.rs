@@ -460,6 +460,38 @@ impl ModelProvider for RouterModelProvider {
         model: &str,
         temperature: CallSampling,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            policy,
+        )
+        .await
+    }
+
+    async fn chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
@@ -467,10 +499,11 @@ impl ModelProvider for RouterModelProvider {
         with_exact_dispatch_route(
             provider_name.clone(),
             resolved_model.clone(),
-            ProviderDispatch::from_ref(&**model_provider).chat_with_sampling(
+            ProviderDispatch::from_ref(&**model_provider).chat_with_sampling_and_tool_round_policy(
                 request,
                 &resolved_model,
                 temperature,
+                policy,
             ),
         )
         .await
@@ -632,6 +665,40 @@ impl ModelProvider for RouterModelProvider {
         temperature: CallSampling,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+            policy,
+        )
+    }
+
+    fn stream_chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
         mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
@@ -668,11 +735,13 @@ impl ModelProvider for RouterModelProvider {
                 match with_exact_dispatch_route(
                     provider_name,
                     resolved_model.clone(),
-                    ProviderDispatch::from_ref(&*provider).chat_with_sampling(
-                        request,
-                        &resolved_model,
-                        temperature,
-                    ),
+                    ProviderDispatch::from_ref(&*provider)
+                        .chat_with_sampling_and_tool_round_policy(
+                            request,
+                            &resolved_model,
+                            temperature,
+                            policy,
+                        ),
                 )
                 .await
                 {
@@ -697,13 +766,22 @@ impl ModelProvider for RouterModelProvider {
         stream_with_exact_dispatch_route(
             provider_name.clone(),
             resolved_model.clone(),
-            ProviderDispatch::from_ref(&**model_provider).stream_chat_with_sampling(
-                request,
-                &resolved_model,
-                temperature,
-                options,
-            ),
+            ProviderDispatch::from_ref(&**model_provider)
+                .stream_chat_with_sampling_and_tool_round_policy(
+                    request,
+                    &resolved_model,
+                    temperature,
+                    options,
+                    policy,
+                ),
         )
+    }
+
+    fn supports_single_tool_rounds(&self, model: &str) -> bool {
+        let (index, resolved_model) = self.resolve(model);
+        self.model_providers[index]
+            .1
+            .supports_single_tool_rounds(&resolved_model)
     }
 
     fn capabilities(&self) -> crate::traits::ProviderCapabilities {

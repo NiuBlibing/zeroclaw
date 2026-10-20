@@ -253,6 +253,14 @@ pub fn strip_think_tags(text: &str) -> String {
     result.trim().to_string()
 }
 
+/// Requested tool-call cadence for one provider response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolRoundPolicy {
+    #[default]
+    Batch,
+    Single,
+}
+
 /// Request payload for model_provider chat calls.
 #[derive(Debug, Clone, Copy)]
 pub struct ChatRequest<'a> {
@@ -736,6 +744,46 @@ pub struct ModelInfo {
 
 #[async_trait]
 pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
+    /// Preserve candidate-specific sampling while applying a per-call native
+    /// tool-round policy. Composite providers forward both controls together.
+    async fn chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        sampling: CallSampling,
+        policy: ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        match policy {
+            ToolRoundPolicy::Batch => self.chat_with_sampling(request, model, sampling).await,
+            ToolRoundPolicy::Single => {
+                self.chat_with_tool_round_policy(request, model, sampling.resolve_for(None), policy)
+                    .await
+            }
+        }
+    }
+
+    fn stream_chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        sampling: CallSampling,
+        options: StreamOptions,
+        policy: ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        match policy {
+            ToolRoundPolicy::Batch => {
+                self.stream_chat_with_sampling(request, model, sampling, options)
+            }
+            ToolRoundPolicy::Single => self.stream_chat_with_tool_round_policy(
+                request,
+                model,
+                sampling.resolve_for(None),
+                options,
+                policy,
+            ),
+        }
+    }
+
     async fn chat_with_system_with_sampling(
         &self,
         system_prompt: Option<&str>,
@@ -852,6 +900,33 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         capabilities.native_tool_calling = self.supports_native_tools();
         capabilities.vision = self.supports_vision();
         capabilities
+    }
+
+    /// Whether every reachable route for this model honors a native one-call control.
+    fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+        false
+    }
+
+    /// Explicit per-request policy. Unsupported adapters retain their batch path.
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        _policy: ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat(request, model, temperature).await
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        _policy: ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat(request, model, temperature, options)
     }
 
     /// Name the entry that forced `vision` to `false` on this provider's
@@ -1135,6 +1210,65 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 /// boilerplate in test and production code.
 #[async_trait]
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
+    async fn chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        sampling: CallSampling,
+        policy: ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        self.as_ref()
+            .chat_with_sampling_and_tool_round_policy(request, model, sampling, policy)
+            .await
+    }
+
+    fn stream_chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        sampling: CallSampling,
+        options: StreamOptions,
+        policy: ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.as_ref()
+            .stream_chat_with_sampling_and_tool_round_policy(
+                request, model, sampling, options, policy,
+            )
+    }
+
+    fn supports_single_tool_rounds(&self, model: &str) -> bool {
+        self.as_ref().supports_single_tool_rounds(model)
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        self.as_ref()
+            .chat_with_tool_round_policy(request, model, temperature, policy)
+            .await
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.as_ref().stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            policy,
+        )
+    }
+
     async fn chat_with_system_with_sampling(
         &self,
         system_prompt: Option<&str>,

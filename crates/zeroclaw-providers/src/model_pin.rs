@@ -87,6 +87,10 @@ impl ModelProvider for ModelPinnedProvider {
         model == self.pinned_model && self.inner.has_stable_request_identity(&self.pinned_model)
     }
 
+    fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+        self.inner.supports_single_tool_rounds(&self.pinned_model)
+    }
+
     fn capabilities(&self) -> super::traits::ProviderCapabilities {
         self.inner.capabilities()
     }
@@ -219,9 +223,46 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: CallSampling,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling_and_tool_round_policy(
+            request,
+            _model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling_and_tool_round_policy(
+            request,
+            _model,
+            CallSampling::Explicit(temperature),
+            policy,
+        )
+        .await
+    }
+
+    async fn chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        temperature: CallSampling,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
-            .chat_with_sampling(request, &self.pinned_model, temperature)
+            .chat_with_sampling_and_tool_round_policy(
+                request,
+                &self.pinned_model,
+                temperature,
+                policy,
+            )
             .await
     }
 
@@ -344,13 +385,49 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: CallSampling,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_sampling_and_tool_round_policy(
+            request,
+            _model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_sampling_and_tool_round_policy(
+            request,
+            _model,
+            CallSampling::Explicit(temperature),
+            options,
+            policy,
+        )
+    }
+
+    fn stream_chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
         stream_as_dispatch_composite(
-            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_sampling(
-                request,
-                &self.pinned_model,
-                temperature,
-                options,
-            ),
+            ProviderDispatch::from_ref(&*self.inner)
+                .stream_chat_with_sampling_and_tool_round_policy(
+                    request,
+                    &self.pinned_model,
+                    temperature,
+                    options,
+                    policy,
+                ),
         )
     }
 }

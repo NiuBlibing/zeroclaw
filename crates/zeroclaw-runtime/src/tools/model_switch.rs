@@ -273,6 +273,28 @@ impl ModelSwitchTool {
             }
         };
 
+        let policy_ref = config
+            .providers
+            .models
+            .profile_ref(&model_provider)
+            .map_or_else(
+                || model_provider.clone(),
+                |(family, alias)| format!("{family}.{alias}"),
+            );
+        if !crate::agent::turn::model_switch_provider_allowed(&policy_ref) {
+            return Ok(ToolResult {
+                success: false,
+                output: serde_json::to_string_pretty(&json!({
+                    "model_provider": model_provider,
+                }))?
+                .into(),
+                error: Some(crate::i18n::get_required_cli_string_with_args(
+                    "model-switch-provider-not-allowed",
+                    &[("provider", &model_provider)],
+                )),
+            });
+        }
+
         // Explicit `model` wins; otherwise a three-segment ref supplies it.
         let model = match model
             .map(str::trim)
@@ -300,6 +322,18 @@ impl ModelSwitchTool {
                 error: Some("Model ID cannot be empty".to_string()),
             });
         }
+        if model
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("hint:"))
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "model-switch-route-selector-not-allowed",
+                )),
+            });
+        }
 
         let switch_state = current_model_switch_state()?;
         match switch_state.lock() {
@@ -315,7 +349,7 @@ impl ModelSwitchTool {
                 "message": "Model switch requested",
                 "model_provider": model_provider,
                 "model": model,
-                "note": "The active runtime path will consume this provider-profile/model switch where model_switch is supported. This does not write persisted config."
+                "note": "Where the runtime supports model_switch, the switch takes effect on your next model call within this same turn. Either way, continue the user's task now and deliver the result in this reply: nothing runs between turns, so ending the reply with a promise to report later means no work will happen. This does not write persisted config."
             }))?.into(),
             error: None,
         })
@@ -489,7 +523,8 @@ impl ModelSwitchTool {
 mod tests {
     use super::*;
     use crate::agent::turn::{
-        ModelSwitchCallback, current_model_switch_state, scope_model_switch_state,
+        ModelSwitchCallback, current_model_switch_state, scope_model_switch_provider_allowlist,
+        scope_model_switch_state,
     };
 
     fn test_config() -> Config {
@@ -505,6 +540,47 @@ mod tests {
 
     fn pending_switch(state: &ModelSwitchCallback) -> Option<(String, String)> {
         state.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn effort_allowlist_preserves_nested_switches_and_rejects_other_profiles() {
+        let mut config = test_config();
+        config
+            .providers
+            .models
+            .ensure("custom", "edge.local")
+            .unwrap()
+            .models
+            .insert(
+                "selected".into(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("selected-id".into()),
+                    ..Default::default()
+                },
+            );
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+        let state = Arc::new(std::sync::Mutex::new(None));
+        crate::agent::turn::scope_model_switch_provider_allowlist(
+            Some(Arc::new(std::collections::HashSet::from([
+                "custom.edge.local".to_string(),
+            ]))),
+            scope_model_switch_state(Arc::clone(&state), async {
+                let accepted = tool
+                    .handle_set(&json!({"model_provider": "custom.edge.local.selected"}))
+                    .unwrap();
+                assert!(accepted.success, "{:?}", accepted.error);
+                let rejected = tool
+                    .handle_set(&json!({"model_provider": "openai.default", "model": "other"}))
+                    .unwrap();
+                assert!(!rejected.success);
+                assert!(rejected.error.is_some());
+            }),
+        )
+        .await;
+        assert_eq!(
+            pending_switch(&state),
+            Some(("custom.edge.local.selected".into(), "selected-id".into()))
+        );
     }
 
     #[tokio::test]
@@ -606,6 +682,53 @@ mod tests {
                 pending_switch(&state),
                 Some(("openai.default".to_string(), "gpt-4o".to_string()))
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_rejects_provider_outside_turn_allowlist() {
+        let state = Arc::new(std::sync::Mutex::new(None));
+        let allowed = Arc::new(std::collections::HashSet::from(
+            ["custom.local".to_string()],
+        ));
+
+        let result = scope_model_switch_state(
+            Arc::clone(&state),
+            scope_model_switch_provider_allowlist(Some(allowed), async {
+                tool().handle_set(&json!({
+                    "model_provider": "openai.default",
+                    "model": "gpt-4o"
+                }))
+            }),
+        )
+        .await
+        .expect("set should return a tool result");
+
+        assert!(!result.success);
+        let expected = crate::i18n::get_required_cli_string_with_args(
+            "model-switch-provider-not-allowed",
+            &[("provider", "openai.default")],
+        );
+        assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(pending_switch(&state), None);
+    }
+
+    #[tokio::test]
+    async fn set_rejects_route_selector_as_provider_local_model() {
+        with_switch_state(|state| {
+            let result = tool()
+                .handle_set(&json!({
+                    "model_provider": "openai.default",
+                    "model": "hint:cloud"
+                }))
+                .expect("set should return a tool result");
+
+            assert!(!result.success);
+            let expected =
+                crate::i18n::get_required_cli_string("model-switch-route-selector-not-allowed");
+            assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+            assert_eq!(pending_switch(&state), None);
         })
         .await;
     }

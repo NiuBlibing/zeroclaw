@@ -1130,7 +1130,7 @@ impl ModelRoutingConfigTool {
             || agentic_update.is_some();
         let delegates_update_requested = delegates_update.is_some();
 
-        zeroclaw_config::migration::ensure_disk_at_current_version(&self.config.config_path)?;
+        zeroclaw_config::migration::ensure_disk_at_current_version(&(self.config)().config_path)?;
         let mut cfg = self.load_config_without_env()?;
         let existing_agent = cfg.agents.get(&name).cloned();
 
