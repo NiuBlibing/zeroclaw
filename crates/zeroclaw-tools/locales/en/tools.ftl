@@ -177,7 +177,12 @@ tool-memory-store = Store a fact, preference, or note in long-term memory. Use c
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
 tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
-tool-model-routing-config-write-busy = Another configuration update is in progress. Retry this change after it finishes.
+tool-model-routing-config-error-missing-risk-profile = agent `{$agent}` references missing risk profile `{$profile}`
+tool-model-routing-config-error-shared-risk-profile = risk profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
+tool-model-routing-config-error-risk-profile-collision = risk profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
+tool-model-routing-config-error-missing-runtime-profile = agent `{$agent}` references missing runtime profile `{$profile}`
+tool-model-routing-config-error-shared-runtime-profile = runtime profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
+tool-model-routing-config-error-runtime-profile-collision = runtime profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 
@@ -239,12 +244,16 @@ tool-web-search-tool = Search the web for information. Returns relevant search r
 tool-web-search-tool-error-duckduckgo-blocked = DuckDuckGo is rate-limiting this machine. Do not retry or rephrase the search; wait a few minutes, fetch known URLs directly with web_fetch, or configure SearXNG, Brave, or Tavily as the web_search provider.
 tool-web-search-tool-error-searxng-not-configured = SearXNG instance URL not configured. Set [web_search] searxng_instance_url in config.toml, or override it with the ZEROCLAW_web_search__searxng_instance_url environment variable.
 tool-web-search-tool-note-truncated-results = (further results omitted)
+tool-web-search-tool-error-anysearch-config-parse = Failed to parse config file { $path } for AnySearch API key ({ $error_code }{ $location })
+tool-web-search-tool-error-anysearch-config-parse-line = , line { $line }
+tool-web-search-tool-error-anysearch-config-read = Failed to read config file { $path } for AnySearch API key: { $error }
+tool-web-search-tool-error-anysearch-response-too-large = AnySearch response exceeds the { $limit } byte size limit
+tool-web-search-tool-error-anysearch-invalid-response = Invalid AnySearch API response
+tool-web-search-tool-error-anysearch-api = AnySearch returned error (code { $code }): { $message }
+tool-web-search-tool-anysearch-no-title = No title
+tool-web-search-tool-anysearch-no-error-details = no error details
 
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
-
-tool-llm-task-agent-missing = Unknown model_provider agent: { $agent }
-tool-llm-task-provider-invalid = Invalid model_provider reference: { $provider }
-tool-llm-task-model-missing = No model configured for model_provider: { $provider }
 
 tool-weather = Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0-3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required.
 
