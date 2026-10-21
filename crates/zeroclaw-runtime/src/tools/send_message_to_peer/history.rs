@@ -64,6 +64,14 @@ impl SessionAccessPolicy for PeerAuthority {
     }
 }
 impl PermissionResolver for PeerAuthority {
+    fn tool_authority_evidence(
+        &self,
+        stream: &SessionStreamId,
+        name: &str,
+    ) -> Result<serde_json::Value, SessionError> {
+        self.current()?;
+        self.base.tool_authority_evidence(stream, name)
+    }
     fn authorize(&self, intent: &EffectIntent) -> Result<(), SessionError> {
         self.current()?;
         PermissionResolver::authorize(self.base.as_ref(), intent)
@@ -155,4 +163,86 @@ pub(super) async fn open(
             },
         )
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_config::{
+        multi_agent::{AgentAlias, PeerGroupConfig},
+        schema::AliasedAgentConfig,
+    };
+
+    #[test]
+    fn peer_tool_evidence_tracks_live_policy_and_route_revocation() {
+        let mut config = Config::default();
+        config
+            .risk_profiles
+            .insert("fixture".into(), Default::default());
+        for alias in ["sender", "recipient"] {
+            config.agents.insert(
+                alias.into(),
+                AliasedAgentConfig {
+                    channels: vec!["telegram.prod".into()],
+                    risk_profile: "fixture".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        config.peer_groups.insert(
+            "fixture".into(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                ..Default::default()
+            },
+        );
+        let live = crate::LiveConfigAuthority::new(config.clone());
+        let capability = live.execution_capability();
+        let stream = SessionStreamId::new();
+        let peer = PeerAuthority {
+            base: Arc::new(crate::live_config_authority::AgentHistoryAuthority {
+                admission: capability.admit("recipient").expect("admission"),
+                actor: EventActor::System {
+                    component: "peer_inbox".into(),
+                },
+                stream: stream.clone(),
+                origin: zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                parent_alias: None,
+            }),
+            capability,
+            sender: "sender".into(),
+            recipient: "recipient".into(),
+            channel: "telegram.prod".into(),
+        };
+        let before = peer
+            .tool_authority_evidence(&stream, "shell")
+            .expect("evidence");
+        assert_eq!(before["source"], "live_tool_admission");
+        config
+            .risk_profiles
+            .get_mut("fixture")
+            .expect("profile")
+            .always_ask = vec!["shell".into()];
+        let revision = live.publish_for_test(config.clone());
+        let after = peer
+            .tool_authority_evidence(&stream, "shell")
+            .expect("updated evidence");
+        assert_eq!(
+            after["config_revision"],
+            serde_json::to_value(revision).expect("revision")
+        );
+        assert_ne!(after["config_revision"], before["config_revision"]);
+        assert_eq!(
+            after["matched_rules"]["always_ask"],
+            serde_json::json!(["shell"])
+        );
+        assert!(
+            peer.tool_authority_evidence(&SessionStreamId::new(), "shell")
+                .is_err()
+        );
+        config.peer_groups.clear();
+        live.publish_for_test(config);
+        assert!(peer.tool_authority_evidence(&stream, "shell").is_err());
+    }
 }

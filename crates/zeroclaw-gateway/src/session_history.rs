@@ -298,6 +298,14 @@ impl SessionAccessPolicy for IngressAuthority {
     }
 }
 impl PermissionResolver for IngressAuthority {
+    fn tool_authority_evidence(
+        &self,
+        stream: &SessionStreamId,
+        name: &str,
+    ) -> Result<serde_json::Value, SessionError> {
+        self.current()?;
+        self.base.tool_authority_evidence(stream, name)
+    }
     fn authorize_context(
         &self,
         stream: &SessionStreamId,
@@ -468,6 +476,14 @@ impl SessionAccessPolicy for GatewayAuthority {
     }
 }
 impl PermissionResolver for GatewayAuthority {
+    fn tool_authority_evidence(
+        &self,
+        stream: &SessionStreamId,
+        name: &str,
+    ) -> Result<serde_json::Value, SessionError> {
+        self.current()?;
+        self.base.tool_authority_evidence(stream, name)
+    }
     fn authorize_context(
         &self,
         stream: &SessionStreamId,
@@ -733,6 +749,82 @@ pub(crate) mod tests {
     use zeroclaw_kernel::session::engine::{
         EngineSession, EngineSessionSource, FamilyDescriptor, FamilyQuery,
     };
+
+    #[test]
+    fn gateway_and_ingress_tool_evidence_tracks_live_policy_and_authentication() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .risk_profiles
+            .insert("fixture".into(), Default::default());
+        config.agents.insert(
+            "web".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "fixture".into(),
+                ..Default::default()
+            },
+        );
+        let mut state = crate::api::tests::test_state(config.clone());
+        state.pairing = Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+            true,
+            &["fixture-bearer".into()],
+            Default::default(),
+        ));
+        let subject = state
+            .pairing
+            .authenticate_and_hash("fixture-bearer")
+            .expect("authenticate");
+        let stream = SessionStreamId::new();
+        let gateway = authority(&state, stream.clone(), "web", Some(&subject)).expect("authority");
+        let ingress = IngressAuthority {
+            base: gateway.clone(),
+            proof: IngressProof::Paired {
+                subject: Some(subject.clone()),
+            },
+            live: state.config.clone(),
+            pairing: state.pairing.clone(),
+            root_alias: "web".into(),
+        };
+        let evidence = gateway
+            .tool_authority_evidence(&stream, "shell")
+            .expect("gateway evidence");
+        assert_eq!(evidence["source"], "live_tool_admission");
+        let before = ingress
+            .tool_authority_evidence(&stream, "shell")
+            .expect("ingress evidence");
+        assert_eq!(before["source"], "live_tool_admission");
+        config
+            .risk_profiles
+            .get_mut("fixture")
+            .expect("profile")
+            .always_ask = vec!["shell".into()];
+        let revision = state.config_authority.publish_for_test(config);
+        for evidence in [
+            gateway
+                .tool_authority_evidence(&stream, "shell")
+                .expect("updated gateway"),
+            ingress
+                .tool_authority_evidence(&stream, "shell")
+                .expect("updated ingress"),
+        ] {
+            assert_eq!(
+                evidence["config_revision"],
+                serde_json::to_value(revision).expect("revision")
+            );
+            assert_ne!(evidence["config_revision"], before["config_revision"]);
+            assert_eq!(
+                evidence["matched_rules"]["always_ask"],
+                serde_json::json!(["shell"])
+            );
+        }
+        assert!(
+            gateway
+                .tool_authority_evidence(&SessionStreamId::new(), "shell")
+                .is_err()
+        );
+        assert!(state.pairing.revoke_token_hash(&subject));
+        assert!(gateway.tool_authority_evidence(&stream, "shell").is_err());
+        assert!(ingress.tool_authority_evidence(&stream, "shell").is_err());
+    }
 
     #[test]
     fn gateway_recovery_route_does_not_persist_credentials() {
