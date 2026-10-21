@@ -4715,7 +4715,12 @@ impl Config {
             if source == crate::traits::AliasSource::ModelProviders {
                 for (family, alias, profile) in self.providers.models.iter_entries() {
                     out.push(format!("{family}.{alias}"));
-                    out.extend(profile.models.keys().map(|model| format!("{family}.{alias}.{model}")));
+                    out.extend(
+                        profile
+                            .models
+                            .keys()
+                            .map(|model| format!("{family}.{alias}.{model}")),
+                    );
                 }
                 out.sort();
                 out.dedup();

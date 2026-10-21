@@ -41,14 +41,14 @@ pub fn alias_kind_for_map_path(path: &str) -> Option<AliasKind> {
         && let Some((family, profile_alias)) = rest
             .strip_suffix(".models")
             .and_then(|profile| profile.split_once('.'))
-            && !family.is_empty()
-            && !profile_alias.is_empty()
-        {
-            return Some(AliasKind::ModelAlias {
-                family: family.to_string(),
-                profile_alias: profile_alias.to_string(),
-            });
-        }
+        && !family.is_empty()
+        && !profile_alias.is_empty()
+    {
+        return Some(AliasKind::ModelAlias {
+            family: family.to_string(),
+            profile_alias: profile_alias.to_string(),
+        });
+    }
 
     if let Some(rest) = path.strip_prefix("providers.") {
         let (cat, family) = rest.split_once('.')?;
