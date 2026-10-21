@@ -13,6 +13,7 @@ pub mod capture;
 mod children;
 mod context;
 mod context_messages;
+mod context_summary;
 pub use context::ContextMaintenanceCommand;
 mod authority;
 mod controls;

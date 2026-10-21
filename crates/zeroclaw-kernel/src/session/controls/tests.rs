@@ -2,6 +2,7 @@ use super::super::engine::{EngineSession, EngineSessionAuthority};
 use super::super::query::{SessionAccess, SessionAccessPolicy};
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
+use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_api::principal::PrincipalId;
 use zeroclaw_api::session_events::capture::*;
 
@@ -1918,7 +1919,10 @@ async fn summary_uses_the_projection_committed_by_the_previous_lane_owner() {
             Box::new(|source| {
                 Box::pin(async move {
                     assert_eq!(
-                        source.chat_projection().last().expect("new input").content,
+                        match &source[source.len() - 2] {
+                            ConversationMessage::Chat(chat) => &chat.content,
+                            _ => panic!("chat input"),
+                        },
                         "previous lane owner committed this"
                     );
                     anyhow::bail!("fixture_summary_stop")
@@ -1952,6 +1956,58 @@ async fn summary_uses_the_projection_committed_by_the_previous_lane_owner() {
                 .content,
             "previous lane owner committed this"
         );
+    }
+}
+
+#[tokio::test]
+async fn empty_summary_settles_without_replacing_context() {
+    for backend in ["sqlite", "jsonl"] {
+        for text in [
+            "",
+            " \n ",
+            "<think>internal reasoning</think>",
+            "<think>unfinished",
+        ] {
+            let directory = tempfile::TempDir::new().expect("directory");
+            let (port, _) = session(directory.path(), backend);
+            port.append_assistant("retained original")
+                .await
+                .expect("seed");
+            let before = port
+                .restore_context()
+                .await
+                .expect("restore")
+                .expect("context");
+            let error = port
+                .summarize_context(
+                    ProviderPurpose::Summary,
+                    Box::new(move |_| Box::pin(async move { Ok(text.to_owned()) })),
+                )
+                .await
+                .expect_err("empty summary rejected");
+            assert!(error.to_string().contains("empty_context_summary"));
+            let after = port
+                .restore_context()
+                .await
+                .expect("restore")
+                .expect("context");
+            assert_eq!(
+                serde_json::to_value(before).expect("before"),
+                serde_json::to_value(after).expect("after")
+            );
+            let history = port.owner.stream_history(&port.stream).expect("history");
+            assert_eq!(
+                history.last().expect("outcome").body.kind(),
+                EventKind::ContextTransformFailed
+            );
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|event| event.body.kind() == EventKind::ContextTransformFailed)
+                    .count(),
+                1
+            );
+        }
     }
 }
 
@@ -2019,10 +2075,6 @@ async fn summary_installation_errors_settle_once_without_inventing_uncertain_out
                             ProviderPurpose::Summary,
                             Box::new(move |_source| {
                                 Box::pin(async move {
-                                    let kept = ContextSnapshot {
-                                        messages: vec![],
-                                        history_has_trim_breadcrumb: Some(false),
-                                    };
                                     let text = Box::pin(async {
                                         let observer = current_provider_admission()
                                     .expect("summary capture")
@@ -2069,10 +2121,7 @@ async fn summary_installation_errors_settle_once_without_inventing_uncertain_out
                                         Ok::<String, anyhow::Error>("captured summary".into())
                                     })
                                     .await?;
-                                    Ok(zeroclaw_api::session_events::capture::ContextSummary {
-                                        kept,
-                                        text,
-                                    })
+                                    Ok(text)
                                 })
                             }),
                         )
@@ -2205,26 +2254,13 @@ async fn summary_generation_settlement_failure_preserves_original_error_chain() 
                     ProviderPurpose::Summary,
                     Box::new(move |_source| {
                         Box::pin(async move {
-                            let kept = ContextSnapshot {
-                                messages: vec![],
-                                history_has_trim_breadcrumb: Some(false),
-                            };
-                            let text = Box::pin(async move {
-                                Err(if cancelled {
-                                    anyhow::Error::new(zeroclaw_api::turn_stop::ToolLoopCancelled)
-                                } else {
-                                    anyhow::Error::new(std::io::Error::other(
-                                        "fixture summary generation failed",
-                                    ))
-                                })
+                            Err(if cancelled {
+                                anyhow::Error::new(zeroclaw_api::turn_stop::ToolLoopCancelled)
+                            } else {
+                                anyhow::Error::new(std::io::Error::other(
+                                    "fixture summary generation failed",
+                                ))
                             })
-                            .await?;
-                            Ok(
-                                zeroclaw_api::session_events::capture::ContextSummary {
-                                    kept,
-                                    text,
-                                },
-                            )
                         })
                     }),
                 )

@@ -776,14 +776,7 @@ async fn cancelled_provider_attempts_retain_durable_partial_and_never_retry() {
             let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 if summary {
                     session
-                        .summarize_context(ProviderPurpose::Summary, Box::new(move |_source| Box::pin(async move {
-      let kept = ContextSnapshot {
-                                messages: vec![],
-                                history_has_trim_breadcrumb: Some(false),
-                            };
-      let text = Box::pin(work).await?;
-      Ok(zeroclaw_api::session_events::capture::ContextSummary { kept, text })
-  })))
+                        .summarize_context(ProviderPurpose::Summary, Box::new(move |_source| Box::pin(work)))
                         .await.map(|_| String::new())
                 } else {
                     session.execute(input.clone(), Box::pin(work)).await
@@ -1109,6 +1102,101 @@ async fn audit_request_reasoning_disclosure(backend: &str) {
     assert!(matches!(read, Err(SessionError::PermissionDenied(_))));
 }
 
+#[tokio::test]
+async fn summary_policy_retains_system_context_and_captures_the_assembled_request() {
+    use zeroclaw_api::principal::PrincipalId;
+    use zeroclaw_api::session_events::capture::{ContextSnapshot, SessionExecutionPort};
+    for backend in ["sqlite", "jsonl"] {
+        let h = Harness::new(backend);
+        let events = h.events();
+        let session = zeroclaw_kernel::session::engine::EngineSession::new(
+            Arc::new(SessionCoordinator::new(h.store.clone())),
+            h.stream.clone(),
+            events[0].branch_id.clone().unwrap(),
+            PrincipalId::shared_operator(),
+            Arc::new(ChildAuthority),
+        );
+        session
+            .replace_context(
+                ContextSnapshot {
+                    messages: vec![
+                        ConversationMessage::Chat(ChatMessage::system("keep these instructions")),
+                        ConversationMessage::Chat(ChatMessage::user("summarize this request")),
+                        ConversationMessage::Chat(ChatMessage::assistant("original response")),
+                    ],
+                    history_has_trim_breadcrumb: Some(false),
+                },
+                "fixture_summary_seed",
+            )
+            .await
+            .expect("seed context");
+        let installed = session
+            .summarize_context(
+                ProviderPurpose::Summary,
+                Box::new(|conversation| {
+                    Box::pin(async move {
+                        let messages: Vec<_> = conversation
+                            .into_iter()
+                            .map(|message| match message {
+                                ConversationMessage::Chat(chat) => chat,
+                                _ => panic!("fixture only has chat messages"),
+                            })
+                            .collect();
+                        assert_eq!(messages.len(), 4);
+                        assert_eq!(messages[0].content, "keep these instructions");
+                        assert_eq!(messages[1].content, "summarize this request");
+                        assert_eq!(messages[2].content, "original response");
+                        assert_eq!(messages[3].role, "user");
+                        assert!(
+                            messages[3]
+                                .content
+                                .starts_with("Summarize the conversation for continuation.")
+                        );
+                        let response = ProviderDispatch::from_ref(&Mixed)
+                            .chat(
+                                ChatRequest {
+                                    messages: &messages,
+                                    tools: None,
+                                    thinking: None,
+                                },
+                                "fixture",
+                                None,
+                            )
+                            .await?;
+                        Ok(response.text_or_empty().to_owned())
+                    })
+                }),
+            )
+            .await
+            .expect("summary committed");
+        let messages = installed.chat_projection();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "keep these instructions");
+        assert_eq!(messages[1].content, "[Context summary]\nanswer");
+        assert_eq!(installed.history_has_trim_breadcrumb, Some(true));
+        let events = h.events();
+        let request = events
+            .iter()
+            .find_map(|event| match &event.body.data {
+                EventData::ProviderRequestPrepared { request_ref, .. } => {
+                    Some(h.payload::<serde_json::Value>(request_ref))
+                }
+                _ => None,
+            })
+            .expect("captured request");
+        let messages_ref: StoredPayloadRef =
+            serde_json::from_value(request["messages_ref"].clone()).expect("messages reference");
+        let messages: Vec<ChatMessage> = h.payload(&messages_ref);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].content, "keep these instructions");
+        assert!(
+            messages[3]
+                .content
+                .starts_with("Summarize the conversation for continuation.")
+        );
+    }
+}
+
 async fn audit_summary(backend: &str) {
     use zeroclaw_api::principal::PrincipalId;
     use zeroclaw_api::session_events::capture::*;
@@ -1123,10 +1211,6 @@ async fn audit_summary(backend: &str) {
         Arc::new(ChildAuthority),
     );
     session.append_assistant("old context").await.unwrap();
-    let kept = ContextSnapshot {
-        messages: vec![],
-        history_has_trim_breadcrumb: Some(true),
-    };
     let generate = async {
         let messages = [ChatMessage::user("summarize")];
         let response = ProviderDispatch::from_ref(&Mixed)
@@ -1148,11 +1232,14 @@ async fn audit_summary(backend: &str) {
                 ProviderPurpose::Summary,
                 Box::new(move |source| Box::pin(async move {
                     assert_eq!(
-                        source.chat_projection().last().unwrap().content,
+                        match &source[source.len() - 2] {
+                            zeroclaw_api::model_provider::ConversationMessage::Chat(chat) =>
+                                &chat.content,
+                            _ => panic!("chat input"),
+                        },
                         "old context"
                     );
-                    let text = generate.await?;
-                    Ok(zeroclaw_api::session_events::capture::ContextSummary { kept, text })
+                    generate.await
                 }))
             )
             .await
@@ -1231,11 +1318,6 @@ async fn audit_summary(backend: &str) {
         .replace_context(restored.clone(), "summary_preserving_noop")
         .await
         .expect("preserve summary provenance");
-    let kept = session
-        .restore_context()
-        .await
-        .expect("restore")
-        .expect("context");
     let generated = async {
         let messages = [ChatMessage::user("summarize again")];
         let response = ProviderDispatch::from_ref(&Mixed)
@@ -1254,12 +1336,7 @@ async fn audit_summary(backend: &str) {
     session
         .summarize_context(
             ProviderPurpose::Summary,
-            Box::new(move |_source| {
-                Box::pin(async move {
-                    let text = generated.await?;
-                    Ok(zeroclaw_api::session_events::capture::ContextSummary { kept, text })
-                })
-            }),
+            Box::new(move |_source| Box::pin(generated)),
         )
         .await
         .expect("second summary");
@@ -1289,15 +1366,7 @@ async fn audit_summary(backend: &str) {
         .summarize_context(
             ProviderPurpose::ContextRepair,
             Box::new(move |_source| {
-                Box::pin(async move {
-                    let kept = ContextSnapshot {
-                        messages: vec![],
-                        history_has_trim_breadcrumb: None,
-                    };
-                    let text =
-                        Box::pin(async { anyhow::bail!("fixture summary rejected") }).await?;
-                    Ok(zeroclaw_api::session_events::capture::ContextSummary { kept, text })
-                })
+                Box::pin(async move { anyhow::bail!("fixture summary rejected") })
             }),
         )
         .await;
@@ -1321,17 +1390,9 @@ async fn audit_summary(backend: &str) {
             ProviderPurpose::Summary,
             Box::new(move |_source| {
                 Box::pin(async move {
-                    let kept = ContextSnapshot {
-                        messages: vec![],
-                        history_has_trim_breadcrumb: None,
-                    };
-                    let text = Box::pin(async {
-                        Err(anyhow::Error::new(
-                            zeroclaw_api::turn_stop::ToolLoopCancelled,
-                        ))
-                    })
-                    .await?;
-                    Ok(zeroclaw_api::session_events::capture::ContextSummary { kept, text })
+                    Err(anyhow::Error::new(
+                        zeroclaw_api::turn_stop::ToolLoopCancelled,
+                    ))
                 })
             }),
         )

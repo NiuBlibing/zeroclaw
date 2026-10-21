@@ -671,17 +671,20 @@ impl EngineSession {
             )
             .await?;
         let capture = transform.provider_capture(purpose)?;
+        let (kept, messages) = super::context_summary::prepare(source);
         let result = std::panic::AssertUnwindSafe(
             zeroclaw_api::session_events::capture::scope_provider_capture(capture, async move {
-                summary(source).await
+                let text = summary(messages).await?;
+                super::context_summary::validate(&text)?;
+                Ok::<String, anyhow::Error>(text)
             }),
         )
         .catch_unwind()
         .await
         .unwrap_or_else(|_| Err(anyhow::Error::msg("summary_executor_panic")));
         match result {
-            Ok(result) => {
-                transform.complete_summary(result.kept, result.text).await?;
+            Ok(text) => {
+                transform.complete_summary(kept, text).await?;
                 self.restore_context()
                     .await?
                     .ok_or_else(|| anyhow::Error::msg("native_context_missing"))

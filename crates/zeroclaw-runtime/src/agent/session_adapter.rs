@@ -161,24 +161,14 @@ impl Agent {
         &mut self,
         native: Arc<dyn zeroclaw_api::session_events::capture::SessionExecutionPort>,
     ) -> Result<usize> {
-        use zeroclaw_api::session_events::{
-            ProviderPurpose,
-            capture::{ContextSnapshot, ContextSummary, ContextSummaryExecutor},
-        };
+        use zeroclaw_api::session_events::{ProviderPurpose, capture::ContextSummaryExecutor};
         let dispatcher = self.tool_dispatcher.as_ref();
         let provider = self.model_provider.as_ref();
         let model = self.model_name.as_str();
         let temperature = self.temperature;
-        let summarize: ContextSummaryExecutor<'_> = Box::new(|context| {
+        let summarize: ContextSummaryExecutor<'_> = Box::new(|conversation| {
             Box::pin(async move {
-                let mut messages = dispatcher.to_provider_messages(&context.messages);
-                messages.push(ChatMessage::user("Summarize the conversation for continuation. Preserve unresolved requests, decisions, tool outcomes and relevant file references. Return only the summary."));
-                let kept = ContextSnapshot {
-                messages: context.messages.into_iter()
-                    .filter(|message| matches!(message, ConversationMessage::Chat(chat) if chat.role == "system"))
-                    .collect(),
-                history_has_trim_breadcrumb: Some(true),
-            };
+                let messages = dispatcher.to_provider_messages(&conversation);
                 let response = zeroclaw_providers::dispatch::ProviderDispatch::from_ref(provider)
                     .chat(
                         zeroclaw_api::model_provider::ChatRequest {
@@ -190,14 +180,7 @@ impl Agent {
                         temperature,
                     )
                     .await?;
-                anyhow::ensure!(
-                    !response.is_semantically_empty_terminal(),
-                    "empty_context_summary"
-                );
-                Ok(ContextSummary {
-                    kept,
-                    text: response.text_or_empty().to_owned(),
-                })
+                Ok(response.text_or_empty().to_owned())
             })
         });
         let installed = native

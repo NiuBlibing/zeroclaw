@@ -238,19 +238,17 @@ pub struct ContextSnapshot {
     pub history_has_trim_breadcrumb: Option<bool>,
 }
 
-/// Executor output derived from the kernel's frozen input. The kernel checks
-/// summary provenance before installing the retained context and summary.
-pub struct ContextSummary {
-    pub kept: ContextSnapshot,
-    pub text: String,
-}
-
 pub type ContextSummaryFuture<'a> =
-    Pin<Box<dyn Future<Output = anyhow::Result<ContextSummary>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>>;
 
-/// Invoked once, after admission and while the foreground lane is held.
-pub type ContextSummaryExecutor<'a> =
-    Box<dyn FnOnce(ContextSnapshot) -> ContextSummaryFuture<'a> + Send + 'a>;
+/// Invoked once under the foreground lane with the kernel-assembled summary
+/// conversation. The executor converts messages and calls the model; context
+/// retention, prompt policy and summary validation remain kernel-owned.
+pub type ContextSummaryExecutor<'a> = Box<
+    dyn FnOnce(Vec<crate::model_provider::ConversationMessage>) -> ContextSummaryFuture<'a>
+        + Send
+        + 'a,
+>;
 
 /// Host-owned metadata observed during execution. This cannot change session
 /// identity, ownership or permissions.

@@ -24,7 +24,7 @@ macro_rules! legacy_fixture_call {
         #[cfg(not(any(test, feature = "test-util")))]
         {
             let _ = (&$repository, $(&$argument),*);
-            Err::<$result, anyhow::Error>(anyhow::anyhow!("legacy transcript operations require the session execution port"))
+            Err::<$result, anyhow::Error>(anyhow::Error::msg("legacy transcript operations require the session execution port"))
         }
     }};
 }

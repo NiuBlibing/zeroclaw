@@ -294,9 +294,13 @@ replay never regenerates a summary. The kernel's embedded session capability
 also exposes frozen branch creation and hide/replace operations. Branches inherit
 context and model selection only through their frozen ancestor cursors.
 
-The kernel takes the execution lane before reading the source projection and
-passes that frozen snapshot to the injected summary executor. Runtime converts
-only this snapshot into provider messages. The kernel returns the committed
+The kernel takes the execution lane before reading the source projection.
+`session/context_summary.rs` derives the retained system messages, assembles
+the summary prompt and rejects empty or reasoning-only summary text. The
+injected executor receives that assembled conversation and returns only text;
+it cannot choose the retained context. Runtime converts the conversation and
+calls the current provider through `ProviderDispatch`; providers own no summary
+policy. The kernel returns the committed
 projection while still holding the lane, so runtime installs that result
 without independently rereading the session. Existing transform and provider
 events retain success, rejection, failure, panic and cancellation evidence.

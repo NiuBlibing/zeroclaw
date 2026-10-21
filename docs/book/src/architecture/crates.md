@@ -13,8 +13,10 @@ also owns approval gating and tool execution contracts. See
 [Append-only session events](./session-events.md).
 
 `session/model_selection.rs` owns selection inheritance and durable switch
-observations. Context maintenance freezes its source under the execution lane
-and invokes an injected summary executor; concrete providers stay outside kernel.
+observations. Context maintenance freezes its source under the execution lane.
+`session/context_summary.rs` owns the summary prompt, system-message retention
+and text validation; an injected executor only converts the assembled
+conversation and calls the model. Concrete providers stay outside kernel.
 
 ### `zeroclaw-session-host`
 
