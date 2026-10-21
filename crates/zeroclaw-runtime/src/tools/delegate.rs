@@ -1157,12 +1157,12 @@ impl DelegateTool {
     /// config handle when one was carried in (so reloads are visible),
     /// otherwise the root snapshot. `None` (with a once-per-process warning)
     /// when the tool was built without either.
-    fn cost_scope_config_snapshot(&self) -> Option<Config> {
+    fn cost_scope_config_snapshot(&self) -> Option<Arc<Config>> {
         if let Some(live) = self.live_config.as_ref() {
-            return Some(live.read().clone());
+            return Some(Arc::new(live.read().clone()));
         }
         if let Some(root) = self.root_config.as_ref() {
-            return Some((**root).clone());
+            return Some(Arc::clone(root));
         }
         delegate_cost_scope_missing_config_warn_once();
         None
@@ -1283,14 +1283,23 @@ impl DelegateTool {
         })
     }
 
-    async fn build_target_provider(
+    fn build_target_provider<'a>(
+        &'a self,
+        target_alias: &'a str,
+        config: Option<&'a Config>,
+        model_provider: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, anyhow::Result<BuiltDelegateProvider>> {
+        Box::pin(self.build_target_provider_body(target_alias, config, model_provider))
+    }
+
+    async fn build_target_provider_body(
         &self,
         target_alias: &str,
         config: Option<&Config>,
         model_provider: &str,
     ) -> anyhow::Result<BuiltDelegateProvider> {
         if let Some(config) = config.or(self.root_config.as_deref()) {
-            let config = config.clone();
+            let config = Box::new(config.clone());
             let target_alias = target_alias.to_string();
             let model_provider = model_provider.to_string();
             return zeroclaw_providers::model::build_nonblocking(move || {
@@ -1376,7 +1385,20 @@ impl DelegateTool {
         .await
     }
 
-    async fn independent_agentic_tools_for_target_from_config(
+    fn independent_agentic_tools_for_target_from_config<'a>(
+        &'a self,
+        config: &'a Config,
+        agent_name: &'a str,
+        target_policy: Arc<SecurityPolicy>,
+    ) -> futures_util::future::BoxFuture<'a, anyhow::Result<IndependentTargetTools>> {
+        Box::pin(self.independent_agentic_tools_for_target_from_config_body(
+            config,
+            agent_name,
+            target_policy,
+        ))
+    }
+
+    async fn independent_agentic_tools_for_target_from_config_body(
         &self,
         config: &Config,
         agent_name: &str,
@@ -3109,7 +3131,16 @@ impl DelegateTool {
 
     /// Spawn a sub-agent in a background tokio task. Returns a task_id immediately.
     /// The result is persisted to `workspace/delegate_results/{task_id}.json`.
-    async fn execute_background(
+    fn execute_background<'a>(
+        &'a self,
+        agent_name: &'a str,
+        prompt: &'a str,
+        args: &'a serde_json::Value,
+    ) -> futures_util::future::BoxFuture<'a, anyhow::Result<ToolResult>> {
+        Box::pin(self.execute_background_body(agent_name, prompt, args))
+    }
+
+    async fn execute_background_body(
         &self,
         agent_name: &str,
         prompt: &str,
@@ -3654,7 +3685,15 @@ impl DelegateTool {
     // ── Parallel Execution ──────────────────────────────────────────
 
     /// Run multiple agents concurrently with the same prompt.
-    async fn execute_parallel(
+    fn execute_parallel<'a>(
+        &'a self,
+        parallel_agents: &'a [serde_json::Value],
+        args: &'a serde_json::Value,
+    ) -> futures_util::future::BoxFuture<'a, anyhow::Result<ToolResult>> {
+        Box::pin(self.execute_parallel_body(parallel_agents, args))
+    }
+
+    async fn execute_parallel_body(
         &self,
         parallel_agents: &[serde_json::Value],
         args: &serde_json::Value,

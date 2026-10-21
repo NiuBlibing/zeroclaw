@@ -25,22 +25,28 @@ struct AdmittedModelConfig {
 
 /// Bind model tools to the same configuration generation as their owning turn.
 /// Nested turns establish their own binding; unrelated agents use their owner.
-pub async fn scope_model_config<F: std::future::Future>(
+pub fn scope_model_config<F: std::future::Future>(
     config: Arc<Config>,
     agent_alias: impl Into<String>,
     future: F,
-) -> F::Output {
-    let parent = ADMITTED_MODEL_CONFIG.try_with(Arc::clone).ok();
-    ADMITTED_MODEL_CONFIG
-        .scope(
-            Arc::new(AdmittedModelConfig {
-                agent_alias: agent_alias.into(),
-                config,
-                parent,
-            }),
-            future,
-        )
-        .await
+) -> impl std::future::Future<Output = F::Output> {
+    // Keep task-local wrappers from embedding the complete caller state
+    // machine again at each nested delegation hop.
+    let future = Box::pin(future);
+    let agent_alias = agent_alias.into();
+    async move {
+        let parent = ADMITTED_MODEL_CONFIG.try_with(Arc::clone).ok();
+        ADMITTED_MODEL_CONFIG
+            .scope(
+                Arc::new(AdmittedModelConfig {
+                    agent_alias,
+                    config,
+                    parent,
+                }),
+                future,
+            )
+            .await
+    }
 }
 
 /// Capture before spawning so pipeline workers and bounded delegates retain
@@ -51,6 +57,7 @@ pub fn inherit_model_config_scope<F: std::future::Future>(
     future: F,
 ) -> impl std::future::Future<Output = F::Output> {
     let admitted = ADMITTED_MODEL_CONFIG.try_with(Arc::clone).ok();
+    let future = Box::pin(future);
     async move {
         match admitted {
             Some(admitted) => ADMITTED_MODEL_CONFIG.scope(admitted, future).await,

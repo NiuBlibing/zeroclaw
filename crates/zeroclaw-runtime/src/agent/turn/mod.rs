@@ -3316,8 +3316,12 @@ async fn run_tool_call_loop_impl<'a>(
             parallel_tools && should_execute_tools_in_parallel(&executable_calls, approval);
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
-        let execution =
-            crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
+        // Each task-local scope otherwise embeds the tool batch's entire
+        // future in both scoped/unscoped branches. Keep one heap allocation
+        // across the admission wrappers, especially for nested delegates.
+        let execution = Box::pin(crate::sop::executor::scope_live_action_queue(
+            live_sop_queue.clone(),
+            async {
                 if allow_parallel_execution && executable_calls.len() > 1 {
                     let meta = ctx.meta();
                     let dispatch = ToolDispatchContext {
@@ -3355,7 +3359,8 @@ async fn run_tool_call_loop_impl<'a>(
                     )
                     .await
                 }
-            });
+            },
+        ));
         // Parallel tool calls are joined in this task. Registry, pipeline, and
         // nested skill calls therefore share this admission without a live read.
         let execution = async {

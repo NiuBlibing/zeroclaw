@@ -24034,9 +24034,13 @@ Let me check the result."#;
                 ..Default::default()
             },
         );
-        config
-            .risk_profiles
-            .insert("default".to_string(), RiskProfileConfig::default());
+        config.risk_profiles.insert(
+            "default".to_string(),
+            RiskProfileConfig {
+                auto_approve: vec!["model_switch".into()],
+                ..Default::default()
+            },
+        );
         config.multimodal.vision_model_provider = Some("ollama.vision".to_string());
 
         let capturing = Arc::new(CapturingObserver::default());
