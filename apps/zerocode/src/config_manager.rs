@@ -9189,13 +9189,6 @@ mod tests {
         terminal
             .draw(|frame| manager.draw_into(frame, frame.area()))
             .unwrap();
-        let before = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
         // The picker keeps the complete option set in state; the compact
         // renderer may clip non-selected rows when the terminal is narrow.
         assert!(manager
