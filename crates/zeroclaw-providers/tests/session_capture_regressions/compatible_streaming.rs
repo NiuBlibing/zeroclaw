@@ -43,7 +43,7 @@ fn assert_preserved_content(store: &dyn SessionEventStore, blocks: &[ResponseBlo
     let mut extension = 0;
     let mut audio_metadata = Vec::new();
     let mut invalid_audio = 0;
-    for block in blocks {
+    for block in semantic_blocks(store, blocks) {
         match block {
             ResponseBlock::Text { text_ref } => {
                 text.push(String::from_utf8(payload_bytes(store, text_ref)).unwrap());
@@ -601,7 +601,7 @@ async fn compatible_stream_decode_failures_preserve_valid_prefix_and_signed_reas
                 let mut texts = String::new();
                 let mut reasoning = Vec::new();
                 let mut media = 0;
-                for block in &response.blocks {
+                for block in semantic_blocks(h.store.as_ref(), &response.blocks) {
                     match block {
                         ResponseBlock::Text { text_ref } => texts.push_str(
                             &String::from_utf8(payload_bytes(&*h.store, text_ref)).unwrap(),

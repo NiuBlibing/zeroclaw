@@ -54,7 +54,7 @@ fn fixture(mode: &str) -> (Vec<Value>, Vec<Value>, Vec<&'static str>, &'static s
             vec![
                 json!({"type":"message","id":"same-message-id","content":[{"type":"output_text","text":"A\u{4e2d}\u{1f642} tail"},{"type":"output_text","text":"B"}]}),
             ],
-            vec!["A", "\u{4e2d}", "\u{1f642}", "B"],
+            vec!["A", "\u{4e2d}", "B", "\u{1f642}"],
             "A\u{4e2d}B\u{1f642}",
         ),
         _ => panic!("unknown fixture"),
@@ -337,8 +337,13 @@ async fn audit(backend: &str, mode: &'static str, ending: &str, streaming: bool)
     let invalid_utf8 = ending.contains("utf8");
     let unfinished_frame = ending.contains("unterminated");
     if mode == "item_suffix" && terminal_frame && !unfinished_frame {
-        expected.insert(3, " tail");
+        expected.push(" tail");
         expected_text = "A\u{4e2d}B\u{1f642} tail";
+    }
+    if mode == "mixed_suffix" && terminal_frame && !unfinished_frame {
+        // A parsed terminal adds item-level metadata, making the mixed
+        // coordinates ambiguous. Capture then retains observation order.
+        expected = vec!["A", "B", "\u{4e2d}", "\u{1f642}", "A"];
     }
     match ending {
         "failed" => frames.push(json!({"type":"response.failed","response":{"error":{"code":"fixture_failed","message":"fixture failed after done"}}})),
@@ -507,9 +512,7 @@ async fn audit(backend: &str, mode: &'static str, ending: &str, streaming: bool)
             ContentCompletion::Partial
         }
     );
-    let texts: Vec<_> = response
-        .blocks
-        .iter()
+    let texts: Vec<_> = semantic_blocks(h.store.as_ref(), &response.blocks)
         .map(|block| match block {
             ResponseBlock::Text { text_ref } => {
                 String::from_utf8(bytes(h.store.as_ref(), text_ref)).expect("text bytes")
@@ -534,12 +537,14 @@ async fn audit(backend: &str, mode: &'static str, ending: &str, streaming: bool)
                     segment_ref,
                 } = operation
                 {
-                    assert_eq!(component, "text");
                     let block: ResponseBlock = h.payload(&segment_ref);
-                    let next = offsets.entry(position).or_insert(0);
+                    assert_eq!(component, block.component().0);
+                    let next = offsets.entry((position, component)).or_insert(0);
                     assert_eq!(byte_offset, *next);
                     *next += block.component().1.byte_len;
-                    segments += 1;
+                    if matches!(block, ResponseBlock::Text { .. }) {
+                        segments += 1;
+                    }
                 }
             }
         }

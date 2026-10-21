@@ -211,9 +211,7 @@ async fn codex_late_coordinates_preserve_observed_order_both_backends() {
                     }
                     let events = h.events();
                     let (reference, response) = response(&h, &events, ending);
-                    let text: Vec<_> = response
-                        .blocks
-                        .iter()
+                    let text: Vec<_> = semantic_blocks(h.store.as_ref(), &response.blocks)
                         .map(|block| match block {
                             ResponseBlock::Text { text_ref } => {
                                 String::from_utf8(bytes(&*h.store, text_ref)).unwrap()
@@ -278,7 +276,7 @@ async fn codex_later_item_parts_preserve_media_and_unknown_updates_both_backends
                 let events = h.events();
                 let (reference, response) = response(&h, &events, "completed");
                 let mut projected = Vec::new();
-                for block in &response.blocks {
+                for block in semantic_blocks(h.store.as_ref(), &response.blocks) {
                     match block {
                         ResponseBlock::Text { text_ref } => {
                             projected.push(String::from_utf8(bytes(&*h.store, text_ref)).unwrap());
@@ -320,9 +318,9 @@ async fn codex_later_item_parts_preserve_media_and_unknown_updates_both_backends
                         vec![
                             "A",
                             "image initial",
-                            "image updated",
                             "audio",
                             "unknown initial",
+                            "image updated",
                             "unknown updated",
                         ]
                     } else {

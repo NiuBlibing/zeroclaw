@@ -42,6 +42,42 @@ struct Harness {
     stream: SessionStreamId,
     admission: Arc<dyn zeroclaw_api::session_events::capture::ProviderAdmissionPort>,
 }
+
+/// Validate supplemental evidence separately from assertions about semantic
+/// content. Unknown semantic blocks still reach the caller's exhaustive match.
+fn semantic_blocks<'a>(
+    store: &'a dyn SessionEventStore,
+    blocks: &'a [ResponseBlock],
+) -> impl Iterator<Item = &'a ResponseBlock> {
+    blocks.iter().filter(move |block| {
+        let ResponseBlock::Other {
+            type_name,
+            classified_body_ref,
+        } = block
+        else {
+            return true;
+        };
+        if type_name != "provider.content_metadata" {
+            return true;
+        }
+        let PayloadRead::Present(payload) = store
+            .read_payload(&classified_body_ref.payload_id)
+            .expect("supplemental evidence")
+        else {
+            panic!("supplemental evidence must remain available");
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&payload.body).expect("metadata JSON");
+        assert!(matches!(
+            value["kind"].as_str(),
+            Some("provider_item" | "content_metadata")
+        ));
+        assert!(value["type_name"].is_string());
+        assert!(value["fields"].is_object());
+        false
+    })
+}
+
 impl Harness {
     fn new(backend: &str) -> Self {
         let dir = tempfile::TempDir::new().expect("dir");
@@ -1589,9 +1625,47 @@ async fn codex_done_only_and_mixed_parts_preserve_order_both_backends() {
                     };
                     record.body
                 };
-                let projected: Vec<_> = response
+                let metadata: Vec<serde_json::Value> = response
                     .blocks
                     .iter()
+                    .filter_map(|block| match block {
+                        ResponseBlock::Other {
+                            type_name,
+                            classified_body_ref,
+                        } if type_name == "provider.content_metadata" => {
+                            Some(h.payload(classified_body_ref))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let expected_message_id = if mode == "unidentified_items" {
+                    "terminal-message-id"
+                } else {
+                    "message-main"
+                };
+                assert!(
+                    metadata.iter().any(|value| {
+                        value["kind"] == "provider_item"
+                            && value["type_name"] == "message"
+                            && value["fields"]["id"] == expected_message_id
+                    }),
+                    "message identity survives capture: {backend} {mode} streaming={streaming}"
+                );
+                if mode == "mixed_items" {
+                    assert!(
+                        metadata
+                            .iter()
+                            .any(|value| { value["fields"]["id"] == "message-prior" })
+                    );
+                }
+                if mode == "duplicate_done" {
+                    assert!(metadata.iter().any(|value| {
+                        value["kind"] == "content_metadata"
+                            && value["fields"]["id"] == "item-tool"
+                            && value["fields"]["call_id"] == "call-fixture"
+                    }));
+                }
+                let projected: Vec<_> = semantic_blocks(h.store.as_ref(), &response.blocks)
                     .map(|block| match block {
                         ResponseBlock::Text { text_ref } => {
                             String::from_utf8(bytes(text_ref)).expect("text bytes")
@@ -1641,12 +1715,16 @@ async fn codex_done_only_and_mixed_parts_preserve_order_both_backends() {
                     .collect();
                 let expected = match mode {
                     "mixed_items" => vec!["P", "A", "audio", "B", "image", "C"],
+                    // Item metadata and part coordinates coexist, so the
+                    // canonical capture retains actual observation order.
+                    "interleaved_delta" => vec!["A", "B", "C", "audio", "image"],
                     "split_delta" => vec!["A", "a", "audio", "B", "image", "C"],
                     "credential_delta" => {
                         vec!["token=[REDACTED]", " tail", "audio", "B", "image", "C"]
                     }
                     "unknown_parts" => vec!["A", "unknown", "audio", "B", "image", "C"],
                     "duplicate_done" => vec![
+                        "tool",
                         "thinking",
                         "reasoning",
                         "A",
@@ -1654,7 +1732,6 @@ async fn codex_done_only_and_mixed_parts_preserve_order_both_backends() {
                         "B",
                         "image",
                         "C",
-                        "tool",
                     ],
                     "unidentified_items" => vec![
                         "A", "audio", "B", "image", "C", "A", "audio", "B", "image", "C",

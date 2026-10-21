@@ -4419,6 +4419,12 @@ async fn run_native_gateway_turn(
         ),
     )
     .await?;
+    // Ordinary webhook turns previously used the non-interactive daemon loop.
+    // Preserve that observer attribution when executing through Agent; streamed
+    // turns retain their existing Agent attribution.
+    if events.is_none() {
+        agent.set_channel_name("daemon".to_string());
+    }
     session_history::restore(port.as_ref(), &mut agent).await?;
     agent.set_memory_session_id(Some(zeroclaw_api::session_keys::sanitize_session_key(
         family,
