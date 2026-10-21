@@ -49,7 +49,6 @@ pub fn alias_kind_for_map_path(path: &str) -> Option<AliasKind> {
                 profile_alias: profile_alias.to_string(),
             });
         }
-    }
 
     if let Some(rest) = path.strip_prefix("providers.") {
         let (cat, family) = rest.split_once('.')?;
