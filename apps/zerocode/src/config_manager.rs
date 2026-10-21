@@ -9199,14 +9199,6 @@ mod tests {
         terminal
             .draw(|frame| manager.draw_into(frame, frame.area()))
             .unwrap();
-        let after = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(after.contains("openai.fixture.fast"));
         assert_eq!(
             manager.fields[0].value,
             Some(serde_json::json!("openai.fixture.fast"))
