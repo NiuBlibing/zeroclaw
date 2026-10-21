@@ -3330,6 +3330,21 @@ mod tests {
     // ── ModelAlias tests ────────────────────────────────────────────────────
 
     #[test]
+    fn model_picker_does_not_invent_truncated_profile_keys() {
+        let cfg: Config = toml::from_str(
+            r#"
+[providers.models.openrouter."glm-5.2"]
+model = "glm-5.2"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_alias_source(crate::traits::AliasSource::ModelProviders),
+            vec!["openrouter.glm-5.2"]
+        );
+    }
+
+    #[test]
     fn quoted_toml_profile_and_model_keys_preserve_cascade_boundaries() {
         let mut cfg: Config = toml::from_str(
             r#"
@@ -3343,6 +3358,15 @@ model_provider = "custom.gw.v2.fast.v1"
         )
         .unwrap();
         let refs = cfg.resolve_alias_source(crate::traits::AliasSource::ModelProviders);
+        assert_eq!(
+            refs,
+            vec![
+                "custom.gw",
+                "custom.gw.v2",
+                "custom.gw.v2.fast",
+                "custom.gw.v2.fast.v1"
+            ]
+        );
         assert!(refs.contains(&"custom.gw.v2".to_string()));
         assert!(refs.contains(&"custom.gw.v2.fast.v1".to_string()));
         assert!(!refs.contains(&"custom.gw.models".to_string()));

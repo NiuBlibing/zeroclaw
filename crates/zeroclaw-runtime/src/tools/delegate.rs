@@ -19442,8 +19442,10 @@ command = "rm independent-delegate-marker"
 
     #[test]
     fn resolve_brain_preserves_dotted_keys() {
-        let mut profile = ModelProviderConfig::default();
-        profile.model = Some("versioned-model".into());
+        let profile = ModelProviderConfig {
+            model: Some("versioned-model".into()),
+            ..Default::default()
+        };
         let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
             .with_providers_models(HashMap::from([(
                 "custom".into(),

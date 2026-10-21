@@ -4695,6 +4695,23 @@ impl Config {
     /// `PropKind::AliasRef` pickers and validation.
     #[must_use]
     pub fn resolve_alias_source(&self, source: crate::traits::AliasSource) -> Vec<String> {
+        // Model references have dynamic keys containing literal dots. Build
+        // them from the typed maps, never from flattened property paths.
+        if source == crate::traits::AliasSource::ModelProviders {
+            let mut refs = Vec::new();
+            for (family, alias, profile) in self.providers.models.iter_entries() {
+                refs.push(format!("{family}.{alias}"));
+                refs.extend(
+                    profile
+                        .models
+                        .keys()
+                        .map(|model| format!("{family}.{alias}.{model}")),
+                );
+            }
+            refs.sort();
+            refs.dedup();
+            return refs;
+        }
         let section = source.section_path();
         if source.is_two_tier() {
             let prefix = format!("{section}.");
@@ -4711,19 +4728,6 @@ impl Config {
                         }
                     }
                 }
-            }
-            if source == crate::traits::AliasSource::ModelProviders {
-                for (family, alias, profile) in self.providers.models.iter_entries() {
-                    out.push(format!("{family}.{alias}"));
-                    out.extend(
-                        profile
-                            .models
-                            .keys()
-                            .map(|model| format!("{family}.{alias}.{model}")),
-                    );
-                }
-                out.sort();
-                out.dedup();
             }
             out.sort();
             out
