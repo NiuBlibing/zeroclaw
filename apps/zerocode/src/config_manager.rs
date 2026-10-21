@@ -9169,6 +9169,8 @@ mod tests {
             }
         });
         manager.sections = vec![entry_with_cost("agents", "")];
+        manager.loaded_section = Some(0);
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
         let mut selected = field("agents.worker.model_provider");
         selected.value = Some(serde_json::json!("openai.fixture.default"));
         selected.populated = true;
@@ -9189,16 +9191,32 @@ mod tests {
         terminal
             .draw(|frame| manager.draw_into(frame, frame.area()))
             .unwrap();
-        // The picker keeps the complete option set in state; the compact
-        // renderer may clip non-selected rows when the terminal is narrow.
-        assert!(manager
-            .select_items
+        let before = terminal
+            .backend()
+            .buffer()
+            .content
             .iter()
-            .any(|item| item == "openai.fixture.fast"));
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(before.contains("openai.fixture.fast"));
+        assert!(
+            manager
+                .select_items
+                .iter()
+                .any(|item| item == "openai.fixture.fast")
+        );
         manager.commit_select(1).await.unwrap();
         terminal
             .draw(|frame| manager.draw_into(frame, frame.area()))
             .unwrap();
+        let after = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(after.contains("openai.fixture.fast"));
         assert_eq!(
             manager.fields[0].value,
             Some(serde_json::json!("openai.fixture.fast"))
