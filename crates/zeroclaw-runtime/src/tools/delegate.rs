@@ -2746,7 +2746,25 @@ impl DelegateTool {
         Ok(result)
     }
 
-    async fn execute_sync_with_admission_inner(
+    fn execute_sync_with_admission_inner<'a>(
+        &'a self,
+        agent_name: &'a str,
+        prompt: &'a str,
+        args: &'a serde_json::Value,
+        admission: DelegateAdmission,
+        execution_admission: Option<AgentExecutionAdmission>,
+    ) -> futures_util::future::BoxFuture<'a, anyhow::Result<ToolResult>> {
+        // Bound nested delegation state at its execution boundary.
+        Box::pin(self.execute_sync_with_admission_inner_body(
+            agent_name,
+            prompt,
+            args,
+            admission,
+            execution_admission,
+        ))
+    }
+
+    async fn execute_sync_with_admission_inner_body(
         &self,
         agent_name: &str,
         prompt: &str,
@@ -4775,7 +4793,33 @@ impl DelegateTool {
         .await
     }
 
-    async fn execute_agentic_with_approval_registry(
+    fn execute_agentic_with_approval_registry<'a>(
+        &'a self,
+        agent_name: &'a str,
+        agent_config: &'a AliasedAgentConfig,
+        provider_type: &'a str,
+        model: &'a str,
+        model_provider: &'a dyn ModelProvider,
+        full_prompt: &'a str,
+        temperature: Option<f64>,
+        admission: DelegateAdmission,
+        approval_context: DelegateApprovalContext<'a>,
+    ) -> futures_util::future::BoxFuture<'a, anyhow::Result<ToolResult>> {
+        // Bound nested delegation state at its execution boundary.
+        Box::pin(self.execute_agentic_with_approval_registry_body(
+            agent_name,
+            agent_config,
+            provider_type,
+            model,
+            model_provider,
+            full_prompt,
+            temperature,
+            admission,
+            approval_context,
+        ))
+    }
+
+    async fn execute_agentic_with_approval_registry_body(
         &self,
         agent_name: &str,
         agent_config: &AliasedAgentConfig,

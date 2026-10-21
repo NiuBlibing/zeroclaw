@@ -987,7 +987,7 @@ pub async fn update_context_windows(
 /// --check` (configured-model verification) and future interactive flows (the
 /// `quickstart` model picker, which also wants pricing) share one fetch path.
 pub async fn fetch_provider_catalog(config: &Config, provider_ref: &str) -> Result<Vec<String>> {
-    let config = config.clone();
+    let config = Box::new(config.clone());
     let provider_ref = provider_ref.to_string();
     let provider = zeroclaw_providers::model::build_nonblocking(move || {
         create_doctor_model_provider(&config, &provider_ref)

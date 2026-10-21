@@ -91,15 +91,23 @@ pub fn shared_construction_depends_on_prop(prop: &str) -> bool {
 
 /// Run provider materialization outside the async runtime's polling context.
 /// Some credential providers perform blocking OAuth refresh during construction.
-pub async fn build_nonblocking<T, F>(factory: F) -> anyhow::Result<T>
+pub fn build_nonblocking<T, F>(
+    factory: F,
+) -> impl std::future::Future<Output = anyhow::Result<T>> + Send
 where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
-    use anyhow::Context;
-    tokio::task::spawn_blocking(factory)
-        .await
-        .context("provider construction task failed")?
+    // Config-owning closures can be large. Box before creating the async
+    // state machine so enclosing catalog and delegated calls retain a pointer
+    // instead of embedding another complete configuration value.
+    let factory = Box::new(factory);
+    async move {
+        use anyhow::Context;
+        tokio::task::spawn_blocking(factory)
+            .await
+            .context("provider construction task failed")?
+    }
 }
 
 /// Materialize a routed binding from an already admitted config generation.

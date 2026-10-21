@@ -332,7 +332,9 @@ pub async fn model_catalog_with_config_result(
     // A configured alias is the canonical source for provider construction:
     // it owns its endpoint, credential, headers, and typed runtime options.
     // Bare-family requests retain the public-catalog fallback below.
-    let configured = config.filter(|_| configured_profile).cloned();
+    let configured = config
+        .filter(|_| configured_profile)
+        .map(|config| Box::new(config.clone()));
     let reference = resolved.as_ref().map_or_else(
         || model_provider.to_owned(),
         |(family, alias, _)| {
