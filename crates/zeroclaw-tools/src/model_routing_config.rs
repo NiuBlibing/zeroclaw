@@ -622,24 +622,24 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        // A three-segment reference explicitly targets a nested model entry.
-        // Parsing mirrors `resolve_model_selection` (`splitn(3)`), so the
-        // model alias may itself contain dots.
+        // Resolve the configured profile boundary before extracting a model
+        // suffix: both profile keys and model keys can contain literal dots.
         let explicit_model_alias = match &provider_update {
             MaybeSet::Set(model_provider) => {
-                let mut parts = model_provider.splitn(3, '.');
-                let family = parts.next().unwrap_or_default();
-                let alias = parts.next();
-                let model_alias = parts.next();
-                match (alias, model_alias) {
-                    (None, _) | (Some(_), None) => None,
-                    (Some(alias), Some(model_alias)) => {
-                        if family.is_empty() || alias.is_empty() || model_alias.is_empty() {
+                match cfg.providers.models.profile_ref(model_provider) {
+                    None => None,
+                    Some((family, alias)) => {
+                        let profile = format!("{family}.{alias}");
+                        let model_alias = model_provider
+                            .trim()
+                            .strip_prefix(&profile)
+                            .and_then(|suffix| suffix.strip_prefix('.'));
+                        if model_alias == Some("") {
                             anyhow::bail!(
                                 "model_provider `{model_provider}` must use `<type>.<alias>` or `<type>.<alias>.<model>` form"
                             );
                         }
-                        Some(model_alias.to_string())
+                        model_alias.map(str::to_string)
                     }
                 }
             }
@@ -1905,7 +1905,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_default_profile_ref_updates_the_selected_nested_default() {
+    async fn set_default_dotted_profile_ref_updates_the_selected_nested_default() {
         let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         use zeroclaw_config::schema::{
             ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
@@ -1919,7 +1919,7 @@ mod tests {
             ..Config::default()
         };
         config.providers.models.openai.insert(
-            "gateway".to_string(),
+            "gateway.v2".to_string(),
             OpenAIModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("legacy-shadowed".to_string()),
@@ -1941,7 +1941,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "model_provider": "openai.gateway",
+                "model_provider": "openai.gateway.v2",
                 "model": "new-default",
                 "temperature": 0.3
             }))
@@ -1949,7 +1949,7 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "{:?}", result.error);
-        let entry = read_saved_provider_entry(&cfg_path, "openai", "gateway").unwrap();
+        let entry = read_saved_provider_entry(&cfg_path, "openai", "gateway.v2").unwrap();
         assert_eq!(entry.model.as_deref(), Some("legacy-shadowed"));
         let selected = entry.models.get("default").unwrap();
         assert_eq!(selected.id.as_deref(), Some("new-default"));

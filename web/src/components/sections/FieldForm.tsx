@@ -70,7 +70,7 @@ import {
   type PatchOp,
 } from "../../lib/api";
 import { useConfigDraft } from "../../lib/draftStore";
-import { entityConfigPath } from "../../lib/entityLinks";
+import { entityConfigPath, modelCatalogTarget } from "../../lib/entityLinks";
 import { useModelProfileAliases } from "../../lib/useModelProfileAliases";
 import { fuzzyFilter } from "../../lib/fuzzy";
 import {
@@ -1918,13 +1918,14 @@ function FieldRow({
   // Per-alias model field — the profile-level `providers.models.<type>.<alias>.model`
   // or a multi-model entry's `providers.models.<type>.<alias>.models.<model_alias>.id`.
   // Both are provider-local model IDs that get the known-model dropdown.
-  const isProviderModelField =
-    /^providers\.models\.[^.]+\.[^.]+\.model$/.test(entry.path) ||
-    /^providers\.models\.[^.]+\.[^.]+\.models\.[^.]+\.id$/.test(entry.path);
+  const catalogAliases = useModelProfileAliases(
+    entry.path.startsWith('providers.models.') ? entry.path.slice('providers.models.'.length) : undefined,
+  );
+  const catalogTarget = modelCatalogTarget(entry.path, catalogAliases);
+  const isProviderModelField = catalogTarget !== undefined && !catalogTarget.array;
   // The same alias's `fallback_models` array (profile-level) — a list of model
   // IDs from the same provider catalog, so it gets the same dropdown per row.
-  const isProviderModelArrayField =
-    /^providers\.models\.[^.]+\.[^.]+\.fallback_models$/.test(entry.path);
+  const isProviderModelArrayField = catalogTarget?.array ?? false;
   // Either model field needs the provider's catalog fetched.
   const needsProviderModels = isProviderModelField || isProviderModelArrayField;
   // Skill-bundle directory field — `skill-bundles.<alias>.directory` (or
@@ -2010,7 +2011,8 @@ function FieldRow({
   useEffect(() => {
     if (!needsProviderModels) return;
     void primeModelProviderCatalog();
-    const [, , provider, alias] = entry.path.split('.');
+    const provider = catalogTarget?.family;
+    const alias = catalogTarget?.alias;
     if (!provider || !alias) return;
     const cacheKey = `${provider}.${alias}`;
     const cached = modelsCache[cacheKey];
@@ -2034,7 +2036,7 @@ function FieldRow({
         setProviderModels([]);
         setModelsFetchFailed(true);
       });
-  }, [needsProviderModels, entry.path]);
+  }, [needsProviderModels, entry.path, catalogTarget?.family, catalogTarget?.alias]);
 
   // Refetch on every mount so newly-created channels / agents / bundles
   // (added in a different section) surface without a page reload.

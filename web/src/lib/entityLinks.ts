@@ -36,6 +36,19 @@ export function modelProfileRef(id: string, aliases: readonly string[]): string 
   return alias ? `${id.slice(0, dot)}.${alias}` : undefined;
 }
 
+/** Property paths are flattened config paths, not TOML source to tokenize.
+ * Resolve the dynamic key from configured aliases before examining its fields.
+ */
+export function modelCatalogTarget(path: string, aliases: readonly string[]): { family: string; alias: string; array: boolean } | undefined {
+  const reference = path.startsWith('providers.models.') ? path.slice('providers.models.'.length) : '';
+  const profile = modelProfileRef(reference, aliases);
+  if (!profile) return undefined;
+  const field = reference.slice(profile.length);
+  if (field !== '.model' && field !== '.fallback_models' && !/^\.models\..+\.id$/.test(field)) return undefined;
+  const dot = profile.indexOf('.');
+  return { family: profile.slice(0, dot), alias: profile.slice(dot + 1), array: field === '.fallback_models' };
+}
+
 export function entityConfigPath(kind: EntityKind, id: string, modelAliases: readonly string[] = []): string {
   const { section, shape } = ENTITY_SECTION[kind];
   if (shape === 'picker') return `/config/${section}`;

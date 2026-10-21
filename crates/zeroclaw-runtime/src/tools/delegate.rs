@@ -1524,18 +1524,30 @@ impl DelegateTool {
     /// Resolve `model_provider` (`type.alias` or `type.alias.model`) →
     /// (provider_type, credential, model, temperature).
     fn resolve_brain(&self, model_provider: &str) -> (String, Option<String>, String, Option<f64>) {
-        let mut parts = model_provider.splitn(3, '.');
-        let type_key = parts.next().unwrap_or(model_provider);
-        let alias_key = parts.next();
-        let model_alias = parts.next();
-
-        if let Some(alias_key) = alias_key
-            && let Some(alias_map) = self.providers_models.get(type_key)
-            && let Some(cfg) = alias_map.get(alias_key)
+        let (type_key, tail) = model_provider
+            .split_once('.')
+            .unwrap_or((model_provider, ""));
+        if let Some(alias_map) = self.providers_models.get(type_key)
+            && let Some((alias, cfg)) = alias_map
+                .iter()
+                .filter(|(alias, _)| {
+                    tail == alias.as_str() || tail.starts_with(&format!("{alias}."))
+                })
+                .max_by_key(|(alias, _)| alias.len())
         {
             // A three-segment ref selects a model entry; its `id` (with its own
             // temperature) overrides the profile's `model`/`temperature`.
-            let model_entry = model_alias.and_then(|m| cfg.models.get(m));
+            let model_alias = tail
+                .strip_prefix(alias.as_str())
+                .and_then(|suffix| suffix.strip_prefix('.'));
+            let model_entry = match model_alias {
+                Some(alias) => cfg.models.get(alias),
+                None => cfg.models.get("default").or_else(|| {
+                    (cfg.models.len() == 1)
+                        .then(|| cfg.models.values().next())
+                        .flatten()
+                }),
+            };
             let model = model_entry
                 .and_then(|e| e.id.clone())
                 .or_else(|| cfg.model.clone())
@@ -19426,6 +19438,23 @@ command = "rm independent-delegate-marker"
                 assert_eq!(body["temperature"], expected_temperature);
             }
         }
+    }
+
+    #[test]
+    fn resolve_brain_preserves_dotted_keys() {
+        let mut profile = ModelProviderConfig::default();
+        profile.model = Some("versioned-model".into());
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_providers_models(HashMap::from([(
+                "custom".into(),
+                HashMap::from([
+                    ("gw".into(), ModelProviderConfig::default()),
+                    ("gw.v2".into(), profile),
+                ]),
+            )]));
+        let (family, _, model, _) = tool.resolve_brain("custom.gw.v2");
+        assert_eq!(family, "custom");
+        assert_eq!(model, "versioned-model");
     }
 
     #[test]

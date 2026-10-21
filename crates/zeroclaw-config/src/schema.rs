@@ -4695,6 +4695,21 @@ impl Config {
     /// `PropKind::AliasRef` pickers and validation.
     #[must_use]
     pub fn resolve_alias_source(&self, source: crate::traits::AliasSource) -> Vec<String> {
+        if source == crate::traits::AliasSource::ModelProviders {
+            let mut refs = Vec::new();
+            for (family, alias, profile) in self.providers.models.iter_entries() {
+                refs.push(format!("{family}.{alias}"));
+                refs.extend(
+                    profile
+                        .models
+                        .keys()
+                        .map(|model| format!("{family}.{alias}.{model}")),
+                );
+            }
+            refs.sort();
+            refs.dedup();
+            return refs;
+        }
         let section = source.section_path();
         if source.is_two_tier() {
             let prefix = format!("{section}.");
@@ -4708,22 +4723,6 @@ impl Config {
                         let dotted = format!("{ty}.{alias}");
                         if !out.contains(&dotted) {
                             out.push(dotted);
-                        }
-                    }
-                }
-            }
-            // For model providers, also append per-profile model alias entries as
-            // three-segment `<family>.<alias>.<model_alias>` refs so pickers can
-            // target individual models without requiring a separate provider profile.
-            if source == crate::traits::AliasSource::ModelProviders {
-                for (family, alias, profile) in self.providers.models.iter_entries() {
-                    let mut model_aliases: Vec<&str> =
-                        profile.models.keys().map(String::as_str).collect();
-                    model_aliases.sort();
-                    for model_alias in model_aliases {
-                        let three_seg = format!("{family}.{alias}.{model_alias}");
-                        if !out.contains(&three_seg) {
-                            out.push(three_seg);
                         }
                     }
                 }

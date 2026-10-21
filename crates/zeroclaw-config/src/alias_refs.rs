@@ -38,13 +38,11 @@ pub fn alias_kind_for_map_path(path: &str) -> Option<AliasKind> {
 
     // providers.models.<family>.<profile_alias>.models — model alias level
     if let Some(rest) = path.strip_prefix("providers.models.") {
-        let mut parts = rest.splitn(3, '.');
-        if let (Some(family), Some(profile_alias), Some("models")) =
-            (parts.next(), parts.next(), parts.next())
+        if let Some((family, profile_alias)) = rest
+            .strip_suffix(".models")
+            .and_then(|profile| profile.split_once('.'))
             && !family.is_empty()
-            && !family.contains('.')
             && !profile_alias.is_empty()
-            && !profile_alias.contains('.')
         {
             return Some(AliasKind::ModelAlias {
                 family: family.to_string(),
@@ -426,7 +424,9 @@ fn delete_model_alias(
 
     let applied = report.scrubs.clone();
     let target = format!("{family}.{profile_alias}.{model_alias}");
-    scrub_model_alias_refs(cfg, &target);
+    if cfg.providers.models.profile_ref(&target) == Some((family, profile_alias)) {
+        scrub_model_alias_refs(cfg, &target);
+    }
 
     // Remove the model alias from the profile's models map.
     let section = format!("providers.models.{family}.{profile_alias}.models");
@@ -964,6 +964,9 @@ fn rewrite_model_alias_refs(
     new: &str,
 ) -> Vec<String> {
     let old_target = format!("{family}.{profile_alias}.{old}");
+    if cfg.providers.models.profile_ref(&old_target) != Some((family, profile_alias)) {
+        return Vec::new();
+    }
     let new_target = format!("{family}.{profile_alias}.{new}");
     let mut dirty = Vec::new();
     for (name, agent) in cfg.agents.iter_mut() {
@@ -1274,6 +1277,9 @@ fn collect_model_alias_refs(
     sites: &mut Vec<RefSite>,
 ) {
     let target = format!("{family}.{profile_alias}.{model_alias}");
+    if cfg.providers.models.profile_ref(&target) != Some((family, profile_alias)) {
+        return;
+    }
     for (name, agent) in sorted_agents(cfg) {
         if agent.model_provider.as_str().trim() == target {
             sites.push(RefSite::hard(
@@ -3324,6 +3330,53 @@ mod tests {
 
     // ── ModelAlias tests ────────────────────────────────────────────────────
 
+    #[test]
+    fn quoted_toml_profile_and_model_keys_preserve_cascade_boundaries() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+[providers.models.custom.gw.models."v2.fast"]
+id = "short-profile-model"
+[providers.models.custom."gw.v2".models."fast.v1"]
+id = "versioned-model"
+[agents.bot]
+model_provider = "custom.gw.v2.fast.v1"
+"#,
+        )
+        .unwrap();
+        let refs = cfg.resolve_alias_source(crate::traits::AliasSource::ModelProviders);
+        assert!(refs.contains(&"custom.gw.v2".to_string()));
+        assert!(refs.contains(&"custom.gw.v2.fast.v1".to_string()));
+        assert!(!refs.contains(&"custom.gw.models".to_string()));
+        assert!(
+            find_all_references(&cfg, &model_alias_kind("custom", "gw"), "v2.fast.v1").is_empty()
+        );
+        let kind = alias_kind_for_map_path("providers.models.custom.gw.v2.models").unwrap();
+        assert!(!plan_delete(&cfg, &kind, "fast.v1").allowed);
+        rename_with_cascade(&mut cfg, &kind, "fast.v1", "fast_v2").unwrap();
+        assert_eq!(
+            cfg.agents["bot"].model_provider.as_str(),
+            "custom.gw.v2.fast_v2"
+        );
+        let reloaded: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            reloaded
+                .resolve_model_selection("custom.gw.v2.fast_v2")
+                .unwrap()
+                .model_id
+                .as_deref(),
+            Some("versioned-model")
+        );
+        assert!(
+            reloaded
+                .providers
+                .models
+                .find("custom", "gw")
+                .unwrap()
+                .models
+                .contains_key("v2.fast")
+        );
+    }
+
     fn model_alias_kind(family: &str, profile_alias: &str) -> AliasKind {
         AliasKind::ModelAlias {
             family: family.to_string(),
@@ -3333,6 +3386,10 @@ mod tests {
 
     #[test]
     fn alias_kind_for_map_path_recognizes_model_alias_section() {
+        assert_eq!(
+            alias_kind_for_map_path("providers.models.custom.gw.models.v2.models"),
+            Some(model_alias_kind("custom", "gw.models.v2"))
+        );
         let kind = alias_kind_for_map_path("providers.models.custom.rag_bot.models");
         assert_eq!(
             kind,
