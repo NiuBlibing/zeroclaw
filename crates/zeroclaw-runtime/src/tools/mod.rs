@@ -7161,6 +7161,7 @@ permissions = ["http_client"]
             OpenAIModelProviderConfig {
                 base: ModelProviderConfig {
                     requires_openai_auth: true,
+                    model: Some("gpt-5-codex".into()),
                     ..ModelProviderConfig::default()
                 },
             },

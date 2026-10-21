@@ -287,7 +287,11 @@ mod tests {
                     " \t ",
                     ConfigApiCode::RequiredFieldEmpty,
                     "model",
-                    "model must not be empty",
+                    if section == "model_routes" {
+                        "model may be omitted only when model_provider resolves to a configured model id"
+                    } else {
+                        "model must not be empty"
+                    },
                 ),
             ] {
                 let mut config = Config::default();

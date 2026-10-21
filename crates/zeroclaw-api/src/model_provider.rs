@@ -753,13 +753,8 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         sampling: CallSampling,
         policy: ToolRoundPolicy,
     ) -> anyhow::Result<ChatResponse> {
-        match policy {
-            ToolRoundPolicy::Batch => self.chat_with_sampling(request, model, sampling).await,
-            ToolRoundPolicy::Single => {
-                self.chat_with_tool_round_policy(request, model, sampling.resolve_for(None), policy)
-                    .await
-            }
-        }
+        self.chat_with_tool_round_policy(request, model, sampling.resolve_for(None), policy)
+            .await
     }
 
     fn stream_chat_with_sampling_and_tool_round_policy(
@@ -770,18 +765,13 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         options: StreamOptions,
         policy: ToolRoundPolicy,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-        match policy {
-            ToolRoundPolicy::Batch => {
-                self.stream_chat_with_sampling(request, model, sampling, options)
-            }
-            ToolRoundPolicy::Single => self.stream_chat_with_tool_round_policy(
-                request,
-                model,
-                sampling.resolve_for(None),
-                options,
-                policy,
-            ),
-        }
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            sampling.resolve_for(None),
+            options,
+            policy,
+        )
     }
 
     async fn chat_with_system_with_sampling(
@@ -1593,6 +1583,100 @@ mod capability_tests {
                 .native_tool_calling,
             "model-aware capability lookup must preserve legacy supports_native_tools overrides"
         );
+    }
+}
+
+#[cfg(test)]
+mod combined_call_tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct PolicyProvider(Mutex<Vec<(ToolRoundPolicy, Option<f64>)>>);
+
+    impl crate::attribution::Attributable for PolicyProvider {
+        fn role(&self) -> crate::attribution::Role {
+            crate::attribution::Role::Provider(crate::attribution::ProviderKind::Model(
+                crate::attribution::ModelProviderKind::Custom,
+            ))
+        }
+        fn alias(&self) -> &str {
+            "policy-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for PolicyProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            panic!("combined calls must reach the explicit policy implementation")
+        }
+
+        async fn chat_with_tool_round_policy(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            temperature: Option<f64>,
+            policy: ToolRoundPolicy,
+        ) -> anyhow::Result<ChatResponse> {
+            self.0.lock().unwrap().push((policy, temperature));
+            Ok(ChatResponse {
+                text: Some("ok".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn stream_chat_with_tool_round_policy(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            temperature: Option<f64>,
+            _: StreamOptions,
+            policy: ToolRoundPolicy,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.0.lock().unwrap().push((policy, temperature));
+            stream::empty().boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn combined_calls_preserve_explicit_policy_for_both_transports() {
+        let provider = Arc::new(PolicyProvider::default());
+        let mut expected = Vec::new();
+        for policy in [ToolRoundPolicy::Batch, ToolRoundPolicy::Single] {
+            for temperature in [None, Some(0.4)] {
+                expected.extend([(policy, temperature); 2]);
+                provider
+                    .chat_with_sampling_and_tool_round_policy(
+                        ChatRequest::new(&[]),
+                        "model",
+                        CallSampling::Explicit(temperature),
+                        policy,
+                    )
+                    .await
+                    .unwrap();
+                let events = provider
+                    .stream_chat_with_sampling_and_tool_round_policy(
+                        ChatRequest::new(&[]),
+                        "model",
+                        CallSampling::Explicit(temperature),
+                        StreamOptions::default(),
+                        policy,
+                    )
+                    .collect::<Vec<_>>()
+                    .await;
+                assert!(events.is_empty());
+            }
+        }
+        assert_eq!(*provider.0.lock().unwrap(), expected);
     }
 }
 

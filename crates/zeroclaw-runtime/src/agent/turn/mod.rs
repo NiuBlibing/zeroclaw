@@ -1602,14 +1602,14 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     p: ToolLoop<'a>,
     subject: InitialIngressSubject<'a>,
     reported_usage: Option<ReportedRequestUsage>,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, Some(subject), reported_usage)
+) -> futures_util::future::BoxFuture<'a, Result<String>> {
+    Box::pin(run_tool_call_loop_impl(p, Some(subject), reported_usage))
 }
 
-pub fn run_tool_call_loop(
-    p: ToolLoop<'_>,
-) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_tool_call_loop_impl(p, None, None)
+pub fn run_tool_call_loop(p: ToolLoop<'_>) -> futures_util::future::BoxFuture<'_, Result<String>> {
+    // Bound the future stored by every transport and delegated turn. The turn
+    // state machine is large even when its nested provider calls are boxed.
+    Box::pin(run_tool_call_loop_impl(p, None, None))
 }
 
 async fn run_tool_call_loop_impl<'a>(

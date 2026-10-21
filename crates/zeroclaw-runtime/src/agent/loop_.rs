@@ -23947,7 +23947,7 @@ Let me check the result."#;
                                 "type": "function",
                                 "function": {
                                     "name": "model_switch",
-                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.default\",\"model\":\"switched-model\"}"
+                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.switched.default\",\"model\":\"switched-model\"}"
                                 }
                             }]
                         }
@@ -24105,7 +24105,7 @@ Let me check the result."#;
             .expect("AgentEnd for the switch agent should be present");
         assert_eq!(
             end_route,
-            ("ollama.default".to_string(), "switched-model".to_string()),
+            ("ollama.switched".to_string(), "switched-model".to_string()),
             "AgentEnd must be attributed to the switched-TO route (set_model_route), \
              not the original one, got {events:?}"
         );

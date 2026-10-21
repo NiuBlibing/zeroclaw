@@ -3081,6 +3081,20 @@ impl Agent {
         agent_alias: &str,
         context: AgentBuildContext<'_>,
     ) -> Result<Self> {
+        // Keep construction state out of enclosing RPC/delegation futures.
+        Box::pin(Self::from_config_with_context_body(
+            config,
+            agent_alias,
+            context,
+        ))
+        .await
+    }
+
+    async fn from_config_with_context_body(
+        config: &Config,
+        agent_alias: &str,
+        context: AgentBuildContext<'_>,
+    ) -> Result<Self> {
         let AgentBuildContext {
             session_cwd,
             initialize_mcp,
@@ -3892,7 +3906,7 @@ impl Agent {
             let selector = format!("hint:{}", selection.route.hint);
             let installed_route = self.model_route_resolver.resolve(&selector);
             if installed_route.provider_name != selection.route.model_provider
-                || installed_route.model != selection.route.effective_model(&config)
+                || installed_route.model != selection.route.effective_model(config)
             {
                 return Err(anyhow::Error::msg(
                     "effort routing changed after this provider generation was installed; retry after the model configuration refresh completes",
@@ -3901,7 +3915,7 @@ impl Agent {
             super::eval::log_effort_route_selection(&selection, user_message.len(), "agent");
             return Ok(TurnModelSelection {
                 selector,
-                allowed_provider_refs: Some(Arc::new(selection.allowed_profile_refs(&config))),
+                allowed_provider_refs: Some(Arc::new(selection.allowed_profile_refs(config))),
             });
         }
 
@@ -4117,6 +4131,12 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        // A caller may keep several sequential turn futures in one state
+        // machine. Store the large turn state on the heap at this boundary.
+        Box::pin(self.turn_body(user_message)).await
+    }
+
+    async fn turn_body(&mut self, user_message: &str) -> Result<String> {
         if user_message.trim().is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
@@ -4623,12 +4643,12 @@ impl Agent {
         steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
         let mut steering = CloseSteeringOnExit(steering_rx);
-        self.turn_streamed_with_steering_body(
+        Box::pin(self.turn_streamed_with_steering_body(
             user_message,
             event_tx,
             cancel_token,
             steering.0.as_deref_mut(),
-        )
+        ))
         .await
     }
 
