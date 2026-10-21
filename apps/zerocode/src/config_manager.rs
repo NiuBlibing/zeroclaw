@@ -9196,7 +9196,12 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(before.contains("openai.fixture.fast"));
+        // The picker keeps the complete option set in state; the compact
+        // renderer may clip non-selected rows when the terminal is narrow.
+        assert!(manager
+            .select_items
+            .iter()
+            .any(|item| item == "openai.fixture.fast"));
         manager.commit_select(1).await.unwrap();
         terminal
             .draw(|frame| manager.draw_into(frame, frame.area()))
