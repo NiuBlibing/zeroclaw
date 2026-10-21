@@ -3076,18 +3076,17 @@ impl Agent {
         Self::from_config_with_context(&config, agent_alias, context).await
     }
 
-    pub async fn from_config_with_context(
+    pub fn from_config_with_context(
         config: &Config,
         agent_alias: &str,
         context: AgentBuildContext<'_>,
-    ) -> Result<Self> {
+    ) -> futures_util::future::BoxFuture<'_, Result<Self>> {
         // Keep construction state out of enclosing RPC/delegation futures.
         Box::pin(Self::from_config_with_context_body(
             config,
             agent_alias,
             context,
         ))
-        .await
     }
 
     async fn from_config_with_context_body(
@@ -4130,10 +4129,10 @@ impl Agent {
         )
     }
 
-    pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+    pub fn turn(&mut self, user_message: &str) -> futures_util::future::BoxFuture<'_, Result<String>> {
         // A caller may keep several sequential turn futures in one state
         // machine. Store the large turn state on the heap at this boundary.
-        Box::pin(self.turn_body(user_message)).await
+        Box::pin(self.turn_body(user_message))
     }
 
     async fn turn_body(&mut self, user_message: &str) -> Result<String> {

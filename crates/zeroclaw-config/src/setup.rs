@@ -289,6 +289,8 @@ mod tests {
                     "model",
                     if section == "model_routes" {
                         "model may be omitted only when model_provider resolves to a configured model id"
+                    } else if provider == "openai" {
+                        "model_provider must use two-segment `<type>.<alias>` form; set embedding_routes[0].model separately (got \"openai\")"
                     } else {
                         "model must not be empty"
                     },
