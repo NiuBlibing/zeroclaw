@@ -89,7 +89,8 @@ impl ToolScope {
         let _ = self.owner.wakeups.send(self.stream.clone());
         Ok(receipt)
     }
-    /// Resolve from committed content rather than a second response/call map.
+    /// Associate the proposal with the current committed response. Arguments
+    /// may have undergone schema recovery; they are not a call identifier.
     fn proposal(&self, intent: &ToolPreparationIntent) -> anyhow::Result<(EventId, usize)> {
         if let Some(event) = self.owner.store.read_latest_event(
             &self.stream,
@@ -109,13 +110,7 @@ impl ToolScope {
                     ResponseBlock::ToolCall { tool_call_ref } => {
                         let call: serde_json::Value =
                             serde_json::from_slice(&self.payload(tool_call_ref)?)?;
-                        let arguments_ref: StoredPayloadRef =
-                            serde_json::from_value(call["arguments_ref"].clone())?;
-                        let arguments: serde_json::Value =
-                            serde_json::from_slice(&self.payload(&arguments_ref)?)?;
                         if call["name"].as_str() == Some(&intent.proposed_name)
-                            && arguments
-                                == privacy::classify_value(intent.proposed_arguments.clone())
                             && intent.provider_call_id.as_ref().is_none_or(|id| {
                                 call["provider_call_id"].as_str() == Some(id.as_str())
                             })
@@ -133,16 +128,12 @@ impl ToolScope {
             }
             if let Some(index) = text_index {
                 let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(&text);
-                if calls.iter().any(|call| {
-                    call.name == intent.proposed_name
-                        && call.arguments
-                            == privacy::classify_value(intent.proposed_arguments.clone())
-                }) {
+                if calls.iter().any(|call| call.name == intent.proposed_name) {
                     return Ok((event.event_id.clone(), index));
                 }
             }
             // A proposal must come from the immediately preceding response,
-            // never an older call with coincidentally identical arguments.
+            // never an older call with coincidentally identical identifiers.
         }
         anyhow::bail!("tool_proposal_has_no_committed_provider_origin")
     }

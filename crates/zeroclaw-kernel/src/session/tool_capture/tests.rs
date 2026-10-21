@@ -202,6 +202,19 @@ impl Harness {
             .events
     }
     async fn prepare(&self, text_protocol: bool) -> Arc<dyn PreparedToolPort> {
+        self.prepare_with_arguments(
+            text_protocol,
+            serde_json::json!({"command":"true"}),
+            serde_json::json!({"command":"true"}),
+        )
+        .await
+    }
+    async fn prepare_with_arguments(
+        &self,
+        text_protocol: bool,
+        provider_arguments: serde_json::Value,
+        execution_arguments: serde_json::Value,
+    ) -> Arc<dyn PreparedToolPort> {
         let provider = self.owner.provider_capture(
             self.stream.clone(),
             self.branch.clone(),
@@ -223,17 +236,17 @@ impl Harness {
             })
             .await
             .expect("provider admit");
-        let args = PayloadRecord::json(
-            "session.tool-arguments/v1",
-            &serde_json::json!({"command":"true"}),
-        )
-        .expect("args");
+        let args =
+            PayloadRecord::json("session.tool-arguments/v1", &provider_arguments).expect("args");
         let call=PayloadRecord::json("session.tool-call/v1",&serde_json::json!({"name":"shell","provider_call_id":"call-1","arguments_ref":StoredPayloadRef::from(&args)})).expect("call");
         let text = PayloadRecord::new(
             PayloadId::new(),
             "session.text/v1".into(),
-            b"<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"true\"}}</tool_call>"
-                .to_vec(),
+            format!(
+                "<tool_call>{}</tool_call>",
+                serde_json::json!({"name":"shell","arguments":provider_arguments})
+            )
+            .into_bytes(),
         )
         .expect("text");
         let response = PayloadRecord::json(
@@ -275,15 +288,108 @@ impl Harness {
         tools
             .prepare(ToolPreparationIntent {
                 proposed_name: "shell".into(),
-                proposed_arguments: serde_json::json!({"command":"true"}),
                 provider_call_id: (!text_protocol).then(|| "call-1".into()),
                 name: "shell".into(),
-                arguments: serde_json::json!({"command":"true"}),
+                arguments: execution_arguments,
                 approval_requirement: "prompt".into(),
                 trusted_route: serde_json::json!({"channel":"fixture"}),
             })
             .await
             .expect("prepare")
+    }
+}
+
+#[tokio::test]
+async fn recovered_arguments_preserve_origin_and_execute_after_approval() {
+    for backend in ["sqlite", "jsonl"] {
+        for text_protocol in [false, true] {
+            for recovered in [
+                serde_json::json!({"maxResults":3}),
+                serde_json::json!(["first", "second"]),
+            ] {
+                let h = Harness::new(backend);
+                let provider_arguments = serde_json::json!({"params":recovered.to_string()});
+                let execution_arguments = serde_json::json!({"params":recovered});
+                let port = h
+                    .prepare_with_arguments(
+                        text_protocol,
+                        provider_arguments.clone(),
+                        execution_arguments.clone(),
+                    )
+                    .await;
+                port.verify_action("shell", &execution_arguments)
+                    .await
+                    .expect("recovered arguments are the execution input");
+                assert!(
+                    port.verify_action("shell", &provider_arguments)
+                        .await
+                        .is_err()
+                );
+                assert!(port.start().await.is_err(), "approval is still required");
+                port.request_approval(Default::default())
+                    .await
+                    .expect("request");
+                port.resolve_approval(
+                    ChannelApprovalResponse::Approve,
+                    "approved",
+                    None,
+                    serde_json::json!({"fixture_operator_reply":true}),
+                )
+                .await
+                .expect("approve");
+                let _observer = port.start().await.expect("start recovered call");
+                let events = h.events();
+                let proposal = events
+                    .iter()
+                    .find_map(|event| match &event.body.data {
+                        EventData::ToolCallProposed {
+                            provider_result_event_id,
+                            block_index,
+                        } => Some((provider_result_event_id, *block_index)),
+                        _ => None,
+                    })
+                    .expect("proposal origin");
+                let provider = events
+                    .iter()
+                    .find(|event| event.body.kind() == EventKind::ProviderAttemptCompleted)
+                    .expect("provider response");
+                assert_eq!(proposal, (&provider.event_id, 0));
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| event.body.kind() == EventKind::ToolEffectStarted)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn proposal_still_requires_current_provider_call_identity() {
+    for backend in ["sqlite", "jsonl"] {
+        let h = Harness::new(backend);
+        let _prepared = h.prepare(false).await;
+        let tools = h.owner.tool_capture(
+            h.stream.clone(),
+            h.branch.clone(),
+            h.turn.clone(),
+            h.authority.clone(),
+        );
+        for (name, id) in [("different", "call-1"), ("shell", "different")] {
+            assert!(
+                tools
+                    .prepare(ToolPreparationIntent {
+                        proposed_name: name.into(),
+                        provider_call_id: Some(id.into()),
+                        name: "shell".into(),
+                        arguments: serde_json::json!({"command":"true"}),
+                        approval_requirement: "prompt".into(),
+                        trusted_route: serde_json::json!({"channel":"fixture"}),
+                    })
+                    .await
+                    .is_err()
+            );
+        }
     }
 }
 
@@ -1092,7 +1198,6 @@ async fn approval_resolution_rejects_another_invocations_delivered_reply() {
             )
             .prepare(ToolPreparationIntent {
                 proposed_name: "shell".into(),
-                proposed_arguments: serde_json::json!({"command":"true"}),
                 provider_call_id: Some("call-1".into()),
                 name: "shell".into(),
                 arguments: serde_json::json!({"command":"true"}),

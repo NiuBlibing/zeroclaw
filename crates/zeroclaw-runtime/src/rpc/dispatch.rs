@@ -32346,7 +32346,7 @@ mod tests {
                     last_progress_event_id:None,
                 }, vec![arguments, call, response]).await?;
                 let prepared = current_tool_admission().expect("tool admission").prepare(ToolPreparationIntent {
-                    proposed_name:"shell".into(), proposed_arguments:json!({"command":"true"}),
+                    proposed_name:"shell".into(),
                     provider_call_id:Some("revision-call".into()), name:"shell".into(),
                     arguments:json!({"command":"true"}), approval_requirement:"not_required".into(),
                     trusted_route:json!({"source":"fixture"}),

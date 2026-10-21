@@ -331,12 +331,11 @@ pub fn current_provider_admission() -> Option<Arc<dyn ProviderAdmissionPort>> {
     ADMISSION.try_with(Arc::clone).ok()
 }
 
-/// The original proposal and the action after host hooks/defaults are distinct
-/// observations. Neither is an authorization grant.
+/// The provider call identity and the action after schema recovery and host
+/// hooks/defaults are distinct observations. Neither is an authorization grant.
 #[derive(Clone, Debug)]
 pub struct ToolPreparationIntent {
     pub proposed_name: String,
-    pub proposed_arguments: Value,
     pub provider_call_id: Option<String>,
     pub name: String,
     pub arguments: Value,

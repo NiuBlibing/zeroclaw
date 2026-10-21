@@ -161,7 +161,6 @@ async fn record_suppressed_proposal(
     if let Some(port) = zeroclaw_api::session_events::capture::current_tool_admission() {
         port.prepare(zeroclaw_api::session_events::capture::ToolPreparationIntent {
             proposed_name: call.name.clone(),
-            proposed_arguments: call.arguments.clone(),
             provider_call_id: call.tool_call_id.clone(),
             name: name.into(),
             arguments: arguments.clone(),
@@ -374,7 +373,7 @@ pub(crate) async fn prepare_tool_calls(
             zeroclaw_api::session_events::capture::current_tool_admission()
         {
             match port.prepare(zeroclaw_api::session_events::capture::ToolPreparationIntent {
-                proposed_name:call.name.clone(),proposed_arguments:call.arguments.clone(),provider_call_id:call.tool_call_id.clone(),
+                proposed_name:call.name.clone(),provider_call_id:call.tool_call_id.clone(),
                 name:tool_name.clone(),arguments:tool_args.clone(),
                 approval_requirement:match ctx.approval.map(|manager|manager.approval_requirement(&tool_name)) {
                     Some(crate::approval::ApprovalRequirement::Prompt)=>"prompt",

@@ -193,7 +193,6 @@ impl TurnExecutorPort for ContextExecutor {
                 .prepare(
                     zeroclaw_api::session_events::capture::ToolPreparationIntent {
                         proposed_name: "shell".into(),
-                        proposed_arguments: serde_json::json!({"command":"true"}),
                         provider_call_id: Some(id.into()),
                         name: "shell".into(),
                         arguments: serde_json::json!({"command":"true"}),
