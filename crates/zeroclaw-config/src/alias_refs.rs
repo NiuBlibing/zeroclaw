@@ -37,8 +37,8 @@ pub fn alias_kind_for_map_path(path: &str) -> Option<AliasKind> {
     }
 
     // providers.models.<family>.<profile_alias>.models — model alias level
-    if let Some(rest) = path.strip_prefix("providers.models.") {
-        if let Some((family, profile_alias)) = rest
+    if let Some(rest) = path.strip_prefix("providers.models.")
+        && let Some((family, profile_alias)) = rest
             .strip_suffix(".models")
             .and_then(|profile| profile.split_once('.'))
             && !family.is_empty()
