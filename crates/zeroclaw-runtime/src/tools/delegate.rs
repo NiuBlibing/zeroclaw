@@ -1321,9 +1321,12 @@ impl DelegateTool {
         credential: Option<&str>,
     ) -> anyhow::Result<(Box<dyn ModelProvider>, String, String)> {
         if let Some(config) = config.or(self.root_config.as_deref()) {
-            let (provider, provider_name, model_name, _resolver) =
-                crate::agent::agent::build_session_model_provider(config, model_provider, None)?;
-            return Ok((provider, provider_name, model_name));
+            let binding = zeroclaw_providers::factory::build_session_model_provider(
+                config,
+                model_provider,
+                None,
+            )?;
+            return Ok((binding.provider, binding.provider_ref, binding.model));
         }
         let provider = zeroclaw_providers::create_model_provider_with_options(
             provider_type,

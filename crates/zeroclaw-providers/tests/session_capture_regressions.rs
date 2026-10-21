@@ -776,15 +776,15 @@ async fn cancelled_provider_attempts_retain_durable_partial_and_never_retry() {
             let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 if summary {
                     session
-                        .summarize_context(
-                            ContextSnapshot {
+                        .summarize_context(ProviderPurpose::Summary, Box::new(move |_source| Box::pin(async move {
+      let kept = ContextSnapshot {
                                 messages: vec![],
                                 history_has_trim_breadcrumb: Some(false),
-                            },
-                            ProviderPurpose::Summary,
-                            Box::pin(work),
-                        )
-                        .await
+                            };
+      let text = Box::pin(work).await?;
+      Ok(zeroclaw_api::session_events::capture::ContextSummary { kept, text })
+  })))
+                        .await.map(|_| String::new())
                 } else {
                     session.execute(input.clone(), Box::pin(work)).await
                 }
@@ -1140,14 +1140,26 @@ async fn audit_summary(backend: &str) {
                 None,
             )
             .await?;
-        Ok(response.text_or_empty().to_owned())
+        Ok::<String, anyhow::Error>(response.text_or_empty().to_owned())
     };
     assert_eq!(
         session
-            .summarize_context(kept, ProviderPurpose::Summary, Box::pin(generate))
+            .summarize_context(
+                ProviderPurpose::Summary,
+                Box::new(move |source| Box::pin(async move {
+                    assert_eq!(
+                        source.chat_projection().last().unwrap().content,
+                        "old context"
+                    );
+                    let text = generate.await?;
+                    Ok(zeroclaw_api::session_events::capture::ContextSummary { kept, text })
+                }))
+            )
             .await
-            .unwrap(),
-        "answer"
+            .unwrap()
+            .chat_projection()[0]
+            .content,
+        "[Context summary]\nanswer"
     );
     let restored = session.restore_context().await.unwrap().unwrap();
     assert_eq!(restored.messages.len(), 1);
@@ -1237,10 +1249,18 @@ async fn audit_summary(backend: &str) {
                 None,
             )
             .await?;
-        Ok(response.text_or_empty().to_owned())
+        Ok::<String, anyhow::Error>(response.text_or_empty().to_owned())
     };
     session
-        .summarize_context(kept, ProviderPurpose::Summary, Box::pin(generated))
+        .summarize_context(
+            ProviderPurpose::Summary,
+            Box::new(move |_source| {
+                Box::pin(async move {
+                    let text = generated.await?;
+                    Ok(zeroclaw_api::session_events::capture::ContextSummary { kept, text })
+                })
+            }),
+        )
         .await
         .expect("second summary");
     let restored_again = session
@@ -1267,12 +1287,18 @@ async fn audit_summary(backend: &str) {
     // the transform independently of its captured uncertain provider attempt.
     let failure = session
         .summarize_context(
-            ContextSnapshot {
-                messages: vec![],
-                history_has_trim_breadcrumb: None,
-            },
             ProviderPurpose::ContextRepair,
-            Box::pin(async { anyhow::bail!("fixture summary rejected") }),
+            Box::new(move |_source| {
+                Box::pin(async move {
+                    let kept = ContextSnapshot {
+                        messages: vec![],
+                        history_has_trim_breadcrumb: None,
+                    };
+                    let text =
+                        Box::pin(async { anyhow::bail!("fixture summary rejected") }).await?;
+                    Ok(zeroclaw_api::session_events::capture::ContextSummary { kept, text })
+                })
+            }),
         )
         .await;
     assert!(failure.is_err());
@@ -1292,15 +1318,21 @@ async fn audit_summary(backend: &str) {
     );
     let cancellation = session
         .summarize_context(
-            ContextSnapshot {
-                messages: vec![],
-                history_has_trim_breadcrumb: None,
-            },
             ProviderPurpose::Summary,
-            Box::pin(async {
-                Err(anyhow::Error::new(
-                    zeroclaw_api::turn_stop::ToolLoopCancelled,
-                ))
+            Box::new(move |_source| {
+                Box::pin(async move {
+                    let kept = ContextSnapshot {
+                        messages: vec![],
+                        history_has_trim_breadcrumb: None,
+                    };
+                    let text = Box::pin(async {
+                        Err(anyhow::Error::new(
+                            zeroclaw_api::turn_stop::ToolLoopCancelled,
+                        ))
+                    })
+                    .await?;
+                    Ok(zeroclaw_api::session_events::capture::ContextSummary { kept, text })
+                })
             }),
         )
         .await;

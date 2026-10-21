@@ -27,6 +27,10 @@ use zeroclaw_providers::{
     self, ChatMessage, ConversationMessage, ModelProvider, ToolResultMessage,
 };
 
+#[path = "session_adapter.rs"]
+mod session_adapter;
+use session_adapter::{RestoreTurnModel, SessionModelProvider};
+
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
@@ -35,104 +39,9 @@ pub use zeroclaw_api::agent::TurnEvent;
 /// type (see `crate::agent::turn::ContextLimitsResolver`).
 use crate::agent::loop_::ContextLimitsResolver;
 
-/// Provider handle, its `<type>.<alias>` reference, the resolved model name,
-/// and the route resolver bound to that provider — the four values a session
-/// needs to swap a model provider while keeping route-aware limits correct.
-type SessionModelProvider = (
-    Box<dyn ModelProvider>,
-    String,
-    String,
-    Arc<zeroclaw_providers::router::ModelRouteResolver>,
-);
-
 struct TurnModelSelection {
     selector: String,
     allowed_provider_refs: Option<Arc<HashSet<String>>>,
-}
-
-type PreparedModelSwitch = (
-    Box<dyn ModelProvider>,
-    Arc<zeroclaw_providers::router::ModelRouteResolver>,
-);
-
-/// Retain the actual base route only while a turn temporarily replaces it.
-/// Restoring on drop also covers a cancelled or dropped turn future.
-struct RestoreTurnModel<'a> {
-    agent: &'a mut Agent,
-    base: Option<SessionModelProvider>,
-}
-
-impl Drop for RestoreTurnModel<'_> {
-    fn drop(&mut self) {
-        if let Some((provider, provider_name, model, resolver)) = self.base.take() {
-            self.agent.model_provider = provider;
-            self.agent.model_provider_name = provider_name;
-            self.agent.model_name = model;
-            self.agent.model_route_resolver = resolver;
-        }
-    }
-}
-
-pub fn build_session_model_provider(
-    config: &Config,
-    model_provider_ref: &str,
-    model_override: Option<&str>,
-) -> Result<SessionModelProvider> {
-    let (model_provider_name, model_provider_alias) = model_provider_ref
-        .split_once('.')
-        .map(|(t, a)| (t.to_string(), a.to_string()))
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
-            ))
-        })?;
-
-    let entry = config
-        .providers
-        .models
-        .find(&model_provider_name, &model_provider_alias);
-    let model_name = model_override
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            entry
-                .and_then(|e| e.model.as_deref())
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .map(str::to_string)
-        })
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "model_provider `{model_provider_ref}` has no `model` configured and no model \
-                 override was supplied"
-            ))
-        })?;
-
-    let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
-        config,
-        &model_provider_name,
-        &model_provider_alias,
-    );
-
-    let (model_provider, model_route_resolver) =
-        zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-            config,
-            model_provider_ref,
-            entry.and_then(|e| e.api_key.as_deref()),
-            entry.and_then(|e| e.uri.as_deref()),
-            &config.reliability,
-            &config.model_routes,
-            &model_name,
-            &model_provider_runtime_options,
-        )?;
-
-    Ok((
-        model_provider,
-        model_provider_ref.to_string(),
-        model_name,
-        model_route_resolver,
-    ))
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -3098,23 +3007,15 @@ impl Agent {
         };
 
         let provider_ref = format!("{provider_name}.{provider_alias}");
-        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+        let zeroclaw_providers::factory::SessionModelProvider {
+            provider: model_provider,
+            route_resolver: model_route_resolver,
+            ..
+        } = zeroclaw_providers::factory::build_session_model_provider(
             config,
-            provider_name,
-            provider_alias,
-        );
-
-        let (model_provider, model_route_resolver) =
-            zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-                config,
-                &provider_ref,
-                agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.and_then(|e| e.uri.as_deref()),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
+            &provider_ref,
+            Some(&model_name),
+        )?;
 
         let tool_dispatcher =
             tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref(), &model_name);
@@ -3597,205 +3498,6 @@ impl Agent {
         Ok(())
     }
 
-    async fn apply_observed_model_switch(
-        &mut self,
-        current_model: &str,
-        provider: String,
-        model: String,
-        turn_base: Option<&mut Option<SessionModelProvider>>,
-    ) -> Result<Option<String>> {
-        use zeroclaw_api::session_events::capture::{
-            ModelChangeDisposition, ModelOverrideSelection, ModelRouteMode,
-            current_provider_admission, current_session_execution,
-        };
-        let thinking = match current_session_execution() {
-            Some(session) => match session.restore_model_override().await? {
-                Some(ModelOverrideSelection::Set { thinking, .. })
-                | Some(ModelOverrideSelection::Inherit { thinking }) => thinking,
-                _ => None,
-            },
-            None => None,
-        };
-        let selection = ModelOverrideSelection::Set {
-            provider_ref: provider.clone(),
-            model: model.clone(),
-            thinking,
-            route_mode: if self.automatic_model_routing {
-                ModelRouteMode::Automatic
-            } else {
-                ModelRouteMode::Manual
-            },
-        };
-        let prepared = self.prepare_model_switch(current_model, &provider, &model);
-        if let Some(admission) = current_provider_admission() {
-            admission
-                .observe_model_change(
-                    selection,
-                    match &prepared {
-                        Ok(_) if turn_base.is_some() => ModelChangeDisposition::AppliedForTurn,
-                        Ok(_) => ModelChangeDisposition::Applied,
-                        Err(error) => ModelChangeDisposition::Rejected {
-                            reason_key: "model_switch_construction_failed".into(),
-                            diagnostic: Some(Self::session_execution_diagnostic(error)),
-                        },
-                    },
-                )
-                .await?;
-        }
-        match prepared {
-            Ok(Some((new_provider, resolver))) => {
-                let previous = (
-                    std::mem::replace(&mut self.model_provider, new_provider),
-                    std::mem::replace(&mut self.model_provider_name, provider),
-                    std::mem::replace(&mut self.model_name, model.clone()),
-                    std::mem::replace(&mut self.model_route_resolver, resolver),
-                );
-                if let Some(base) = turn_base {
-                    base.get_or_insert(previous);
-                }
-                Ok(Some(model))
-            }
-            Ok(None) => Ok(None),
-            Err(error) => {
-                ::zeroclaw_log::record!(ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error":Self::session_execution_diagnostic(&error)})),
-                    "model_switch_construction_failed");
-                Ok(None)
-            }
-        }
-    }
-
-    /// Restore a committed selection using the provider's canonical route
-    /// configuration. Credential bytes are resolved here, never from history.
-    pub fn restore_session_model_selection(
-        &mut self,
-        selection: zeroclaw_api::session_events::capture::ModelOverrideSelection,
-    ) -> Result<()> {
-        use zeroclaw_api::session_events::capture::{ModelOverrideSelection, ModelRouteMode};
-        self.sync_config_generation();
-        let (provider, model, route_mode) = match selection {
-            ModelOverrideSelection::Set {
-                provider_ref,
-                model,
-                route_mode,
-                ..
-            } => (provider_ref, model, route_mode),
-            ModelOverrideSelection::Inherit { .. } | ModelOverrideSelection::Clear => {
-                let config = self
-                    .provider_switch_config
-                    .as_ref()
-                    .and_then(|config| config.config.as_ref())
-                    .ok_or_else(|| {
-                        anyhow::Error::msg("session_default_model_configuration_missing")
-                    })?;
-                let (family, alias, entry) = config
-                    .resolved_model_provider_for_agent(&self.agent_alias)
-                    .ok_or_else(|| anyhow::Error::msg("session_default_model_profile_missing"))?;
-                (
-                    format!("{family}.{alias}"),
-                    entry
-                        .model
-                        .clone()
-                        .ok_or_else(|| anyhow::Error::msg("session_default_model_missing"))?,
-                    ModelRouteMode::Automatic,
-                )
-            }
-        };
-        if let Some((new_provider, resolver)) =
-            self.prepare_model_switch(&self.model_name, &provider, &model)?
-        {
-            self.model_provider = new_provider;
-            self.model_route_resolver = resolver;
-            self.model_provider_name = provider;
-            self.model_name = model;
-        }
-        self.automatic_model_routing = route_mode == ModelRouteMode::Automatic;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn try_apply_model_switch(
-        &mut self,
-        current_effective_model: &str,
-        new_model_provider: String,
-        new_model: String,
-    ) -> Option<String> {
-        let (new_provider, resolver) = self
-            .prepare_model_switch(current_effective_model, &new_model_provider, &new_model)
-            .ok()??;
-        self.model_provider = new_provider;
-        self.model_route_resolver = resolver;
-        self.model_provider_name = new_model_provider;
-        self.model_name = new_model.clone();
-        Some(new_model)
-    }
-
-    fn prepare_model_switch(
-        &self,
-        current_effective_model: &str,
-        new_model_provider: &str,
-        new_model: &str,
-    ) -> Result<Option<PreparedModelSwitch>> {
-        if new_model_provider == self.model_provider_name && new_model == current_effective_model {
-            return Ok(None);
-        }
-        let switch_outcome: anyhow::Result<PreparedModelSwitch> = match self
-            .provider_switch_config
-            .as_ref()
-            .and_then(|cfg| cfg.config.as_ref())
-        {
-            Some(full_config) => {
-                let target_entry = new_model_provider
-                    .split_once('.')
-                    .and_then(|(family, alias)| full_config.providers.models.find(family, alias));
-                // A dotted target profile is the canonical source of endpoint
-                // and credentials. Falling back to the current agent profile is
-                // only retained for legacy bare-family switch requests.
-                let current_agent_entry = full_config
-                    .resolved_model_provider_for_agent(&self.agent_alias)
-                    .map(|(_ty, _alias, entry)| entry);
-                let target_or_current = target_entry.or(current_agent_entry);
-                let default_api_key = target_or_current.and_then(|entry| entry.api_key.as_deref());
-                let default_base_url = target_or_current.and_then(|entry| entry.uri.as_deref());
-
-                // Prefer a route-specific api_key when the switched
-                // provider/model matches a configured model_route entry.
-                let route_api_key = full_config
-                    .model_routes
-                    .iter()
-                    .find(|r| {
-                        r.model_provider.eq_ignore_ascii_case(new_model_provider)
-                            && (r.model.eq_ignore_ascii_case(new_model)
-                                || r.hint.eq_ignore_ascii_case(new_model))
-                    })
-                    .and_then(|r| r.api_key.as_deref());
-                let api_key = route_api_key.or(default_api_key);
-
-                let runtime_options =
-                    switch_runtime_options(full_config.as_ref(), new_model_provider);
-
-                zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-                    full_config.as_ref(),
-                    new_model_provider,
-                    api_key,
-                    default_base_url,
-                    &full_config.reliability,
-                    &full_config.model_routes,
-                    new_model,
-                    &runtime_options,
-                )
-            }
-            None => Err(anyhow::Error::msg(
-                "model_switch requested but agent has no provider_switch_config; \
-                 cannot rebuild provider safely",
-            )),
-        };
-
-        switch_outcome.map(Some)
-    }
-
     fn classify_model(&self, user_message: &str) -> Result<TurnModelSelection> {
         let resolved_agent = self
             .full_config()
@@ -4059,61 +3761,6 @@ impl Agent {
     /// existing credential boundary before a session owner persists it.
     pub fn session_execution_diagnostic(error: &anyhow::Error) -> String {
         zeroclaw_api::session_events::privacy::classify_text(&format!("{error:#}"))
-    }
-
-    /// Manual native compaction uses the existing provider dispatch and lane.
-    /// The kernel records the frozen source, actual attempt and ordered result.
-    pub async fn compact_native_context(
-        &mut self,
-        native: Arc<dyn zeroclaw_api::session_events::capture::SessionExecutionPort>,
-    ) -> Result<usize> {
-        use zeroclaw_api::session_events::{ProviderPurpose, capture::ContextSnapshot};
-        let context = native
-            .restore_context()
-            .await?
-            .ok_or_else(|| anyhow::Error::msg("native_context_missing"))?;
-        let mut messages = self.tool_dispatcher.to_provider_messages(&context.messages);
-        messages.push(ChatMessage::user("Summarize the conversation for continuation. Preserve unresolved requests, decisions, tool outcomes and relevant file references. Return only the summary."));
-        let kept = ContextSnapshot {
-            messages: context
-                .messages
-                .iter()
-                .filter(|m| matches!(m,ConversationMessage::Chat(c) if c.role=="system"))
-                .cloned()
-                .collect(),
-            history_has_trim_breadcrumb: Some(true),
-        };
-        let generate = async {
-            let response = zeroclaw_providers::dispatch::ProviderDispatch::from_ref(
-                self.model_provider.as_ref(),
-            )
-            .chat(
-                zeroclaw_api::model_provider::ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                    thinking: None,
-                },
-                &self.model_name,
-                self.temperature,
-            )
-            .await?;
-            anyhow::ensure!(
-                !response.is_semantically_empty_terminal(),
-                "empty_context_summary"
-            );
-            Ok(response.text_or_empty().to_owned())
-        };
-        native
-            .summarize_context(kept, ProviderPurpose::Summary, Box::pin(generate))
-            .await?;
-        let installed = native
-            .restore_context()
-            .await?
-            .ok_or_else(|| anyhow::Error::msg("native_context_missing"))?;
-        let count = installed.messages.len();
-        self.seed_conversation_history(installed.messages);
-        self.set_history_has_trim_breadcrumb(installed.history_has_trim_breadcrumb.unwrap_or(true));
-        Ok(count)
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
@@ -5569,30 +5216,6 @@ impl Agent {
     }
 }
 
-/// Runtime options for the provider a live model switch rebuilds.
-///
-/// Dotted aliases resolve their entry through `provider_runtime_options_for_alias`;
-/// a bare family reference has no entry, and must take the config-owned
-/// `[multimodal]` policy through `provider_runtime_options_for_bare_family`
-/// rather than `ModelProviderRuntimeOptions::default()`. The default embeds
-/// `max_images = 4` / `max_image_size_mb = 5`, so a bare-family switch built
-/// on defaults would re-normalize already-prepared history under narrower
-/// caps than the operator configured and silently drop images.
-///
-/// A free function so a regression can pin the switch path's options
-/// directly — the rebuilt provider box is opaque to the runtime's tests.
-fn switch_runtime_options(
-    config: &zeroclaw_config::schema::Config,
-    new_model_provider: &str,
-) -> zeroclaw_providers::ModelProviderRuntimeOptions {
-    match new_model_provider.split_once('.') {
-        Some((family, alias)) => {
-            zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias)
-        }
-        None => zeroclaw_providers::provider_runtime_options_for_bare_family(config),
-    }
-}
-
 pub async fn run(
     config: Config,
     agent_alias: &str,
@@ -5683,53 +5306,6 @@ mod tests {
             origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
             internal_principal: None,
         }
-    }
-
-    #[test]
-    fn build_session_model_provider_rejects_undotted_ref() {
-        let config = Config::default();
-        let err = match build_session_model_provider(&config, "anthropic", Some("m")) {
-            Ok(_) => panic!("undotted ref must error"),
-            Err(e) => e,
-        };
-        assert!(err.to_string().contains("<type>.<alias>"), "got: {err}");
-    }
-
-    #[test]
-    fn build_session_model_provider_requires_a_model() {
-        // No configured entry and no override → cannot resolve a model name.
-        let config = Config::default();
-        let err = match build_session_model_provider(&config, "anthropic.default", None) {
-            Ok(_) => panic!("missing model must error"),
-            Err(e) => e,
-        };
-        assert!(
-            err.to_string().contains("no `model` configured"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn build_session_model_provider_returns_full_canonical_ref() {
-        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
-
-        let mut config = Config::default();
-        config.providers.models.openai.insert(
-            "fast".to_string(),
-            OpenAIModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("gpt-4o-mini".to_string()),
-                    api_key: Some("test-key".to_string()),
-                    ..Default::default()
-                },
-            },
-        );
-
-        let (_provider, provider_ref, model, _route_resolver) =
-            build_session_model_provider(&config, "openai.fast", None).unwrap();
-
-        assert_eq!(provider_ref, "openai.fast");
-        assert_eq!(model, "gpt-4o-mini");
     }
 
     /// Regression: trim write-back must never persist the provider-only
@@ -20716,31 +20292,6 @@ model_provider = "custom.only"
             "provider_name must update on a provider-only switch"
         );
         assert_eq!(agent.model_name, "shared-name");
-    }
-
-    #[test]
-    fn model_switch_options_carry_the_configured_policy_for_bare_families() {
-        // A live switch to a bare family rebuilds the provider from the
-        // config. Building it on `ModelProviderRuntimeOptions::default()`
-        // reset the provider boundary to `max_images = 4` /
-        // `max_image_size_mb = 5`, so a request the operator had configured
-        // for 8 images was re-trimmed to 4 after the switch. The switch path
-        // must resolve the config-owned policy for bare families, the same
-        // way dotted aliases resolve theirs.
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.multimodal.max_images = 8;
-        config.multimodal.max_image_size_mb = 10;
-
-        let options = switch_runtime_options(&config, "ollama");
-
-        assert_eq!(
-            options.multimodal.max_images, 8,
-            "a bare-family switch must carry the configured max_images, not the default 4"
-        );
-        assert_eq!(
-            options.multimodal.max_image_size_mb, 10,
-            "a bare-family switch must carry the configured max_image_size_mb, not the default 5"
-        );
     }
 
     #[test]

@@ -12,6 +12,10 @@ runtime, provider or channel implementations. The first extracted tool cohort
 also owns approval gating and tool execution contracts. See
 [Append-only session events](./session-events.md).
 
+`session/model_selection.rs` owns selection inheritance and durable switch
+observations. Context maintenance freezes its source under the execution lane
+and invokes an injected summary executor; concrete providers stay outside kernel.
+
 ### `zeroclaw-session-host`
 
 Reusable application composition for native session families. It binds the
@@ -26,6 +30,8 @@ The agent loop, security-policy enforcement, SOP engine, cron scheduler, SubAgen
 Notable submodules:
 
 - `agent/`: the main request/response loop, streaming, tool-call orchestration
+- `agent/session_adapter.rs`: installs resolved provider bindings into the Agent
+  and converts frozen context for summary dispatch; session decisions stay in kernel
 - `security/`: policy types, sandbox detection, OTP, emergency stop
 - `sop/`: Standard Operating Procedure engine (see [SOP → Overview](../sop/index.md))
 - `subagent/`: SubAgent spawning and lifecycle (see [Delegation & SubAgents](../agents/delegation.md))

@@ -264,6 +264,12 @@ guard restores the actual base provider and resolver after a temporary switch,
 including failure, cancellation and dropped futures. Channel restoration keeps
 an explicit selection even when it equals the configured default and resolves
 route credentials from current configuration.
+Selection inheritance and switch observations live in kernel's
+`session/model_selection.rs`. The provider factory resolves concrete handles,
+credentials and route resolvers; runtime's `agent/session_adapter.rs` only
+installs those bindings into the Agent and restores turn-local replacements.
+The provider handle, canonical route identity and resolver travel together in
+one transient binding. This adds no persisted selection or policy cache.
 Explicit channel selections also bind the provider's primary model pin and
 cache entry, so a refreshed profile default cannot replace the selected model
 on the wire. Automatic hint routes retain their existing profile-pin rules.
@@ -287,6 +293,13 @@ and again before installation. Failure leaves the prior context installed;
 replay never regenerates a summary. The kernel's embedded session capability
 also exposes frozen branch creation and hide/replace operations. Branches inherit
 context and model selection only through their frozen ancestor cursors.
+
+The kernel takes the execution lane before reading the source projection and
+passes that frozen snapshot to the injected summary executor. Runtime converts
+only this snapshot into provider messages. The kernel returns the committed
+projection while still holding the lane, so runtime installs that result
+without independently rereading the session. Existing transform and provider
+events retain success, rejection, failure, panic and cancellation evidence.
 
 Context projections retain the complete conversation, including tool-call and
 tool-result pairing, reasoning continuation and opaque provider signatures.

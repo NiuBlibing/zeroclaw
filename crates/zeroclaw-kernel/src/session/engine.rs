@@ -4,7 +4,6 @@
 use super::execution::{TurnExecutorPort, UserTurnCommand};
 use super::query::{PayloadSelector, SessionAccess, SessionAccessPolicy, SessionQuery};
 use super::*;
-use futures_util::FutureExt;
 use zeroclaw_api::principal::PrincipalId;
 use zeroclaw_api::session_events::capture::{
     ContextSnapshot, ContextTransformIntent, EngineFileInput, EngineTurnFuture, EngineTurnInput,
@@ -194,11 +193,13 @@ pub struct EngineSession {
     source: Option<Arc<dyn EngineSessionSource>>,
 }
 impl EngineSession {
-    pub(super) fn active_turn(&self) -> Result<Option<TurnId>, ContractError> {
-        if ACTIVE_ENGINE_SESSION
+    pub(super) fn is_active(&self) -> bool {
+        ACTIVE_ENGINE_SESSION
             .try_with(|(stream, branch)| stream == &self.stream && branch == &self.branch)
             .unwrap_or(false)
-        {
+    }
+    pub(super) fn active_turn(&self) -> Result<Option<TurnId>, ContractError> {
+        if self.is_active() {
             zeroclaw_api::session_events::capture::current_engine_turn_id()
                 .map(|id| TurnId::parse(&id))
                 .transpose()
@@ -501,187 +502,15 @@ impl SessionExecutionPort for EngineSession {
 
     async fn restore_context(&self) -> anyhow::Result<Option<ContextSnapshot>> {
         let event = self.latest_context().await?;
-        let query = self.context_query();
-        let read = |path| {
-            query.read_payload(
-                self.stream.clone(),
-                PayloadSelector {
-                    event_sequence: event.sequence,
-                    reference_path: path,
-                },
-                64 * 1024 * 1024,
-            )
-        };
-        let PayloadRead::Present(context) = read(vec![0]).await? else {
-            anyhow::bail!("engine context projection has been erased");
-        };
-        let value: serde_json::Value = serde_json::from_slice(&context.body)?;
-        let messages = if let Some(items) = value.get("message_refs") {
-            let refs: Vec<MessageRef> = serde_json::from_value(items.clone())?;
-            let owner = self.owner.clone();
-            let stream = self.stream.clone();
-            let authority = self.authority.clone();
-            let branch = self.branch.clone();
-            self.owner
-                .blocking(move || {
-                    authority.authorize_context(&stream, &branch)?;
-                    let messages = refs
-                        .iter()
-                        .map(|item| {
-                            super::context_messages::resolve_message(
-                                owner.store.as_ref(),
-                                &stream,
-                                item,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let messages = messages.into_iter().flatten().collect();
-                    authority.authorize_context(&stream, &branch)?;
-                    Ok(messages)
-                })
-                .await?
-        } else if value.get("messages_ref").is_some() {
-            // Registered context references follow canonical object order:
-            // an optional imported message view precedes messages_ref.
-            let index = value
-                .get("legacy_messages")
-                .and_then(serde_json::Value::as_array)
-                .map_or(0, Vec::len);
-            let PayloadRead::Present(bytes) = read(vec![0, index]).await? else {
-                anyhow::bail!("engine historical context bytes have been erased");
-            };
-            decode_context_messages(&bytes.body)?
-        } else if let Some(entries) = value
-            .get("legacy_messages")
-            .and_then(serde_json::Value::as_array)
-        {
-            let mut messages = Vec::new();
-            for (index, entry) in entries.iter().enumerate() {
-                let role = entry
-                    .get("role")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| anyhow::Error::msg("legacy context role missing"))?;
-                let PayloadRead::Present(content) = read(vec![0, index]).await? else {
-                    anyhow::bail!("legacy engine content has been erased");
-                };
-                let content: ContentPayload = serde_json::from_slice(&content.body)?;
-                let mut text = String::new();
-                for (part, recorded) in content.parts.iter().enumerate() {
-                    if matches!(recorded, RecordedContentPart::Text { .. }) {
-                        let PayloadRead::Present(bytes) = read(vec![0, index, part]).await? else {
-                            anyhow::bail!("legacy engine text has been erased");
-                        };
-                        text.push_str(std::str::from_utf8(&bytes.body)?);
-                    } else {
-                        anyhow::bail!("legacy engine context representation unsupported");
-                    }
-                }
-                messages.push(zeroclaw_api::model_provider::ConversationMessage::Chat(
-                    zeroclaw_api::model_provider::ChatMessage {
-                        role: role.into(),
-                        content: text,
-                    },
-                ));
-            }
-            messages
-        } else {
-            decode_context_messages(&serde_json::to_vec(
-                value
-                    .get("messages")
-                    .ok_or_else(|| anyhow::Error::msg("engine context codec unsupported"))?,
-            )?)?
-        };
-        Ok(Some(ContextSnapshot {
-            messages,
-            history_has_trim_breadcrumb: value
-                .get("history_has_trim_breadcrumb")
-                .and_then(serde_json::Value::as_bool),
-        }))
+        self.read_context_snapshot(event).await
     }
+
     async fn summarize_context(
         &self,
-        kept: ContextSnapshot,
         purpose: ProviderPurpose,
-        summary: EngineTurnFuture<'_>,
-    ) -> anyhow::Result<String> {
-        anyhow::ensure!(
-            purpose != ProviderPurpose::Main,
-            "summary_requires_maintenance_purpose"
-        );
-        let input = self.latest_context().await?;
-        let active = ACTIVE_ENGINE_SESSION
-            .try_with(|(stream, branch)| stream == &self.stream && branch == &self.branch)
-            .unwrap_or(false);
-        let lane = self.owner.foreground_lock(&self.stream);
-        let _permit = if active {
-            None
-        } else {
-            Some(lane.lock().await)
-        };
-        SessionAccessPolicy::authorize_actor(
-            self.authority.as_ref(),
-            &self.actor,
-            &self.stream,
-            SessionAccess::Write,
-        )?;
-        let turn = if active { self.active_turn()? } else { None };
-        let transform = self
-            .owner
-            .begin_context_transform(
-                super::context::ContextTransformCommand {
-                    stream: self.stream.clone(),
-                    branch: self.branch.clone(),
-                    turn,
-                    expected_projection: Some(input.event_id),
-                    intent: ContextTransformIntent {
-                        reason_key: if purpose == ProviderPurpose::Summary {
-                            "model_context_summary"
-                        } else {
-                            "model_context_repair"
-                        }
-                        .into(),
-                        algorithm_version: "model-summary/v1".into(),
-                        budget: 0,
-                    },
-                    execution_binding: Some(self.authority.maintenance_binding()?),
-                },
-                self.authority.clone(),
-            )
-            .await?;
-        let capture = transform.provider_capture(purpose)?;
-        let result = std::panic::AssertUnwindSafe(
-            zeroclaw_api::session_events::capture::scope_provider_capture(capture, summary),
-        )
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|_| Err(anyhow::Error::msg("summary_executor_panic")));
-        match result {
-            Ok(text) => {
-                transform.complete_summary(kept, text.clone()).await?;
-                Ok(text)
-            }
-            Err(error) => {
-                let settlement = if zeroclaw_api::turn_stop::is_tool_loop_cancelled(&error) {
-                    transform
-                        .cancelled("summary_cooperatively_stopped".into())
-                        .await
-                } else {
-                    transform
-                        .failed(
-                            self.authority
-                                .diagnostic(&error)
-                                .unwrap_or_else(|| "summary_generation_failed".into()),
-                        )
-                        .await
-                };
-                if let Err(settlement) = settlement {
-                    return Err(error.context(format!(
-                        "summary_generation_settlement_failed: {settlement:#}"
-                    )));
-                }
-                Err(error)
-            }
-        }
+        summary: zeroclaw_api::session_events::capture::ContextSummaryExecutor<'_>,
+    ) -> anyhow::Result<ContextSnapshot> {
+        self.summarize_frozen_context(purpose, summary).await
     }
     async fn replace_context(
         &self,
@@ -703,10 +532,7 @@ impl SessionExecutionPort for EngineSession {
         // Use its bound transform port rather than taking that lane again.
         // A port belonging to another stream must use ordinary maintenance
         // admission, even when invoked from inside an unrelated turn.
-        if ACTIVE_ENGINE_SESSION
-            .try_with(|(stream, branch)| stream == &self.stream && branch == &self.branch)
-            .unwrap_or(false)
-        {
+        if self.is_active() {
             let port = zeroclaw_api::session_events::capture::current_provider_admission()
                 .ok_or_else(|| anyhow::Error::msg("active engine capture missing"))?;
             let transform = port

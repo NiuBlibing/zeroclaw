@@ -1897,6 +1897,104 @@ async fn context_installation_errors_settle_once_without_inventing_uncertain_out
 }
 
 #[tokio::test]
+async fn summary_uses_the_projection_committed_by_the_previous_lane_owner() {
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::TempDir::new().expect("directory");
+        let (port, _) = session(directory.path(), backend);
+        let lane = port.owner.foreground_lock(&port.stream);
+        let permit = lane.lock().await;
+        // Queue an update first, then a summary behind it. Tokio's FIFO lane
+        // must make the summary consume the update's committed projection.
+        let update = port.append_assistant("previous lane owner committed this");
+        tokio::pin!(update);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(update.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        let summary = port.summarize_context(
+            ProviderPurpose::Summary,
+            Box::new(|source| {
+                Box::pin(async move {
+                    assert_eq!(
+                        source.chat_projection().last().expect("new input").content,
+                        "previous lane owner committed this"
+                    );
+                    anyhow::bail!("fixture_summary_stop")
+                })
+            }),
+        );
+        tokio::pin!(summary);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(summary.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        drop(permit);
+        let (updated, summarized) = tokio::join!(update, summary);
+        updated.expect("update committed");
+        assert!(
+            summarized
+                .expect_err("fixture stop")
+                .to_string()
+                .contains("fixture_summary_stop")
+        );
+        assert_eq!(
+            port.restore_context()
+                .await
+                .expect("restore")
+                .expect("context")
+                .chat_projection()
+                .last()
+                .expect("retained input")
+                .content,
+            "previous lane owner committed this"
+        );
+    }
+}
+
+#[tokio::test]
+async fn summary_executor_panics_settle_and_revoked_executors_never_run() {
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::TempDir::new().expect("directory");
+        let (port, authority) = session(directory.path(), backend);
+        let error = port
+            .summarize_context(
+                ProviderPurpose::Summary,
+                Box::new(|_| panic!("fixture executor construction")),
+            )
+            .await
+            .expect_err("panic settled");
+        assert!(error.to_string().contains("summary_executor_panic"));
+        assert_eq!(
+            port.owner
+                .stream_history(&port.stream)
+                .expect("history")
+                .last()
+                .expect("outcome")
+                .body
+                .kind(),
+            EventKind::ContextTransformFailed
+        );
+        let through = port.owner.store.head(&port.stream).expect("head");
+        authority.0.store(false, Ordering::SeqCst);
+        assert!(
+            port.summarize_context(
+                ProviderPurpose::Summary,
+                Box::new(|_| panic!("revoked executor must not run"))
+            )
+            .await
+            .expect_err("revoked")
+            .to_string()
+            .contains("revoked")
+        );
+        assert_eq!(port.owner.store.head(&port.stream).expect("head"), through);
+    }
+}
+
+#[tokio::test]
 async fn summary_installation_errors_settle_once_without_inventing_uncertain_outcomes() {
     for backend in ["sqlite", "jsonl"] {
         for active in [false, true] {
@@ -1918,13 +2016,15 @@ async fn summary_installation_errors_settle_once_without_inventing_uncertain_out
                 let summarize = async move {
                     bound
                         .summarize_context(
-                            ContextSnapshot {
-                                messages: vec![],
-                                history_has_trim_breadcrumb: Some(false),
-                            },
                             ProviderPurpose::Summary,
-                            Box::pin(async {
-                                let observer = current_provider_admission()
+                            Box::new(move |_source| {
+                                Box::pin(async move {
+                                    let kept = ContextSnapshot {
+                                        messages: vec![],
+                                        history_has_trim_breadcrumb: Some(false),
+                                    };
+                                    let text = Box::pin(async {
+                                        let observer = current_provider_admission()
                                     .expect("summary capture")
                                     .admit(ProviderDispatchIntent {
                                         requested_route: None,
@@ -1939,37 +2039,45 @@ async fn summary_installation_errors_settle_once_without_inventing_uncertain_out
                                         temperature: None,
                                     })
                                     .await?;
-                                let text = PayloadRecord::new(
-                                    PayloadId::new(),
-                                    "session.text/v1".into(),
-                                    b"captured summary".to_vec(),
-                                )?;
-                                let response = PayloadRecord::json(
-                                    "session.response/v1",
-                                    &ProviderResponsePayload {
-                                        blocks: vec![ResponseBlock::Text {
-                                            text_ref: StoredPayloadRef::from(&text),
-                                        }],
-                                        completion: ContentCompletion::Complete,
-                                        finish_evidence_ref: None,
-                                        usage_ref: None,
-                                        reasoning_absence: Some("not_returned".into()),
-                                    },
-                                )?;
-                                observer
-                                    .observe(
-                                        EventData::ProviderAttemptCompleted {
-                                            response_ref: StoredPayloadRef::from(&response),
-                                            served_attribution_ref: None,
-                                            last_progress_event_id: None,
-                                        },
-                                        vec![text, response],
-                                    )
+                                        let text = PayloadRecord::new(
+                                            PayloadId::new(),
+                                            "session.text/v1".into(),
+                                            b"captured summary".to_vec(),
+                                        )?;
+                                        let response = PayloadRecord::json(
+                                            "session.response/v1",
+                                            &ProviderResponsePayload {
+                                                blocks: vec![ResponseBlock::Text {
+                                                    text_ref: StoredPayloadRef::from(&text),
+                                                }],
+                                                completion: ContentCompletion::Complete,
+                                                finish_evidence_ref: None,
+                                                usage_ref: None,
+                                                reasoning_absence: Some("not_returned".into()),
+                                            },
+                                        )?;
+                                        observer
+                                            .observe(
+                                                EventData::ProviderAttemptCompleted {
+                                                    response_ref: StoredPayloadRef::from(&response),
+                                                    served_attribution_ref: None,
+                                                    last_progress_event_id: None,
+                                                },
+                                                vec![text, response],
+                                            )
+                                            .await?;
+                                        Ok::<String, anyhow::Error>("captured summary".into())
+                                    })
                                     .await?;
-                                Ok("captured summary".into())
+                                    Ok(zeroclaw_api::session_events::capture::ContextSummary {
+                                        kept,
+                                        text,
+                                    })
+                                })
                             }),
                         )
                         .await
+                        .map(|_| String::new())
                 };
                 let error = if active {
                     port.execute(input(), Box::pin(summarize)).await
@@ -2094,18 +2202,29 @@ async fn summary_generation_settlement_failure_preserves_original_error_chain() 
             )));
             let error = port
                 .summarize_context(
-                    ContextSnapshot {
-                        messages: vec![],
-                        history_has_trim_breadcrumb: Some(false),
-                    },
                     ProviderPurpose::Summary,
-                    Box::pin(async move {
-                        Err(if cancelled {
-                            anyhow::Error::new(zeroclaw_api::turn_stop::ToolLoopCancelled)
-                        } else {
-                            anyhow::Error::new(std::io::Error::other(
-                                "fixture summary generation failed",
-                            ))
+                    Box::new(move |_source| {
+                        Box::pin(async move {
+                            let kept = ContextSnapshot {
+                                messages: vec![],
+                                history_has_trim_breadcrumb: Some(false),
+                            };
+                            let text = Box::pin(async move {
+                                Err(if cancelled {
+                                    anyhow::Error::new(zeroclaw_api::turn_stop::ToolLoopCancelled)
+                                } else {
+                                    anyhow::Error::new(std::io::Error::other(
+                                        "fixture summary generation failed",
+                                    ))
+                                })
+                            })
+                            .await?;
+                            Ok(
+                                zeroclaw_api::session_events::capture::ContextSummary {
+                                    kept,
+                                    text,
+                                },
+                            )
                         })
                     }),
                 )

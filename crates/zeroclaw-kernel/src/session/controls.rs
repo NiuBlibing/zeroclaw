@@ -3,10 +3,7 @@ use super::engine::EngineSession;
 use super::query::{SessionAccess, SessionAccessPolicy};
 use super::*;
 use zeroclaw_api::model_provider::ChatMessage;
-use zeroclaw_api::session_events::capture::{
-    ModelChangeDisposition, ModelOverrideSelection, SessionExecutionPort,
-    SessionMetadataObservation,
-};
+use zeroclaw_api::session_events::capture::{SessionExecutionPort, SessionMetadataObservation};
 use zeroclaw_api::session_events::*;
 
 #[cfg(test)]
@@ -442,7 +439,7 @@ impl EngineSession {
         admission.disarm();
         Ok(command.message_id)
     }
-    fn control_input(
+    pub(super) fn control_input(
         &self,
         value: serde_json::Value,
     ) -> anyhow::Result<(SessionEvent, Vec<PayloadRecord>)> {
@@ -700,17 +697,6 @@ impl EngineSession {
             .await?;
         Ok(id)
     }
-    pub(super) async fn control_model_change(
-        &self,
-        selection: ModelOverrideSelection,
-        outcome: ModelChangeDisposition,
-    ) -> anyhow::Result<()> {
-        let (control, payloads) = self.control_input(serde_json::json!({"command":"model_override", "selection":selection,"source":"authenticated_session_command"}))?;
-        self.owner
-            .record_model_change(control, payloads, outcome, self.authority.clone())
-            .await?;
-        Ok(())
-    }
     pub(super) async fn control_cancellation(
         &self,
         turn: Option<&str>,
@@ -745,94 +731,5 @@ impl EngineSession {
         requested.causation_id = Some(control.event_id.clone());
         self.commit_control(vec![control, requested], payloads)
             .await
-    }
-}
-
-impl SessionCoordinator {
-    pub(super) async fn record_model_change(
-        self: &Arc<Self>,
-        control: SessionEvent,
-        mut payloads: Vec<PayloadRecord>,
-        outcome: ModelChangeDisposition,
-        resolver: Arc<dyn PermissionResolver>,
-    ) -> Result<(), SessionError> {
-        let owner = self.clone();
-        self.blocking(move || {
-            let stream = control.stream_id.clone();
-            let branch = control
-                .branch_id
-                .clone()
-                .ok_or(SessionError::InvocationMismatch)?;
-            let lock = owner.lock_for(&stream);
-            let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            resolver.authorize_context(&stream, &branch)?;
-            if matches!(outcome, ModelChangeDisposition::AppliedForTurn) {
-                control.turn_id.as_ref().ok_or_else(|| {
-                    SessionError::InvalidAdmission("turn model selection requires bound turn".into())
-                })?;
-            }
-            if matches!(outcome, ModelChangeDisposition::Applied | ModelChangeDisposition::AppliedForTurn)
-                && let Some(turn) = control.turn_id.as_ref()
-            {
-                owner.require_known_turn(&stream, &branch, Some(turn))?;
-            }
-            let head = owner.store.head(&stream)?;
-            let history = owner.stream_history(&stream)?;
-            let lineage = lineage::frozen_lineage(&history, &stream, &branch, head.sequence)?;
-            let previous = history.iter().rev().find(|event| {
-                lineage::includes(&lineage, event)
-                    && matches!(event.body.data, EventData::SessionModelOverrideChanged {
-                        resolution: ModelResolution::Applied { .. }
-                    })
-            }).map(|event| event.event_id.clone());
-            let resolution = match outcome {
-                ModelChangeDisposition::Applied => ModelResolution::Applied {
-                    previous_selection_event_id: previous,
-                },
-                ModelChangeDisposition::AppliedForTurn => ModelResolution::AppliedForTurn,
-                ModelChangeDisposition::Rejected { reason_key, diagnostic } => {
-                    let evidence=PayloadRecord::json("session.error-detail/v1", &serde_json::json!({
-                        "error_key":reason_key,
-                        "detail":diagnostic.as_deref().map(privacy::classify_text),
-                        "detail_unavailable_reason":if diagnostic.is_none(){Some("host_diagnostic_unavailable")}else{None},
-                    })).map_err(AppendError::from)?;
-                    let reference=StoredPayloadRef::from(&evidence);
-                    payloads.push(evidence);
-                    ModelResolution::Rejected {reason_key, evidence_ref:Some(reference)}
-                },
-            };
-            let mut changed = SessionEvent::typed(
-                stream.clone(),
-                EventData::SessionModelOverrideChanged { resolution },
-                control.actor.clone(),
-            )
-            .map_err(AppendError::from)?;
-            changed.branch_id = Some(branch.clone());
-            changed.turn_id = control.turn_id.clone();
-            changed.causation_id = Some(control.event_id.clone());
-            let key = format!("model-change:{}", control.event_id);
-            let mut events = vec![control, changed];
-            if let Some(binding) = payloads
-                .iter()
-                .find(|payload| payload.codec == "session.execution-binding/v1")
-                && let Some(revision) =
-                    owner.authority_observation(&stream, &branch, &events[0].actor, binding)?
-            {
-                events.push(revision);
-            }
-            let request = AppendRequest {
-                stream_id: stream.clone(),
-                expected_head: head,
-                idempotency_key: key,
-                events,
-                payloads,
-                erasure_reference_commitment: None,
-            };
-            rules::validate_history_batch(&history, &request)?;
-            owner.store.append_batch(request)?;
-            let _ = owner.wakeups.send(stream);
-            Ok(())
-        })
-        .await
     }
 }

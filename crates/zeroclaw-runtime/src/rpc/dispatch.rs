@@ -7075,7 +7075,7 @@ impl RpcDispatcher {
             .resolved_agent_config(agent_alias)
             .or_else(|| config_generation.agent(agent_alias).cloned());
         let resolved = agent_cfg.as_ref().and_then(|cfg| {
-            crate::agent::agent::build_session_model_provider(
+            zeroclaw_providers::factory::build_session_model_provider(
                 &config_generation,
                 cfg.model_provider.as_str(),
                 None,
@@ -7083,7 +7083,16 @@ impl RpcDispatcher {
             .ok()
             .map(|tuple| (cfg.model_provider.clone(), cfg.clone(), tuple))
         });
-        let Some((model_provider_ref, cfg, (provider, provider_name, model, resolver))) = resolved
+        let Some((
+            model_provider_ref,
+            cfg,
+            zeroclaw_providers::factory::SessionModelProvider {
+                provider,
+                provider_ref: provider_name,
+                model,
+                route_resolver: resolver,
+            },
+        )) = resolved
         else {
             // The alias is unresolvable against the committed config. Leave the
             // construction-time box in place but keep the session unavailable:
@@ -8574,13 +8583,17 @@ impl RpcDispatcher {
                     .model_provider
                     .as_deref()
                     .unwrap_or_else(|| agent_cfg.model_provider.as_str());
-                let (model_provider, model_provider_name, model_name, model_route_resolver) =
-                    crate::agent::agent::build_session_model_provider(
-                        &config,
-                        model_provider_ref,
-                        merged.model.as_deref(),
-                    )
-                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+                let zeroclaw_providers::factory::SessionModelProvider {
+                    provider: model_provider,
+                    provider_ref: model_provider_name,
+                    model: model_name,
+                    route_resolver: model_route_resolver,
+                } = zeroclaw_providers::factory::build_session_model_provider(
+                    &config,
+                    model_provider_ref,
+                    merged.model.as_deref(),
+                )
+                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
                 let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
                     &agent_cfg,
                     model_provider.as_ref(),
@@ -11983,21 +11996,25 @@ impl RpcDispatcher {
                         ),
                     )
                 })?;
-            let (model_provider, model_provider_name, model_name, model_route_resolver) =
-                crate::agent::agent::build_session_model_provider(
-                    config,
-                    &model_provider_ref,
-                    overrides.model.as_deref(),
-                )
-                .map_err(|error| {
-                    rpc_err(
-                        INVALID_PARAMS,
-                        format!(
-                            "Config update cannot refresh live session `{session_id}` from \
+            let zeroclaw_providers::factory::SessionModelProvider {
+                provider: model_provider,
+                provider_ref: model_provider_name,
+                model: model_name,
+                route_resolver: model_route_resolver,
+            } = zeroclaw_providers::factory::build_session_model_provider(
+                config,
+                &model_provider_ref,
+                overrides.model.as_deref(),
+            )
+            .map_err(|error| {
+                rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "Config update cannot refresh live session `{session_id}` from \
                              `{model_provider_ref}`: {error}"
-                        ),
-                    )
-                })?;
+                    ),
+                )
+            })?;
             let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
                 &agent_cfg,
                 model_provider.as_ref(),

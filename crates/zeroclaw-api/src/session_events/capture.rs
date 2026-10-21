@@ -238,6 +238,20 @@ pub struct ContextSnapshot {
     pub history_has_trim_breadcrumb: Option<bool>,
 }
 
+/// Executor output derived from the kernel's frozen input. The kernel checks
+/// summary provenance before installing the retained context and summary.
+pub struct ContextSummary {
+    pub kept: ContextSnapshot,
+    pub text: String,
+}
+
+pub type ContextSummaryFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<ContextSummary>> + Send + 'a>>;
+
+/// Invoked once, after admission and while the foreground lane is held.
+pub type ContextSummaryExecutor<'a> =
+    Box<dyn FnOnce(ContextSnapshot) -> ContextSummaryFuture<'a> + Send + 'a>;
+
 /// Host-owned metadata observed during execution. This cannot change session
 /// identity, ownership or permissions.
 #[derive(Clone, Debug)]
@@ -663,13 +677,13 @@ pub trait SessionExecutionPort: Send + Sync {
     async fn restore_context(&self) -> anyhow::Result<Option<ContextSnapshot>> {
         Ok(None)
     }
-    /// Capture a real maintenance provider call and install its derived summary.
+    /// Freeze input under the foreground lane, capture one maintenance provider
+    /// call, and return the committed projection before releasing the lane.
     async fn summarize_context(
         &self,
-        _kept: ContextSnapshot,
         _purpose: ProviderPurpose,
-        _summary: EngineTurnFuture<'_>,
-    ) -> anyhow::Result<String> {
+        _summary: ContextSummaryExecutor<'_>,
+    ) -> anyhow::Result<ContextSnapshot> {
         anyhow::bail!("session_summary_capture_unsupported")
     }
     /// Clear/restore replaces a derived context through a recorded transform.

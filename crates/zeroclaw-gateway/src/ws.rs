@@ -367,14 +367,13 @@ fn ws_consolidation_model(
         .providers
         .models
         .find(provider_type, provider_alias)?;
-    let (provider, _, resolved_model, _) =
-        zeroclaw_runtime::agent::agent::build_session_model_provider(
-            config,
-            provider_ref,
-            Some(model),
-        )
-        .ok()?;
-    Some((provider, resolved_model, entry.temperature))
+    let binding = zeroclaw_providers::factory::build_session_model_provider(
+        config,
+        provider_ref,
+        Some(model),
+    )
+    .ok()?;
+    Some((binding.provider, binding.model, entry.temperature))
 }
 
 async fn handle_ws_sop_frame<S>(
