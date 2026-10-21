@@ -4,6 +4,21 @@ The workspace is split into layers. Edge crates talk to the outside world; core 
 
 ## Layer: Core
 
+### `zeroclaw-kernel`
+
+The session execution owner, durable effect admission, authorized history
+queries and recovery. It accepts API execution ports and has no dependency on
+runtime, provider or channel implementations. The first extracted tool cohort
+also owns approval gating and tool execution contracts. See
+[Append-only session events](./session-events.md).
+
+### `zeroclaw-session-host`
+
+Reusable application composition for native session families. It binds the
+installation format manifest, legacy import and one kernel coordinator per family.
+Gateway, ACP and the main application share this implementation. It depends
+on API, config, infrastructure and kernel, and constructs no providers or tools.
+
 ### `zeroclaw-runtime`
 
 The agent loop, security-policy enforcement, SOP engine, cron scheduler, SubAgent lifecycle, and RPC layer for zerocode. Depends on every other core and edge crate.
@@ -39,6 +54,7 @@ The kernel ABI. Defines the core public traits, including:
 - `Tool`: agent-callable capabilities
 - `Memory`: conversation storage and retrieval
 - `Observer`: typed metrics/observability sink
+- `session_events`: typed history, payload references, codecs and pure validators
 
 The runtime depends only on these traits, not on concrete implementations. This is what makes provider/channel/tool additions a matter of implementing a trait rather than patching the core.
 

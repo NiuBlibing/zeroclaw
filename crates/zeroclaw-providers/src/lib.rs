@@ -6,6 +6,7 @@ pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
 pub mod catalog;
+mod cli_output;
 pub mod compatible;
 pub mod copilot;
 pub mod dispatch;
@@ -13,6 +14,7 @@ pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
 pub mod grok_cli;
+mod output;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod hailo_ollama;
 pub mod kilocli;
@@ -957,125 +959,7 @@ pub fn options_for_provider_ref(
     }
 }
 
-fn is_secret_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')
-}
-
-fn token_end(input: &str, from: usize) -> usize {
-    let mut end = from;
-    for (i, c) in input[from..].char_indices() {
-        if is_secret_char(c) {
-            end = from + i + c.len_utf8();
-        } else {
-            break;
-        }
-    }
-    end
-}
-
-/// Remove credentials from HTTP(S) URLs embedded in error text.
-///
-/// Query and fragment punctuation cannot safely identify where a credential
-/// ends: commas, apostrophes, and parentheses are all legal data. Treat the
-/// URL's entire non-whitespace query or fragment tail as sensitive instead.
-/// This also covers credential parameter names that the sanitizer does not know
-/// about. URL userinfo is likewise always sensitive and is replaced as one unit
-/// while retaining the host and path needed for an actionable endpoint
-/// diagnostic.
-fn scrub_url_credentials(input: &str) -> String {
-    let lowercase = input.to_ascii_lowercase();
-    let mut scrubbed = String::with_capacity(input.len());
-    let mut cursor = 0;
-
-    while cursor < input.len() {
-        let remaining = &input[cursor..];
-        let remaining_lowercase = &lowercase[cursor..];
-        let next_http = remaining_lowercase.find("http://");
-        let next_https = remaining_lowercase.find("https://");
-        let Some(relative_url_start) = (match (next_http, next_https) {
-            (Some(http), Some(https)) => Some(http.min(https)),
-            (Some(http), None) => Some(http),
-            (None, Some(https)) => Some(https),
-            (None, None) => None,
-        }) else {
-            scrubbed.push_str(remaining);
-            break;
-        };
-        let url_start = cursor + relative_url_start;
-        scrubbed.push_str(&input[cursor..url_start]);
-
-        let url_tail = &input[url_start..];
-        let url_end = url_start + url_tail.find(char::is_whitespace).unwrap_or(url_tail.len());
-        let url_token = &input[url_start..url_end];
-        let sensitive_suffix_start = [url_token.find('?'), url_token.find('#')]
-            .into_iter()
-            .flatten()
-            .min();
-        let without_query_or_fragment =
-            sensitive_suffix_start.map_or(url_token, |suffix_start| &url_token[..suffix_start]);
-        let scheme_end = without_query_or_fragment
-            .find("://")
-            .map_or(0, |separator| separator + 3);
-        let authority_end = without_query_or_fragment[scheme_end..]
-            .find('/')
-            .map_or(without_query_or_fragment.len(), |end| scheme_end + end);
-        let authority = &without_query_or_fragment[scheme_end..authority_end];
-        if let Some(userinfo_end) = authority.rfind('@') {
-            scrubbed.push_str(&without_query_or_fragment[..scheme_end]);
-            scrubbed.push_str("[REDACTED]@");
-            scrubbed.push_str(&without_query_or_fragment[scheme_end + userinfo_end + 1..]);
-        } else {
-            scrubbed.push_str(without_query_or_fragment);
-        }
-        cursor = url_end;
-    }
-
-    scrubbed
-}
-
-/// Scrub known secret-like token prefixes from model_provider error strings.
-/// Provider API-key prefixes come from the same canonical table used for
-/// credential-family validation; non-provider prefixes cover Slack, GitHub,
-/// and Google/Gemini credentials. Complete query strings and fragments are
-/// removed from embedded HTTP(S) URLs because either suffix may carry
-/// credentials under provider-specific names.
-pub fn scrub_secret_patterns(input: &str) -> String {
-    const NON_PROVIDER_SECRET_PREFIXES: &[&str] = &[
-        "xoxb-",
-        "xoxp-",
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "github_pat_",
-        "AIza",
-    ];
-
-    let mut scrubbed = scrub_url_credentials(input);
-
-    for prefix in KEY_PREFIX_MODEL_PROVIDERS
-        .iter()
-        .map(|(prefix, _)| *prefix)
-        .chain(NON_PROVIDER_SECRET_PREFIXES.iter().copied())
-    {
-        let mut search_from = 0;
-        while let Some(rel) = scrubbed[search_from..].find(prefix) {
-            let start = search_from + rel;
-            let content_start = start + prefix.len();
-            let end = token_end(&scrubbed, content_start);
-
-            // Bare prefixes like "sk-" should not stop future scans.
-            if end == content_start {
-                search_from = content_start;
-                continue;
-            }
-
-            scrubbed.replace_range(start..end, "[REDACTED]");
-            search_from = start + "[REDACTED]".len();
-        }
-    }
-
-    scrubbed
-}
+pub use zeroclaw_api::session_events::privacy::scrub_secret_patterns;
 
 pub(crate) fn truncate_api_error(input: &str) -> String {
     if input.chars().count() <= MAX_API_ERROR_CHARS {
@@ -1118,11 +1002,11 @@ fn mentions_tools_token(message: &str) -> bool {
         let preceded_by_word_char = message[..start]
             .chars()
             .next_back()
-            .is_some_and(&is_word_char);
+            .is_some_and(is_word_char);
         let followed_by_word_char = bytes
             .get(end)
             .map(|byte| *byte as char)
-            .is_some_and(&is_word_char);
+            .is_some_and(is_word_char);
 
         if !preceded_by_word_char && !followed_by_word_char {
             return true;
@@ -1296,23 +1180,61 @@ pub(crate) fn stream_idle_error_message(
 }
 
 /// Build a sanitized model_provider error from a failed HTTP response.
+pub(crate) fn stream_read_error(
+    error: &reqwest::Error,
+    bound: StreamIdleBound,
+) -> traits::StreamError {
+    let message = stream_idle_error_message(error, bound);
+    if error.is_timeout() {
+        traits::StreamError::ResponseTimeout(message)
+    } else {
+        traits::StreamError::Http(message)
+    }
+}
+
 pub async fn api_error(model_provider: &str, response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
+    let request_id = ["x-request-id", "request-id", "x-goog-request-id"]
+        .into_iter()
+        .find_map(|key| {
+            response
+                .headers()
+                .get(key)
+                .and_then(|value| value.to_str().ok())
+                .map(zeroclaw_api::session_events::privacy::classify_text)
+        });
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .map(zeroclaw_api::session_events::privacy::classify_text);
     let body = response
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read model_provider error body>".to_string());
-    api_error_from_parts(model_provider, status, &body)
+    let mut error = api_error_from_parts(model_provider, status, &body);
+    if let Some(failure) = error.downcast_mut::<dispatch::ProviderHttpFailure>() {
+        failure.request_id = request_id;
+        failure.retry_after = retry_after;
+    }
+    error
 }
 
 /// Build a sanitized model_provider error after a caller has already consumed
 /// the response body to classify a narrowly bounded fallback.
+pub(crate) fn classified_api_error_body(body: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) => zeroclaw_api::session_events::privacy::classify_value(value).to_string(),
+        Err(_) => sanitize_api_error(body),
+    }
+}
+
 pub(crate) fn api_error_from_parts(
     model_provider: &str,
     status: reqwest::StatusCode,
     body: &str,
 ) -> anyhow::Error {
-    let sanitized = sanitize_api_error(body);
+    let sanitized = classified_api_error_body(body);
     ::zeroclaw_log::record!(
         ERROR,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -1324,9 +1246,13 @@ pub(crate) fn api_error_from_parts(
             })),
         "providers: API error"
     );
-    anyhow::Error::msg(format!(
-        "{model_provider} API error ({status}): {sanitized}"
-    ))
+    anyhow::Error::new(dispatch::ProviderHttpFailure {
+        provider_ref: model_provider.into(),
+        status: status.as_u16(),
+        detail: sanitized,
+        request_id: None,
+        retry_after: None,
+    })
 }
 
 /// Resolve API key for a model_provider from the typed alias config/override.
@@ -1343,21 +1269,7 @@ fn resolve_model_provider_credential(
         .map(ToString::to_string)
 }
 
-/// Single source of truth for `(key_prefix, canonical_model_provider_family)`
-/// pairs used by `check_api_key_prefix`. Order matters: longer prefixes
-/// must come before shorter ones that share a head (`sk-ant-` and `sk-or-`
-/// must precede `sk-`).
-const KEY_PREFIX_MODEL_PROVIDERS: &[(&str, &str)] = &[
-    ("sk-ant-", "anthropic"),
-    ("sk-or-", "openrouter"),
-    ("sk-", "openai"),
-    ("gsk_", "groq"),
-    ("pplx-", "perplexity"),
-    ("xai-", "xai"),
-    ("nvapi-", "nvidia"),
-    ("KEY-", "telnyx"),
-    ("zcr_", "zerorouter"),
-];
+use zeroclaw_api::session_events::privacy::KEY_PREFIX_MODEL_PROVIDERS;
 
 fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static str> {
     let likely_model_provider = KEY_PREFIX_MODEL_PROVIDERS
@@ -2024,7 +1936,9 @@ pub fn provider_runtime_options_for_bare_family(
     }
 }
 
-fn create_resilient_model_provider_from_ref_with_model_override(
+/// Build a profile's reliability chain with an explicit primary model pin.
+/// Fallback entries retain their own configured models and credentials.
+pub fn create_resilient_model_provider_from_ref_with_model_override(
     config: &zeroclaw_config::schema::Config,
     name: &str,
     api_key: Option<&str>,

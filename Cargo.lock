@@ -13810,12 +13810,14 @@ dependencies = [
  "zeroclaw-gateway",
  "zeroclaw-hardware",
  "zeroclaw-infra",
+ "zeroclaw-kernel",
  "zeroclaw-log",
  "zeroclaw-macros",
  "zeroclaw-memory",
  "zeroclaw-plugins",
  "zeroclaw-providers",
  "zeroclaw-runtime",
+ "zeroclaw-session-host",
  "zeroclaw-spawn",
  "zeroclaw-tls",
  "zeroclaw-tool-call-parser",
@@ -13834,12 +13836,14 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "strum",
  "strum_macros",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -13947,10 +13951,12 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-infra",
+ "zeroclaw-kernel",
  "zeroclaw-log",
  "zeroclaw-memory",
  "zeroclaw-providers",
  "zeroclaw-runtime",
+ "zeroclaw-session-host",
  "zeroclaw-spawn",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
@@ -14106,11 +14112,13 @@ dependencies = [
  "zeroclaw-channels",
  "zeroclaw-config",
  "zeroclaw-infra",
+ "zeroclaw-kernel",
  "zeroclaw-log",
  "zeroclaw-memory",
  "zeroclaw-plugins",
  "zeroclaw-providers",
  "zeroclaw-runtime",
+ "zeroclaw-session-host",
  "zeroclaw-spawn",
  "zeroclaw-tls",
  "zeroclaw-tools",
@@ -14157,6 +14165,7 @@ version = "0.8.6"
 dependencies = [
  "anyhow",
  "chrono",
+ "libc",
  "parking_lot",
  "portable-atomic",
  "rusqlite",
@@ -14169,6 +14178,29 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-log",
  "zeroclaw-spawn",
+]
+
+[[package]]
+name = "zeroclaw-kernel"
+version = "0.8.6"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures-util",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-infra",
+ "zeroclaw-log",
+ "zeroclaw-spawn",
+ "zeroclaw-tool-call-parser",
 ]
 
 [[package]]
@@ -14333,6 +14365,8 @@ dependencies = [
  "windows-sys 0.61.2",
  "zeroclaw-api",
  "zeroclaw-config",
+ "zeroclaw-infra",
+ "zeroclaw-kernel",
  "zeroclaw-log",
  "zeroclaw-spawn",
 ]
@@ -14426,12 +14460,14 @@ dependencies = [
  "zeroclaw-commands",
  "zeroclaw-config",
  "zeroclaw-infra",
+ "zeroclaw-kernel",
  "zeroclaw-log",
  "zeroclaw-macros",
  "zeroclaw-memory",
  "zeroclaw-plugins",
  "zeroclaw-providers",
  "zeroclaw-relay-proto",
+ "zeroclaw-session-host",
  "zeroclaw-sop-graph",
  "zeroclaw-spawn",
  "zeroclaw-tls",
@@ -14439,6 +14475,21 @@ dependencies = [
  "zeroclaw-tools",
  "zeroize",
  "zerorelay",
+]
+
+[[package]]
+name = "zeroclaw-session-host"
+version = "0.8.6"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-infra",
+ "zeroclaw-kernel",
 ]
 
 [[package]]

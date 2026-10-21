@@ -39,6 +39,10 @@ enum IncompleteHailoResponseError {
     MalformedJson,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}. Check that Hailo-Ollama is running and the model is loaded")]
+struct HailoHttpFailure(#[source] crate::dispatch::ProviderHttpFailure);
+
 impl std::fmt::Display for IncompleteHailoResponseError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -353,23 +357,52 @@ impl HailoOllamaModelProvider {
     }
 
     fn sanitize_response_body(&self, body: &str) -> String {
-        let mut redacted = super::scrub_secret_patterns(body);
-        for value in self.request_headers.values() {
-            let Ok(value) = value.to_str() else {
-                continue;
-            };
-            for secret in [Some(value), value.strip_prefix("Bearer ")]
-                .into_iter()
-                .flatten()
-                .filter(|secret| !secret.is_empty())
-            {
-                let scrubbed_secret = super::scrub_secret_patterns(secret);
-                redacted = redacted.replace(secret, "[REDACTED]");
-                if scrubbed_secret != secret {
-                    redacted = redacted.replace(&scrubbed_secret, "[REDACTED]");
+        let redact = |text: &str| {
+            let mut redacted = super::scrub_secret_patterns(text);
+            for value in self.request_headers.values() {
+                let Ok(value) = value.to_str() else {
+                    continue;
+                };
+                for secret in [Some(value), value.strip_prefix("Bearer ")]
+                    .into_iter()
+                    .flatten()
+                    .filter(|secret| !secret.is_empty())
+                {
+                    let scrubbed_secret = super::scrub_secret_patterns(secret);
+                    redacted = redacted.replace(secret, "[REDACTED]");
+                    if scrubbed_secret != secret {
+                        redacted = redacted.replace(&scrubbed_secret, "[REDACTED]");
+                    }
                 }
             }
+            redacted
+        };
+        fn redact_strings(value: &mut serde_json::Value, redact: &impl Fn(&str) -> String) {
+            match value {
+                serde_json::Value::String(text) => *text = redact(text),
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        redact_strings(value, redact);
+                    }
+                }
+                serde_json::Value::Object(values) => {
+                    for (key, mut value) in std::mem::take(values) {
+                        redact_strings(&mut value, redact);
+                        values.insert(redact(&key), value);
+                    }
+                }
+                _ => {}
+            }
         }
+        // Decode JSON strings before comparing configured header values: wire
+        // escaping must not conceal a reflected credential from classification.
+        let redacted = match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(mut value) => {
+                redact_strings(&mut value, &redact);
+                zeroclaw_api::session_events::privacy::classify_value(value).to_string()
+            }
+            Err(_) => redact(body),
+        };
         super::truncate_api_error(&redacted)
     }
 
@@ -1016,10 +1049,25 @@ impl HailoOllamaModelProvider {
             .send()
             .await?;
         let status = response.status();
-        let body = response.bytes().await?;
+        let evidence_header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| self.sanitize_response_body(value))
+        };
+        let request_id = ["x-request-id", "request-id", "x-goog-request-id"]
+            .into_iter()
+            .find_map(evidence_header);
+        let retry_after = evidence_header("retry-after");
+        let body = response.bytes().await;
 
         if !status.is_success() {
-            let raw = String::from_utf8_lossy(&body);
+            // A received rejection remains definite even if its body is truncated.
+            let raw = body
+                .as_ref()
+                .map(|body| String::from_utf8_lossy(body))
+                .unwrap_or_else(|_| "<failed to read provider error body>".into());
             let sanitized = self.sanitize_response_body(&raw);
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1033,14 +1081,18 @@ impl HailoOllamaModelProvider {
                     })),
                 "Hailo-Ollama API error response"
             );
-            anyhow::bail!(
-                "Hailo-Ollama API error ({}): {}. Check that Hailo-Ollama is running and the \
-                 model is loaded",
-                status,
-                sanitized
-            );
+            return Err(anyhow::Error::new(HailoHttpFailure(
+                crate::dispatch::ProviderHttpFailure {
+                    provider_ref: "Hailo-Ollama".into(),
+                    status: status.as_u16(),
+                    detail: sanitized,
+                    request_id,
+                    retry_after,
+                },
+            )));
         }
 
+        let body = body?;
         let parsed: ApiChatResponse = serde_json::from_slice(&body).map_err(|error| {
             let raw = String::from_utf8_lossy(&body);
             let sanitized = self.sanitize_response_body(&raw);
@@ -1190,11 +1242,7 @@ impl HailoOllamaModelProvider {
     }
 
     fn response_text(response: &ApiChatResponse) -> anyhow::Result<String> {
-        // Hailo advertises no extended-thinking capability. The native
-        // service can nevertheless place its only non-empty output in the
-        // optional `thinking` field, so this compatibility fallback is
-        // deliberately returned as ordinary text and not reported as
-        // `reasoning_content`.
+        // Keep the legacy visible-text fallback independent of durable capture.
         let content = Self::strip_think_tags(&response.message.content);
         if !content.trim().is_empty() {
             return Ok(content);
@@ -1223,11 +1271,55 @@ impl HailoOllamaModelProvider {
         // ReliableModelProvider can classify it as semantic-empty and retain
         // any provider-reported usage before retry/fallback.
         let text = Self::response_text(&response).unwrap_or_default();
+        use zeroclaw_api::model_provider::ProviderOutputBlock;
+        let mut output_blocks = Vec::new();
+        let mut reasoning = String::new();
+        if let Some(thinking) = &response.message.thinking {
+            reasoning.push_str(thinking);
+            output_blocks.push(ProviderOutputBlock::Reasoning {
+                representation: "hailo.thinking".into(),
+                bytes: zeroclaw_api::session_events::privacy::classify_text(thinking).into_bytes(),
+                replay_requirement: "provider_defined".into(),
+            });
+        }
+        let mut remaining = response.message.content.as_str();
+        // Inline tags are a received reasoning representation, including an
+        // unterminated final tag. Display filtering must not discard them.
+        while let Some(start) = remaining.find("<think>") {
+            output_blocks.push(ProviderOutputBlock::Text {
+                text: remaining[..start].into(),
+            });
+            let after_start = &remaining[start + "<think>".len()..];
+            let (thought, tail) = after_start
+                .split_once("</think>")
+                .unwrap_or((after_start, ""));
+            reasoning.push_str(thought);
+            output_blocks.push(ProviderOutputBlock::Reasoning {
+                representation: "hailo.think_tag".into(),
+                bytes: zeroclaw_api::session_events::privacy::classify_text(thought).into_bytes(),
+                replay_requirement: "provider_defined".into(),
+            });
+            remaining = tail;
+        }
+        output_blocks.push(ProviderOutputBlock::Text {
+            text: remaining.into(),
+        });
+        if let Some(model) = response.model {
+            output_blocks.push(ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"served_attribution","protocol":"ollama","model":model}),
+            });
+        }
+        if let Some(reason) = response.done_reason {
+            output_blocks.push(ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"finish","protocol":"ollama","done_reason":reason}),
+            });
+        }
         Ok(ChatResponse {
+            output_blocks,
             text: Some(text),
             tool_calls: Vec::new(),
             usage,
-            reasoning_content: None,
+            reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
         })
     }
 
@@ -1435,6 +1527,64 @@ mod tests {
 
         let sanitized = provider.sanitize_response_body("reflected private-prefix-sk-abc");
         assert!(!sanitized.contains("private-prefix-"));
+
+        let escaped = HailoOllamaModelProvider::new("audit", None, 5, 5, OllamaTuning::default())
+            .expect("provider")
+            .with_auth_headers(
+                None,
+                &[("X-Fixture".into(), "fixture-\"quoted\"-secret".into())]
+                    .into_iter()
+                    .collect(),
+            )
+            .expect("header");
+        let sanitized = escaped.sanitize_response_body(
+            &serde_json::json!({"error":{"message":"reflected fixture-\"quoted\"-secret"}, "fixture-\"quoted\"-secret":"reflected key"})
+                .to_string(),
+        );
+        assert!(!sanitized.contains("quoted"));
+        assert!(sanitized.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn http_failure_preserves_status_without_reflecting_configured_credentials() {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let secret = "fixture-custom-header-value";
+        let app = axum::Router::new().route("/api/chat", axum::routing::post(move || async move {
+            (axum::http::StatusCode::UNAUTHORIZED,
+             [("x-request-id", secret), ("retry-after", secret)],
+             axum::Json(serde_json::json!({"error":{"code":"fixture_rejected","message":format!("reflected {secret}"),"api_key":"fixture-api-key"}})))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("fixture server");
+        });
+        let provider =
+            HailoOllamaModelProvider::new("audit", Some(&url), 5, 5, OllamaTuning::default())
+                .expect("provider")
+                .with_auth_headers(
+                    Some("fixture-api-key"),
+                    &[("X-Fixture".into(), secret.into())].into_iter().collect(),
+                )
+                .expect("headers");
+        let error = provider
+            .chat_with_system(None, "fixture", "fixture", None)
+            .await
+            .expect_err("rejection");
+        let failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::dispatch::ProviderHttpFailure>())
+            .expect("typed HTTP evidence");
+        assert_eq!(failure.status(), 401);
+        assert!(failure.detail.contains("fixture_rejected"));
+        assert!(!format!("{failure:?}").contains(secret));
+        assert!(!format!("{failure:?}").contains("fixture-api-key"));
+        assert_eq!(failure.request_id.as_deref(), Some("[REDACTED]"));
+        assert_eq!(failure.retry_after.as_deref(), Some("[REDACTED]"));
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
