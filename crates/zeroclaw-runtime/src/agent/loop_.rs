@@ -23917,16 +23917,15 @@ Let me check the result."#;
     async fn run_model_switch_emits_single_balanced_pair_for_the_switched_route() {
         use axum::{Json, Router, extract::State, routing::post};
         use tokio::net::TcpListener;
-        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, ModelProviderConfig, ModelRouteConfig, OllamaModelProviderConfig,
-            RiskProfileConfig, RuntimeProfileConfig,
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
         };
 
         let _hook_lock = observability::HOOK_TEST_LOCK.lock().await;
 
-        // The simple prompt stays on the local route. First response: a native
-        // tool call requesting a different model on that allowed provider.
+        // This positive-switch test has no effort profile: a local-only effort
+        // admission would correctly reject the other connection profile.
+        // First response: a native tool call requesting the switched profile.
         // Second response (only reachable once the switched-to model is
         // actually in use): plain "done".
         type CallCount = Arc<std::sync::atomic::AtomicUsize>;
@@ -23937,6 +23936,15 @@ Let me check the result."#;
         ) -> Json<serde_json::Value> {
             let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(body["temperature"], if call == 0 { 0.2 } else { 0.8 });
+            assert_eq!(
+                body["model"],
+                if call == 0 {
+                    "run-lifecycle-switch-default-model"
+                } else {
+                    "run-lifecycle-switch-vision-model"
+                },
+                "the switched non-vision selection must use its configured vision route"
+            );
             if call == 0 {
                 Json(serde_json::json!({
                     "choices": [{
@@ -24005,32 +24013,6 @@ Let me check the result."#;
             AliasedAgentConfig {
                 model_provider: "ollama.default".into(),
                 risk_profile: "default".into(),
-                runtime_profile: "effort".into(),
-                ..Default::default()
-            },
-        );
-        config.model_routes = vec![
-            ModelRouteConfig {
-                hint: "local".into(),
-                model_provider: "ollama.default".into(),
-                model: "run-lifecycle-switch-default-model".into(),
-                api_key: None,
-            },
-            ModelRouteConfig {
-                hint: "cloud".into(),
-                model_provider: "ollama.switched".into(),
-                model: "switched-model".into(),
-                api_key: None,
-            },
-        ];
-        config.runtime_profiles.insert(
-            "effort".to_string(),
-            RuntimeProfileConfig {
-                effort_routing: Some(EffortRoutingConfig {
-                    local_hint: "local".into(),
-                    cloud_hint: "cloud".into(),
-                    cloud_escalation: CloudEscalationPolicy::Auto,
-                }),
                 ..Default::default()
             },
         );
