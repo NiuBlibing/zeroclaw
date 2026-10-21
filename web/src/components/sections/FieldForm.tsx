@@ -70,6 +70,8 @@ import {
   type PatchOp,
 } from "../../lib/api";
 import { useConfigDraft } from "../../lib/draftStore";
+import { entityConfigPath } from "../../lib/entityLinks";
+import { useModelProfileAliases } from "../../lib/useModelProfileAliases";
 import { fuzzyFilter } from "../../lib/fuzzy";
 import {
   SECRET_MAP_KIND,
@@ -827,19 +829,14 @@ function AgentEmptyAliasFallback({
 function agentAliasJumpPath(
   fieldKind: keyof AgentOptionsResponse,
   alias: string,
+  modelAliases: readonly string[],
 ): string {
   const base = AGENT_ALIAS_SOURCE_PATH[fieldKind];
   // Channels and model_providers use dotted alias (`telegram.default`,
   // `anthropic.work`); split into the two URL segments. Single-tier
   // sections use the alias directly.
   if (fieldKind === "model_providers") {
-    // model_provider refs may be three-segment (`<type>.<alias>.<model>`);
-    // the edit surface is the profile page keyed by `<type>/<alias>`, so take
-    // the first two segments and drop any trailing `<model>`.
-    const [type, aliasSeg] = alias.split(".");
-    if (type && aliasSeg) {
-      return `${base}/${encodeURIComponent(type)}/${encodeURIComponent(aliasSeg)}`;
-    }
+    return entityConfigPath('model-provider', alias, modelAliases);
   }
   if (fieldKind === "channels") {
     const dot = alias.indexOf(".");
@@ -2006,6 +2003,9 @@ function FieldRow({
   const [agentOptions, setAgentOptions] = useState<AgentOptionsResponse | null>(
     null,
   );
+  const modelProfileAliases = useModelProfileAliases(
+    agentSingleAliasKind === 'model_providers' ? value : undefined,
+  );
 
   useEffect(() => {
     if (!needsProviderModels) return;
@@ -2312,7 +2312,7 @@ function FieldRow({
               </select>
               {value && (
                 <Link
-                  to={agentAliasJumpPath(agentSingleAliasKind, value)}
+                  to={agentAliasJumpPath(agentSingleAliasKind, value, modelProfileAliases)}
                   title={`${t("fieldform.edit_in_source_prefix")}${value}${t("fieldform.edit_in_source_suffix")}`}
                   className="btn-icon flex-shrink-0"
                 >

@@ -823,13 +823,13 @@ pub async fn update_context_windows(
 
     // Collect all the data we need first to avoid borrow conflicts
     let targets: Vec<ProviderTarget> = if let Some(model_provider) = provider_override {
-        // A three-segment ref selects one nested model; a two-segment ref
-        // keeps the historical behavior of expanding the whole profile.
+        // A suffix after the resolved profile selects one nested model;
+        // a profile ref expands all entries, including dotted profile aliases.
         if let Some((t, a, entry)) = config.providers.models.find_by_name(model_provider) {
             let model_alias = model_provider
                 .trim()
-                .splitn(3, '.')
-                .nth(2)
+                .strip_prefix(&format!("{t}.{a}"))
+                .and_then(|suffix| suffix.strip_prefix('.'))
                 .filter(|segment| !segment.is_empty());
             let targets = expand_profile_targets(t, &a, entry, model_alias);
             if targets.is_empty() {
@@ -4167,7 +4167,7 @@ mod tests {
             let entry2 = config
                 .providers
                 .models
-                .ensure("groq", "alias2")
+                .ensure("groq", "alias2.v2")
                 .expect("groq provider type exists");
             entry2.model = Some("llama-3.1-8b-instant".into());
         }
@@ -4181,7 +4181,7 @@ mod tests {
             },
         );
         let updated =
-            update_context_windows(&mut config, Some("groq.alias2"), false, Some(mock_fetch))
+            update_context_windows(&mut config, Some("groq.alias2.v2"), false, Some(mock_fetch))
                 .await
                 .expect("update_context_windows should succeed");
 
@@ -4205,7 +4205,7 @@ mod tests {
         let alias2_ctx = config
             .providers
             .models
-            .find("groq", "alias2")
+            .find("groq", "alias2.v2")
             .expect("alias2 should exist")
             .context_window;
         assert_eq!(
@@ -4290,7 +4290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_context_windows_targets_only_selected_nested_model() {
+    async fn update_context_windows_targets_only_selected_nested_model_in_dotted_profile() {
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
         let mut config = Config {
             config_path: temp_dir.path().join("config.toml"),
@@ -4299,7 +4299,7 @@ mod tests {
         let entry = config
             .providers
             .models
-            .ensure("openai", "gw")
+            .ensure("openai", "gw.v2")
             .expect("openai provider type exists");
         entry.models.insert(
             "cheap".to_string(),
@@ -4324,7 +4324,7 @@ mod tests {
         );
         let updated = update_context_windows(
             &mut config,
-            Some("openai.gw.cheap"),
+            Some("openai.gw.v2.cheap"),
             false,
             Some(mock_fetch),
         )
@@ -4335,7 +4335,7 @@ mod tests {
         let entry = config
             .providers
             .models
-            .find("openai", "gw")
+            .find("openai", "gw.v2")
             .expect("profile exists");
         assert_eq!(entry.models["cheap"].context_window, Some(11_000));
         assert_eq!(entry.models["big"].context_window, None);

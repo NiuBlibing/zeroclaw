@@ -368,7 +368,7 @@ fn delete_model_provider(
 
     let applied = report.scrubs.clone();
     let target = format!("{family}.{alias}");
-    scrub_model_provider_refs(cfg, &target);
+    scrub_model_provider_refs(cfg, family, alias);
     let removed = cfg.providers.models.remove_alias(family, alias);
     debug_assert!(removed, "existence was checked above");
 
@@ -477,44 +477,48 @@ fn scrub_model_alias_refs(cfg: &mut Config, target: &str) {
 }
 
 /// Whether `reference` points at the `target` model-provider profile,
-/// accounting for three-segment `family.alias.model` refs whose profile
-/// portion (`family.alias`) is what a profile delete/rename must match.
-fn ref_targets_profile(reference: &str, target: &str) -> bool {
+/// resolving the longest configured alias before interpreting any model suffix.
+fn ref_targets_profile(cfg: &Config, reference: &str, target: &str) -> bool {
     let reference = reference.trim();
-    match crate::schema::provider_profile_ref(reference) {
+    match cfg.providers.models.profile_ref(reference) {
         Some((family, alias)) => format!("{family}.{alias}") == target,
         None => reference == target,
     }
 }
 
-fn scrub_model_provider_refs(cfg: &mut Config, target: &str) {
+fn scrub_model_provider_refs(cfg: &mut Config, family: &str, alias: &str) {
+    let references: std::collections::HashSet<String> = find_all_references(
+        cfg,
+        &AliasKind::Provider {
+            category: ProviderCategory::Models,
+            family: family.to_string(),
+        },
+        alias,
+    )
+    .into_iter()
+    .map(|site| site.raw_value.trim().to_string())
+    .collect();
+    let matches = |reference: &str| references.contains(reference.trim());
     for agent in cfg.agents.values_mut() {
-        if ref_targets_profile(agent.classifier_provider.as_str(), target) {
+        if matches(agent.classifier_provider.as_str()) {
             agent.classifier_provider = crate::providers::ModelProviderRef::default();
         }
-        if ref_targets_profile(agent.summary_provider.as_str(), target) {
+        if matches(agent.summary_provider.as_str()) {
             agent.summary_provider = crate::providers::ModelProviderRef::default();
         }
     }
     // Profile-level context-compression summarizer ref
     for profile in cfg.runtime_profiles.values_mut() {
-        if ref_targets_profile(
-            profile.context_compression.summary_provider.as_str(),
-            target,
-        ) {
+        if matches(profile.context_compression.summary_provider.as_str()) {
             profile.context_compression.summary_provider =
                 crate::providers::ModelProviderRef::default();
         }
     }
     for (_ty, _al, profile) in cfg.providers.models.iter_entries_mut() {
-        profile
-            .fallback
-            .retain(|fb| !ref_targets_profile(fb.as_str(), target));
+        profile.fallback.retain(|fb| !matches(fb.as_str()));
     }
-    cfg.model_routes
-        .retain(|r| !ref_targets_profile(&r.model_provider, target));
-    cfg.embedding_routes
-        .retain(|r| !ref_targets_profile(&r.model_provider, target));
+    cfg.model_routes.retain(|r| !matches(&r.model_provider));
+    cfg.embedding_routes.retain(|r| !matches(&r.model_provider));
 }
 
 fn delete_agent(
@@ -767,6 +771,13 @@ pub fn rename_with_cascade(
         return Err(RenameError::Reserved(RESERVED_DEFAULT_AGENT.to_string()));
     }
 
+    // Resolve before moving the key: afterwards a dotted alias could bind to
+    // another configured profile. This set exists only for this mutation.
+    let model_references: std::collections::HashSet<String> =
+        find_all_references(cfg, kind, old_alias)
+            .into_iter()
+            .map(|site| site.raw_value.trim().to_string())
+            .collect();
     let section = section_path(kind);
     // `rename_map_key` validates `new_alias` via `validate_alias_key` (whose
     // leading-underscore rule also blocks the `_deleted` marker) and refuses a
@@ -787,9 +798,14 @@ pub fn rename_with_cascade(
             family,
             profile_alias,
         } => rewrite_model_alias_refs(cfg, family, profile_alias, old_alias, new_alias),
-        AliasKind::Provider { category, family } => {
-            rewrite_provider_refs(cfg, *category, family, old_alias, new_alias)
-        }
+        AliasKind::Provider { category, family } => rewrite_provider_refs(
+            cfg,
+            *category,
+            family,
+            old_alias,
+            new_alias,
+            &model_references,
+        ),
         AliasKind::Channel { channel_type } => {
             rewrite_channel_refs(cfg, channel_type, old_alias, new_alias)
         }
@@ -914,9 +930,10 @@ fn rewrite_provider_refs(
     family: &str,
     old: &str,
     new: &str,
+    references: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     match category {
-        ProviderCategory::Models => rewrite_model_provider_refs(cfg, family, old, new),
+        ProviderCategory::Models => rewrite_model_provider_refs(cfg, family, old, new, references),
         ProviderCategory::Tts => rewrite_tts_provider_refs(cfg, family, old, new),
         ProviderCategory::Transcription => {
             rewrite_transcription_provider_refs(cfg, family, old, new)
@@ -927,16 +944,16 @@ fn rewrite_provider_refs(
 /// Rewrite `reference` to point at `new_target` when it targets `old_target`,
 /// preserving any three-segment `.model` suffix. Returns `None` when the
 /// reference does not target the renamed profile.
-fn retarget_profile_ref(reference: &str, old_target: &str, new_target: &str) -> Option<String> {
+fn retarget_profile_ref(
+    reference: &str,
+    old_target: &str,
+    new_target: &str,
+    references: &std::collections::HashSet<String>,
+) -> Option<String> {
     let trimmed = reference.trim();
-    match crate::schema::provider_profile_ref(trimmed) {
-        Some((fam, al)) if format!("{fam}.{al}") == old_target => {
-            let suffix = &trimmed[old_target.len()..]; // "" or ".model"
-            Some(format!("{new_target}{suffix}"))
-        }
-        Some(_) => None,
-        None => (trimmed == old_target).then(|| new_target.to_string()),
-    }
+    references
+        .contains(trimmed)
+        .then(|| format!("{new_target}{}", &trimmed[old_target.len()..]))
 }
 
 fn rewrite_model_alias_refs(
@@ -1017,27 +1034,37 @@ fn rewrite_model_provider_refs(
     family: &str,
     old: &str,
     new: &str,
+    references: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     let old_target = format!("{family}.{old}");
     let new_target = format!("{family}.{new}");
     let mut dirty = Vec::new();
     for (name, agent) in cfg.agents.iter_mut() {
         let mut touched = false;
-        if let Some(v) =
-            retarget_profile_ref(agent.model_provider.as_str(), &old_target, &new_target)
-        {
+        if let Some(v) = retarget_profile_ref(
+            agent.model_provider.as_str(),
+            &old_target,
+            &new_target,
+            references,
+        ) {
             agent.model_provider = v.as_str().into();
             touched = true;
         }
-        if let Some(v) =
-            retarget_profile_ref(agent.classifier_provider.as_str(), &old_target, &new_target)
-        {
+        if let Some(v) = retarget_profile_ref(
+            agent.classifier_provider.as_str(),
+            &old_target,
+            &new_target,
+            references,
+        ) {
             agent.classifier_provider = v.as_str().into();
             touched = true;
         }
-        if let Some(v) =
-            retarget_profile_ref(agent.summary_provider.as_str(), &old_target, &new_target)
-        {
+        if let Some(v) = retarget_profile_ref(
+            agent.summary_provider.as_str(),
+            &old_target,
+            &new_target,
+            references,
+        ) {
             agent.summary_provider = v.as_str().into();
             touched = true;
         }
@@ -1051,6 +1078,7 @@ fn rewrite_model_provider_refs(
             profile.context_compression.summary_provider.as_str(),
             &old_target,
             &new_target,
+            references,
         ) {
             profile.context_compression.summary_provider = v.as_str().into();
             dirty.push(format!(
@@ -1061,7 +1089,8 @@ fn rewrite_model_provider_refs(
     for (ty, al, profile) in cfg.providers.models.iter_entries_mut() {
         let mut touched = false;
         for fb in profile.fallback.iter_mut() {
-            if let Some(v) = retarget_profile_ref(fb.as_str(), &old_target, &new_target) {
+            if let Some(v) = retarget_profile_ref(fb.as_str(), &old_target, &new_target, references)
+            {
                 *fb = v.as_str().into();
                 touched = true;
             }
@@ -1072,7 +1101,9 @@ fn rewrite_model_provider_refs(
     }
     let mut routes_touched = false;
     for r in cfg.model_routes.iter_mut() {
-        if let Some(v) = retarget_profile_ref(&r.model_provider, &old_target, &new_target) {
+        if let Some(v) =
+            retarget_profile_ref(&r.model_provider, &old_target, &new_target, references)
+        {
             r.model_provider = v; // String field
             routes_touched = true;
         }
@@ -1082,7 +1113,9 @@ fn rewrite_model_provider_refs(
     }
     let mut embed_touched = false;
     for r in cfg.embedding_routes.iter_mut() {
-        if let Some(v) = retarget_profile_ref(&r.model_provider, &old_target, &new_target) {
+        if let Some(v) =
+            retarget_profile_ref(&r.model_provider, &old_target, &new_target, references)
+        {
             r.model_provider = v;
             embed_touched = true;
         }
@@ -1324,21 +1357,21 @@ fn collect_provider_refs(
     match category {
         ProviderCategory::Models => {
             for (name, agent) in sorted_agents(cfg) {
-                if ref_targets_profile(agent.model_provider.as_str(), &target) {
+                if ref_targets_profile(cfg, agent.model_provider.as_str(), &target) {
                     sites.push(RefSite::hard(
                         format!("agents.{name}.model_provider"),
                         ScrubAction::Refuse,
                         agent.model_provider.as_str(),
                     ));
                 }
-                if ref_targets_profile(agent.classifier_provider.as_str(), &target) {
+                if ref_targets_profile(cfg, agent.classifier_provider.as_str(), &target) {
                     sites.push(RefSite::soft(
                         format!("agents.{name}.classifier_provider"),
                         ScrubAction::ClearOptional,
                         agent.classifier_provider.as_str(),
                     ));
                 }
-                if ref_targets_profile(agent.summary_provider.as_str(), &target) {
+                if ref_targets_profile(cfg, agent.summary_provider.as_str(), &target) {
                     sites.push(RefSite::soft(
                         format!("agents.{name}.summary_provider"),
                         ScrubAction::ClearOptional,
@@ -1354,7 +1387,7 @@ fn collect_provider_refs(
                     let sp = &cfg.runtime_profiles[pname]
                         .context_compression
                         .summary_provider;
-                    if ref_targets_profile(sp.as_str(), &target) {
+                    if ref_targets_profile(cfg, sp.as_str(), &target) {
                         sites.push(RefSite::soft(
                             format!(
                                 "runtime_profiles.{pname}.context_compression.summary_provider"
@@ -1367,7 +1400,7 @@ fn collect_provider_refs(
             }
             for (ty, al, profile) in cfg.providers.models.iter_entries() {
                 for (i, fb) in profile.fallback.iter().enumerate() {
-                    if ref_targets_profile(fb.as_str(), &target) {
+                    if ref_targets_profile(cfg, fb.as_str(), &target) {
                         sites.push(RefSite::soft(
                             format!("providers.models.{ty}.{al}.fallback[{i}]"),
                             ScrubAction::DropFromVec { index: i },
@@ -1377,7 +1410,7 @@ fn collect_provider_refs(
                 }
             }
             for (i, route) in cfg.model_routes.iter().enumerate() {
-                if ref_targets_profile(route.model_provider.as_str(), &target) {
+                if ref_targets_profile(cfg, route.model_provider.as_str(), &target) {
                     sites.push(RefSite::soft(
                         format!("model_routes[{i}].model_provider"),
                         ScrubAction::DropFromVec { index: i },
@@ -1386,7 +1419,7 @@ fn collect_provider_refs(
                 }
             }
             for (i, route) in cfg.embedding_routes.iter().enumerate() {
-                if ref_targets_profile(route.model_provider.as_str(), &target) {
+                if ref_targets_profile(cfg, route.model_provider.as_str(), &target) {
                     sites.push(RefSite::soft(
                         format!("embedding_routes[{i}].model_provider"),
                         ScrubAction::DropFromVec { index: i },
@@ -2989,6 +3022,45 @@ mod tests {
         let err = rename_with_cascade(&mut cfg, &AliasKind::Agent, "bot", "_deleted").unwrap_err();
         assert!(matches!(err, RenameError::InvalidName(_)));
         assert!(cfg.agents.contains_key("bot"));
+    }
+
+    #[test]
+    fn dotted_profiles_keep_independent_rename_and_delete_boundaries() {
+        let mut cfg = cfg_with_provider("custom", "gw");
+        cfg.providers.models.ensure("custom", "gw.v2").unwrap();
+        for (agent, reference) in [
+            ("base", "custom.gw.fast"),
+            ("versioned", "custom.gw.v2.fast"),
+        ] {
+            cfg.agents.insert(
+                agent.into(),
+                AliasedAgentConfig {
+                    model_provider: reference.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let kind = provider_kind("custom");
+        assert_eq!(find_all_references(&cfg, &kind, "gw").len(), 1);
+        assert_eq!(find_all_references(&cfg, &kind, "gw.v2").len(), 1);
+        assert!(!plan_delete(&cfg, &kind, "gw.v2").allowed);
+        rename_with_cascade(&mut cfg, &kind, "gw", "gateway").unwrap();
+        assert_eq!(
+            cfg.agents["base"].model_provider.as_str(),
+            "custom.gateway.fast"
+        );
+        assert_eq!(
+            cfg.agents["versioned"].model_provider.as_str(),
+            "custom.gw.v2.fast"
+        );
+        cfg.agents.remove("versioned");
+        cfg.agents.get_mut("base").unwrap().summary_provider = "custom.gw.v2.fast".into();
+        delete_with_cascade(&mut cfg, &kind, "gw.v2", CascadePolicy::RefuseOnHard).unwrap();
+        assert!(cfg.agents["base"].summary_provider.as_str().is_empty());
+        assert_eq!(
+            cfg.agents["base"].model_provider.as_str(),
+            "custom.gateway.fast"
+        );
     }
 
     #[test]

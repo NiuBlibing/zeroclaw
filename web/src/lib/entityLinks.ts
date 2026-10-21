@@ -27,20 +27,24 @@ const ENTITY_SECTION = {
 
 export type EntityKind = keyof typeof ENTITY_SECTION;
 
-export function entityConfigPath(kind: EntityKind, id: string): string {
+export function modelProfileRef(id: string, aliases: readonly string[]): string | undefined {
+  const dot = id.indexOf('.');
+  if (dot < 1) return undefined;
+  const tail = id.slice(dot + 1);
+  const alias = aliases.filter((candidate) => tail === candidate || tail.startsWith(`${candidate}.`))
+    .sort((a, b) => b.length - a.length)[0];
+  return alias ? `${id.slice(0, dot)}.${alias}` : undefined;
+}
+
+export function entityConfigPath(kind: EntityKind, id: string, modelAliases: readonly string[] = []): string {
   const { section, shape } = ENTITY_SECTION[kind];
   if (shape === 'picker') return `/config/${section}`;
   if (shape === 'typed') {
-    // A model-provider ref may be three-segment (`<type>.<alias>.<model>`);
-    // the edit surface is always the profile page keyed by `<type>/<alias>`,
-    // so route on the first two segments and drop any `<model>`. Other typed
-    // sections (channels) are always two-segment `<type>.<alias>`.
     if (kind === 'model-provider') {
-      const [type, alias] = id.split('.');
-      if (type && alias) {
-        return `/config/${section}/${encodeURIComponent(type)}/${encodeURIComponent(alias)}`;
-      }
-      return `/config/${section}`;
+      const profile = modelProfileRef(id, modelAliases);
+      if (!profile) return `/config/${section}`;
+      const dot = profile.indexOf('.');
+      return `/config/${section}/${encodeURIComponent(profile.slice(0, dot))}/${encodeURIComponent(profile.slice(dot + 1))}`;
     }
     const dot = id.indexOf('.');
     if (dot > 0) {
