@@ -128,7 +128,13 @@ impl ToolScope {
             }
             if let Some(index) = text_index {
                 let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(&text);
-                if calls.iter().any(|call| call.name == intent.proposed_name) {
+                if calls.iter().any(|call| {
+                    call.name == intent.proposed_name
+                        && intent
+                            .provider_call_id
+                            .as_ref()
+                            .is_none_or(|id| call.tool_call_id.as_deref() == Some(id.as_str()))
+                }) {
                     return Ok((event.event_id.clone(), index));
                 }
             }

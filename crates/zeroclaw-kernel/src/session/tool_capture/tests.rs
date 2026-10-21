@@ -244,7 +244,7 @@ impl Harness {
             "session.text/v1".into(),
             format!(
                 "<tool_call>{}</tool_call>",
-                serde_json::json!({"name":"shell","arguments":provider_arguments})
+                serde_json::json!({"name":"shell","arguments":provider_arguments,"tool_call_id":"call-1"})
             )
             .into_bytes(),
         )
@@ -367,28 +367,41 @@ async fn recovered_arguments_preserve_origin_and_execute_after_approval() {
 #[tokio::test]
 async fn proposal_still_requires_current_provider_call_identity() {
     for backend in ["sqlite", "jsonl"] {
-        let h = Harness::new(backend);
-        let _prepared = h.prepare(false).await;
-        let tools = h.owner.tool_capture(
-            h.stream.clone(),
-            h.branch.clone(),
-            h.turn.clone(),
-            h.authority.clone(),
-        );
-        for (name, id) in [("different", "call-1"), ("shell", "different")] {
-            assert!(
-                tools
-                    .prepare(ToolPreparationIntent {
-                        proposed_name: name.into(),
-                        provider_call_id: Some(id.into()),
-                        name: "shell".into(),
-                        arguments: serde_json::json!({"command":"true"}),
-                        approval_requirement: "prompt".into(),
-                        trusted_route: serde_json::json!({"channel":"fixture"}),
-                    })
-                    .await
-                    .is_err()
+        for text_protocol in [false, true] {
+            let h = Harness::new(backend);
+            let _prepared = h.prepare(text_protocol).await;
+            let tools = h.owner.tool_capture(
+                h.stream.clone(),
+                h.branch.clone(),
+                h.turn.clone(),
+                h.authority.clone(),
             );
+            tools
+                .prepare(ToolPreparationIntent {
+                    proposed_name: "shell".into(),
+                    provider_call_id: Some("call-1".into()),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command":"true"}),
+                    approval_requirement: "prompt".into(),
+                    trusted_route: serde_json::json!({"channel":"fixture"}),
+                })
+                .await
+                .expect("provider identity matches without comparing arguments");
+            for (name, id) in [("different", "call-1"), ("shell", "different")] {
+                assert!(
+                    tools
+                        .prepare(ToolPreparationIntent {
+                            proposed_name: name.into(),
+                            provider_call_id: Some(id.into()),
+                            name: "shell".into(),
+                            arguments: serde_json::json!({"command":"true"}),
+                            approval_requirement: "prompt".into(),
+                            trusted_route: serde_json::json!({"channel":"fixture"}),
+                        })
+                        .await
+                        .is_err()
+                );
+            }
         }
     }
 }
