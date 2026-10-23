@@ -90,7 +90,7 @@ async fn provider_content_metadata_survives_complete_and_interrupted_capture() {
                 metadata[1]["position"],
                 serde_json::json!({"output_index":0,"content_index":0})
             );
-            assert_eq!(metadata[1]["fields"]["future"]["token"], "[REDACTED]");
+            assert_eq!(metadata[1]["fields"]["future"]["token"], "fixture-secret");
             assert_eq!(metadata[2]["fields"]["id"], "fc_fixture");
             assert_eq!(metadata[2]["fields"]["namespace"], "search");
             assert_eq!(
@@ -359,7 +359,7 @@ async fn native_anthropic_signed_reasoning_preserves_partial_final_and_request_r
             } else {
                 let partial = partial.expect("durable partial signature");
                 assert_eq!(partial["activity"]["delta"]["signature"], signature);
-                assert_eq!(partial["activity"]["delta"]["api_key"], "[REDACTED]");
+                assert_eq!(partial["activity"]["delta"]["api_key"], "fixture-secret");
             }
             let readable = response
                 .blocks
@@ -374,8 +374,8 @@ async fn native_anthropic_signed_reasoning_preserves_partial_final_and_request_r
                     }
                     _ => None,
                 })
-                .expect("classified readable thinking");
-            assert_eq!(readable, b"weigh the options token=[REDACTED]");
+                .expect("original readable thinking");
+            assert_eq!(readable, thinking.as_bytes());
             let finalized = response
                 .blocks
                 .iter()
@@ -549,7 +549,7 @@ async fn native_anthropic_signed_reasoning_preserves_partial_final_and_request_r
 }
 
 #[tokio::test]
-async fn ordinary_reasoning_keeps_credential_classification_without_signed_adapter_evidence() {
+async fn ordinary_reasoning_preserves_original_content_without_signed_adapter_evidence() {
     for backend in ["sqlite", "jsonl"] {
         let h = Harness::new(backend);
         let provider = Leaf {
@@ -567,25 +567,28 @@ async fn ordinary_reasoning_keeps_credential_classification_without_signed_adapt
         .await
         .unwrap()
         .unwrap();
+        let plain = "ordinary token=fixture-secret";
+        let structured = r#"{"thinking":"ordinary","signature":"sk-fixture-signature"}"#;
         for event in [
-            StreamEvent::ThinkingDelta("ordinary token=fixture-secret".into()),
-            StreamEvent::ReasoningFinalized("ordinary token=fixture-secret".into()),
-            StreamEvent::ReasoningFinalized(
-                r#"{"thinking":"ordinary","signature":"sk-fixture-signature"}"#.into(),
-            ),
+            StreamEvent::ThinkingDelta(plain.into()),
+            StreamEvent::ReasoningFinalized(plain.into()),
+            StreamEvent::ReasoningFinalized(structured.into()),
         ] {
             recorder.event(&event).await.unwrap();
         }
         recorder.event(&StreamEvent::Final).await.unwrap();
         assert_eq!(recorder.blocks.len(), 3);
-        for block in recorder.blocks.iter().map(|segment| &segment.block) {
+        for (block, expected) in recorder
+            .blocks
+            .iter()
+            .map(|segment| &segment.block)
+            .zip([plain, plain, structured])
+        {
             let ResponseBlock::Reasoning { payload_ref, .. } = block else {
                 panic!("reasoning")
             };
             let text = String::from_utf8(h.bytes(payload_ref)).unwrap();
-            assert!(text.contains("[REDACTED]"));
-            assert!(!text.contains("fixture-secret"));
-            assert!(!text.contains("sk-fixture-signature"));
+            assert_eq!(text, expected);
         }
     }
 }
@@ -651,9 +654,7 @@ async fn signed_reasoning_projection_is_consumed_once_and_only_when_adjacent() {
                 assert_eq!(bytes, signed.as_bytes());
             } else {
                 assert_eq!(representation_kind, "provider_replay");
-                let classified = String::from_utf8(bytes).unwrap();
-                assert!(classified.contains("[REDACTED]"));
-                assert!(!classified.contains("sk-fixture-signature"));
+                assert_eq!(bytes, signed.as_bytes());
             }
         }
     }

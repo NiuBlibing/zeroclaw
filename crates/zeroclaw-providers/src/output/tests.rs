@@ -146,7 +146,7 @@ fn gemini_signature_does_not_turn_text_or_tool_into_reasoning() {
 }
 
 #[test]
-fn gemini_thought_classifies_ordinary_fields_and_preserves_only_known_signature() {
+fn gemini_thought_preserves_original_text_signatures_and_unknown_fields() {
     let thought = serde_json::json!({
         "thought":true, "text":"ordinary api_key=fixture-key",
         "thoughtSignature":"sk-fixture-continuation",
@@ -156,10 +156,7 @@ fn gemini_thought_classifies_ordinary_fields_and_preserves_only_known_signature(
         panic!("reasoning");
     };
     let value: Value = serde_json::from_slice(&bytes).expect("thought");
-    assert_eq!(value["text"], "ordinary api_key=[REDACTED]");
-    assert_eq!(value["thoughtSignature"], "sk-fixture-continuation");
-    assert_eq!(value["futureField"]["token"], "[REDACTED]");
-    assert_eq!(value["futureField"]["signature"], "[REDACTED]");
+    assert_eq!(value, thought);
 
     let malformed = serde_json::json!({
         "thought":true, "text":"ordinary",
@@ -169,7 +166,7 @@ fn gemini_thought_classifies_ordinary_fields_and_preserves_only_known_signature(
         panic!("reasoning");
     };
     let value: Value = serde_json::from_slice(&bytes).expect("malformed signature");
-    assert_eq!(value["thoughtSignature"]["api_key"], "[REDACTED]");
+    assert_eq!(value, malformed);
 }
 
 #[test]

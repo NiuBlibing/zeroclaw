@@ -23,6 +23,11 @@ the existing authorization resolvers. Task execution ownership remains with
 the task registry. A historical approval, policy observation or cursor grants
 no permission. Bound effect handles retain identities, not policy snapshots.
 
+The synchronous legacy conversation-binding owner refuses native session
+access without execution admission. It must not acknowledge a cache-only
+exchange that is absent from the event store. Native callers use the session
+execution and authorized history ports.
+
 ## Execution and recovery
 
 The coordinator commits input and turn admission before polling the supplied

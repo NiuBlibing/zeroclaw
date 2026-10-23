@@ -52,14 +52,14 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
             tool_calls: vec![ToolCall {
                 id: "call-1".into(),
                 name: "read".into(),
-                arguments: "{}".into(),
+                arguments: r#"{"token":"fixture-secret"}"#.into(),
                 extra_content: None,
             }],
-            reasoning_content: Some("retained reasoning".into()),
+            reasoning_content: Some("retained reasoning token=fixture-secret".into()),
         });
         history.push(ConversationMessage::ToolResults(vec![ToolResultMessage {
             tool_call_id: "call-1".into(),
-            content: "result".into(),
+            content: "result api_key=fixture-secret".into(),
             tool_name: "read".into(),
         }]));
         old.append_turn("live", &history).unwrap();

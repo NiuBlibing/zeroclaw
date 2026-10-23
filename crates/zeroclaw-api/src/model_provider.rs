@@ -485,9 +485,9 @@ impl StreamChunk {
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// Protocol position of the immediately following semantic segment.
-    /// Offsets are assigned after credential classification by capture.
+    /// Offsets refer to the original content observed by capture.
     ContentPosition(ProviderContentPosition),
-    /// A complete classified non-text/opaque content block. Text and tool
+    /// A complete non-text/opaque content block. Text and tool
     /// deltas retain their existing streaming variants; this is never flattened.
     OutputBlock(ProviderOutputBlock),
     /// Text delta from the assistant.
