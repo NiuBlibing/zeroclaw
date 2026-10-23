@@ -280,8 +280,7 @@ impl From<RawNativeResponseMessage> for NativeResponseMessage {
                 0,
                 ProviderOutputBlock::Reasoning {
                     representation: "reasoning_content".into(),
-                    bytes: zeroclaw_api::session_events::privacy::classify_text(reasoning)
-                        .into_bytes(),
+                    bytes: reasoning.to_owned().into_bytes(),
                     replay_requirement: "provider_defined".into(),
                 },
             );
@@ -1026,7 +1025,7 @@ pub(crate) async fn run_responses_sse(
     if !http_response.status().is_success() {
         let status = http_response.status();
         let body = http_response.text().await.unwrap_or_default();
-        let sanitized = super::classified_api_error_body(&body);
+        let sanitized = super::sanitize_api_error(&body);
         let _ = tx
             .send(Err(StreamError::HttpStatus {
                 status: status.as_u16(),
@@ -2151,7 +2150,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_plain_reasoning_is_classified_without_inferring_signed_content() {
+    fn native_plain_reasoning_is_preserved_without_inferring_signed_content() {
         let reasoning =
             r#"{"thinking":"ordinary token=fixture-token","signature":"sk-fixture-signature"}"#;
         let message: NativeResponseMessage = serde_json::from_value(serde_json::json!({
@@ -2164,12 +2163,9 @@ mod tests {
         else {
             panic!("typed reasoning");
         };
-        assert_eq!(
-            bytes,
-            zeroclaw_api::session_events::privacy::classify_text(reasoning).as_bytes()
-        );
-        assert!(!String::from_utf8_lossy(bytes).contains("fixture-token"));
-        assert!(!String::from_utf8_lossy(bytes).contains("sk-fixture-signature"));
+        assert_eq!(bytes, reasoning.to_owned().as_bytes());
+        assert!(String::from_utf8_lossy(bytes).contains("fixture-token"));
+        assert!(String::from_utf8_lossy(bytes).contains("sk-fixture-signature"));
     }
 
     #[tokio::test]

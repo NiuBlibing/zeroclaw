@@ -225,7 +225,7 @@ async fn replacement_from_legacy_adapter_records_body_without_fabricating_identi
 }
 
 #[tokio::test]
-async fn replacement_replies_retain_all_classified_content_and_selected_identity_after_reopen() {
+async fn replacement_replies_retain_all_original_content_and_selected_identity_after_reopen() {
     for backend in ["sqlite", "jsonl"] {
         let h = Harness::new(backend);
         let port = h.prepare(false).await;
@@ -284,7 +284,7 @@ async fn replacement_replies_retain_all_classified_content_and_selected_identity
             evidence.clone(),
         )
         .await
-        .expect("matching classified response resolves");
+        .expect("matching original response resolves");
         let resolved_head = h.store.head(&h.stream).expect("resolved head");
         port.resolve_approval(
             response,
@@ -339,7 +339,7 @@ async fn replacement_replies_retain_all_classified_content_and_selected_identity
         );
         for (id, text, expected_actor) in [
             (first, "first proposed replacement".to_owned(), None),
-            (selected, privacy::classify_text(replacement), Some(actor)),
+            (selected, replacement.to_owned(), Some(actor)),
         ] {
             let (event, reply) = recorded_reply(reopened.as_ref(), &id);
             assert_eq!(reply.decision, ApprovalReplyDecision::Replace);
@@ -355,7 +355,6 @@ async fn replacement_replies_retain_all_classified_content_and_selected_identity
             };
             assert_eq!(StoredPayloadRef::from(&content), reference);
             assert_eq!(content.body, text.as_bytes());
-            assert!(!text.contains("fixture-secret-value"));
         }
     }
 }

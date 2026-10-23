@@ -10,7 +10,7 @@ use zeroclaw_api::session_events::capture::{
 use zeroclaw_api::session_events::projection::{HistoryProjection, InvocationStatus};
 use zeroclaw_api::session_events::{
     ContentPayload, ContextMessageSource, Digest, EventData, EventId, MessageId, PayloadId,
-    PayloadRead, RecordedContentPart, StoredPayloadRef, TurnCompletion, canonical_json, privacy,
+    PayloadRead, RecordedContentPart, StoredPayloadRef, TurnCompletion, canonical_json,
 };
 
 #[cfg(test)]
@@ -37,7 +37,7 @@ pub struct UserTurnCommand {
 /// resolve their own capabilities; kernel never constructs providers or tools.
 #[async_trait::async_trait]
 pub trait TurnExecutorPort: Send {
-    /// The host owns credential scrubbing and error-chain formatting. Kernel
+    /// The host owns explicit error-chain formatting. Kernel
     /// persists only this explicit diagnostic, never arbitrary panic data.
     fn diagnostic(&self, _error: &anyhow::Error) -> Option<String> {
         None
@@ -459,7 +459,7 @@ impl SessionCoordinator {
                         (RecordedContentPart::File { file_id }, EngineInputPart::File(file)) if file_id == &file.file_id => {}
                         (RecordedContentPart::Opaque {type_name,body_ref}, EngineInputPart::Opaque {type_name:expected,body}) if type_name==expected => {
                             let PayloadRead::Present(leaf)=owner.store.read_payload(&body_ref.payload_id)? else {return Err(SessionError::StaleTarget("accepted opaque part unavailable".into()));};
-                            if leaf.body!=canonical_json(&privacy::classify_value(body.clone())).map_err(AppendError::from)? {return Err(AppendError::IdempotencyConflict(command.ingress_key).into());}
+                            if leaf.body!=canonical_json(&body.clone()).map_err(AppendError::from)? {return Err(AppendError::IdempotencyConflict(command.ingress_key).into());}
                         }
                         _ => return Err(AppendError::IdempotencyConflict(command.ingress_key).into()),
                     }
@@ -490,11 +490,11 @@ impl SessionCoordinator {
                             .map_err(|error|ReadError::Corrupt(error.to_string()))?;
                         let metadata: StoredPayloadRef = serde_json::from_value(policy["observed_file_metadata_ref"].clone())
                             .map_err(|error|ReadError::Corrupt(error.to_string()))?;
-                        let expected_metadata = canonical_json(&privacy::classify_value(file.registration.clone()))
+                        let expected_metadata = canonical_json(&file.registration.clone())
                             .map_err(AppendError::from)?;
                         if file_id != &file.file_id || representation != &StoredPayloadRef::from(&file.representation)
                             || metadata.body_digest != Digest::from_bytes(&expected_metadata)
-                            || policy.get("policy") != Some(&privacy::classify_value(file.policy_evidence.clone())) {
+                            || policy.get("policy") != Some(&file.policy_evidence.clone()) {
                             return Err(AppendError::IdempotencyConflict(command.ingress_key).into());
                         }
                     }
@@ -523,7 +523,7 @@ impl SessionCoordinator {
                         files.push((index, file.clone()));
                     }
                     EngineInputPart::Opaque {type_name,body} => {
-                        let leaf=PayloadRecord::json("session.bytes/v1",&privacy::classify_value(body.clone())).map_err(AppendError::from)?;
+                        let leaf=PayloadRecord::json("session.bytes/v1",&body.clone()).map_err(AppendError::from)?;
                         parts.push(RecordedContentPart::Opaque {type_name:type_name.clone(),body_ref:StoredPayloadRef::from(&leaf)});
                         leaves.push(leaf);
                     }
@@ -592,10 +592,10 @@ impl SessionCoordinator {
                 }
             }
             for (index,file) in files {
-                let metadata=PayloadRecord::json("session.locator/v1",&zeroclaw_api::session_events::privacy::classify_value(file.registration))
+                let metadata=PayloadRecord::json("session.locator/v1",&file.registration)
                     .map_err(AppendError::from)?;
                 let policy=PayloadRecord::json("session.evidence/v1",&serde_json::json!({
-                    "policy":zeroclaw_api::session_events::privacy::classify_value(file.policy_evidence),
+                    "policy":(file.policy_evidence),
                     "observed_file_metadata_ref":StoredPayloadRef::from(&metadata),
                 })).map_err(AppendError::from)?;
                 let mut data=Vec::new();
@@ -838,7 +838,7 @@ impl SessionCoordinator {
                         {
                                         let source = owner.store.read_event(content_event_id)?.ok_or_else(|| SessionError::StaleTarget("terminal content missing".into()))?;
                                         if source.turn_id.as_ref() == Some(&command.turn_id)
-                                            && super::context_messages::resolve_message(owner.store.as_ref(), &command.stream_id, item)?.is_some_and(|message| matches!(message, zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.role == "assistant" && chat.content == privacy::classify_text(&text))) {
+                                            && super::context_messages::resolve_message(owner.store.as_ref(), &command.stream_id, item)?.is_some_and(|message| matches!(message, zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.role == "assistant" && chat.content == text)) {
                                             existing = Some(content_event_id.clone());
                                         }
                         }
@@ -869,7 +869,7 @@ impl SessionCoordinator {
                             // With a model response present, reuse its canonical
                             // leaves; display receipts/notices are not raw output.
                             let text = PayloadRecord::new(zeroclaw_api::session_events::PayloadId::new(),
-                                "session.text/v1".into(), zeroclaw_api::session_events::privacy::classify_text(&text).into_bytes()).map_err(AppendError::from)?;
+                                "session.text/v1".into(), text.to_owned().into_bytes()).map_err(AppendError::from)?;
                             parts.push(RecordedContentPart::Text {text_ref: StoredPayloadRef::from(&text)});
                             payloads.push(text);
                         }

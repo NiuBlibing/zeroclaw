@@ -3381,8 +3381,7 @@ impl AcpServer {
                         &blob,
                     )
                     .map_err(|error| {
-                        let diagnostic =
-                            zeroclaw_api::session_events::privacy::classify_text(&error.0);
+                        let diagnostic = error.0.to_owned();
                         ::zeroclaw_log::record!(
                             ERROR,
                             ::zeroclaw_log::Event::new(

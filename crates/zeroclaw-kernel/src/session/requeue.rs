@@ -184,7 +184,7 @@ impl EngineSession {
             "invalid_recovery_rejection_reason"
         );
         let turn = TurnId::parse(turn)?;
-        let reason = self.authority.classify_text(reason);
+        let reason = reason.to_owned();
         let session = self.clone();
         self.owner
             .blocking(move || {

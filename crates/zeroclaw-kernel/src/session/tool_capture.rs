@@ -165,15 +165,14 @@ impl ToolAdmissionPort for ToolScope {
                 let (provider_result_event_id,block_index) = work_scope.proposal(&intent)?;
                 let invocation = InvocationId::new();
                 let proposal = work_scope.event(&invocation,EventData::ToolCallProposed {provider_result_event_id,block_index})?;
-                let classified_arguments = privacy::classify_value(intent.arguments.clone());
-                let arguments = PayloadRecord::json("session.tool-arguments/v1",&classified_arguments)?;
+                let arguments = PayloadRecord::json("session.tool-arguments/v1",&intent.arguments)?;
                 let action = PayloadRecord::json("session.tool-call/v1",&serde_json::json!({"name":intent.name,"arguments_ref":StoredPayloadRef::from(&arguments)}))?;
                 let current=work_scope.resolver.tool_authority_evidence(&work_scope.stream,&intent.name)?;
                 let authority = PayloadRecord::json("session.authority/v1",&serde_json::json!({"approval_observation":{"requirement":intent.approval_requirement,"source":"current_approval_manager"},"admission":current}))?;
                 let route = PayloadRecord::json("session.route/v1",&intent.trusted_route)?;
                 let policy = work_scope.event(&invocation,EventData::PolicyDecisionRecorded {
                     proposed_event_id:proposal.event_id.clone(),final_action_ref:StoredPayloadRef::from(&action),
-                    decision:intent.approval_requirement.clone(),action_fingerprint:Digest::from_bytes(&canonical_json(&serde_json::json!({"name":intent.name,"arguments":classified_arguments}))?),
+                    decision:intent.approval_requirement.clone(),action_fingerprint:Digest::from_bytes(&canonical_json(&serde_json::json!({"name":intent.name,"arguments":intent.arguments}))?),
                     matched_rule_refs:vec![],authority_evidence_ref:StoredPayloadRef::from(&authority),
                 })?;
                 let prepared = PreparedTool {scope:Arc::clone(&work_scope),invocation,
@@ -350,8 +349,7 @@ impl PreparedToolPort for PreparedTool {
             !classification.is_empty(),
             "approval_rejection_classification_missing"
         );
-        let evidence =
-            PayloadRecord::json("session.evidence/v1", &privacy::classify_value(evidence))?;
+        let evidence = PayloadRecord::json("session.evidence/v1", &evidence)?;
         let event = self.scope.event(
             &self.invocation,
             EventData::ApprovalReplyRejected {
@@ -565,7 +563,7 @@ impl ToolObservationPort for EffectObservationHandle {
                 let lock = owner.lock_for(&stream);
                 let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
                 let proof =
-                    PayloadRecord::json("session.evidence/v1", &privacy::classify_value(evidence))
+                    PayloadRecord::json("session.evidence/v1", &evidence)
                         .map_err(AppendError::from)?;
                 let key = format!("tool-verified-cancel:{invocation}");
                 if let Some(receipt) = owner.store.lookup_receipt(&stream, &key)? {

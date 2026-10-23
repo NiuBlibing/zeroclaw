@@ -1,5 +1,5 @@
 //! Narrow bridge from admitted session commands to an existing engine future.
-//! Hosts supply current authority and classified execution evidence; this
+//! Hosts supply current authority and execution evidence; this
 //! bridge creates no capability factory or second model/tool loop.
 use super::execution::{TurnExecutorPort, UserTurnCommand};
 use super::query::{PayloadSelector, SessionAccess, SessionAccessPolicy, SessionQuery};
@@ -21,7 +21,6 @@ pub trait EngineSessionAuthority: SessionAccessPolicy + PermissionResolver {
     }
     fn execution_binding(&self, input: &EngineTurnInput) -> Result<PayloadRecord, SessionError>;
     fn maintenance_binding(&self) -> Result<PayloadRecord, SessionError>;
-    fn classify_text(&self, text: &str) -> String;
     fn diagnostic(&self, error: &anyhow::Error) -> Option<String>;
 }
 
@@ -241,25 +240,7 @@ impl EngineSession {
         let turn = TurnId::parse(&input.turn_id)?;
         let ingress_key = format!("engine-input:{turn}");
         let binding = self.authority.execution_binding(&input)?;
-        let parts = input
-            .parts
-            .into_iter()
-            .map(|part| match part {
-                zeroclaw_api::session_events::capture::EngineInputPart::Text(text) => {
-                    zeroclaw_api::session_events::capture::EngineInputPart::Text(
-                        self.authority.classify_text(&text),
-                    )
-                }
-                zeroclaw_api::session_events::capture::EngineInputPart::Opaque {
-                    type_name,
-                    body,
-                } => zeroclaw_api::session_events::capture::EngineInputPart::Opaque {
-                    type_name: self.authority.classify_text(&type_name),
-                    body: privacy::classify_value(body),
-                },
-                file => file,
-            })
-            .collect();
+        let parts = input.parts;
         let mut ingress = serde_json::to_value(&input.ingress)?;
         if let Some(workspace) = &input.execution_workspace {
             ingress["execution_workspace"] = serde_json::to_value(workspace)?;
@@ -269,8 +250,7 @@ impl EngineSession {
         let route = input
             .reply_route
             .map(|route| -> anyhow::Result<PayloadRecord> {
-                let mut payload =
-                    PayloadRecord::json("session.route/v1", &privacy::classify_value(route))?;
+                let mut payload = PayloadRecord::json("session.route/v1", &route)?;
                 payload.payload_id = PayloadId::parse(format!("reply-route-{turn}"))?;
                 Ok(payload)
             })

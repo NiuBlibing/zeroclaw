@@ -7,7 +7,7 @@ use zeroclaw_api::session_events::capture::{
 use zeroclaw_api::session_events::*;
 
 // A synchronous response API can consume an asynchronous wire protocol. The
-// existing dispatch owns the sole recorder; the adapter only lends classified
+// existing dispatch owns the sole recorder; the adapter only lends observed
 // observations to it. Nested composite dispatches mask their parent's scope.
 tokio::task_local! {
     static ADAPTER_CAPTURE: Arc<tokio::sync::Mutex<Option<Recorder>>>;
@@ -120,37 +120,6 @@ fn metadata_codec(metadata: &serde_json::Value) -> &'static str {
     } else {
         "session.bytes/v1"
     }
-}
-
-fn classified_metadata(metadata: &serde_json::Value) -> serde_json::Value {
-    let mut classified = zeroclaw_api::session_events::privacy::classify_value(metadata.clone());
-    // These tags are emitted by the Anthropic adapter, not inferred from text.
-    // A partial signature is protocol continuation, never a credential field.
-    if metadata.get("kind").and_then(serde_json::Value::as_str) == Some("partial_content")
-        && metadata.get("protocol").and_then(serde_json::Value::as_str) == Some("anthropic")
-        && metadata
-            .get("component")
-            .and_then(serde_json::Value::as_str)
-            == Some("reasoning")
-        && metadata
-            .get("type_name")
-            .and_then(serde_json::Value::as_str)
-            == Some("signature_delta")
-        && metadata
-            .pointer("/activity/type")
-            .and_then(serde_json::Value::as_str)
-            == Some("content_block_delta")
-        && metadata
-            .pointer("/activity/delta/type")
-            .and_then(serde_json::Value::as_str)
-            == Some("signature_delta")
-        && let Some(signature) = metadata.pointer("/activity/delta/signature")
-        && signature.is_string()
-        && let Some(value) = classified.pointer_mut("/activity/delta/signature")
-    {
-        *value = signature.clone();
-    }
-    classified
 }
 
 fn is_content_metadata(metadata: &serde_json::Value) -> bool {
@@ -271,7 +240,7 @@ impl Recorder {
         payloads: &mut Vec<PayloadRecord>,
     ) -> anyhow::Result<StoredPayloadRef> {
         let bytes = match codec {
-            // Provider continuation is already a classified content surface.
+            // Provider continuation is already a protocol content surface.
             // Its signed/opaque bytes must survive a request round trip exactly.
             "session.reasoning/v1" => bytes,
             "session.text/v1"
@@ -279,13 +248,11 @@ impl Recorder {
             | "session.tool-result/v1"
             | "session.locator/v1" => {
                 let text = std::str::from_utf8(&bytes)?;
-                zeroclaw_api::session_events::privacy::classify_text(text).into_bytes()
+                text.to_owned().into_bytes()
             }
             "session.tool-arguments/v1" => {
                 let arguments: serde_json::Value = serde_json::from_slice(&bytes)?;
-                canonical_json(&zeroclaw_api::session_events::privacy::classify_value(
-                    arguments,
-                ))?
+                canonical_json(&arguments)?
             }
             _ => bytes,
         };
@@ -346,7 +313,7 @@ impl Recorder {
             .into(),
             payload_ref: self.leaf(
                 "session.reasoning/v1",
-                zeroclaw_api::session_events::privacy::classify_text(text).into_bytes(),
+                text.to_owned().into_bytes(),
                 payloads,
             )?,
             completion: if finalized {
@@ -423,8 +390,7 @@ impl Recorder {
                 metadata,
             } = block
             {
-                let record =
-                    PayloadRecord::json(metadata_codec(metadata), &classified_metadata(metadata))?;
+                let record = PayloadRecord::json(metadata_codec(metadata), metadata)?;
                 self.charge(record.body.len())?;
                 if metadata.get("kind").and_then(serde_json::Value::as_str)
                     == Some("served_attribution")
@@ -551,9 +517,7 @@ impl Recorder {
                 type_name: type_name.clone(),
                 classified_body_ref: self.leaf(
                     "session.reasoning/v1",
-                    canonical_json(&zeroclaw_api::session_events::privacy::classify_value(
-                        content.clone(),
-                    ))?,
+                    canonical_json(&content.clone())?,
                     payloads,
                 )?,
             },
@@ -707,7 +671,7 @@ impl Recorder {
             DiagnosticDetail::Available {
                 detail_ref: self.leaf(
                     "session.error-detail/v1",
-                    crate::scrub_secret_patterns(detail).into_bytes(),
+                    detail.as_bytes().to_vec(),
                     &mut payloads,
                 )?,
             }
@@ -715,7 +679,7 @@ impl Recorder {
             DiagnosticDetail::Available {
                 detail_ref: self.leaf(
                     "session.error-detail/v1",
-                    crate::sanitize_api_error(&format!("{error:#}")).into_bytes(),
+                    format!("{error:#}").into_bytes(),
                     &mut payloads,
                 )?,
             }
@@ -724,7 +688,7 @@ impl Recorder {
                 reason_key: "panic_payload_is_untrusted".into(),
             }
         };
-        // The classified response body is the canonical source for protocol codes.
+        // The provider response body is the canonical source for protocol codes.
         // Retain codes only when the provider actually supplied them.
         let body = http
             .map(|http| http.detail.as_str())
@@ -743,7 +707,7 @@ impl Recorder {
                         .or_else(|| body.pointer("/error/type"))
                         .or_else(|| body.get("code"))
                         .and_then(serde_json::Value::as_str)
-                        .map(zeroclaw_api::session_events::privacy::classify_text)
+                        .map(str::to_owned)
                 })
             });
         let context_limit = provider_code.as_deref().is_some_and(|code| {
@@ -971,8 +935,7 @@ impl Recorder {
                     metadata["position"] = serde_json::to_value(position)?;
                 }
                 let metadata = &metadata;
-                let record =
-                    PayloadRecord::json(metadata_codec(metadata), &classified_metadata(metadata))?;
+                let record = PayloadRecord::json(metadata_codec(metadata), metadata)?;
                 self.charge(record.body.len())?;
                 if metadata.get("kind").and_then(serde_json::Value::as_str)
                     == Some("served_attribution")

@@ -143,7 +143,7 @@ fn import_existing(
         PayloadId::parse(format!("legacy-acp-overlap-evidence-{stream}"))?,
         "session.evidence/v1".into(),
         canonical_json(
-            &serde_json::json!({"source_digest":Digest::from_bytes(&canonical_json(&privacy::classify_value(serde_json::json!({
+            &serde_json::json!({"source_digest":Digest::from_bytes(&canonical_json(&(serde_json::json!({
             "messages":imported.data.messages,"context":imported.data.retained_context,"checkpoint":imported.checkpoint,"metadata":imported.metadata,"closed":imported.closed
         })))?)}),
         )?,
@@ -205,7 +205,7 @@ fn import_existing(
             let mut items = Vec::new();
             let mut missing = Vec::new();
             for message in rows {
-                let message = privacy::classify_conversation(message);
+                let message = message.clone();
                 let digest = Digest::from_bytes(&canonical_json(&message)?);
                 if let Some(item) = available
                     .get_mut(digest.as_str())
@@ -310,16 +310,10 @@ fn import_one(
     } = imported;
     let stream = stream_id(family)?;
     let branch = BranchId::parse(format!("branch-{stream}"))?;
-    let history: Vec<_> = data
-        .messages
-        .iter()
-        .map(privacy::classify_conversation)
-        .collect();
+    let history = data.messages.clone();
     let context = data.retained_context.take().unwrap_or_else(|| {
         zeroclaw_api::session_events::transcript::provider_safe_history(&data.messages)
     });
-    let context: Vec<_> = context.iter().map(privacy::classify_conversation).collect();
-    let checkpoint = checkpoint.map(privacy::classify_value);
     let source_digest = Digest::from_bytes(&canonical_json(&serde_json::json!({
         "history":history,"context":context,"checkpoint":checkpoint,"closed":closed,"metadata":metadata,
         "principal_id":data.principal_id,"agent":data.agent_alias,

@@ -199,7 +199,7 @@ impl SessionCoordinator {
             let lock=owner.lock_for(&stream);let _guard=lock.lock().unwrap_or_else(|p|p.into_inner());
             owner.require_known_turn(&stream,&branch,Some(&turn))?;
             let target=PayloadRecord::json("session.evidence/v1",&serde_json::json!({"agent_alias":intent.target_agent})).map_err(AppendError::from)?;
-            let input=PayloadRecord::json("session.bytes/v1",&serde_json::json!({"prompt":privacy::classify_text(&intent.prompt),"parent_projection_event_id":context})).map_err(AppendError::from)?;
+            let input=PayloadRecord::json("session.bytes/v1",&serde_json::json!({"prompt":intent.prompt.to_owned(),"parent_projection_event_id":context})).map_err(AppendError::from)?;
             let proof=PayloadRecord::json("session.evidence/v1",&serde_json::json!({"source":"current_child_admission","reason_key":"child_authority_denied"})).map_err(AppendError::from)?;
             let actor=EventActor::System {component:"child_executor".into()};
             let mut requested=SessionEvent::typed(stream.clone(),EventData::ChildInvocationRequested {relation:intent.relation,execution_mode:intent.execution_mode,target_agent_ref:StoredPayloadRef::from(&target),input_projection_ref:StoredPayloadRef::from(&input),policy_evidence_ref:StoredPayloadRef::from(&proof),task_id:intent.task_id},actor.clone()).map_err(AppendError::from)?;
@@ -240,7 +240,7 @@ impl SessionCoordinator {
         let execution_turn_id = TurnId::new();
         let child_turn = execution_turn_id.clone();
         let target = intent.target_agent.clone();
-        let classified = privacy::classify_text(&intent.prompt);
+        let prompt = intent.prompt.to_owned();
         let child_scope = child_stream.clone();
         let child_initial_branch = child_branch.clone();
         let child_authority = authority.clone();
@@ -258,7 +258,7 @@ impl SessionCoordinator {
                 // Freeze the exact parent seed and the child's normalized input.
                 let input_ref = PayloadRecord::json(
                     "session.bytes/v1",
-                    &serde_json::json!({"prompt":classified,"parent_projection_event_id":context}),
+                    &serde_json::json!({"prompt":prompt,"parent_projection_event_id":context}),
                 )
                 .map_err(AppendError::from)?;
                 let evidence = PayloadRecord::json(
@@ -483,7 +483,7 @@ impl SessionCoordinator {
             "session.error-detail/v1",
             &serde_json::json!({
                 "error_key":"child_initialization_write_failed",
-                "detail":privacy::classify_text(&error.to_string()),
+                "detail":error.to_string(),
             }),
         )
         .map_err(AppendError::from)?;
@@ -608,7 +608,7 @@ impl ChildExecutionPort for ChildBinding {
                 self.stream.clone(),
                 format!("child-interruption:{}", self.parent.event_id),
                 Arc::new(StoppedChildFuture {
-                    reason: privacy::classify_text(reason_key),
+                    reason: reason_key.to_owned(),
                 }),
             )
             .await?;
@@ -642,7 +642,7 @@ impl ChildBinding {
         let parent = self.parent.clone();
         let child = self.stream.clone();
         let turn = TurnId::parse(&self.input.turn_id).map_err(AppendError::from)?;
-        let reason = privacy::classify_text(reason_key);
+        let reason = reason_key.to_owned();
         self.owner.blocking(move || {
             // Closing an unaccepted stream is the local execution fence. It
             // records no invented turn and races admission under the same lock.
@@ -997,7 +997,7 @@ impl SessionCoordinator {
             let started=owner.store.read_event(started.event_ids.first().ok_or_else(|| SessionError::StoreUnhealthy("consumer receipt empty".into()))?)?.ok_or_else(|| SessionError::StoreUnhealthy("consumer turn event missing".into()))?;
             let EventData::TurnStarted {accepted_event_id,..}=started.body.data else {return Err(SessionError::StoreUnhealthy("consumer turn kind mismatch".into()));};
             let key=format!("child-consumed:{}:{turn}",request.event_id);
-            let payload=super::retry::payload(&request.event_id,&format!("consumed-{turn}"),"session.bytes/v1",&privacy::classify_value(value))?;
+            let payload=super::retry::payload(&request.event_id,&format!("consumed-{turn}"),"session.bytes/v1",&value)?;
             if let Some(receipt)=owner.store.lookup_receipt(&stream,&key)? {
                 let existing=owner.store.read_event(receipt.event_ids.first().ok_or_else(|| SessionError::StoreUnhealthy("consumption receipt empty".into()))?)?.ok_or_else(|| SessionError::StoreUnhealthy("consumption event missing".into()))?;
                 if !matches!(existing.body.data,EventData::ChildResultConsumed {consumed_result_ref,..} if consumed_result_ref==StoredPayloadRef::from(&payload)) {return Err(SessionError::InvalidAdmission("child consumption changed during retry".into()));}

@@ -240,7 +240,7 @@ pub async fn open_cli_session(
             let state_path = lease.as_ref().ok_or_else(|| anyhow::Error::msg("CLI legacy import lease missing"))?.path().to_owned();
             let imported = import_legacy_snapshot(&data_dir, LegacyImport {
                 family:&family, owning_agent:&alias, target:backend, stream:stream.clone(), branch:branch.clone(),
-                session:session_id.clone(), source_kind:"cli-state-json", classify:classify_cli_message,
+                session:session_id.clone(), source_kind:"cli-state-json",
             }, || {
                 let mut options = std::fs::OpenOptions::new();
                 options.read(true);
@@ -319,14 +319,6 @@ pub async fn open_cli_session(
         session.authority,
     )))
 }
-fn classify_cli_message(
-    message: &zeroclaw_api::model_provider::ChatMessage,
-) -> zeroclaw_api::model_provider::ChatMessage {
-    zeroclaw_api::model_provider::ChatMessage {
-        role: message.role.clone(),
-        content: zeroclaw_api::session_events::privacy::classify_text(&message.content),
-    }
-}
 struct CliOwnershipRecovery;
 impl zeroclaw_kernel::session::recovery::StreamExecutionLossVerifier for CliOwnershipRecovery {
     fn verify_stream_loss(
@@ -369,9 +361,6 @@ impl EngineSessionAuthority for CliAuthority {
         Ok(PayloadRecord::json("session.execution-binding/v1", &serde_json::json!({
             "config_revision":self.capability.config_handle().revision(),"purpose":"context_maintenance",
         })).map_err(AppendError::from)?)
-    }
-    fn classify_text(&self, text: &str) -> String {
-        zeroclaw_api::session_events::privacy::classify_text(text)
     }
     fn diagnostic(&self, error: &anyhow::Error) -> Option<String> {
         Some(zeroclaw_runtime::agent::Agent::session_execution_diagnostic(error))

@@ -749,8 +749,7 @@ async fn rejected_replies_keep_bound_approval_identity_without_resolving_it() {
             };
             let actual: serde_json::Value =
                 serde_json::from_slice(&payload.body).expect("evidence");
-            assert_eq!(actual, privacy::classify_value(evidence.clone()));
-            assert_ne!(actual["api_key"], evidence["api_key"]);
+            assert_eq!(actual, evidence);
         }
         assert!(!events.iter().any(|event| matches!(
             event.body.kind(),

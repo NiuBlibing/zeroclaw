@@ -351,9 +351,6 @@ impl EngineSessionAuthority for IngressAuthority {
         self.current()?;
         self.base.maintenance_binding()
     }
-    fn classify_text(&self, text: &str) -> String {
-        self.base.classify_text(text)
-    }
     fn diagnostic(&self, error: &anyhow::Error) -> Option<String> {
         self.base.diagnostic(error)
     }
@@ -526,9 +523,6 @@ impl EngineSessionAuthority for GatewayAuthority {
     fn maintenance_binding(&self) -> Result<PayloadRecord, SessionError> {
         self.current()?;
         self.base.maintenance_binding()
-    }
-    fn classify_text(&self, text: &str) -> String {
-        self.base.classify_text(text)
     }
     fn diagnostic(&self, error: &anyhow::Error) -> Option<String> {
         self.base.diagnostic(error)

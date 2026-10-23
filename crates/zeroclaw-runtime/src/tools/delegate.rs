@@ -102,9 +102,11 @@ where
             let value = match &result {
                 Ok(result) if result.success => Ok(result.output.as_str().to_owned()),
                 Ok(result) => Err(anyhow::Error::msg(
-                    zeroclaw_api::session_events::privacy::classify_text(
-                        result.error.as_deref().unwrap_or("child_execution_failed"),
-                    ),
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or("child_execution_failed")
+                        .to_owned(),
                 )),
                 Err(error) => Err(anyhow::Error::msg(
                     crate::agent::Agent::session_execution_diagnostic(error),
@@ -3413,9 +3415,7 @@ impl DelegateTool {
                     &result_path,
                     initial_result,
                     crate::control_plane::TaskStatus::Failed,
-                    Some(zeroclaw_api::session_events::privacy::classify_text(
-                        &format!("{error:#}"),
-                    )),
+                    Some(format!("{error:#}")),
                     std::process::id(),
                     task_control_plane.boot_id.clone(),
                 )
@@ -3631,7 +3631,7 @@ impl DelegateTool {
                     }.await {
                             // TaskRegistry still settles below. Capture failure
                             // is retained as the task error, not ignored.
-                            outcome = Err(format!("session_capture_failed: {}",zeroclaw_api::session_events::privacy::classify_text(&format!("{error:#}"))));
+                            outcome = Err(format!("session_capture_failed: {error:#}"));
                 }
                 drop(inner);
                 drop(args_inner);

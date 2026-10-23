@@ -18,7 +18,7 @@ fn payload_bytes(h: &Harness, reference: &StoredPayloadRef) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn plain_reasoning_and_unknown_content_are_classified_both_backends() {
+async fn plain_reasoning_and_unknown_content_are_preserved_both_backends() {
     for backend in ["sqlite", "jsonl"] {
         for (adapter, field) in [
             ("openai", "reasoning_content"),
@@ -79,7 +79,9 @@ async fn audit(backend: &str, adapter: &str, field: &str, reasoning: &str) {
                 .build(),
         )
     };
-    let messages = [ChatMessage::user("fixture")];
+    let original_input =
+        "token=fixture-token api_key=fixture-key https://example.test/?q=rust#page";
+    let messages = [ChatMessage::user(original_input)];
     let response = scope_provider_capture(
         h.admission.clone(),
         ProviderDispatch::from_ref(&*provider).chat(
@@ -97,6 +99,19 @@ async fn audit(backend: &str, adapter: &str, field: &str, reasoning: &str) {
     assert_eq!(response.text.as_deref(), Some("answer"));
     assert_eq!(response.reasoning_content.as_deref(), Some(reasoning));
     let events = h.events();
+    let request = events
+        .iter()
+        .find_map(|event| match &event.body.data {
+            EventData::ProviderRequestPrepared { request_ref, .. } => {
+                Some(h.payload::<Value>(request_ref))
+            }
+            _ => None,
+        })
+        .expect("captured request");
+    let messages_ref: StoredPayloadRef =
+        serde_json::from_value(request["messages_ref"].clone()).expect("messages reference");
+    let recorded: Vec<ChatMessage> = h.payload(&messages_ref);
+    assert_eq!(recorded[0].content, original_input);
     let completed = events.last().expect("terminal outcome");
     let EventData::ProviderAttemptCompleted { response_ref, .. } = &completed.body.data else {
         panic!("completed attempt");
@@ -110,7 +125,7 @@ async fn audit(backend: &str, adapter: &str, field: &str, reasoning: &str) {
                 reasoning_count += 1;
                 assert_eq!(
                     payload_bytes(&h, payload_ref),
-                    privacy::classify_text(reasoning).as_bytes(),
+                    reasoning.to_owned().as_bytes(),
                     "{backend} {adapter} {field}",
                 );
             }
@@ -120,14 +135,14 @@ async fn audit(backend: &str, adapter: &str, field: &str, reasoning: &str) {
             } => {
                 let bytes = payload_bytes(&h, classified_body_ref);
                 let value: Value = serde_json::from_slice(&bytes).expect("unknown content");
-                assert_eq!(value["token"], "[REDACTED]");
+                assert_eq!(value["token"], "fixture-token");
                 match type_name.as_str() {
-                    "fixture.future" => assert_eq!(value["api_key"], "[REDACTED]"),
+                    "fixture.future" => assert_eq!(value["api_key"], "fixture-key"),
                     "gemini.part_replay" => {
-                        assert_eq!(value["thoughtSignature"], "[REDACTED]");
+                        assert_eq!(value["thoughtSignature"], "sk-fixture-spoof");
                     }
                     "assistant.future_extension" => {
-                        assert_eq!(value["api_key"], "[REDACTED]");
+                        assert_eq!(value["api_key"], json!({"nested":"fixture-key"}));
                         assert_eq!(value["payload_id"], "wire-value");
                     }
                     other => panic!("unexpected unknown block: {other}"),

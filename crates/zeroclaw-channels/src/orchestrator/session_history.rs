@@ -208,9 +208,6 @@ impl EngineSessionAuthority for ChannelAuthority {
             "config_revision":self.ctx.live_config.revision(),"purpose":"channel_context_maintenance",
         })).map_err(AppendError::from)?)
     }
-    fn classify_text(&self, text: &str) -> String {
-        privacy::classify_text(text)
-    }
     fn diagnostic(&self, error: &anyhow::Error) -> Option<String> {
         Some(zeroclaw_runtime::agent::Agent::session_execution_diagnostic(error))
     }

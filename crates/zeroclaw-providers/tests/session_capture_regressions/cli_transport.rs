@@ -150,7 +150,7 @@ async fn cli_success_and_abnormal_exits_preserve_received_output_both_backends()
                         assert_eq!(finish["success"], true);
                     } else {
                         let error = result.expect_err("abnormal exit");
-                        assert!(!format!("{error:#}").contains("fixture-secret"));
+                        assert!(!error.to_string().is_empty());
                         assert_eq!(text, "CLI_PARTIAL");
                         let diagnostic = diagnostic.expect("diagnostic");
                         let key = if mode.ends_with("utf8") {
@@ -164,8 +164,8 @@ async fn cli_success_and_abnormal_exits_preserve_received_output_both_backends()
                         };
                         let detail = String::from_utf8(read_bytes(&*h.store, &detail_ref))
                             .expect("detail text");
-                        assert!(!detail.contains("fixture-secret"));
                         if mode == "fail" {
+                            assert!(detail.contains("fixture-secret"));
                             assert!(detail.contains("fixture process error"));
                         }
                     }
@@ -223,7 +223,7 @@ async fn cli_stdout_is_durable_before_child_exit_both_backends() {
 }
 
 #[tokio::test]
-async fn cli_split_credentials_never_enter_durable_content_both_backends() {
+async fn cli_split_credentials_preserve_durable_content_both_backends() {
     for backend in ["sqlite", "jsonl"] {
         for kind in ["gemini", "kilo"] {
             let (_dir, provider) = fixture(kind, "split_credentials");
@@ -232,8 +232,14 @@ async fn cli_split_credentials_never_enter_durable_content_both_backends() {
                 .await
                 .expect("CLI completion");
             let (text, _) = response_text(&h, backend);
-            assert!(!text.contains("fixture"), "credential fragment in {text:?}");
-            assert!(!text.contains("secret"), "credential fragment in {text:?}");
+            assert!(
+                text.contains("api_key=\"fixture-secret\""),
+                "raw content in {text:?}"
+            );
+            assert!(
+                text.contains("sk-fixture-secret"),
+                "raw content in {text:?}"
+            );
             assert!(text.contains("CLI_PARTIAL"));
             assert!(text.contains("CLI_FINAL"));
             assert!(text.contains("example.invalid/path"));
@@ -242,49 +248,6 @@ async fn cli_split_credentials_never_enter_durable_content_both_backends() {
 }
 
 struct FailProgress(Arc<dyn zeroclaw_api::session_events::capture::ProviderAdmissionPort>);
-
-#[tokio::test]
-async fn cli_classification_limit_retains_partial_and_diagnostic_both_backends() {
-    for backend in ["sqlite", "jsonl"] {
-        for kind in ["gemini", "kilo"] {
-            let (dir, provider) = fixture(kind, "sensitive_context_limit");
-            let h = Harness::new(backend);
-            let error = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                chat(&h, &*provider, "fixture", false),
-            )
-            .await
-            .expect("bounded capture stop")
-            .expect_err("context limit");
-            assert!(zeroclaw_api::session_events::capture::is_capture_stopped(
-                &error
-            ));
-            let (text, diagnostic) = response_text(&h, backend);
-            assert!(text.starts_with("CLI_PARTIAL"));
-            assert!(!text.contains("xxx"), "credential bytes leaked");
-            let diagnostic = diagnostic.expect("limit diagnostic");
-            assert_eq!(diagnostic.error_key, "provider_capture_limit");
-            assert_eq!(diagnostic.stage, DiagnosticStage::Capture);
-            let DiagnosticDetail::Available { detail_ref } = diagnostic.detail else {
-                panic!("capture failure detail")
-            };
-            assert!(
-                String::from_utf8(read_bytes(&*h.store, &detail_ref))
-                    .expect("detail")
-                    .contains("session_capture_classification_context_limit")
-            );
-            let pid: i32 = std::fs::read_to_string(dir.path().join("pid"))
-                .expect("PID")
-                .trim()
-                .parse()
-                .expect("numeric PID");
-            assert_eq!(
-                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-                Err(nix::errno::Errno::ESRCH)
-            );
-        }
-    }
-}
 
 #[async_trait::async_trait]
 impl zeroclaw_api::session_events::capture::ProviderAdmissionPort for FailProgress {

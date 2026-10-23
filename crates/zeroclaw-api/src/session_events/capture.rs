@@ -622,7 +622,7 @@ pub trait SessionExecutionPort: Send + Sync {
     ) -> anyhow::Result<MessageId> {
         anyhow::bail!("session_context_input_capture_unsupported")
     }
-    /// Host control evidence, classified before commit. This never grants
+    /// Host control evidence, preserved as observed. This never grants
     /// permission or authorizes an external effect.
     async fn record_control(&self, _value: Value) -> anyhow::Result<()> {
         anyhow::bail!("session_control_capture_unsupported")

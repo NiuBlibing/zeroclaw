@@ -40,11 +40,8 @@ impl EngineSessionAuthority for Authority {
         )
         .map_err(AppendError::from)?)
     }
-    fn classify_text(&self, text: &str) -> String {
-        privacy::classify_text(text)
-    }
     fn diagnostic(&self, error: &anyhow::Error) -> Option<String> {
-        Some(privacy::classify_text(&format!("{error:#}")))
+        Some(format!("{error:#}"))
     }
 }
 

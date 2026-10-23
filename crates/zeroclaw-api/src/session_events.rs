@@ -15,7 +15,6 @@ pub mod context_read;
 mod index;
 pub mod lineage;
 pub mod payloads;
-pub mod privacy;
 pub mod projection;
 mod provider_observation;
 pub mod rules;

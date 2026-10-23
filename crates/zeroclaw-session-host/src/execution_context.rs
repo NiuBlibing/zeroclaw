@@ -16,29 +16,27 @@ pub fn execution_context_evidence(
         .risk_profile_for_agent(alias)
         .ok_or_else(|| SessionError::PermissionDenied("agent risk profile missing".into()))?;
     let workspace = config.agent_workspace_dir(alias);
-    Ok(zeroclaw_api::session_events::privacy::classify_value(
-        serde_json::json!({
-            "cwd":cwd.unwrap_or(&workspace),
-            "workspace_roots":[cwd.unwrap_or(&workspace)],
-            "permission_profile":agent.risk_profile,
-            "permissions":{
-                "autonomy_level":profile.level,
-                "workspace_only":profile.workspace_only,
-                "allowed_roots":profile.allowed_roots,
-                "forbidden_paths":profile.forbidden_paths,
-                "allowed_commands":profile.allowed_commands,
-                "allowed_tools":profile.effective_allowed_tools(),
-                "excluded_tools":profile.excluded_tools,
-                "auto_approve":profile.auto_approve,
-                "always_ask":profile.always_ask,
-                "require_approval_for_medium_risk":profile.require_approval_for_medium_risk,
-                "block_high_risk_commands":profile.block_high_risk_commands,
-                "approval_route":profile.approval_route,
-                "delegation_policy":profile.delegation_policy,
-                "sandbox":profile.sandbox_config(),
-            },
-        }),
-    ))
+    Ok(serde_json::json!({
+        "cwd":cwd.unwrap_or(&workspace),
+        "workspace_roots":[cwd.unwrap_or(&workspace)],
+        "permission_profile":agent.risk_profile,
+        "permissions":{
+            "autonomy_level":profile.level,
+            "workspace_only":profile.workspace_only,
+            "allowed_roots":profile.allowed_roots,
+            "forbidden_paths":profile.forbidden_paths,
+            "allowed_commands":profile.allowed_commands,
+            "allowed_tools":profile.effective_allowed_tools(),
+            "excluded_tools":profile.excluded_tools,
+            "auto_approve":profile.auto_approve,
+            "always_ask":profile.always_ask,
+            "require_approval_for_medium_risk":profile.require_approval_for_medium_risk,
+            "block_high_risk_commands":profile.block_high_risk_commands,
+            "approval_route":profile.approval_route,
+            "delegation_policy":profile.delegation_policy,
+            "sandbox":profile.sandbox_config(),
+        },
+    }))
 }
 
 #[cfg(test)]

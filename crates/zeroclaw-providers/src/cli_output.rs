@@ -10,53 +10,6 @@ use tokio::time::{Duration, timeout};
 
 const MAX_STDOUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
-const MAX_CLASSIFICATION_CONTEXT: usize = 64 * 1024;
-
-#[derive(Default)]
-struct TextCheckpoint {
-    context: String,
-    published: String,
-}
-
-impl TextCheckpoint {
-    async fn push(&mut self, text: &str, final_chunk: bool) -> anyhow::Result<()> {
-        use zeroclaw_api::session_events::privacy::{classify_text, classify_text_checkpoint};
-        self.context.push_str(text);
-        anyhow::ensure!(
-            self.context.len() <= MAX_CLASSIFICATION_CONTEXT,
-            "session_capture_classification_context_limit"
-        );
-        let classified = if final_chunk {
-            classify_text(&self.context)
-        } else {
-            classify_text_checkpoint(&self.context)
-        };
-        anyhow::ensure!(
-            classified.starts_with(&self.published),
-            "session_capture_classification_prefix_changed"
-        );
-        if classified.len() > self.published.len() {
-            observe_adapter_event(&StreamEvent::TextDelta(StreamChunk::delta(
-                &classified[self.published.len()..],
-            )))
-            .await?;
-        }
-        self.published = classified;
-        let cut =
-            zeroclaw_api::session_events::privacy::text_checkpoint_context_start(&self.context);
-        if cut > 0 {
-            let prefix = classify_text(&self.context[..cut]);
-            anyhow::ensure!(
-                self.published.starts_with(&prefix),
-                "session_capture_classification_context_changed"
-            );
-            self.context.drain(..cut);
-            self.published.drain(..prefix.len());
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct ProcessFailure {
     pub(crate) protocol: &'static str,
@@ -91,7 +44,7 @@ impl ProcessFailure {
         serde_json::json!({
             "protocol":self.protocol, "exit_code":self.status.and_then(|status| status.code()),
             "exit_status":self.status.map(|status| status.to_string()), "stderr":self.stderr,
-            "error":self.source.as_ref().map(|error| crate::scrub_secret_patterns(&format!("{error:#}"))),
+            "error":self.source.as_ref().map(|error| format!("{error:#}")),
         })
     }
 }
@@ -100,7 +53,6 @@ impl ProcessFailure {
 struct Stdout {
     text: String,
     pending: Vec<u8>,
-    checkpoint: TextCheckpoint,
 }
 
 impl Stdout {
@@ -122,18 +74,14 @@ impl Stdout {
         };
         if valid != 0 {
             let value = std::str::from_utf8(&self.pending[..valid])?;
-            self.checkpoint.push(value, eof).await?;
+            observe_adapter_event(&StreamEvent::TextDelta(StreamChunk::delta(value))).await?;
             self.text.push_str(value);
             self.pending.drain(..valid);
         }
         if let Some(error) = invalid
             && (error.error_len().is_some() || eof)
         {
-            self.checkpoint.push("", true).await?;
             return Err(error.into());
-        }
-        if eof {
-            self.checkpoint.push("", true).await?;
         }
         Ok(())
     }
@@ -152,10 +100,8 @@ impl Stderr {
         self.bytes.extend_from_slice(&bytes[..accepted]);
         self.truncated |= accepted < bytes.len();
     }
-    fn classified(&self) -> String {
-        let mut text = zeroclaw_api::session_events::privacy::classify_text(
-            &crate::scrub_secret_patterns(&String::from_utf8_lossy(&self.bytes)),
-        );
+    fn text(&self) -> String {
+        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
         if self.truncated {
             text.push_str(" [truncated]");
         }
@@ -234,7 +180,7 @@ pub(crate) async fn run(
                 Err(ProcessFailure {
                     protocol,
                     status,
-                    stderr: diagnostic.classified(),
+                    stderr: diagnostic.text(),
                     source: None,
                 }
                 .into())
@@ -244,22 +190,14 @@ pub(crate) async fn run(
     if let Err(mut error) = result {
         let capture_failed = zeroclaw_api::session_events::capture::is_capture_stopped(&error)
             || error.to_string().starts_with("session_capture_");
-        if !capture_failed {
-            if let Err(flush) = output.checkpoint.push("", true).await {
-                error =
-                    zeroclaw_api::session_events::capture::capture_stopped(flush.context(format!(
-                        "CLI transport failed: {}",
-                        crate::sanitize_api_error(&format!("{error:#}"))
-                    )));
-            } else if !error.is::<ProcessFailure>() {
-                error = ProcessFailure {
-                    protocol,
-                    status,
-                    stderr: diagnostic.classified(),
-                    source: Some(error),
-                }
-                .into();
+        if !capture_failed && !error.is::<ProcessFailure>() {
+            error = ProcessFailure {
+                protocol,
+                status,
+                stderr: diagnostic.text(),
+                source: Some(error),
             }
+            .into();
         }
         // Reaping the owned child says nothing about remote execution or
         // escaped descendants. Such invocation outcomes remain unknown.
@@ -333,21 +271,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unresolved_sensitive_context_stops_at_its_bound() {
-        let mut checkpoint = TextCheckpoint::default();
-        checkpoint.push("api_key=\"", false).await.expect("key");
-        let mut result = Ok(());
-        for _ in 0..9 {
-            result = checkpoint.push(&"x".repeat(8192), false).await;
-            if result.is_err() {
-                break;
-            }
+    async fn stdout_preserves_credential_shaped_text_across_reads() {
+        let text = format!("api_key=\"{}\"", "x".repeat(72 * 1024));
+        let mut output = Stdout::default();
+        for chunk in text.as_bytes().chunks(8192) {
+            output.accept(chunk, false).await.expect("chunk");
         }
-        assert!(
-            result
-                .expect_err("bounded sensitive field")
-                .to_string()
-                .contains("session_capture_classification_context_limit")
-        );
+        output.accept(&[], true).await.expect("EOF");
+        assert_eq!(output.text, text);
     }
 }

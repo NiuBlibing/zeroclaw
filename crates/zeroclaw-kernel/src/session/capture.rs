@@ -158,26 +158,8 @@ impl ProviderAdmissionPort for ProviderCaptureScope {
     ) -> anyhow::Result<Arc<dyn ProviderObservationPort>> {
         // Requests contain complete replay history, including signed thinking
         // and opaque continuation. Ordinary messages have their own read view.
-        let messages = PayloadRecord::json(
-            "session.reasoning/v1",
-            &intent
-                .messages
-                .iter()
-                .map(|message| zeroclaw_api::model_provider::ChatMessage {
-                    role: message.role.clone(),
-                    content: zeroclaw_api::session_events::privacy::classify_chat_content(
-                        &message.role,
-                        &message.content,
-                    ),
-                })
-                .collect::<Vec<_>>(),
-        )?;
-        let tools = PayloadRecord::json(
-            "session.bytes/v1",
-            &zeroclaw_api::session_events::privacy::classify_value(serde_json::to_value(
-                &intent.tools,
-            )?),
-        )?;
+        let messages = PayloadRecord::json("session.reasoning/v1", &intent.messages)?;
+        let tools = PayloadRecord::json("session.bytes/v1", &intent.tools)?;
         let request = PayloadRecord::json(
             "session.request/v1",
             &serde_json::json!({"messages_ref":StoredPayloadRef::from(&messages),"tools_ref":StoredPayloadRef::from(&tools),"temperature":intent.temperature,"thinking":intent.thinking,"tool_round_policy":intent.tool_round_policy}),

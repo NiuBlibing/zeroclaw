@@ -5,7 +5,7 @@ use super::installation::{FormatPhase, InstallationGuard, NativeBackend, family_
 use super::*;
 use crate::session_backend::SessionBackend;
 use std::collections::BTreeSet;
-use zeroclaw_api::session_events::{BranchId, SessionId, privacy};
+use zeroclaw_api::session_events::{BranchId, SessionId};
 mod acp;
 pub(crate) mod legacy_acp;
 
@@ -240,10 +240,6 @@ fn import_one(
             session: SessionId::parse(format!("session-{stream}"))?,
             stream,
             source_kind,
-            classify: |message| zeroclaw_api::model_provider::ChatMessage {
-                role: message.role.clone(),
-                content: privacy::classify_text(&message.content),
-            },
         },
         snapshot,
     )?;

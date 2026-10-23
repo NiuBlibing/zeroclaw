@@ -372,7 +372,7 @@ fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
     {
         return StreamError::HttpStatus {
             status: status.as_u16(),
-            message: super::classified_api_error_body(body),
+            message: super::sanitize_api_error(body),
         };
     }
     let message = serde_json::from_str(body)
@@ -2229,8 +2229,7 @@ impl From<RawResponseMessage> for ResponseMessage {
                 0,
                 zeroclaw_api::model_provider::ProviderOutputBlock::Reasoning {
                     representation: "provider_replay".into(),
-                    bytes: zeroclaw_api::session_events::privacy::classify_text(reasoning)
-                        .into_bytes(),
+                    bytes: reasoning.to_owned().into_bytes(),
                     replay_requirement: "provider_defined".into(),
                 },
             );
@@ -2799,10 +2798,7 @@ fn sse_choice_content_events(
                 StreamEvent::ProtocolMetadata(metadata)
             }
             ProviderOutputBlock::Other { type_name, content } => {
-                StreamEvent::OutputBlock(ProviderOutputBlock::Other {
-                    type_name,
-                    content: zeroclaw_api::session_events::privacy::classify_value(content),
-                })
+                StreamEvent::OutputBlock(ProviderOutputBlock::Other { type_name, content })
             }
             block => StreamEvent::OutputBlock(block),
         });

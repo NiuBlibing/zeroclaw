@@ -590,11 +590,8 @@ impl EngineSessionAuthority for Authority {
         )
         .map_err(|error| AppendError::from(error).into())
     }
-    fn classify_text(&self, text: &str) -> String {
-        privacy::classify_text(text)
-    }
     fn diagnostic(&self, error: &anyhow::Error) -> Option<String> {
-        Some(privacy::classify_text(&error.to_string()))
+        Some(error.to_string())
     }
 }
 

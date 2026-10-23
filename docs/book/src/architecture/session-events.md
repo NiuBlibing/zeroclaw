@@ -2,7 +2,11 @@
 
 Session events record accepted inputs, execution and observations. Reading
 history never executes a provider, tool, child agent or delivery operation.
-Event payloads are stored as plaintext; authentication credentials are excluded.
+Event payloads are stored as plaintext and preserve observed content, including
+credential-shaped text. Session capture does not filter messages, reasoning,
+tool arguments, results or migration input. Existing configuration credential
+encryption and provider error, log, UI and telemetry boundaries are unchanged;
+their presentation copies do not replace canonical session content.
 
 ## Ownership
 
@@ -30,23 +34,23 @@ output. Content still in an uncommitted memory buffer cannot survive a crash.
 
 Gemini CLI and Kilo CLI drain stdout and stderr while writing stdin. Received
 UTF-8 stdout is checkpointed before process exit, including output received
-before a nonzero exit, signal, decode error or timeout. Incremental credential
-classification keeps unfinished fields, tokens and URLs out of durable content.
-The transport bounds stdout at 32 MiB, retained stderr at 64 KiB, and unresolved
-classification context at 64 KiB. Limits stop capture explicitly; retained
+before a nonzero exit, signal, decode error or timeout. Text is checkpointed
+unchanged, including tokens and URLs split across reads.
+The transport bounds stdout at 32 MiB and retained stderr at 64 KiB.
+Limits stop capture explicitly; retained
 stderr reports truncation while the transport continues draining the pipe.
 An I/O deadline cannot cancel an observation already awaiting durable commit.
 Cleanup reaps the owned child without asserting a remote cancellation.
 Actual exit status is recorded when observed; an abnormal process exit leaves
 the remote invocation unknown. Unreported token usage remains absent.
-Grok ACP explicit error frames retain their classified message, code and data
+Grok ACP explicit error frames retain their observed message, code and data
 and settle as failed, preserving earlier thought and tool observations. These
 details stay outside the public error source chain. Its request deadline applies
 to raw protocol I/O, so an inflight observation finishes before timeout handling.
 Bedrock Converse retains the returned `stopReason`, including unfamiliar values;
 an absent reason remains absent.
 
-Provider capture currently bounds classified content at 32 MiB and 16,384
+Provider capture currently bounds observed content at 32 MiB and 16,384
 blocks per physical attempt. A limit stops the attempt and propagates a capture
 error; previously committed checkpoints remain available. Protocol metadata,
 including actual finish/stop reasons and adapter-observed completion signals,
@@ -68,12 +72,12 @@ first poll, after durable admission. Server-side tool observations preserve
 actual provider call IDs; a missing ID remains absent rather than becoming a
 tool name or a generated local execution identity. Partial signatures remain
 reasoning-protected, display-only observations; they never manufacture a signed
-replay block. Unsupported multimodal deltas keep their classified protocol
+replay block. Unsupported multimodal deltas keep their original protocol
 bytes and coordinates instead of disappearing before the terminal frame.
 Anthropic adapters emit typed signed and redacted reasoning before their
 legacy continuation projection. Capture stores the canonical bytes once and
 consumes only the immediately adjacent matching projection. Ordinary readable
-thinking remains credential-classified. Signed and redacted continuation is
+thinking is preserved unchanged. Signed and redacted continuation is
 replayed unchanged; a partial signature never becomes replayable continuation.
 Forced non-streaming responses retain the received block order, including
 media, unsupported blocks and protocol metadata.
@@ -88,13 +92,13 @@ previously committed complete frames remain available.
 OpenAI-compatible streams preserve structured content, audio and unknown delta
 extensions before termination. Native legacy text-stream entry points use the
 same structured dispatch and recorder, then project chunks for their callers.
-Received protocol metadata is stored as a classified content leaf. A provider's
+Received protocol metadata is stored as an unmodified content leaf. A provider's
 ordinary `payload_id` field cannot create an internal storage reference, and
 received content remains eligible for authorized erasure. Historical
 observation descriptors and lifecycle identities remain structural facts.
-Plain reasoning strings and unknown blocks undergo credential classification;
-unknown blocks retain the existing reasoning-protected content codec. A wire
-type name cannot opt out of classification. Gemini adapters preserve only
+Plain reasoning strings and unknown blocks retain their original content;
+unknown blocks retain the existing reasoning-protected content codec.
+Gemini adapters preserve only
 protocol-owned thought signatures as typed continuation metadata, without
 copying text, tool arguments or media into a second replay payload.
 
@@ -104,7 +108,7 @@ log probabilities, tool namespaces and generated-media prompts) use
 `content_metadata` evidence. Its `position` identifies the provider output and
 content indices; `fields` excludes normalized text, arguments and media bytes.
 Provider item `id` remains distinct from the executable tool `call_id` and local
-`message_id`. Unknown supplemental fields remain classified evidence as well.
+`message_id`. Unknown supplemental fields remain original evidence as well.
 These leaves are referenced by `provider.content_metadata` response blocks and
 stream observations, so complete and interrupted responses retain them without
 adding a second transcript, table or mandatory field to older records.
@@ -171,7 +175,7 @@ session access. ACP and WebSocket protocols without an authenticated responder
 identity explicitly record `approval_identity_unavailable`; pairing tokens and
 their hashes never stand in for a person.
 
-Replacement replies retain their classified text through an erasable
+Replacement replies retain their original text through an erasable
 `replacement_ref` in the original reply payload. Resolution does not copy that
 text and checks it against the response actually delivered. Historical replace
 replies without text remain readable but cannot authorize a new replacement.
@@ -423,8 +427,8 @@ Stable import identities and bounded batches allow restart at
 the last committed receipt. Only after every import completes are old history
 files renamed with a `.backup` suffix and the ready state published. Sources
 are not deleted or reopened for writes. Conflicting source histories fail
-explicitly. API keys and tokens retain existing classification; ordinary
-messages, reasoning and media stay in plaintext.
+explicitly. Migration preserves original payload content without credential
+filtering. Configuration credentials retain their existing encryption.
 
 ACP sessions use the same configured session backend. Ownership, workspace,
 interaction surface, plans, usage and lifecycle observations are metadata

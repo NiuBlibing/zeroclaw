@@ -279,10 +279,6 @@ async fn captured_session_regressions_both_backends() {
         assert_eq!(response.blocks.len(), 3);
         assert!(response.reasoning_absence.is_none());
     }
-    assert_eq!(
-        privacy::classify_text("https://example.test/search?q=rust&page=2#details"),
-        "https://example.test/search?q=rust&page=2#details"
-    );
 }
 struct RevokeAfterAccepted {
     store: Arc<dyn SessionEventStore>,
@@ -644,9 +640,6 @@ impl zeroclaw_kernel::session::engine::EngineSessionAuthority for ChildAuthority
             &serde_json::json!({"source":"fixture"}),
         )
         .unwrap())
-    }
-    fn classify_text(&self, s: &str) -> String {
-        s.into()
     }
     fn diagnostic(&self, e: &anyhow::Error) -> Option<String> {
         Some(e.to_string())
@@ -1813,7 +1806,7 @@ async fn codex_done_only_and_mixed_parts_preserve_order_both_backends() {
                     "interleaved_delta" => vec!["A", "B", "C", "audio", "image"],
                     "split_delta" => vec!["A", "a", "audio", "B", "image", "C"],
                     "credential_delta" => {
-                        vec!["token=[REDACTED]", " tail", "audio", "B", "image", "C"]
+                        vec!["token=fixture-secretA", " tail", "audio", "B", "image", "C"]
                     }
                     "unknown_parts" => vec!["A", "unknown", "audio", "B", "image", "C"],
                     "duplicate_done" => vec![

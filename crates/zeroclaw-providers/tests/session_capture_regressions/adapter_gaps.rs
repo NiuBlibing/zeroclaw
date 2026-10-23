@@ -209,7 +209,7 @@ async fn hailo_http_rejections_keep_exact_evidence_both_backends() {
                     .expect("provider");
             let h = Harness::new(backend);
             let error = chat(&h, &provider).await.expect_err("HTTP rejection");
-            assert!(!format!("{error:#}").contains("fixture-secret"));
+            assert!(format!("{error:#}").contains("fixture-secret"));
             let events = h.events();
             let EventData::ProviderAttemptFailed { error_ref, .. } =
                 &events.last().expect("outcome").body.data
@@ -364,7 +364,7 @@ async fn copilot_capture_child() {
                 .find(|(kind, _)| kind == "assistant.future")
                 .expect("future extension");
             let opaque: Value = serde_json::from_slice(opaque).expect("opaque value");
-            assert_eq!(opaque["token"], "[REDACTED]");
+            assert_eq!(opaque["token"], "fixture-secret");
             assert_eq!(opaque["payload_id"], "received-value");
             server.abort();
             let _ = server.await;
@@ -490,7 +490,7 @@ async fn grok_captures_native_activity_and_interrupted_thoughts_both_backends() 
                 .expect("plan");
             assert_eq!(
                 serde_json::from_slice::<Value>(plan).expect("plan JSON")["token"],
-                "[REDACTED]"
+                "fixture-secret"
             );
             if mode != "crash" {
                 assert!(content.contains(&("media".into(), b"png".to_vec())));
@@ -599,7 +599,7 @@ async fn grok_explicit_error_retains_diagnostic_and_partial_both_backends() {
         assert_eq!(detail["code"], -32042);
         assert_eq!(detail["message"], "REMOTE_ERROR_DETAIL");
         assert_eq!(detail["data"]["request_id"], "audit-request-42");
-        assert_eq!(detail["data"]["api_key"], "[REDACTED]");
+        assert_eq!(detail["data"]["api_key"], "fixture-secret");
         let partial: ProviderResponsePayload =
             serde_json::from_slice(&bytes(&*store, partial)).expect("partial");
         let content = contents(&*store, &partial);

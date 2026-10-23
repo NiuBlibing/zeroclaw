@@ -21,8 +21,8 @@ impl EngineSession {
         let payload = PayloadRecord::json(
             "session.evidence/v1",
             &serde_json::json!({
-                "transport":intent.transport,"target":self.authority.classify_text(&intent.target),
-                "content":self.authority.classify_text(&intent.content),"completion_boundary":intent.completion_boundary,
+                "transport":intent.transport,"target":intent.target.to_owned(),
+                "content":intent.content.to_owned(),"completion_boundary":intent.completion_boundary,
             }),
         )?;
         let mut started = SessionEvent::typed(
@@ -77,10 +77,7 @@ impl EngineSession {
             .unwrap_or_else(|_| Err(anyhow::Error::msg("channel_delivery_adapter_panic")));
         let (data, payload) = match &result {
             Ok(receipt) => {
-                let payload = PayloadRecord::json(
-                    "session.evidence/v1",
-                    &privacy::classify_value(receipt.clone()),
-                )?;
+                let payload = PayloadRecord::json("session.evidence/v1", &receipt.clone())?;
                 (
                     EventData::DeliveryCompleted {
                         started_event_id: started.event_id.clone(),

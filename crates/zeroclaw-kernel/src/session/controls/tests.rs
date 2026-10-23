@@ -95,11 +95,8 @@ impl EngineSessionAuthority for Authority {
         )
         .map_err(AppendError::from)?)
     }
-    fn classify_text(&self, text: &str) -> String {
-        privacy::classify_text(text)
-    }
     fn diagnostic(&self, error: &anyhow::Error) -> Option<String> {
-        Some(privacy::classify_text(&format!("{error:#}")))
+        Some(format!("{error:#}"))
     }
 }
 fn session(directory: &std::path::Path, backend: &str) -> (EngineSession, Arc<Authority>) {
@@ -254,7 +251,7 @@ async fn execution_metadata_serializes_with_commands_and_rechecks_live_authority
         assert_eq!(counts.last(), Some(&0));
         let plan = plan.expect("durable plan");
         assert!(plan.contains("review"));
-        assert!(!plan.contains("sk-plan-fixture-secret"));
+        assert!(plan.contains("sk-plan-fixture-secret"));
         let before = session.owner.head(&session.stream).expect("head");
         authority.0.store(false, Ordering::SeqCst);
         assert!(

@@ -2043,9 +2043,6 @@ impl zeroclaw_kernel::session::engine::EngineSessionAuthority for RpcHistoryAuth
     {
         self.binding_evidence(None)
     }
-    fn classify_text(&self, text: &str) -> String {
-        zeroclaw_api::session_events::privacy::classify_text(text)
-    }
     fn diagnostic(&self, error: &anyhow::Error) -> Option<String> {
         Some(crate::agent::Agent::session_execution_diagnostic(error))
     }
@@ -8615,7 +8612,7 @@ impl RpcDispatcher {
                 Err(error) => {
                     if changes_model && let Some(native) = &native_control {
                         native.observe_model_change(requested_selection,
-                            zeroclaw_api::session_events::capture::ModelChangeDisposition::Rejected {reason_key:"provider_construction_failed".into(), diagnostic:Some(zeroclaw_api::session_events::privacy::classify_text(&error.message))})
+                            zeroclaw_api::session_events::capture::ModelChangeDisposition::Rejected {reason_key:"provider_construction_failed".into(), diagnostic:Some(error.message.to_owned())})
                             .await.map_err(|error|rpc_err(INTERNAL_ERROR,error.to_string()))?;
                     }
                     return Err(error);

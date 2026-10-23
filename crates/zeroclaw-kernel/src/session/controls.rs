@@ -19,18 +19,12 @@ impl EngineSession {
             !file.file_id.is_empty() && !operation.is_empty(),
             "invalid_file_observation"
         );
-        let metadata = PayloadRecord::json(
-            "session.locator/v1",
-            &privacy::classify_value(file.registration),
-        )?;
+        let metadata = PayloadRecord::json("session.locator/v1", &file.registration)?;
         let registration = PayloadRecord::json(
             "session.file-registration/v1",
             &serde_json::json!({"metadata_ref":StoredPayloadRef::from(&metadata),"representation_ref":StoredPayloadRef::from(&file.representation)}),
         )?;
-        let evidence = PayloadRecord::json(
-            "session.evidence/v1",
-            &privacy::classify_value(file.policy_evidence),
-        )?;
+        let evidence = PayloadRecord::json("session.evidence/v1", &file.policy_evidence)?;
         let operation = operation.to_owned();
         let owner = self.owner.clone();
         let authority = self.authority.clone();
@@ -89,10 +83,9 @@ impl EngineSession {
         let prompt = PayloadRecord::new(
             PayloadId::new(),
             "session.text/v1".into(),
-            self.authority.classify_text(prompt).into_bytes(),
+            prompt.to_owned().into_bytes(),
         )?;
-        let schema =
-            PayloadRecord::json("session.bytes/v1", &privacy::classify_value(schema.clone()))?;
+        let schema = PayloadRecord::json("session.bytes/v1", schema)?;
         let (control, mut payloads) = self.control_input(
             serde_json::json!({"command":"elicitation_request", "request_id":request_id}),
         )?;
@@ -118,10 +111,7 @@ impl EngineSession {
         request_id: &str,
         resolution: &serde_json::Value,
     ) -> anyhow::Result<()> {
-        let payload = PayloadRecord::json(
-            "session.bytes/v1",
-            &privacy::classify_value(resolution.clone()),
-        )?;
+        let payload = PayloadRecord::json("session.bytes/v1", resolution)?;
         let (control, mut payloads) = self.control_input(
             serde_json::json!({"command":"elicitation_resolution", "request_id":request_id}),
         )?;
@@ -172,14 +162,8 @@ impl EngineSession {
             !classification.is_empty(),
             "approval_rejection_classification_missing"
         );
-        let request_id = request_id.map(|value| {
-            privacy::classify_text(&value)
-                .chars()
-                .take(256)
-                .collect::<String>()
-        });
-        let evidence =
-            PayloadRecord::json("session.evidence/v1", &privacy::classify_value(evidence))?;
+        let request_id = request_id.map(|value| value.chars().take(256).collect::<String>());
+        let evidence = PayloadRecord::json("session.evidence/v1", &evidence)?;
         let owner = self.owner.clone();
         let authority = self.authority.clone();
         let stream = self.stream.clone();
@@ -247,7 +231,7 @@ impl EngineSession {
             .owner
             .admit_user_input(&command, &self.actor, &self.actor, self.authority.clone())
             .await?;
-        let classified_context = self.authority.classify_text(context_text);
+        let observed_context = context_text.to_owned();
         if let Some(receipt) = complete {
             let page = query
                 .read_page(
@@ -300,7 +284,7 @@ impl EngineSession {
                 })
                 .await?;
             if !matches!(&projection.body.data,EventData::ContextProjectionCreated {reason_key:recorded,..} if recorded==reason_key)
-                || !matches!(messages.last(), Some(zeroclaw_api::model_provider::ConversationMessage::Chat(message)) if message.role == "user" && message.content == classified_context)
+                || !matches!(messages.last(), Some(zeroclaw_api::model_provider::ConversationMessage::Chat(message)) if message.role == "user" && message.content == observed_context)
                 || value.get("message_refs").is_none()
             {
                 return Err(AppendError::IdempotencyConflict(outcome_key).into());
@@ -317,7 +301,7 @@ impl EngineSession {
         snapshot
             .messages
             .push(zeroclaw_api::model_provider::ConversationMessage::Chat(
-                ChatMessage::user(classified_context),
+                ChatMessage::user(observed_context),
             ));
         let accepted = query
             .latest_event(
@@ -450,7 +434,7 @@ impl EngineSession {
             SessionAccess::Write,
         )?;
         let binding = self.authority.maintenance_binding()?;
-        let control = PayloadRecord::json("session.control/v1", &privacy::classify_value(value))?;
+        let control = PayloadRecord::json("session.control/v1", &value)?;
         let ingress = PayloadRecord::json(
             "session.ingress/v1",
             &serde_json::json!({"source":"authenticated_session_command", "execution_binding_ref":StoredPayloadRef::from(&binding)}),
@@ -536,7 +520,7 @@ impl EngineSession {
         let value = PayloadRecord::new(
             PayloadId::new(),
             "session.text/v1".into(),
-            self.authority.classify_text(title).into_bytes(),
+            title.to_owned().into_bytes(),
         )?;
         let (control, mut payloads) = self.control_input(
             serde_json::json!({"command":"rename", "value_ref":StoredPayloadRef::from(&value)}),
@@ -564,11 +548,9 @@ impl EngineSession {
                 "session.authority/v1",
                 serde_json::json!(input_tokens.unwrap_or(0)),
             ),
-            SessionMetadataObservation::Plan { entries } => (
-                "plan",
-                "session.bytes/v1",
-                privacy::classify_value(serde_json::to_value(entries)?),
-            ),
+            SessionMetadataObservation::Plan { entries } => {
+                ("plan", "session.bytes/v1", (serde_json::to_value(entries)?))
+            }
         };
         let value = PayloadRecord::json(codec, &value)?;
         let mut changed = SessionEvent::typed(
@@ -591,7 +573,7 @@ impl EngineSession {
             .restore_context()
             .await?
             .ok_or_else(|| anyhow::Error::msg("session_context_missing"))?;
-        let text = self.authority.classify_text(text);
+        let text = text.to_owned();
         snapshot
             .messages
             .push(zeroclaw_api::model_provider::ConversationMessage::Chat(

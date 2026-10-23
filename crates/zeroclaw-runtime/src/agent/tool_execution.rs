@@ -337,14 +337,11 @@ pub(crate) async fn execute_one_tool(
         use zeroclaw_api::session_events::{EventData, PayloadRecord, StoredPayloadRef};
         let (data, payloads) = match &tool_result {
             Ok(result) => {
-                // Freeze before receipt/presentation transformations. Use the
-                // existing credential scrubber at this persistence boundary.
-                let body = zeroclaw_api::session_events::privacy::classify_value(
-                    serde_json::json!({"output":result.output.as_str(),
+                // Freeze the original result before receipt/presentation transformations.
+                let body = serde_json::json!({"output":result.output.as_str(),
                     "data":result.output.data(),
                     "attachments":result.output.attachments(),"success":result.success,
-                    "error":result.error.as_deref()}),
-                );
+                    "error":result.error.as_deref()});
                 let raw = PayloadRecord::json("session.tool-result/v1", &body)?;
                 if result.success {
                     (
@@ -360,7 +357,7 @@ pub(crate) async fn execute_one_tool(
                     let error = PayloadRecord::json(
                         "session.error-detail/v1",
                         &serde_json::json!({
-                        "error_key":"tool_reported_failure","detail":result.error.as_deref().map(zeroclaw_api::session_events::privacy::classify_text)}),
+                        "error_key":"tool_reported_failure","detail":result.error.as_deref().map(str::to_owned)}),
                     )?;
                     (
                         EventData::ToolEffectFailed {
@@ -376,7 +373,7 @@ pub(crate) async fn execute_one_tool(
                 let error = PayloadRecord::json(
                     "session.error-detail/v1",
                     &serde_json::json!({
-                    "error_key":"tool_execution_error","detail":zeroclaw_api::session_events::privacy::classify_text(&format!("{error:#}"))}),
+                    "error_key":"tool_execution_error","detail":format!("{error:#}")}),
                 )?;
                 // An opaque adapter error does not prove that an external
                 // effect failed before taking effect.

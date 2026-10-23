@@ -168,8 +168,7 @@ impl Transform {
             self.cancelled("context_input_no_longer_current".into())
                 .await
         } else {
-            self.failed(privacy::classify_text(&format!("{error:#}")))
-                .await
+            self.failed(format!("{error:#}")).await
         };
         if let Err(settlement) = settlement {
             return Err(error.context(format!(
@@ -401,7 +400,7 @@ impl ContextTransformPort for Transform {
                     sources.push(ProviderBlockRef { result_event_id: event.event_id.clone(), block_index });
                 }
             }
-            if actual != privacy::classify_text(&summary) { return Err(SessionError::InvalidAdmission("summary differs from captured output".into())); }
+            if actual != summary { return Err(SessionError::InvalidAdmission("summary differs from captured output".into())); }
             let summary = ConversationMessage::Chat(ChatMessage::system(format!("[Context summary]\n{actual}")));
             // This normalized item creates a new MessageId, retaining actual
             // provider provenance in the projection rather than rewriting input.

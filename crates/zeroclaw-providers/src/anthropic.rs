@@ -3516,7 +3516,7 @@ impl ModelProvider for AnthropicModelProvider {
                         .unwrap_or_else(|_| format!("HTTP error: {status}"));
                     return Err(StreamError::HttpStatus {
                         status: status.as_u16(),
-                        message: super::classified_api_error_body(&body),
+                        message: super::sanitize_api_error(&body),
                     });
                 }
                 let parsed: NativeChatResponse = response
@@ -3747,7 +3747,7 @@ impl ModelProvider for AnthropicModelProvider {
                 let _ = tx
                     .send(Err(StreamError::HttpStatus {
                         status: status.as_u16(),
-                        message: super::classified_api_error_body(&error),
+                        message: super::sanitize_api_error(&error),
                     }))
                     .await;
                 return;

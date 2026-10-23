@@ -127,7 +127,7 @@ impl SessionCoordinator {
                 ModelChangeDisposition::Rejected { reason_key, diagnostic } => {
                     let evidence=PayloadRecord::json("session.error-detail/v1", &serde_json::json!({
                         "error_key":reason_key,
-                        "detail":diagnostic.as_deref().map(privacy::classify_text),
+                        "detail":diagnostic.as_deref().map(str::to_owned),
                         "detail_unavailable_reason":if diagnostic.is_none(){Some("host_diagnostic_unavailable")}else{None},
                     })).map_err(AppendError::from)?;
                     let reference=StoredPayloadRef::from(&evidence);

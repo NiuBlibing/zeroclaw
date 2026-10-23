@@ -76,12 +76,12 @@ fn assert_preserved_content(store: &dyn SessionEventStore, blocks: &[ResponseBlo
                 match type_name.as_str() {
                     "fixture.future_part" => {
                         assert_eq!(value["opaque"], "retained part");
-                        assert_eq!(value["token"], "[REDACTED]");
+                        assert_eq!(value["token"], "synthetic-part-token");
                         unknown += 1;
                     }
                     "assistant.future_extension" => {
                         assert_eq!(value["payload_id"], "wire-data-not-a-reference");
-                        assert_eq!(value["token"], "[REDACTED]");
+                        assert_eq!(value["token"], "synthetic-extension-token");
                         extension += 1;
                     }
                     "chat_completions.audio_delta" => audio_metadata.push(value),
@@ -629,7 +629,7 @@ async fn compatible_stream_decode_failures_preserve_valid_prefix_and_signed_reas
                 );
                 assert_eq!(media, 1);
                 assert_eq!(reasoning.len(), 3);
-                assert!(reasoning.contains(&b"api_key=[REDACTED]".to_vec()));
+                assert!(reasoning.contains(&b"api_key=fixture-readable-thought".to_vec()));
                 assert!(reasoning.contains(&thinking.to_string().into_bytes()));
                 assert!(reasoning.contains(&redacted.to_string().into_bytes()));
                 if let Some(error_ref) = error_ref {

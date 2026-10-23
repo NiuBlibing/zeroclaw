@@ -183,11 +183,6 @@ pub(crate) fn metadata_payload(
     } else {
         "session.bytes/v1"
     };
-    let value = if structural {
-        value
-    } else {
-        zeroclaw_api::session_events::privacy::classify_value(value)
-    };
     Ok(PayloadRecord::json(codec, &value)?)
 }
 

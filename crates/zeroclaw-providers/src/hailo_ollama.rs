@@ -357,52 +357,23 @@ impl HailoOllamaModelProvider {
     }
 
     fn sanitize_response_body(&self, body: &str) -> String {
-        let redact = |text: &str| {
-            let mut redacted = super::scrub_secret_patterns(text);
-            for value in self.request_headers.values() {
-                let Ok(value) = value.to_str() else {
-                    continue;
-                };
-                for secret in [Some(value), value.strip_prefix("Bearer ")]
-                    .into_iter()
-                    .flatten()
-                    .filter(|secret| !secret.is_empty())
-                {
-                    let scrubbed_secret = super::scrub_secret_patterns(secret);
-                    redacted = redacted.replace(secret, "[REDACTED]");
-                    if scrubbed_secret != secret {
-                        redacted = redacted.replace(&scrubbed_secret, "[REDACTED]");
-                    }
+        let mut redacted = super::scrub_secret_patterns(body);
+        for value in self.request_headers.values() {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            for secret in [Some(value), value.strip_prefix("Bearer ")]
+                .into_iter()
+                .flatten()
+                .filter(|secret| !secret.is_empty())
+            {
+                let scrubbed_secret = super::scrub_secret_patterns(secret);
+                redacted = redacted.replace(secret, "[REDACTED]");
+                if scrubbed_secret != secret {
+                    redacted = redacted.replace(&scrubbed_secret, "[REDACTED]");
                 }
-            }
-            redacted
-        };
-        fn redact_strings(value: &mut serde_json::Value, redact: &impl Fn(&str) -> String) {
-            match value {
-                serde_json::Value::String(text) => *text = redact(text),
-                serde_json::Value::Array(values) => {
-                    for value in values {
-                        redact_strings(value, redact);
-                    }
-                }
-                serde_json::Value::Object(values) => {
-                    for (key, mut value) in std::mem::take(values) {
-                        redact_strings(&mut value, redact);
-                        values.insert(redact(&key), value);
-                    }
-                }
-                _ => {}
             }
         }
-        // Decode JSON strings before comparing configured header values: wire
-        // escaping must not conceal a reflected credential from classification.
-        let redacted = match serde_json::from_str::<serde_json::Value>(body) {
-            Ok(mut value) => {
-                redact_strings(&mut value, &redact);
-                zeroclaw_api::session_events::privacy::classify_value(value).to_string()
-            }
-            Err(_) => redact(body),
-        };
         super::truncate_api_error(&redacted)
     }
 
@@ -1278,7 +1249,7 @@ impl HailoOllamaModelProvider {
             reasoning.push_str(thinking);
             output_blocks.push(ProviderOutputBlock::Reasoning {
                 representation: "hailo.thinking".into(),
-                bytes: zeroclaw_api::session_events::privacy::classify_text(thinking).into_bytes(),
+                bytes: thinking.to_owned().into_bytes(),
                 replay_requirement: "provider_defined".into(),
             });
         }
@@ -1296,7 +1267,7 @@ impl HailoOllamaModelProvider {
             reasoning.push_str(thought);
             output_blocks.push(ProviderOutputBlock::Reasoning {
                 representation: "hailo.think_tag".into(),
-                bytes: zeroclaw_api::session_events::privacy::classify_text(thought).into_bytes(),
+                bytes: thought.to_owned().into_bytes(),
                 replay_requirement: "provider_defined".into(),
             });
             remaining = tail;
@@ -1527,22 +1498,6 @@ mod tests {
 
         let sanitized = provider.sanitize_response_body("reflected private-prefix-sk-abc");
         assert!(!sanitized.contains("private-prefix-"));
-
-        let escaped = HailoOllamaModelProvider::new("audit", None, 5, 5, OllamaTuning::default())
-            .expect("provider")
-            .with_auth_headers(
-                None,
-                &[("X-Fixture".into(), "fixture-\"quoted\"-secret".into())]
-                    .into_iter()
-                    .collect(),
-            )
-            .expect("header");
-        let sanitized = escaped.sanitize_response_body(
-            &serde_json::json!({"error":{"message":"reflected fixture-\"quoted\"-secret"}, "fixture-\"quoted\"-secret":"reflected key"})
-                .to_string(),
-        );
-        assert!(!sanitized.contains("quoted"));
-        assert!(sanitized.contains("[REDACTED]"));
     }
 
     #[tokio::test]

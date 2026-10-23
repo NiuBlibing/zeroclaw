@@ -579,10 +579,11 @@ async fn audit(backend: &str, mode: &'static str, ending: &str, streaming: bool)
         }
         if mismatch {
             assert!(detail.contains("response.output_text.done"));
-            assert!(detail.contains("[REDACTED]"));
-            assert!(!detail.contains("fixture-secretMismatch"));
-            assert!(!detail.contains("fixture-secretApiKey"));
-            assert!(!detail.contains("fixture-secretToken"));
+            assert!(detail.contains("fixture-secretMismatch"));
+            assert!(detail.contains("fixture-secretApiKey"));
+            if mode != "large_mismatch" {
+                assert!(detail.contains("fixture-secretToken"));
+            }
         } else if matches!(ending, "failed" | "error") {
             assert!(detail.contains(&format!("fixture_{ending}")));
         } else if unfinished_frame {

@@ -272,8 +272,8 @@ impl SessionCoordinator {
         let mut refs = Vec::new();
         let mut payloads = Vec::new();
         for (index, message) in messages.iter().enumerate() {
-            let value = serde_json::to_value(privacy::classify_conversation(message))
-                .map_err(|e| ReadError::Corrupt(e.to_string()))?;
+            let value =
+                serde_json::to_value(message).map_err(|e| ReadError::Corrupt(e.to_string()))?;
             let bytes = canonical_json(&value).map_err(AppendError::from)?;
             if let Some((_, item, _)) = candidates
                 .iter()

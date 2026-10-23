@@ -1539,9 +1539,6 @@ impl zeroclaw_kernel::session::engine::EngineSessionAuthority for AgentHistoryAu
     {
         self.binding_evidence(None)
     }
-    fn classify_text(&self, text: &str) -> String {
-        zeroclaw_api::session_events::privacy::classify_text(text)
-    }
     fn diagnostic(&self, error: &anyhow::Error) -> Option<String> {
         Some(crate::agent::Agent::session_execution_diagnostic(error))
     }

@@ -615,11 +615,8 @@ async fn observe_shell_output(
     bytes: &[u8],
 ) -> anyhow::Result<()> {
     use zeroclaw_api::session_events::*;
-    // Complete lines keep credential tokens split across OS reads together.
-    // Raw offsets refer to the original captured bytes; excluded credentials
-    // may shorten the historical representation, never the source offset.
-    let bytes = scrub_output_bytes(bytes);
-    let bytes = PayloadRecord::new(PayloadId::new(), "session.bytes/v1".into(), bytes)?;
+    // Preserve exact observed bytes and their original stream offsets.
+    let bytes = PayloadRecord::new(PayloadId::new(), "session.bytes/v1".into(), bytes.to_vec())?;
     let observation = PayloadRecord::json(
         "session.tool-observation/v1",
         &ToolObservationPayload {
@@ -640,35 +637,6 @@ async fn observe_shell_output(
         )
         .await?;
     Ok(())
-}
-
-fn scrub_output_bytes(mut bytes: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(bytes.len());
-    loop {
-        let (valid, invalid) = match std::str::from_utf8(bytes) {
-            Ok(text) => (text, 0),
-            Err(error) => {
-                let valid = std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or("");
-                (
-                    valid,
-                    error
-                        .error_len()
-                        .unwrap_or(bytes.len() - error.valid_up_to()),
-                )
-            }
-        };
-        let scrubbed = zeroclaw_api::session_events::privacy::classify_text(
-            &zeroclaw_providers::scrub_secret_patterns(valid),
-        );
-        output.extend_from_slice(scrubbed.as_bytes());
-        if invalid == 0 {
-            break;
-        }
-        let end = valid.len() + invalid;
-        output.extend_from_slice(&bytes[valid.len()..end]);
-        bytes = &bytes[end..];
-    }
-    output
 }
 
 async fn observe_shell_cleanup(pid: Option<u32>) -> anyhow::Result<()> {
@@ -857,7 +825,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn shell_output_observer_preserves_offsets_binary_and_scrubs_split_credentials() {
+    async fn shell_output_observer_preserves_offsets_binary_and_split_credentials() {
         use zeroclaw_api::session_events::*;
         let observer = Arc::new(OutputObserver {
             observed: Default::default(),
@@ -915,9 +883,9 @@ mod tests {
             }
             captured.extend_from_slice(bytes);
         }
-        assert!(!String::from_utf8_lossy(&captured).contains("fixture_secret_value"));
         let mut original = first.to_vec();
         original.extend_from_slice(&binary);
+        assert_eq!(captured, original);
         assert_eq!(output.lock().expect("output").bytes, original);
     }
     #[tokio::test]

@@ -13,7 +13,6 @@ pub struct LegacyImport<'a> {
     pub branch: BranchId,
     pub session: SessionId,
     pub source_kind: &'a str,
-    pub classify: fn(&ChatMessage) -> ChatMessage,
 }
 
 pub struct LegacySnapshot {
@@ -51,12 +50,8 @@ pub(super) fn import_snapshot(
     {
         return Ok(command.stream);
     }
-    let messages: Vec<_> = snapshot.messages.iter().map(command.classify).collect();
-    let metadata: Vec<_> = snapshot
-        .metadata
-        .into_iter()
-        .map(|(field, value)| (field, privacy::classify_value(value)))
-        .collect();
+    let messages = snapshot.messages;
+    let metadata = snapshot.metadata;
     let source_digest = Digest::from_bytes(&canonical_json(&serde_json::json!({
         "messages": messages, "history_has_trim_breadcrumb": snapshot.history_has_trim_breadcrumb,
         "metadata": metadata,

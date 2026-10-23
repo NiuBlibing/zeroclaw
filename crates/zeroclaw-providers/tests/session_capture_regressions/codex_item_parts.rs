@@ -306,7 +306,7 @@ async fn codex_later_item_parts_preserve_media_and_unknown_updates_both_backends
                         } => {
                             assert_eq!(type_name, "fixture.future_part");
                             let value: Value = h.payload(classified_body_ref);
-                            assert_eq!(value["token"], "[REDACTED]");
+                            assert_eq!(value["token"], "fixture-secret");
                             projected.push(format!("unknown {}", value["value"].as_str().unwrap()));
                         }
                         other => panic!("unexpected late-part block: {other:?}"),

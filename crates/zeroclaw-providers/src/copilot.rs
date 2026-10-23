@@ -521,8 +521,7 @@ impl CopilotModelProvider {
             if let Some(reasoning) = reasoning {
                 output_blocks.push(ProviderOutputBlock::Reasoning {
                     representation: representation.into(),
-                    bytes: zeroclaw_api::session_events::privacy::classify_text(reasoning)
-                        .into_bytes(),
+                    bytes: reasoning.to_owned().into_bytes(),
                     replay_requirement: "provider_defined".into(),
                 });
             }

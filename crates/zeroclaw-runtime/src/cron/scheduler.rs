@@ -1244,9 +1244,7 @@ async fn prepare_cron_history_input(
                     .await?;
                 continue;
             };
-            if original_prompt
-                != &zeroclaw_api::session_events::privacy::classify_text(&expected_prompt)
-            {
+            if original_prompt != &expected_prompt.to_owned() {
                 history
                     .reject_pending_input(&input.turn_id, "cron_recovery_input_revised")
                     .await?;

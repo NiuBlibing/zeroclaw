@@ -27,12 +27,7 @@ impl FamilySeed<'_> {
             self.actor.clone(),
         )?;
         root.branch_id = Some(branch.clone());
-        let messages: Vec<_> = self
-            .context
-            .messages
-            .iter()
-            .map(privacy::classify_conversation)
-            .collect();
+        let messages = &self.context.messages;
         let conversation = PayloadRecord::json("session.conversation/v1", &messages)?;
         // The immutable seed creates IDs; later projections resolve its content
         // by source index instead of copying another transcript.

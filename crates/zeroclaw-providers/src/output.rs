@@ -1,5 +1,5 @@
-//! Classify protocol content only. Transport headers and credentials never
-//! enter this path. Unknown semantic blocks remain opaque content.
+//! Decode provider protocol content only. Transport headers never enter this
+//! path, and unknown semantic blocks remain opaque content.
 use base64::Engine;
 use serde_json::Value;
 use zeroclaw_api::model_provider::{ProviderMediaSource, ProviderOutputBlock, ToolCall};
@@ -19,7 +19,7 @@ pub(crate) fn content_block(value: &Value) -> ProviderOutputBlock {
             }
         }
         "thinking" | "redacted_thinking" | "reasoning" => {
-            // Preserve the complete classified content block, including
+            // Preserve the complete observed content block, including
             // signature/encrypted continuation and omission markers.
             return ProviderOutputBlock::Reasoning {
                 representation: kind.into(),
@@ -125,7 +125,7 @@ pub(crate) fn content_block(value: &Value) -> ProviderOutputBlock {
 
 /// Supplemental fields have one owner: protocol evidence, never a second copy
 /// of normalized text, tool arguments or media bytes. Unknown block types and
-/// reasoning already retain their complete classified representation.
+/// reasoning already retain their complete observed representation.
 pub(crate) fn content_metadata(value: &Value) -> Option<ProviderOutputBlock> {
     let block = content_block(value);
     metadata_for(value, &block)
@@ -307,14 +307,7 @@ pub(crate) fn content_parts(parts: &[Value]) -> Vec<ProviderOutputBlock> {
 
 pub(crate) fn gemini_block(value: &Value) -> ProviderOutputBlock {
     if value.get("thought").and_then(Value::as_bool) == Some(true) {
-        let mut content = zeroclaw_api::session_events::privacy::classify_value(value.clone());
-        if let Some(signature) = value
-            .get("thoughtSignature")
-            .filter(|value| value.is_string())
-            && let Some(object) = content.as_object_mut()
-        {
-            object.insert("thoughtSignature".into(), signature.clone());
-        }
+        let content = value.clone();
         return ProviderOutputBlock::Reasoning {
             representation: "gemini.part/v1".into(),
             bytes: content.to_string().into_bytes(),
@@ -384,7 +377,7 @@ pub(crate) fn gemini_block(value: &Value) -> ProviderOutputBlock {
 
 /// A signature can accompany ordinary text, a function call or media. It
 /// must not change that part's semantic type. Preserve replay metadata as a
-/// separate classified block before projecting legacy display text.
+/// separate content block before projecting legacy display text.
 pub(crate) fn gemini_blocks(value: &Value) -> Vec<ProviderOutputBlock> {
     let block = gemini_block(value);
     if matches!(&block, ProviderOutputBlock::Reasoning { .. }) {

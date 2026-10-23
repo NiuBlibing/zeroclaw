@@ -365,8 +365,7 @@ impl Tool for AskUserTool {
                     };
                     resolution_state = "failed";
                     resolution_error_kind = Some(kind);
-                    let diagnostic =
-                        zeroclaw_api::session_events::privacy::classify_text(&diagnostic);
+                    let diagnostic = diagnostic.to_owned();
                     Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
@@ -396,7 +395,7 @@ impl Tool for AskUserTool {
                 }
                 Ok(value) => json!({"state":resolution_state,"diagnostic":value.error}),
                 Err(error) => {
-                    json!({"state":"failed","diagnostic":zeroclaw_api::session_events::privacy::classify_text(&format!("{error:#}"))})
+                    json!({"state":"failed","diagnostic":format!("{error:#}")})
                 }
             };
             if let Some(kind) = resolution_error_kind {

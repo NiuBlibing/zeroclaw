@@ -821,12 +821,12 @@ fn emit_responses_text_part(
             .get(offset..)
             .is_some_and(|remaining| remaining.starts_with(observed))
         {
-            let detail = zeroclaw_api::session_events::privacy::classify_value(serde_json::json!({
+            let detail = serde_json::json!({
                 "item_id":item_id,
                 "output_index":output_index,
                 "content_index":content_index,
                 "completion":evidence,
-            }));
+            });
             return Err(StreamError::InvalidSse(format!(
                 "Responses text completion contradicts previously observed text ({}): {detail}",
                 evidence
@@ -1365,8 +1365,7 @@ pub(crate) fn incomplete_responses_sse_error(buffer: &str) -> Option<StreamError
     if buffer.trim().is_empty() {
         return None;
     }
-    let detail =
-        zeroclaw_api::session_events::privacy::classify_text(&super::scrub_secret_patterns(buffer));
+    let detail = super::scrub_secret_patterns(buffer);
     Some(StreamError::InvalidSse(format!(
         "Responses stream ended before an SSE frame delimiter: {detail}"
     )))

@@ -46,9 +46,7 @@ pub(crate) struct ProviderProtocolFailure {
 
 impl ProviderProtocolFailure {
     pub(crate) fn new(body: serde_json::Value) -> Self {
-        Self {
-            body: zeroclaw_api::session_events::privacy::classify_value(body),
-        }
+        Self { body }
     }
     pub(crate) fn error(&self) -> &serde_json::Value {
         self.body

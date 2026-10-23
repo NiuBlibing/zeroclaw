@@ -278,7 +278,7 @@ async fn generate_in_session(
             continue;
         }
         let original = text(&pending)?;
-        if original != zeroclaw_api::session_events::privacy::classify_text(&prompt) {
+        if original != prompt {
             port.reject_pending_input(&pending.turn_id, "sop_recovery_input_revised")
                 .await?;
             continue;

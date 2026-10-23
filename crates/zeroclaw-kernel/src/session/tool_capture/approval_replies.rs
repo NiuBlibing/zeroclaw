@@ -68,7 +68,7 @@ fn verify_reply(
                 "approval_replacement_payload_codec_mismatch"
             );
             anyhow::ensure!(
-                scope.payload(reference)? == privacy::classify_text(replacement).as_bytes(),
+                scope.payload(reference)? == replacement.to_owned().as_bytes(),
                 "approval_resolution_disagrees_with_recorded_replacement"
             );
         }
@@ -132,7 +132,7 @@ fn append_reply(
         ChannelApprovalResponse::DenyWithEdit { replacement } => Some(PayloadRecord::new(
             PayloadId::new(),
             "session.text/v1".into(),
-            privacy::classify_text(replacement).into_bytes(),
+            replacement.to_owned().into_bytes(),
         )?),
         _ => None,
     };
@@ -143,7 +143,7 @@ fn append_reply(
             replacement_ref: replacement.as_ref().map(StoredPayloadRef::from),
         },
     )?;
-    let ingress = PayloadRecord::json("session.evidence/v1", &privacy::classify_value(evidence))?;
+    let ingress = PayloadRecord::json("session.evidence/v1", &evidence)?;
     let mut event = scope.event(
         invocation,
         EventData::ControlInputRecorded {

@@ -301,6 +301,7 @@ pub enum ResponseBlock {
     },
     Other {
         type_name: String,
+        /// Historical wire name; content is retained unchanged, without credential filtering.
         classified_body_ref: StoredPayloadRef,
     },
 }

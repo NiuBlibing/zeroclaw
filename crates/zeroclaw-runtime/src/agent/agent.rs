@@ -3757,10 +3757,9 @@ impl Agent {
         )
     }
 
-    /// Narrow execution bridge: format the actual error chain using the
-    /// existing credential boundary before a session owner persists it.
+    /// Format the observed error chain for the canonical session diagnostic.
     pub fn session_execution_diagnostic(error: &anyhow::Error) -> String {
-        zeroclaw_api::session_events::privacy::classify_text(&format!("{error:#}"))
+        format!("{error:#}")
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
