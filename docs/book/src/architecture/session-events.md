@@ -489,6 +489,24 @@ execution owners, and never turns retention into payload erasure. Session tools
 read through the admitted execution port and the same authorized kernel views;
 they do not reopen legacy history after upgrade.
 
+Gateway execution resolves TTL-only continuations before binding its live
+authority. A successor uses `gw_resume-<closure-event-id>` as its immutable
+family identity, and its `SessionStarted.causation_id` references the predecessor's
+TTL closure. Retries and concurrent requests therefore select the same successor
+without a locator or a second routing table. The new context starts empty;
+exact history reads retain the archived identity. Explicit closure and deletion
+never create a continuation. Repeated expiry follows the committed closure chain.
+
+CLI and session-host startup share kernel family recovery. After the host proves
+exclusive ownership, recovery settles descendants before their parent, including
+child requests committed before child stream creation. It preserves uncertain
+outcomes and never replays provider or tool execution.
+
+SQLite control-file publication supports Windows using synced files and the
+same directory-flush contract as config publication. Windows does not provide
+Unix directory-fsync guarantees; native JSONL is rejected before initialization
+on non-Unix platforms rather than failing after partial publication.
+
 ## Authorized reads and erasure
 
 Queries check current permission before and after materializing a page. A fixed

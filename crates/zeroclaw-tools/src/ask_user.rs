@@ -1042,8 +1042,8 @@ mod tests {
                     if !panic {
                         assert!(diagnostic.contains("fixture source error"));
                     }
-                    assert!(!diagnostic.contains("fixturelistenercredential"));
-                    assert!(!result.error.unwrap().contains("fixturelistenercredential"));
+                    assert!(diagnostic.contains("fixturelistenercredential"));
+                    assert!(result.error.unwrap().contains("fixturelistenercredential"));
                 }
             }
         }

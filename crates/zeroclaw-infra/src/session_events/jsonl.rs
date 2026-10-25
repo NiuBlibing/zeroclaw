@@ -320,6 +320,11 @@ impl JsonlEventStore {
         Ok(())
     }
     pub fn open(data_dir: &Path) -> Result<Self, AppendError> {
+        if !cfg!(unix) {
+            return Err(AppendError::StorageUnavailable(
+                "JSONL directory durability is unsupported on this platform; use SQLite".into(),
+            ));
+        }
         let root = data_dir.join("sessions/session-events-jsonl");
         filesystem::directory(&data_dir.join("sessions"))?;
         filesystem::directory(&root)?;

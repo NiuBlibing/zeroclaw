@@ -14,6 +14,11 @@ pub fn upgrade_installation(
     requested: NativeBackend,
     resolve_alias: impl Fn(Option<&str>) -> String,
 ) -> Result<(), AppendError> {
+    if requested == NativeBackend::Jsonl && !cfg!(unix) {
+        return Err(AppendError::StorageUnavailable(
+            "JSONL directory durability is unsupported on this platform; use SQLite".into(),
+        ));
+    }
     let directory = data_dir.join("sessions");
     let mut guard = InstallationGuard::acquire(&directory)?;
     let mut upgrade_leases = Vec::new();
@@ -401,7 +406,7 @@ pub fn archive_path(path: &Path, suffix: &str) -> Result<(), AppendError> {
     }
     fs::rename(path, backup)
         .map_err(|error| AppendError::CommitOutcomeUnknown(error.to_string()))?;
-    jsonl::sync_directory(
+    filesystem::sync_directory(
         path.parent()
             .ok_or_else(|| AppendError::InvalidReference("upgrade source parent missing".into()))?,
     )

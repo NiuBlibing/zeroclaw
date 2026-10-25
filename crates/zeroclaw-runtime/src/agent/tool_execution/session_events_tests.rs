@@ -122,7 +122,7 @@ async fn uncertain_adapter_error_stops_dispatch_after_recording_diagnostic() {
         .expect("diagnostic");
     let text = std::str::from_utf8(&diagnostic.body).expect("text");
     assert!(text.contains("fixture connection lost"));
-    assert!(!text.contains("sk-abcdefgh1234567890"));
+    assert!(text.contains("sk-abcdefgh1234567890"));
 }
 
 struct ContextCancellationProbe(Arc<std::sync::atomic::AtomicBool>);

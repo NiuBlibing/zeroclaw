@@ -4,8 +4,8 @@ use super::{AppendError, Arc, Path, SessionCoordinator, SessionEventStore, open_
 use zeroclaw_api::principal::PrincipalId;
 use zeroclaw_api::session_events::capture::{EngineTurnInput, SessionExecutionPort};
 use zeroclaw_api::session_events::{
-    AppendRequest, BranchId, CaptureMode, Digest, EventActor, EventCursor, EventData, EventId,
-    EventKind, PayloadRecord, SessionEvent, SessionId, SessionStreamId, StoredPayloadRef,
+    AppendRequest, BranchId, CaptureMode, Digest, EventActor, EventCursor, EventData, EventKind,
+    PayloadRecord, SessionEvent, SessionId, SessionStreamId, StoredPayloadRef,
 };
 use zeroclaw_infra::session_events::installation::{
     InstallationGuard, NativeBackend, family_identity,
@@ -304,9 +304,8 @@ pub async fn open_cli_session(
     if persistent {
         session
             .owner
-            .recover_interrupted_stream(
+            .recover_family(
                 session.authority.stream.clone(),
-                format!("cli-owner-{}", EventId::new()),
                 Arc::new(CliOwnershipRecovery),
             )
             .await?;

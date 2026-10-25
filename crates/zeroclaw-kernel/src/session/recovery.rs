@@ -27,6 +27,92 @@ pub trait ExecutionLossVerifier: Send + Sync {
 }
 
 impl SessionCoordinator {
+    /// Recover a whole session family without replaying any external effect.
+    pub async fn recover_family(
+        self: &Arc<Self>,
+        stream: SessionStreamId,
+        verifier: Arc<dyn StreamExecutionLossVerifier>,
+    ) -> Result<(), SessionError> {
+        let recovery_key = format!("family-owner-{}", EventId::new());
+        let mut streams = vec![stream.clone()];
+        let mut pending = vec![stream.clone()];
+        let mut visited = std::collections::HashSet::from([stream.clone()]);
+        while let Some(parent) = pending.pop() {
+            let proof = verifier.verify_stream_loss(&parent, &self.head(&parent)?)?;
+            if proof.codec != "session.evidence/v1" {
+                return Err(SessionError::InvalidAdmission(
+                    "family recovery requires ownership proof".into(),
+                ));
+            }
+            self.resume_pending_erasures(parent.clone()).await?;
+            let mut after = EventCursor::beginning(parent.clone());
+            let mut through = None;
+            loop {
+                let owner = Arc::clone(self);
+                let scope = parent.clone();
+                let cursor = after.clone();
+                let limit = through.clone();
+                let page = self
+                    .blocking(move || {
+                        Ok(owner.store.read_page(
+                            &scope,
+                            &cursor,
+                            limit.as_ref(),
+                            256,
+                            4 * 1024 * 1024,
+                        )?)
+                    })
+                    .await?;
+                through = Some(page.through.clone());
+                for event in &page.events {
+                    if matches!(event.body.data, EventData::ChildInvocationRequested { .. }) {
+                        let invocation = event
+                            .invocation_id
+                            .as_ref()
+                            .ok_or(SessionError::InvocationMismatch)?;
+                        let child = SessionStreamId::parse(format!("child-{invocation}"))
+                            .map_err(AppendError::from)?;
+                        let child = if self.head(&child)?.sequence == 0 {
+                            self.recover_requested_child(event.clone(), Arc::clone(&verifier))
+                                .await?
+                        } else {
+                            child
+                        };
+                        if self.head(&child)?.sequence > 0 && visited.insert(child.clone()) {
+                            if streams.len() >= 100_000 {
+                                return Err(SessionError::InvalidAdmission(
+                                    "session family recovery limit exceeded".into(),
+                                ));
+                            }
+                            streams.push(child.clone());
+                            pending.push(child);
+                        }
+                    }
+                }
+                if !page.has_more {
+                    break;
+                }
+                after.sequence = page
+                    .events
+                    .last()
+                    .ok_or_else(|| {
+                        SessionError::Read(ReadError::Corrupt("empty recovery page".into()))
+                    })?
+                    .sequence;
+            }
+        }
+        for child in streams.into_iter().rev().filter(|child| child != &stream) {
+            self.recover_interrupted_stream(
+                child,
+                format!("{recovery_key}-child"),
+                Arc::clone(&verifier),
+            )
+            .await?;
+        }
+        self.recover_interrupted_stream(stream, recovery_key, verifier)
+            .await?;
+        Ok(())
+    }
     /// Settle interrupted local transforms separately from uncertain external
     /// effects. No provider, tool, delivery or child is executed during replay.
     /// `recovery_key` identifies the ownership recovery command across retries.

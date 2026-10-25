@@ -1,4 +1,46 @@
 use super::*;
+
+#[test]
+fn sqlite_publication_supports_fresh_reopen_and_legacy_upgrade() {
+    use crate::session_backend::SessionBackend;
+    for legacy in [false, true] {
+        let directory = tempfile::tempdir().expect("directory");
+        if legacy {
+            let old =
+                crate::session_sqlite::SqliteSessionBackend::new(directory.path()).expect("legacy");
+            old.append(
+                "gw_legacy",
+                &zeroclaw_api::model_provider::ChatMessage::user("retained input"),
+            )
+            .expect("append");
+        }
+        upgrade_installation(directory.path(), NativeBackend::Sqlite, |_| {
+            "fixture".into()
+        })
+        .expect("publish");
+        upgrade_installation(directory.path(), NativeBackend::Sqlite, |_| {
+            "fixture".into()
+        })
+        .expect("reopen");
+        let guard =
+            InstallationGuard::acquire(&directory.path().join("sessions")).expect("manifest");
+        assert_eq!(guard.active().expect("ready").0, NativeBackend::Sqlite);
+        if legacy {
+            assert!(
+                directory
+                    .path()
+                    .join("sessions/sessions.db.backup")
+                    .is_file()
+            );
+            assert_eq!(
+                installation::families(directory.path(), NativeBackend::Sqlite)
+                    .expect("families")
+                    .len(),
+                1
+            );
+        }
+    }
+}
 use crate::{session_sqlite::SqliteSessionBackend, session_store::SessionStore};
 use zeroclaw_api::{
     model_provider::ChatMessage,

@@ -210,81 +210,8 @@ impl NativeSessionHub {
         let owner = Arc::new(SessionCoordinator::new(store).with_search(Arc::new(
             zeroclaw_infra::session_events::search::FullTextSearch,
         )));
-        // The exclusive family lease proves every previous child handle is
-        // gone as well. Recover descendants before the parent, without polling
-        // engine futures or treating a missing child start as execution.
-        let recovery_query = owner.query_actor(
-            EventActor::System {
-                component: "family_metadata_reader".into(),
-            },
-            Arc::new(InternalDescriptorRead),
-        );
-        let mut streams = vec![stream.clone()];
-        let mut pending = vec![stream.clone()];
-        while let Some(parent) = pending.pop() {
-            owner.resume_pending_erasures(parent.clone()).await?;
-            let mut after = EventCursor::beginning(parent.clone());
-            let mut through = None;
-            loop {
-                let page = recovery_query
-                    .read_page(
-                        parent.clone(),
-                        after.clone(),
-                        through.clone(),
-                        256,
-                        4 * 1024 * 1024,
-                    )
-                    .await?;
-                through = Some(page.through.clone());
-                for event in &page.events {
-                    if matches!(event.body.data, EventData::ChildInvocationRequested { .. }) {
-                        let invocation = event.invocation_id.as_ref().ok_or_else(|| {
-                            anyhow::Error::msg("child request invocation missing")
-                        })?;
-                        let child = SessionStreamId::parse(format!("child-{invocation}"))?;
-                        let child = if owner.head(&child)?.sequence == 0 {
-                            owner
-                                .recover_requested_child(
-                                    event.clone(),
-                                    Arc::new(ExclusiveFamilyRecovery),
-                                )
-                                .await?
-                        } else {
-                            child
-                        };
-                        if owner.head(&child)?.sequence > 0 {
-                            anyhow::ensure!(
-                                streams.len() < 100_000,
-                                "session family recovery limit exceeded"
-                            );
-                            streams.push(child.clone());
-                            pending.push(child);
-                        }
-                    }
-                }
-                if let Some(last) = page.events.last() {
-                    after.sequence = last.sequence;
-                }
-                if !page.has_more {
-                    break;
-                }
-            }
-        }
-        for child in streams.into_iter().rev().filter(|child| child != &stream) {
-            owner
-                .recover_interrupted_stream(
-                    child,
-                    format!("family-owner-{}", EventId::new()),
-                    Arc::new(ExclusiveFamilyRecovery),
-                )
-                .await?;
-        }
         owner
-            .recover_interrupted_stream(
-                stream.clone(),
-                format!("family-owner-{}", EventId::new()),
-                Arc::new(ExclusiveFamilyRecovery),
-            )
+            .recover_family(stream.clone(), Arc::new(ExclusiveFamilyRecovery))
             .await?;
         *family_owner = Some(Arc::clone(&owner));
         Ok(Arc::new(
@@ -360,6 +287,43 @@ pub fn open_repository(
 }
 #[async_trait::async_trait]
 impl EngineSessionSource for NativeSessionHub {
+    async fn active_family(&self, family: &str) -> anyhow::Result<String> {
+        // Retention only applies to gateway families. Explicit closure remains
+        // terminal, including when it occurs after one or more TTL successors.
+        if !family.starts_with("gw_") {
+            return Ok(family.to_owned());
+        }
+        let (directory, _) = self.prepare().await?;
+        let family = family.to_owned();
+        let stores = self.stores.clone();
+        tokio::task::spawn_blocking(move || {
+            let installation = InstallationGuard::acquire(&directory.join("sessions"))?;
+            let identities = zeroclaw_infra::session_events::installation::families(&directory, installation.active()?.0)?;
+            let store = stores.open_installation(&installation)?;
+            let mut active = family;
+            for _ in 0..100_000 {
+                let Some(stream) = identities.get(&active) else { return Ok(active); };
+                let mut after = EventCursor::beginning(stream.clone());
+                let mut through = None;
+                let mut closure = None;
+                loop {
+                    let page = store.read_page(stream, &after, through.as_ref(), 256, 4 * 1024 * 1024)?;
+                    through = Some(page.through.clone());
+                    for event in &page.events {
+                        if matches!(event.body.data, EventData::SessionClosed { .. }) { closure = Some(event.clone()); }
+                    }
+                    if !page.has_more { break; }
+                    after.sequence = page.events.last().context("empty continuation page")?.sequence;
+                }
+                let Some(closed) = closure else { return Ok(active); };
+                if !matches!(&closed.body.data, EventData::SessionClosed { reason_key } if reason_key == "session_ttl_expired") {
+                    return Ok(active);
+                }
+                active = format!("gw_resume-{}", closed.event_id);
+            }
+            anyhow::bail!("session continuation limit exceeded")
+        }).await?
+    }
     async fn stream_id(&self, family: &str) -> Result<SessionStreamId, ContractError> {
         let directory = self.config.read().data_dir.clone();
         let family = family.to_owned();

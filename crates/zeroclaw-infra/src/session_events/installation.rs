@@ -191,9 +191,10 @@ impl InstallationGuard {
         let mut file = filesystem::file(&temporary, true).map_err(jsonl::storage)?;
         file.write_all(&bytes).map_err(jsonl::storage)?;
         file.sync_all().map_err(jsonl::storage)?;
+        drop(file);
         fs::rename(&temporary, self.directory.join("session-format.json"))
             .map_err(|error| AppendError::CommitOutcomeUnknown(error.to_string()))?;
-        jsonl::sync_directory(&self.directory)
+        filesystem::sync_directory(&self.directory)
             .map_err(|error| AppendError::CommitOutcomeUnknown(error.to_string()))
     }
 }

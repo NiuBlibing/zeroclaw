@@ -576,6 +576,11 @@ pub(crate) async fn open(
     let Some(source) = &state.native_sessions else {
         return Ok(None);
     };
+    // Authenticate the original scope before resolving its continuation, then
+    // bind fresh live authority to the actual execution stream.
+    authority(state, source.stream_id(family).await?, alias, subject)?;
+    let active = source.active_family(family).await?;
+    let family = active.as_str();
     let authority = authority(state, source.stream_id(family).await?, alias, subject)?;
     Ok(Some(
         source
@@ -680,9 +685,21 @@ pub(crate) async fn command(
         .describe(family.into())
         .await?
         .ok_or_else(|| anyhow::Error::msg("session_not_found"))?;
-    open(state, family, &descriptor.owning_agent, subject)
-        .await?
-        .ok_or_else(|| anyhow::Error::msg("native_session_source_missing"))
+    // Commands address the exact history selected by the caller. Only a new
+    // execution may follow a TTL continuation.
+    let authority = authority(state, descriptor.stream, &descriptor.owning_agent, subject)?;
+    source
+        .open(
+            family.into(),
+            descriptor.owning_agent,
+            PrincipalId::shared_operator(),
+            authority,
+            ContextSnapshot {
+                messages: vec![],
+                history_has_trim_breadcrumb: Some(false),
+            },
+        )
+        .await
 }
 pub(crate) async fn list(
     state: &AppState,

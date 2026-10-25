@@ -4,6 +4,40 @@ use super::*;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 
+/// Sync control-file publication using the same platform contract as config
+/// publication. Windows cannot flush directory handles (ERROR_ACCESS_DENIED);
+/// files must be synced before rename. JSONL commits use their stricter path.
+pub(super) fn sync_directory(path: &Path) -> Result<(), AppendError> {
+    #[cfg(unix)]
+    {
+        File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(jsonl::storage)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(jsonl::storage)?;
+        match directory.sync_all() {
+            Ok(()) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(5) => Ok(()),
+            Err(error) => Err(jsonl::storage(error)),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(AppendError::StorageUnavailable(
+            "session publication unsupported on this platform".into(),
+        ))
+    }
+}
+
 /// Read access never creates a missing object or follows a substituted link.
 /// Validate the opened descriptor, so a FIFO cannot become a blocking reader.
 pub(super) fn reader(path: &Path) -> std::io::Result<File> {

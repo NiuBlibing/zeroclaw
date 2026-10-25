@@ -169,13 +169,14 @@ impl CliStateGuard {
         let mut file = filesystem::file(&temporary, true).map_err(jsonl::storage)?;
         file.write_all(&bytes).map_err(jsonl::storage)?;
         file.sync_all().map_err(jsonl::storage)?;
+        drop(file);
         fs::rename(&temporary, sibling(&self.path, ".native-session")?)
             .map_err(|error| AppendError::CommitOutcomeUnknown(error.to_string()))?;
         let parent = self
             .path
             .parent()
             .ok_or_else(|| AppendError::InvalidReference("CLI state parent missing".into()))?;
-        jsonl::sync_directory(parent)
+        filesystem::sync_directory(parent)
             .map_err(|error| AppendError::CommitOutcomeUnknown(error.to_string()))?;
         self.binding = Some(binding);
         Ok(())
@@ -195,7 +196,7 @@ impl CliStateGuard {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(jsonl::storage(error)),
         }
-        jsonl::sync_directory(
+        filesystem::sync_directory(
             self.path
                 .parent()
                 .ok_or_else(|| AppendError::InvalidReference("CLI state parent missing".into()))?,

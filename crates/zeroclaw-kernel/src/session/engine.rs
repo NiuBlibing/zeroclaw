@@ -29,6 +29,11 @@ pub trait EngineSessionAuthority: SessionAccessPolicy + PermissionResolver {
 #[async_trait::async_trait]
 pub trait EngineSessionSource: Send + Sync {
     async fn stream_id(&self, family: &str) -> Result<SessionStreamId, ContractError>;
+    /// Resolve a TTL successor for execution only. History queries stay exact.
+    /// This does not grant authority; the entrance must bind the returned stream.
+    async fn active_family(&self, family: &str) -> anyhow::Result<String> {
+        Ok(family.to_owned())
+    }
     /// Routing metadata for the trusted authorization resolver. A transport
     /// must authorize before disclosing this descriptor to a caller.
     async fn describe(&self, family: String) -> anyhow::Result<Option<FamilyDescriptor>>;

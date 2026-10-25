@@ -983,6 +983,12 @@ async fn child_capture_uses_a_distinct_stream_and_parent_receipt_never_replays()
 
 #[tokio::test]
 async fn reopening_family_recovers_interrupted_child_without_replaying_provider() {
+    for cli in [false, true] {
+        Box::pin(interrupted_child_is_recovered_without_replay(cli)).await;
+    }
+}
+
+async fn interrupted_child_is_recovered_without_replay(cli: bool) {
     use zeroclaw_api::session_events::capture::{
         ChildDispatchIntent, ContextSnapshot, EngineTurnInput, ProviderDispatchIntent,
         current_provider_admission,
@@ -993,6 +999,16 @@ async fn reopening_family_recovers_interrupted_child_without_replaying_provider(
         let mut config = zeroclaw_config::schema::Config::default();
         config.data_dir = directory.path().to_owned();
         config.channels.session_backend = backend.into();
+        config.agents.insert(
+            "fixture".into(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        config.agents.insert(
+            "fixture-child".into(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        config.agents.get_mut("fixture").expect("parent").delegates =
+            serde_json::from_value(serde_json::json!(["fixture-child"])).expect("delegates");
         let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         let source = NativeSessionHub::new(authority.live_handle());
         let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
@@ -1000,22 +1016,39 @@ async fn reopening_family_recovers_interrupted_child_without_replaying_provider(
             messages: vec![],
             history_has_trim_breadcrumb: Some(false),
         };
-        let session = source
-            .open(
-                "interrupted-family".into(),
-                "fixture".into(),
-                principal.clone(),
-                Arc::new(Access),
-                initial.clone(),
+        let path = directory.path().join("interactive.json");
+        let session = if cli {
+            open_cli_session(
+                directory.path(),
+                backend,
+                "fixture",
+                authority.execution_capability(),
+                Some(&path),
             )
             .await
-            .expect("open");
+            .expect("open CLI")
+        } else {
+            source
+                .open(
+                    "interrupted-family".into(),
+                    "fixture".into(),
+                    principal.clone(),
+                    Arc::new(Access),
+                    initial.clone(),
+                )
+                .await
+                .expect("open")
+        };
         let input = EngineTurnInput {
             execution_workspace: None,
             reply_route: None,
             turn_id: TurnId::new().to_string(),
             agent_alias: Some("fixture".into()),
-            ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+            ingress: if cli {
+                zeroclaw_api::ingress::IngressContext::interactive()
+            } else {
+                zeroclaw_api::ingress::IngressContext::agent_direct()
+            },
             parts: zeroclaw_api::session_events::capture::EngineInputPart::text_and_files(
                 "child interruption".into(),
                 vec![],
@@ -1071,16 +1104,28 @@ async fn reopening_family_recovers_interrupted_child_without_replaying_provider(
         drop(session);
         drop(source);
         let reopened = NativeSessionHub::new(authority.live_handle());
-        let session = reopened
-            .open(
-                "interrupted-family".into(),
-                "fixture".into(),
-                principal,
-                Arc::new(Access),
-                initial,
+        let session = if cli {
+            open_cli_session(
+                directory.path(),
+                backend,
+                "fixture",
+                authority.execution_capability(),
+                Some(&path),
             )
             .await
-            .expect("recover family");
+            .expect("recover CLI")
+        } else {
+            reopened
+                .open(
+                    "interrupted-family".into(),
+                    "fixture".into(),
+                    principal,
+                    Arc::new(Access),
+                    initial,
+                )
+                .await
+                .expect("recover family")
+        };
         assert!(
             session
                 .execute(
@@ -1090,12 +1135,25 @@ async fn reopening_family_recovers_interrupted_child_without_replaying_provider(
                 .await
                 .is_err()
         );
+        let family = if cli {
+            reopened
+                .families()
+                .await
+                .expect("families")
+                .into_iter()
+                .find(|family| family.starts_with("cli:"))
+                .expect("CLI family")
+        } else {
+            "interrupted-family".to_owned()
+        };
         let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
             directory.path(),
-            "interrupted-family",
+            &family,
         )
         .expect("store");
-        let root = NativeSessionHub::stream_id("interrupted-family").expect("root");
+        let root = EngineSessionSource::stream_id(&reopened, &family)
+            .await
+            .expect("root");
         let parent = store
             .read_page(
                 &root,
