@@ -302,7 +302,16 @@ impl PreparedToolPort for PreparedTool {
             "session.evidence/v1",
             &evidence,
         )?;
-        let resolution = if approved {
+        let resolution = if reason == "approval_channel_unsupported" {
+            anyhow::ensure!(
+                self.live_name == "shell" && !approved && reply.is_none(),
+                "invalid_unsupported_channel_fallback"
+            );
+            ApprovalResolution::ChannelUnsupported {
+                confirmation_id: self.request_id.clone(),
+                verification_evidence_ref: StoredPayloadRef::from(&evidence),
+            }
+        } else if approved {
             ApprovalResolution::Approved {
                 confirmation_id: self.request_id.clone(),
                 validity: "one_execution".into(),

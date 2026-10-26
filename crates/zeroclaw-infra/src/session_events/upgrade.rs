@@ -414,7 +414,10 @@ pub fn archive_path(path: &Path, suffix: &str) -> Result<(), AppendError> {
 
 fn archive_sqlite(path: &Path, suffix: &str) -> Result<(), AppendError> {
     if path.try_exists().map_err(jsonl::storage)? {
-        let _file = filesystem::reader(path).map_err(jsonl::storage)?;
+        // Windows requires a writable handle for FlushFileBuffers/sync_all.
+        // The file is not modified here; the write access only supplies the
+        // durability handle used after the WAL checkpoint.
+        let file = filesystem::file(path, false).map_err(jsonl::storage)?;
         let conn = Connection::open(path).map_err(map_sqlite)?;
         let (busy, _, _): (i64, i64, i64) = conn
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
@@ -427,7 +430,8 @@ fn archive_sqlite(path: &Path, suffix: &str) -> Result<(), AppendError> {
             ));
         }
         drop(conn);
-        _file.sync_all().map_err(jsonl::storage)?;
+        file.sync_all().map_err(jsonl::storage)?;
+        drop(file);
         archive_path(path, suffix)?;
     }
     for sidecar in ["-wal", "-shm"] {

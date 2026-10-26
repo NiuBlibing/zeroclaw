@@ -497,6 +497,7 @@ async fn approval_deadlines_follow_owner_intent_and_preserve_legacy_values() {
 }
 
 struct ApprovalOwnerChannel {
+    unsupported: bool,
     store: Arc<dyn SessionEventStore>,
     stream: SessionStreamId,
     append_time: Arc<AtomicI64>,
@@ -550,6 +551,9 @@ impl zeroclaw_api::channel::Channel for ApprovalOwnerChannel {
             "request must be durable before presenting the prompt"
         );
         self.append_time.store(self.response_time, Ordering::SeqCst);
+        if self.unsupported {
+            return Ok(None);
+        }
         let response = if self.source.is_runtime_fail_closed() {
             zeroclaw_api::channel::ChannelApprovalResponse::Deny
         } else {
@@ -570,6 +574,7 @@ async fn approval_gate_preserves_owner_outcome_and_long_wait_without_invented_ex
 
     for backend in ["sqlite", "jsonl"] {
         for (source, source_key, reason_key) in [
+            (ApprovalSource::Unavailable, "unsupported_backchannel", None),
             (ApprovalSource::Operator, "operator", None),
             (
                 ApprovalSource::TimedOut,
@@ -592,6 +597,7 @@ async fn approval_gate_preserves_owner_outcome_and_long_wait_without_invented_ex
             h.append_time.store(requested_at, Ordering::SeqCst);
             let port = h.prepare(false).await;
             let channel = ApprovalOwnerChannel {
+                unsupported: source_key == "unsupported_backchannel",
                 store: Arc::clone(&h.store),
                 stream: h.stream.clone(),
                 append_time: Arc::clone(&h.append_time),
@@ -600,8 +606,16 @@ async fn approval_gate_preserves_owner_outcome_and_long_wait_without_invented_ex
             };
             let manager = ApprovalManager::for_non_interactive_backchannel(
                 &zeroclaw_config::schema::RiskProfileConfig {
-                    level: zeroclaw_config::autonomy::AutonomyLevel::Full,
-                    always_ask: vec!["shell".into()],
+                    level: if source_key == "unsupported_backchannel" {
+                        zeroclaw_config::autonomy::AutonomyLevel::Supervised
+                    } else {
+                        zeroclaw_config::autonomy::AutonomyLevel::Full
+                    },
+                    always_ask: if source_key == "unsupported_backchannel" {
+                        vec![]
+                    } else {
+                        vec!["shell".into()]
+                    },
                     ..Default::default()
                 },
             );
@@ -652,6 +666,20 @@ async fn approval_gate_preserves_owner_outcome_and_long_wait_without_invented_ex
             let resolution: ApprovalResolution =
                 serde_json::from_slice(&resolution.body).expect("resolution value");
             let evidence_ref = match resolution {
+                ApprovalResolution::ChannelUnsupported {
+                    verification_evidence_ref,
+                    ..
+                } => {
+                    assert_eq!(source_key, "unsupported_backchannel");
+                    assert!(matches!(
+                        outcome,
+                        ApprovalGateOutcome::Proceed { approved: false }
+                    ));
+                    port.start()
+                        .await
+                        .expect("shell fallback remains executable");
+                    verification_evidence_ref
+                }
                 ApprovalResolution::Approved {
                     verification_evidence_ref,
                     ..
@@ -686,7 +714,10 @@ async fn approval_gate_preserves_owner_outcome_and_long_wait_without_invented_ex
             let evidence: serde_json::Value =
                 serde_json::from_slice(&evidence.body).expect("evidence value");
             assert_eq!(evidence["source"], source_key);
-            assert_eq!(evidence["operator_reply_available"], reason_key.is_none());
+            assert_eq!(
+                evidence["operator_reply_available"],
+                source == ApprovalSource::Operator
+            );
         }
     }
 }

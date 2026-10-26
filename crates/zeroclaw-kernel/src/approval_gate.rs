@@ -111,13 +111,27 @@ pub async fn gate_tool_approval(
                 match response {
                     Ok(Some(a)) => Some(a),
                     Ok(None) if mgr.unsupported_backchannel_may_fall_back(tool_name) => {
-                        // Native preparation remains prompt-bound: an absent
-                        // approval response must not turn into a grant.
-                        if capture.is_some() {
-                            None
-                        } else {
-                            return ApprovalGateOutcome::Proceed { approved: false };
+                        // Preserve the historical shell-policy fallback when the
+                        // channel has no approval prompt. Capture records the
+                        // unsupported route explicitly; it does not turn the
+                        // absence of a prompt into an approval or a denial.
+                        if let Some(port) = &capture
+                            && let Err(error) = port
+                                .resolve_approval(
+                                    zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                                    "approval_channel_unsupported",
+                                    None,
+                                    serde_json::json!({
+                                        "transport": "channel",
+                                        "source": "unsupported_backchannel",
+                                        "operator_reply_available": false,
+                                    }),
+                                )
+                                .await
+                        {
+                            return ApprovalGateOutcome::Error(error);
                         }
+                        return ApprovalGateOutcome::Proceed { approved: false };
                     }
                     Ok(None) => None,
                     Err(e) if zeroclaw_api::session_events::capture::is_capture_stopped(&e) => {

@@ -492,6 +492,11 @@ pub enum ProtocolEvidence {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ApprovalResolution {
+    /// No prompt was available; execution remains subject to shell policy.
+    ChannelUnsupported {
+        confirmation_id: String,
+        verification_evidence_ref: StoredPayloadRef,
+    },
     Approved {
         confirmation_id: String,
         validity: String,

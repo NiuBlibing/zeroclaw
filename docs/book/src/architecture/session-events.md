@@ -168,6 +168,11 @@ consumption are checked even when no absolute expiry is known. Legacy numeric
 expiry values remain readable and retain the same execution check. Resolution
 evidence distinguishes operator decisions, timeouts, unreachable approvers and
 unavailable approval surfaces.
+An unsupported channel records a distinct `channel_unsupported` resolution.
+Only the existing implicit shell backchannel fallback can use this outcome;
+explicit `always_ask`, missing approvers, timeouts and transport errors still
+fail closed. This outcome is not operator approval: the shell continues under
+its ordinary command policy and current authority checks.
 
 Authenticated approval replies are `ControlInputRecorded` events using
 `session.approval-reply/v1`. The original request owns the capture capability;

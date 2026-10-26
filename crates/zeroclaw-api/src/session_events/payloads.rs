@@ -1179,9 +1179,20 @@ fn validate_semantic_payloads(
                 | ApprovalResolution::Denied {
                     verification_evidence_ref,
                     ..
+                }
+                | ApprovalResolution::ChannelUnsupported {
+                    verification_evidence_ref,
+                    ..
                 } => verification_evidence_ref,
             };
             let evidence: Value = decode(payloads, evidence_ref, "session.evidence/v1")?;
+            if matches!(resolution, ApprovalResolution::ChannelUnsupported { .. })
+                && (evidence["source"] != "unsupported_backchannel"
+                    || evidence["operator_reply_available"] != false
+                    || event.causation_id.is_some())
+            {
+                return Err(invalid("invalid unsupported channel resolution"));
+            }
             if evidence["operator_reply_available"] == false
                 && (approved || event.causation_id.is_some())
             {
@@ -1251,6 +1262,7 @@ fn validate_semantic_payloads(
         EventData::ToolEffectStarted {
             policy_event_id,
             confirmation_event_id: Some(confirmation),
+            execution_ref,
             ..
         } => {
             let resolved = history
@@ -1265,11 +1277,27 @@ fn validate_semantic_payloads(
             };
             let resolution: ApprovalResolution =
                 decode(payloads, resolution_ref, "session.approval-resolution/v1")?;
-            let ApprovalResolution::Approved {
+            if let ApprovalResolution::ChannelUnsupported {
                 confirmation_id, ..
-            } = resolution
-            else {
-                return Err(invalid("denied approval cannot be consumed"));
+            } = &resolution
+            {
+                let action: Value = decode(payloads, execution_ref, "session.tool-call/v1")?;
+                if action["name"] != "shell" || confirmation_id != request_id {
+                    return Err(invalid(
+                        "unsupported channel fallback is restricted to shell",
+                    ));
+                }
+            }
+            let confirmation_id = match resolution {
+                ApprovalResolution::Approved {
+                    confirmation_id, ..
+                }
+                | ApprovalResolution::ChannelUnsupported {
+                    confirmation_id, ..
+                } => confirmation_id,
+                ApprovalResolution::Denied { .. } => {
+                    return Err(invalid("denied approval cannot be consumed"));
+                }
             };
             let approval = approvals
                 .get(&(event.stream_id.clone(), request_id.clone()))
