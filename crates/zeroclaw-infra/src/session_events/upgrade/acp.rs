@@ -119,7 +119,9 @@ fn import_existing(
                         }
                     }
                 }
-                EventData::SessionClosed { .. } => closed = true,
+                EventData::SessionClosed { reason_key } if reason_key != "session_ttl_expired" => {
+                    closed = true
+                }
                 _ => {}
             }
         }

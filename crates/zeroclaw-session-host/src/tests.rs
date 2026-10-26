@@ -7,7 +7,7 @@ use zeroclaw_kernel::session::{EffectIntent, PermissionResolver, SessionError};
 struct Authority(AtomicBool);
 
 #[tokio::test]
-async fn ttl_successors_are_stable_empty_and_preserve_closed_history() {
+async fn ttl_expiry_reopens_same_family_with_history() {
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::tempdir().expect("directory");
         let mut config = zeroclaw_config::schema::Config {
@@ -18,140 +18,94 @@ async fn ttl_successors_are_stable_empty_and_preserve_closed_history() {
         let live = zeroclaw_config::live::LiveConfig::new(config);
         let hub = NativeSessionHub::new(live.handle());
         let authority = Arc::new(Authority(AtomicBool::new(true)));
-        let initial = ContextSnapshot {
-            messages: vec![ConversationMessage::Chat(ChatMessage::user("old history"))],
-            history_has_trim_breadcrumb: Some(false),
-        };
         let port = hub
             .open(
                 "gw_expired".into(),
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
-                initial,
+                ContextSnapshot {
+                    messages: vec![ConversationMessage::Chat(ChatMessage::user("old history"))],
+                    history_has_trim_breadcrumb: Some(false),
+                },
             )
             .await
             .expect("old session");
         drop(port);
         assert_eq!(hub.archive_stale("gw_", i64::MAX).await.expect("expire"), 1);
-        let (first, second) = tokio::join!(
-            hub.active_family("gw_expired"),
-            hub.active_family("gw_expired")
+        let resumed = hub
+            .open(
+                "gw_expired".into(),
+                "fixture".into(),
+                PrincipalId::shared_operator(),
+                authority.clone(),
+                ContextSnapshot {
+                    messages: vec![],
+                    history_has_trim_breadcrumb: Some(false),
+                },
+            )
+            .await
+            .expect("resume session");
+        let restored = resumed
+            .restore_context()
+            .await
+            .expect("context")
+            .expect("history");
+        assert!(
+            matches!(&restored.messages[0], ConversationMessage::Chat(chat) if chat.content == "old history")
         );
-        let successor = first.expect("successor");
-        assert_eq!(successor, second.expect("same successor"));
-        assert_ne!(successor, "gw_expired");
+        assert_eq!(
+            hub.families().await.expect("one logical family"),
+            vec!["gw_expired"]
+        );
+        drop(resumed);
+        drop(hub);
+        let reopened = NativeSessionHub::new(live.handle());
         let empty = ContextSnapshot {
             messages: vec![],
             history_has_trim_breadcrumb: Some(false),
         };
-        let open = || {
-            hub.open(
-                successor.clone(),
-                "fixture".into(),
-                PrincipalId::shared_operator(),
-                authority.clone(),
-                empty.clone(),
-            )
-        };
-        let (one, two) = tokio::join!(open(), open());
-        let one = one.expect("first writer");
-        let two = two.expect("same writer");
-        assert!(
-            one.restore_context()
-                .await
-                .expect("context")
-                .expect("seed")
-                .messages
-                .is_empty()
-        );
-        let query = hub
-            .query(
-                "gw_expired".into(),
-                PrincipalId::shared_operator(),
-                authority.clone(),
-            )
-            .await
-            .expect("history")
-            .expect("old session");
-        assert!(
-            query
-                .query
-                .summary(query.stream.clone())
-                .await
-                .expect("summary")
-                .closed
-        );
-        assert_eq!(
-            query.query.messages(query.stream).await.expect("messages")[0].text,
-            "old history"
-        );
-        let stream = EngineSessionSource::stream_id(&hub, &successor)
-            .await
-            .expect("stream");
-        let store = open_event_store(directory.path(), backend).expect("store");
-        let root = store
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                1,
-                4 * 1024 * 1024,
-            )
-            .expect("root")
-            .events
-            .remove(0);
-        let closure = store
-            .read_event(root.causation_id.as_ref().expect("predecessor link"))
-            .expect("closure")
-            .expect("event");
-        assert!(
-            matches!(closure.body.data, EventData::SessionClosed { ref reason_key } if reason_key == "session_ttl_expired")
-        );
-        drop((one, two));
-        assert_eq!(
-            hub.archive_stale("gw_", i64::MAX)
-                .await
-                .expect("expire again"),
-            1
-        );
-        let next = hub
-            .active_family("gw_expired")
-            .await
-            .expect("second generation");
-        assert_ne!(next, successor);
-        let next_port = hub
+        let resumed = reopened
             .open(
-                next.clone(),
+                "gw_expired".into(),
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
                 empty.clone(),
             )
             .await
-            .expect("next session");
-        next_port.close("session_deleted").await.expect("delete");
-        drop(next_port);
-        let reopened = NativeSessionHub::new(live.handle());
-        assert_eq!(
-            reopened
-                .active_family("gw_expired")
-                .await
-                .expect("exact terminal"),
-            next
+            .expect("resume after restart");
+        assert!(
+            matches!(&resumed.restore_context().await.expect("restored").expect("context").messages[0], ConversationMessage::Chat(chat) if chat.content == "old history")
         );
+        resumed
+            .close("explicit_close")
+            .await
+            .expect("explicit close");
+        drop(resumed);
         assert!(
             reopened
                 .open(
-                    next,
+                    "gw_expired".into(),
                     "fixture".into(),
                     PrincipalId::shared_operator(),
-                    authority,
-                    empty
+                    authority.clone(),
+                    empty.clone()
                 )
                 .await
                 .is_err()
         );
+        let ordinary = reopened
+            .open(
+                "gw_resume-project".into(),
+                "fixture".into(),
+                PrincipalId::shared_operator(),
+                authority.clone(),
+                empty,
+            )
+            .await
+            .expect("client chosen id is ordinary");
+        drop(ordinary);
     }
 }
 
@@ -379,12 +333,7 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
                 .expect("retention"),
             1
         );
-        let successor = hub
-            .active_family("gw_expired")
-            .await
-            .expect("resolve migrated TTL session")
-            .to_owned();
-        assert!(successor.starts_with("gw_resume-"));
+        let successor = "gw_expired".to_owned();
         let continuation = hub
             .open(
                 successor.clone(),
@@ -409,11 +358,11 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
             .expect("query")
             .expect("archived family");
         assert!(
-            query
+            !query
                 .query
                 .summary(query.stream.clone())
                 .await
-                .expect("closed summary")
+                .expect("TTL keeps session open")
                 .closed
         );
         assert_eq!(

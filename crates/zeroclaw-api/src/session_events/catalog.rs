@@ -197,7 +197,9 @@ impl SessionReducer {
                 }
             }
             EventData::SessionClosed { reason_key } => {
-                state.closed = true;
+                // TTL releases an idle execution window, not the logical
+                // conversation. Explicit closures and deletion stay terminal.
+                state.closed |= reason_key != "session_ttl_expired";
                 state.deleted |= reason_key == "session_deleted";
             }
             _ => {}
@@ -537,6 +539,45 @@ mod tests {
         assert!(result.closed && result.deleted);
         assert!(!result.fields.contains_key("created_at"));
         assert!(!result.fields.contains_key("last_activity"));
+    }
+
+    #[test]
+    fn ttl_observations_keep_family_open_and_do_not_undo_explicit_closure() {
+        for explicit in [false, true] {
+            let stream = SessionStreamId::new();
+            let mut reducer = SessionReducer::new(stream.clone(), false);
+            reducer.apply(&root(&stream, false), None).expect("root");
+            reducer
+                .apply(
+                    &event(
+                        &stream,
+                        2,
+                        EventData::SessionClosed {
+                            reason_key: if explicit {
+                                "explicit_close"
+                            } else {
+                                "session_ttl_expired"
+                            }
+                            .into(),
+                        },
+                    ),
+                    None,
+                )
+                .expect("close observation");
+            reducer
+                .apply(
+                    &event(
+                        &stream,
+                        3,
+                        EventData::SessionClosed {
+                            reason_key: "session_ttl_expired".into(),
+                        },
+                    ),
+                    None,
+                )
+                .expect("later TTL observation");
+            assert_eq!(finish(reducer, BTreeMap::new()).closed, explicit);
+        }
     }
 
     #[test]

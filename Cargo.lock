@@ -14231,7 +14231,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-kernel"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14528,7 +14528,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-session-host"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "anyhow",
  "async-trait",

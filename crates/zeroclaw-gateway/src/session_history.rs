@@ -576,11 +576,6 @@ pub(crate) async fn open(
     let Some(source) = &state.native_sessions else {
         return Ok(None);
     };
-    // Authenticate the original scope before resolving its continuation, then
-    // bind fresh live authority to the actual execution stream.
-    authority(state, source.stream_id(family).await?, alias, subject)?;
-    let active = source.active_family(family).await?;
-    let family = active.as_str();
     let authority = authority(state, source.stream_id(family).await?, alias, subject)?;
     Ok(Some(
         source

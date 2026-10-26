@@ -799,7 +799,8 @@ impl HistoryIndex {
                         transforms.insert(id.clone(), true);
                     }
                 }
-                EventKind::SessionClosed => {
+                EventKind::SessionClosed if !matches!(&event.body.data, EventData::SessionClosed { reason_key } if reason_key == "session_ttl_expired") =>
+                {
                     closed.insert(event.stream_id.clone());
                 }
                 _ => {}

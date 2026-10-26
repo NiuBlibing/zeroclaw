@@ -483,19 +483,11 @@ Interrupted transfers resume the committed image, including after the source
 rename. Every mutation checks backend and writer generation, so a handle from
 before a switch stays fenced even if the backend is switched back later.
 
-Gateway TTL appends `SessionClosed` for expired inactive `gw_` families.
-It preserves imported activity timestamps and audit history, skips live
-execution owners, and never turns retention into payload erasure. Session tools
-read through the admitted execution port and the same authorized kernel views;
-they do not reopen legacy history after upgrade.
-
-Gateway execution resolves TTL-only continuations before binding its live
-authority. A successor uses `gw_resume-<closure-event-id>` as its immutable
-family identity, and its `SessionStarted.causation_id` references the predecessor's
-TTL closure. Retries and concurrent requests therefore select the same successor
-without a locator or a second routing table. The new context starts empty;
-exact history reads retain the archived identity. Explicit closure and deletion
-never create a continuation. Repeated expiry follows the committed closure chain.
+Gateway TTL retention ends an idle execution window without closing the logical
+session. A later request using the same session id restores the persisted context
+and continues in the same stream. Historical TTL close observations remain audit
+evidence but do not make the logical session terminal. Explicit closure and
+deletion remain terminal. No successor family or locator is created.
 
 CLI and session-host startup share kernel family recovery. After the host proves
 exclusive ownership, recovery settles descendants before their parent, including

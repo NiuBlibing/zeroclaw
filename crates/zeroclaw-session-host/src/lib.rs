@@ -143,7 +143,9 @@ impl NativeSessionHub {
                 .await?
                 .ok_or_else(|| anyhow::Error::msg("native family missing"))?;
             anyhow::ensure!(
-                record.owning_agent.as_deref() == Some(alias.as_str()) && !record.closed,
+                record.owning_agent.as_deref() == Some(alias.as_str())
+                    && !record.closed
+                    && !record.deleted,
                 "native owning agent differs"
             );
             return Ok(Arc::new(
@@ -287,43 +289,6 @@ pub fn open_repository(
 }
 #[async_trait::async_trait]
 impl EngineSessionSource for NativeSessionHub {
-    async fn active_family(&self, family: &str) -> anyhow::Result<String> {
-        // Retention only applies to gateway families. Explicit closure remains
-        // terminal, including when it occurs after one or more TTL successors.
-        if !family.starts_with("gw_") {
-            return Ok(family.to_owned());
-        }
-        let (directory, _) = self.prepare().await?;
-        let family = family.to_owned();
-        let stores = self.stores.clone();
-        tokio::task::spawn_blocking(move || {
-            let installation = InstallationGuard::acquire(&directory.join("sessions"))?;
-            let identities = zeroclaw_infra::session_events::installation::families(&directory, installation.active()?.0)?;
-            let store = stores.open_installation(&installation)?;
-            let mut active = family;
-            for _ in 0..100_000 {
-                let Some(stream) = identities.get(&active) else { return Ok(active); };
-                let mut after = EventCursor::beginning(stream.clone());
-                let mut through = None;
-                let mut closure = None;
-                loop {
-                    let page = store.read_page(stream, &after, through.as_ref(), 256, 4 * 1024 * 1024)?;
-                    through = Some(page.through.clone());
-                    for event in &page.events {
-                        if matches!(event.body.data, EventData::SessionClosed { .. }) { closure = Some(event.clone()); }
-                    }
-                    if !page.has_more { break; }
-                    after.sequence = page.events.last().context("empty continuation page")?.sequence;
-                }
-                let Some(closed) = closure else { return Ok(active); };
-                if !matches!(&closed.body.data, EventData::SessionClosed { reason_key } if reason_key == "session_ttl_expired") {
-                    return Ok(active);
-                }
-                active = format!("gw_resume-{}", closed.event_id);
-            }
-            anyhow::bail!("session continuation limit exceeded")
-        }).await?
-    }
     async fn stream_id(&self, family: &str) -> Result<SessionStreamId, ContractError> {
         let directory = self.config.read().data_dir.clone();
         let family = family.to_owned();

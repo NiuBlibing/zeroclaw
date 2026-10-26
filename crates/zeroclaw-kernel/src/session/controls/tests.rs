@@ -4207,6 +4207,44 @@ async fn closed_sessions_cancel_recoverable_inputs_without_dispatch() {
 }
 
 #[tokio::test]
+async fn ttl_observation_preserves_recoverable_inputs() {
+    for backend in ["sqlite", "jsonl"] {
+        let dir = tempfile::TempDir::new().expect("directory");
+        let (port, _) = session(dir.path(), backend);
+        let input = input();
+        let command = port.input_command(input.clone()).await.expect("command");
+        port.owner
+            .admit_user_input(&command, &port.actor, &port.actor, port.authority.clone())
+            .await
+            .expect("admit")
+            .detach_for_recovery();
+        port.close("session_ttl_expired").await.expect("close");
+        port.owner
+            .recover_interrupted_stream(
+                port.stream.clone(),
+                "closed-recovery".into(),
+                Arc::new(ElicitationOwnerLost),
+            )
+            .await
+            .expect("recover");
+        assert!(
+            !port
+                .pending_inputs("fixture".into(), "fixture".into())
+                .await
+                .expect("pending")
+                .is_empty()
+        );
+        let history = port.owner.stream_history(&port.stream).expect("history");
+        assert!(!history.iter().any(|event| matches!(&event.body.data, EventData::TurnCancelled {reason_key, ..} if reason_key == "session_closed_before_recovery")));
+        assert!(
+            !history
+                .iter()
+                .any(|event| event.body.kind() == EventKind::TurnStarted)
+        );
+    }
+}
+
+#[tokio::test]
 async fn recovered_input_rejection_requires_current_authority_and_unblocks_queue() {
     for backend in ["sqlite", "jsonl"] {
         let dir = tempfile::TempDir::new().expect("directory");

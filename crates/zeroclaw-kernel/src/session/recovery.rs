@@ -234,7 +234,7 @@ impl SessionCoordinator {
             let cause = recovered.event_id.clone();
             let mut events = vec![recovered];
             let mut payloads=vec![evidence.clone()];
-            let closed = history.iter().any(|event| event.body.kind() == EventKind::SessionClosed);
+            let closed = history.iter().any(|event| matches!(&event.body.data, EventData::SessionClosed { reason_key } if reason_key != "session_ttl_expired"));
             let derived = history.first().is_some_and(|event| event.body.kind() == EventKind::DerivedSessionStarted);
             for (request_id,requested) in elicitations {
                 let resolution=PayloadRecord::json("session.evidence/v1",&serde_json::json!({"state":"interrupted", "reason_key":"elicitation_execution_owner_lost", "ownership_evidence_ref":StoredPayloadRef::from(&evidence)})).map_err(AppendError::from)?;

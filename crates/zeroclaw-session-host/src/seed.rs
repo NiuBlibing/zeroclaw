@@ -27,31 +27,6 @@ impl FamilySeed<'_> {
             self.actor.clone(),
         )?;
         root.branch_id = Some(branch.clone());
-        if let Some(id) = self.family.strip_prefix("gw_resume-") {
-            let id = EventId::parse(id.to_owned())?;
-            let predecessor = store.read_event(&id)?.context("TTL predecessor missing")?;
-            anyhow::ensure!(
-                matches!(&predecessor.body.data, EventData::SessionClosed { reason_key } if reason_key == "session_ttl_expired"),
-                "session continuation requires TTL closure"
-            );
-            let after = EventCursor::beginning(predecessor.stream_id.clone());
-            let first =
-                store.read_page(&predecessor.stream_id, &after, None, 1, 4 * 1024 * 1024)?;
-            anyhow::ensure!(
-                matches!(first.events.first().map(|event| &event.body.data), Some(EventData::SessionStarted { owning_agent, .. }) if owning_agent == self.alias),
-                "session continuation owning agent differs"
-            );
-            if matches!(
-                first.events.first().map(|event| &event.actor),
-                Some(EventActor::Principal { .. })
-            ) {
-                anyhow::ensure!(
-                    first.events.first().map(|event| &event.actor) == Some(&self.actor),
-                    "session continuation principal differs"
-                );
-            }
-            root.causation_id = Some(id);
-        }
         let messages = &self.context.messages;
         let conversation = PayloadRecord::json("session.conversation/v1", &messages)?;
         // The immutable seed creates IDs; later projections resolve its content
