@@ -1,10 +1,10 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-kernel", "crates/zeroclaw-session-host", "crates/zeroclaw-buildinfo", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-dist", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-tls", "crates/zeroclaw-relay-proto", "apps/zerorelay", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-websocket-fixture", "crates/zeroclaw-plugins/tests/fixtures/egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/memory-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-sequential-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-socket-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-websocket-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-buildinfo", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-dist", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-tls", "crates/zeroclaw-relay-proto", "apps/zerorelay", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-websocket-fixture", "crates/zeroclaw-plugins/tests/fixtures/egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/memory-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-sequential-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-socket-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-websocket-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 exclude = ["vendor/crossterm-0.29.0"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.6"
+version = "0.8.7"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
@@ -12,32 +12,30 @@ homepage = "https://www.zeroclaw.com"
 rust-version = "1.96.0"
 
 [workspace.dependencies]
-zeroclaw-session-host = { path = "crates/zeroclaw-session-host", version = "0.8.6" }
-zeroclaw-kernel = { path = "crates/zeroclaw-kernel", version = "0.8.6" }
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.6" }
-zeroclaw-buildinfo = { path = "crates/zeroclaw-buildinfo", version = "0.8.6" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.6" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.6", default-features = false }
-zeroclaw-dist = { path = "crates/zeroclaw-dist", version = "0.8.6" }
-zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.6" }
-zeroclaw-tls = { path = "crates/zeroclaw-tls", version = "0.8.6" }
-zeroclaw-relay-proto = { path = "crates/zeroclaw-relay-proto", version = "0.8.6" }
-zerorelay = { path = "apps/zerorelay", version = "0.8.6" }
-zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.6" }
-zeroclaw-commands = { path = "crates/zeroclaw-commands", version = "0.8.6" }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.6" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.6" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.6", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.6" }
-zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "0.8.6", default-features = false }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.6", default-features = false }
-zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "0.8.6" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.6" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.6" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.6" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.6" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.6" }
-zerocode = { path = "apps/zerocode", version = "0.8.6" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.7" }
+zeroclaw-buildinfo = { path = "crates/zeroclaw-buildinfo", version = "0.8.7" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.7" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.7", default-features = false }
+zeroclaw-dist = { path = "crates/zeroclaw-dist", version = "0.8.7" }
+zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.7" }
+zeroclaw-tls = { path = "crates/zeroclaw-tls", version = "0.8.7" }
+zeroclaw-relay-proto = { path = "crates/zeroclaw-relay-proto", version = "0.8.7" }
+zerorelay = { path = "apps/zerorelay", version = "0.8.7" }
+zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.7" }
+zeroclaw-commands = { path = "crates/zeroclaw-commands", version = "0.8.7" }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.7" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.7" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.7", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.7" }
+zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "0.8.7", default-features = false }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.7", default-features = false }
+zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "0.8.7" }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.7" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.7" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.7" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.7" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.7" }
+zerocode = { path = "apps/zerocode", version = "0.8.7" }
 directories = "6.0"
 sys-locale = "0.3"
 hmac = "0.12"
@@ -92,8 +90,6 @@ zeroclaw-buildinfo.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
-zeroclaw-kernel.workspace = true
-zeroclaw-session-host.workspace = true
 zeroclaw-config = { workspace = true, features = ["clap"] }
 zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
@@ -526,7 +522,6 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
-zeroclaw-infra = { workspace = true, features = ["test-util"] }
 # Enables the runtime crate's test-only `ScopedToolRegistry::from_raw_for_test`
 # so this package's integration-test helpers can mint the now-sealed engine tool
 # registry. dev-dependency only: resolver v2 keeps `test-util` out of the shipped
