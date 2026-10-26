@@ -7,6 +7,13 @@ pub struct StoredPayload {
     pub reference: StoredPayloadRef,
     pub body: Option<Vec<u8>>,
 }
+
+mod codecs;
+
+/// Registered content codecs shared by backend projections and graph validation.
+pub fn content_leaf_codecs() -> impl Iterator<Item = &'static str> {
+    codecs::content_leaf_names()
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PayloadDisposition {
@@ -39,105 +46,26 @@ pub fn disposition(history: &[SessionEvent], id: &PayloadId) -> PayloadDispositi
 /// message/response identities remain immutable. Unknown codecs block graph
 /// mutation while remaining readable.
 pub fn content_leaf(codec: &str) -> bool {
-    matches!(
-        codec,
-        "session.text/v1"
-            | "session.conversation/v1"
-            | "session.reasoning/v1"
-            | "session.bytes/v1"
-            | "session.error-detail/v1"
-            | "session.locator/v1"
-            | "session.tool-arguments/v1"
-            | "session.tool-result/v1"
-    )
-}
-fn validate_structure(payload: &StoredPayload, bytes: &[u8]) -> Result<(), AppendError> {
-    fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, AppendError> {
-        serde_json::from_slice(bytes).map_err(|error| {
-            AppendError::InvalidReference(format!("invalid structural payload: {error}"))
-        })
-    }
-    match payload.reference.codec.as_str() {
-        "session.content/v1" => {
-            let content: ContentPayload = decode(bytes)?;
-            MessageId::parse(content.message_id.as_str())?;
-            for part in content.parts {
-                if let RecordedContentPart::File { file_id } = part
-                    && file_id.is_empty()
-                {
-                    return Err(AppendError::InvalidReference("empty FileId".into()));
-                }
-            }
-        }
-        "session.response/v1" => {
-            let _: ProviderResponsePayload = decode(bytes)?;
-        }
-        "session.provider-observation/v1" => {
-            let _: ProviderObservationPayload = decode(bytes)?;
-        }
-        "session.tool-observation/v1" => {
-            let _: ToolObservationPayload = decode(bytes)?;
-        }
-        "session.diagnostic/v1" => {
-            let _: ProviderDiagnostic = decode(bytes)?;
-        }
-        "session.approval-resolution/v1" => {
-            let _: ApprovalResolution = decode(bytes)?;
-        }
-        "session.approval-reply/v1" => {
-            let reply: ApprovalReplyPayload = decode(bytes)?;
-            if reply.replacement_ref.as_ref().is_some_and(|reference| {
-                reply.decision != ApprovalReplyDecision::Replace
-                    || reference.codec != "session.text/v1"
-            }) {
-                return Err(AppendError::InvalidReference(
-                    "invalid approval replacement reference".into(),
-                ));
-            }
-        }
-        "session.turn-completion/v1" => {
-            let _: TurnCompletion = decode(bytes)?;
-        }
-        _ => {}
-    }
-    Ok(())
+    matches!(codecs::lookup(codec), Some(codecs::Codec::ContentLeaf))
 }
 
 pub fn nested_refs(payload: &StoredPayload) -> Result<Vec<StoredPayloadRef>, AppendError> {
-    if content_leaf(&payload.reference.codec) {
-        return Ok(Vec::new());
-    }
-    if !matches!(
-        payload.reference.codec.as_str(),
-        "session.content/v1"
-            | "session.response/v1"
-            | "session.provider-observation/v1"
-            | "session.tool-observation/v1"
-            | "session.diagnostic/v1"
-            | "session.approval-resolution/v1"
-            | "session.approval-reply/v1"
-            | "session.turn-completion/v1"
-            | "session.request/v1"
-            | "session.context/v1"
-            | "session.file-registration/v1"
-            | "session.ingress/v1"
-            | "session.execution-binding/v1"
-            | "session.authority/v1"
-            | "session.route/v1"
-            | "session.transform/v1"
-            | "session.control/v1"
-            | "session.evidence/v1"
-            | "session.tool-call/v1"
-    ) {
-        return Err(AppendError::UnresolvedReachability(
-            payload.reference.codec.clone(),
-        ));
-    }
+    let validator = match codecs::lookup(&payload.reference.codec) {
+        Some(codecs::Codec::ContentLeaf) => return Ok(Vec::new()),
+        Some(codecs::Codec::Structure(validator)) => validator,
+        None => {
+            return Err(AppendError::UnresolvedReachability(
+                payload.reference.codec.clone(),
+            ));
+        }
+    };
     let bytes = payload
         .body
         .as_ref()
         .ok_or_else(|| AppendError::Corrupt("structural payload body missing".to_owned()))?;
-    validate_structure(payload, bytes)?;
+    if let Some(validate) = validator {
+        validate(bytes)?;
+    }
     let value: Value =
         serde_json::from_slice(bytes).map_err(|error| AppendError::Corrupt(error.to_string()))?;
     refs_in_value(&value)

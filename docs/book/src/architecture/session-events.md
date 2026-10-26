@@ -541,6 +541,14 @@ reference commitment inside the append transaction. New references to pending
 or erased content are rejected. Unknown codecs remain readable but prevent
 graph mutations whose reachability cannot be established.
 
+Payload lifecycle rules have one registry in
+`zeroclaw-api/src/session_events/payloads/codecs.rs`. Each registration declares
+either an opaque content leaf or a structure with an optional typed validator.
+Reference traversal and erasure use that registry; SQLite derives its content
+body projection from the same registrations as JSONL. Adding a codec requires
+one registration, with its decoder when it has a typed schema. Persisted codec
+names and bytes remain unchanged.
+
 Native session deletion appends `SessionClosed`, removes the active session,
 and hides it from ordinary lists. RPC and Gateway responses report
 `history_retained: true`; deletion does not authorize payload erasure. Closed

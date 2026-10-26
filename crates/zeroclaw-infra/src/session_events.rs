@@ -35,6 +35,13 @@ pub mod search;
 
 type SqlitePayloadRow = (String, String, Option<Vec<u8>>, String, i64);
 
+fn content_leaf_sql_list() -> String {
+    zeroclaw_api::session_events::payloads::content_leaf_codecs()
+        .map(|codec| format!("'{}'", codec.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -617,11 +624,11 @@ impl SessionEventStore for SqliteEventStore {
             let history = Self::verified_history(&tx)
                 .map_err(|error| AppendError::Corrupt(error.to_string()))?;
             let existing = {
-                let mut statement = tx
-                .prepare(
-                    "SELECT payload_id, codec, CASE WHEN codec IN ('session.text/v1','session.conversation/v1','session.reasoning/v1','session.bytes/v1','session.error-detail/v1','session.locator/v1','session.tool-arguments/v1','session.tool-result/v1') THEN NULL ELSE body END, body_digest, byte_len FROM event_payloads",
-                )
-                .map_err(map_sqlite)?;
+                let leaf_codecs = content_leaf_sql_list();
+                let query = format!(
+                    "SELECT payload_id, codec, CASE WHEN codec IN ({leaf_codecs}) THEN NULL ELSE body END, body_digest, byte_len FROM event_payloads"
+                );
+                let mut statement = tx.prepare(&query).map_err(map_sqlite)?;
                 let rows = statement
                     .query_map([], |row| {
                         Ok((
@@ -934,7 +941,11 @@ impl SessionEventStore for SqliteEventStore {
         let tx = conn.transaction().map_err(map_sqlite)?;
         let history =
             Self::verified_history(&tx).map_err(|error| AppendError::Corrupt(error.to_string()))?;
-        let mut stmt = tx.prepare("SELECT payload_id,codec,CASE WHEN codec IN ('session.text/v1','session.conversation/v1','session.reasoning/v1','session.bytes/v1','session.error-detail/v1','session.locator/v1','session.tool-arguments/v1','session.tool-result/v1') THEN NULL ELSE body END,body_digest,byte_len FROM event_payloads").map_err(map_sqlite)?;
+        let leaf_codecs = content_leaf_sql_list();
+        let query = format!(
+            "SELECT payload_id,codec,CASE WHEN codec IN ({leaf_codecs}) THEN NULL ELSE body END,body_digest,byte_len FROM event_payloads"
+        );
+        let mut stmt = tx.prepare(&query).map_err(map_sqlite)?;
         let mut payloads = Vec::new();
         for row in stmt
             .query_map([], |row| {
@@ -1054,6 +1065,26 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_api::session_events::{EventActor, EventKind};
+
+    #[test]
+    fn sqlite_body_projection_uses_shared_codec_classification() {
+        use zeroclaw_api::session_events::payloads::{content_leaf, content_leaf_codecs};
+        let conn = Connection::open_in_memory().expect("connection");
+        let query = format!(
+            "SELECT CASE WHEN ?1 IN ({}) THEN NULL ELSE ?2 END",
+            content_leaf_sql_list()
+        );
+        for codec in content_leaf_codecs().chain([
+            "session.content/v1",
+            "session.future/v1",
+            "session.text/v2",
+        ]) {
+            let body: Option<Vec<u8>> = conn
+                .query_row(&query, params![codec, b"body".as_slice()], |row| row.get(0))
+                .expect("body projection");
+            assert_eq!(body.is_none(), content_leaf(codec), "{codec}");
+        }
+    }
 
     pub(super) fn request(stream: &SessionStreamId, key: &str, expected: u64) -> AppendRequest {
         let mut event = SessionEvent::new(
