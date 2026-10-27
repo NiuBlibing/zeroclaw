@@ -144,17 +144,19 @@ pub(crate) async fn finish_after_max_iterations(
 
     // Resolve against the real latest user turn, before the synthetic summary
     // prompt could hide a fresh image from the vision-capability policy.
-    let (vision_provider, degrade_strip_images) = super::vision_route::resolve_vision_provider(
-        config,
-        model_provider,
-        history,
-        multimodal_config,
-        provider_name,
-        model,
-        dispatch_model,
-        security,
-    )
-    .await?;
+    let (vision_provider, degrade_strip_images) =
+        super::vision_route::resolve_vision_provider_with_allowed_refs(
+            config,
+            model_provider,
+            history,
+            multimodal_config,
+            provider_name,
+            model,
+            dispatch_model,
+            security,
+            knobs.provider_attempt_allowlist.as_deref(),
+        )
+        .await?;
     let (model_provider, provider_name, model, dispatch_model) = match vision_provider.as_ref() {
         Some(route) => (
             route.provider.as_ref(),
@@ -340,11 +342,17 @@ pub(crate) async fn finish_after_max_iterations(
                     );
                 }
                 if floor {
+                    // The summary call is tools-free, so the schemas cost nothing here.
                     return Err(super::context_window_exceeded_error(
                         (provider_name, &selected_model),
                         context_limits,
                         tokens,
                         token_counter.source(),
+                        (
+                            crate::agent::history::estimate_history_tokens(&messages),
+                            crate::agent::history::estimate_system_floor_tokens(&messages),
+                            0,
+                        ),
                     ));
                 }
                 break;
@@ -1594,7 +1602,7 @@ mod graceful_summary_metering_tests {
         let mut history = vec![
             ChatMessage::user("call the tool and describe the screenshot"),
             ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_legacy"}]}"#),
-            ChatMessage::tool(tool_content),
+            ChatMessage::tool(tool_content.clone()),
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
@@ -1643,10 +1651,11 @@ mod graceful_summary_metering_tests {
         );
         // A legacy carrier is delivered as its bytes: the body reaches the
         // provider verbatim, quoted marker syntax and raw path included, as
-        // text. Nothing infers, sweeps, or strips it.
-        let body = format!("saw {marker} in output");
+        // text. Nothing infers, sweeps, or strips it. Compare the whole
+        // carrier: its JSON escaping doubles a Windows path's backslashes, so
+        // the unescaped body never appears in it there.
         assert!(
-            captured.contains(&body),
+            captured.contains(&tool_content),
             "the legacy body is delivered verbatim: {captured}"
         );
         assert!(
