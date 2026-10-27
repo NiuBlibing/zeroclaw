@@ -19768,19 +19768,13 @@ command = "rm independent-delegate-marker"
 
     /// Poll until the alias's first ledger row lands (detached tasks write
     /// asynchronously); every iteration opens a fresh tracker so the read is
-    /// served from the ledger file, not a stale in-process cache. Use a real
-    /// deadline rather than a fixed yield count because CI scheduling can
-    /// delay a detached task for longer than a busy executor needs to yield.
+    /// served from the ledger file, not a stale in-process cache.
     async fn poll_agent_cost(data_dir: &Path, alias: &str) -> crate::cost::AgentCostStats {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
+        for _ in 0..20_000 {
             if let Some(stats) = read_agent_cost(data_dir, alias) {
                 return stats;
             }
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::task::yield_now().await;
         }
         panic!("cost record for {alias} never reached the shared ledger at {data_dir:?}");
     }
@@ -21170,11 +21164,10 @@ command = "rm independent-delegate-marker"
         // parent's frozen mode, so the detached child stays scoped after
         // the flip: its admitted call lands on the ledger under the CHILD
         // alias and its next call is refused at the exhausted ancestor
-        // ceiling, never unscoped. The hop's own post-delegate provider
-        // call races the detached child's landings (admitted or refused
-        // depending on whether the child's spend has landed yet), so this
-        // test pins the child-side evidence and leaves the hop's third
-        // call unasserted.
+        // ceiling, never unscoped. The hop's final response has zero usage
+        // so its completion cannot exhaust the ancestor ceiling before
+        // the child's first call. Otherwise which task completes first
+        // decides whether any child usage can land at all.
         let (hop_server, _hop_wire) = start_scripted_chat_server(&[
             heavy_tool_call_completion("live_config_flip_tool", "call_flip", json!({})),
             heavy_tool_call_completion(
@@ -21186,7 +21179,10 @@ command = "rm independent-delegate-marker"
                     "background": true
                 }),
             ),
-            heavy_usage_completion("hop loop ends here"),
+            json!({
+                "choices": [{"message": {"content": "hop loop ends here"}}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+            }),
         ])
         .await;
         let (leaf_server, leaf_wire) = start_scripted_chat_server(&[
@@ -21221,18 +21217,9 @@ command = "rm independent-delegate-marker"
             flipped.load(std::sync::atomic::Ordering::SeqCst),
             "the flip tool must have run between the hop's provider calls"
         );
-        // The detached child is scoped: its admitted call lands under the
-        // CHILD alias (an unscoped detached child would record nothing).
-        let c_stats = poll_agent_cost(&fixture.data_dir, "target2").await;
-        assert_eq!(
-            c_stats.request_count, 1,
-            "the detached child's admitted call must land under its own alias"
-        );
-        assert!((c_stats.cost_usd - 0.015).abs() < 1e-9);
-
-        // ... and it is refused at the boundary instead of running to
-        // completion unscoped. Await it through the shared task store: the
-        // spawning delegate call lives inside the hop's loop, so the task
+        // Await terminal settlement before reading the ledger, so a failure
+        // before the child's first request reports its actual task error.
+        // The spawning delegate call lives inside the hop's loop, so the task
         // is owned by that loop's caller identity and the root tool's own
         // task actions cannot read it back.
         let (task, task_error) = poll_detached_delegate_outcome(&task_store, "target2").await;
@@ -21247,6 +21234,21 @@ command = "rm independent-delegate-marker"
                 .unwrap_or_default()
                 .contains("Budget exceeded for agent `target`"),
             "the detached refusal must name the ancestor: {task_error:?}"
+        );
+        // The detached child is scoped: its admitted call lands under the
+        // CHILD alias (an unscoped detached child would record nothing).
+        let c_stats = read_agent_cost(&fixture.data_dir, "target2")
+            .expect("settled child must have recorded its admitted provider call");
+        assert_eq!(
+            c_stats.request_count, 1,
+            "the detached child's admitted call must land under its own alias"
+        );
+        assert!((c_stats.cost_usd - 0.015).abs() < 1e-9);
+        let b_stats = read_agent_cost(&fixture.data_dir, "target")
+            .expect("the hop's two tool-call responses must be recorded");
+        assert!(
+            (b_stats.cost_usd - 0.030).abs() < 1e-9,
+            "the hop must leave budget for the child's first call: {b_stats:?}"
         );
         assert_eq!(
             leaf_wire.lock().unwrap().len(),
