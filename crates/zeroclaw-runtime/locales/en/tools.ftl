@@ -174,6 +174,8 @@ tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messag
 
 tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
 tool-model-routing-config-write-busy = Another configuration update is in progress. Retry this change after it finishes.
+tool-model-routing-config-reverted = Reverted to '{$model}'.
+tool-model-routing-config-removed-new-alias = Removed the newly created alias.
 tool-model-routing-config-error-missing-risk-profile = agent `{$agent}` references missing risk profile `{$profile}`
 tool-model-routing-config-error-shared-risk-profile = risk profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
 tool-model-routing-config-error-risk-profile-collision = risk profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`

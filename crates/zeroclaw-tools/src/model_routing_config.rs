@@ -843,9 +843,14 @@ impl ModelRoutingConfigTool {
                     };
 
                     let rollback = if previous_provider_entry.is_some() {
-                        format!("Reverted to '{reverted_model}'.")
+                        crate::i18n::get_required_tool_string_with_args(
+                            "tool-model-routing-config-reverted",
+                            &[("model", &reverted_model)],
+                        )
                     } else {
-                        "Removed the newly created alias.".to_string()
+                        crate::i18n::get_required_tool_string(
+                            "tool-model-routing-config-removed-new-alias",
+                        )
                     };
                     return Ok(ToolResult {
                         success: false,

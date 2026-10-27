@@ -19768,13 +19768,19 @@ command = "rm independent-delegate-marker"
 
     /// Poll until the alias's first ledger row lands (detached tasks write
     /// asynchronously); every iteration opens a fresh tracker so the read is
-    /// served from the ledger file, not a stale in-process cache.
+    /// served from the ledger file, not a stale in-process cache. Use a real
+    /// deadline rather than a fixed yield count because CI scheduling can
+    /// delay a detached task for longer than a busy executor needs to yield.
     async fn poll_agent_cost(data_dir: &Path, alias: &str) -> crate::cost::AgentCostStats {
-        for _ in 0..20_000 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
             if let Some(stats) = read_agent_cost(data_dir, alias) {
                 return stats;
             }
-            tokio::task::yield_now().await;
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!("cost record for {alias} never reached the shared ledger at {data_dir:?}");
     }
