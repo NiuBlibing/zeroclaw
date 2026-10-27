@@ -19772,7 +19772,7 @@ command = "rm independent-delegate-marker"
     /// deadline rather than a fixed yield count because CI scheduling can
     /// delay a detached task for longer than a busy executor needs to yield.
     async fn poll_agent_cost(data_dir: &Path, alias: &str) -> crate::cost::AgentCostStats {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(stats) = read_agent_cost(data_dir, alias) {
                 return stats;
@@ -19780,7 +19780,7 @@ command = "rm independent-delegate-marker"
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("cost record for {alias} never reached the shared ledger at {data_dir:?}");
     }
