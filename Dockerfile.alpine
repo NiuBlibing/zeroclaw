@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7-labs
 
 # >>> generated:base-arg-node-alpine from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_NODE_ALPINE=node:24-alpine3.23@sha256:9ec4a2e289874ed0d722e1772ec2de45d2801541db8612f3638b26f128c69ac2
+ARG ZEROCLAW_BASE_NODE_ALPINE=node:24-alpine3.23@sha256:e44c87c7dd212720eb00469aeac89504ca2be77b8f0d6dbffb30665d5fcc59e1
 # >>> end generated:base-arg-node-alpine <<<
 # >>> generated:base-arg-rust-alpine from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_RUST_ALPINE=rust:1.99.1-alpine3.23@sha256:96e773beb97c24572dcc462458cf84776fddc347302b9ab732a6b98b7822ad38
+ARG ZEROCLAW_BASE_RUST_ALPINE=rust:1.99.1-alpine3.23@sha256:2a941e16ec6e357ff7112e92336087772584122b6ae4b30eb36cb9adff5b5458
 # >>> end generated:base-arg-rust-alpine <<<
 # >>> generated:base-arg-alpine from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
 ARG ZEROCLAW_BASE_ALPINE=alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
@@ -160,7 +160,7 @@ RUN for binary in zeroclaw zerocode; do \
 
 FROM ${ZEROCLAW_BASE_ALPINE} AS runtime
 
-RUN apk add --no-cache bash ca-certificates curl git tzdata \
+RUN apk add --no-cache bash 'ca-certificates>=20261020-r0' curl git tzdata \
     && mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /app/zerocode /usr/local/bin/zerocode
