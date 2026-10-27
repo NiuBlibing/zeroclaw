@@ -2882,8 +2882,10 @@ fn resolve_models_command(
     let candidate = raw.trim();
     if let Some((family, alias)) = config.providers.models.profile_ref(candidate) {
         return match config.providers.models.find(family, alias) {
-            Some(_) => ModelsCommandResolution::Resolved(format!("{family}.{alias}")),
-            None => ModelsCommandResolution::NoAlias(candidate.to_string()),
+            Some(_) if config.resolve_model_selection(candidate).is_some() => {
+                ModelsCommandResolution::Resolved(candidate.to_string())
+            }
+            _ => ModelsCommandResolution::NoAlias(candidate.to_string()),
         };
     }
 
@@ -46439,6 +46441,33 @@ BTC is currently around $65,000 based on latest tool output."#
             }
             other => panic!("expected Ambiguous, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_models_command_preserves_and_validates_nested_selection() {
+        let mut config = Config::default();
+        for alias in ["gw", "gw.v2"] {
+            let profile = config.providers.models.ensure("custom", alias).unwrap();
+            for model in ["default", "fast.v1"] {
+                profile.models.insert(
+                    model.into(),
+                    zeroclaw_config::schema::ModelEntryConfig {
+                        id: Some(model.into()),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        for reference in ["custom.gw.fast.v1", "custom.gw.v2", "custom.gw.v2.fast.v1"] {
+            match resolve_models_command(&config, reference) {
+                ModelsCommandResolution::Resolved(actual) => assert_eq!(actual, reference),
+                other => panic!("expected full selection, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            resolve_models_command(&config, "custom.gw.v2.missing"),
+            ModelsCommandResolution::NoAlias(_)
+        ));
     }
 
     #[test]

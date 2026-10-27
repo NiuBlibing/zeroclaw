@@ -264,12 +264,10 @@ fn convert_legacy_to_current(legacy: Value) -> Value {
         }
     }
     if let Some(mp) = get_str("model_provider") {
-        // A model_provider ref may be three-segment (`<type>.<alias>.<model>`);
-        // record the profile alias (second segment) in `_alias`, never
-        // `alias.model`.
-        let mut parts = mp.splitn(3, '.');
-        match (parts.next(), parts.next()) {
-            (Some(ty), Some(alias)) => {
+        // Legacy logs carry no configuration with which to resolve profile
+        // boundaries. Preserve the complete alias after the family separator.
+        match mp.split_once('.') {
+            Some((ty, alias)) => {
                 zeroclaw.insert("model_provider".into(), Value::String(mp.clone()));
                 zeroclaw.insert(type_field("model_provider"), Value::String(ty.to_string()));
                 zeroclaw.insert(
@@ -353,6 +351,15 @@ mod tests {
             .map(|l| l.unwrap())
             .filter(|l| !l.trim().is_empty())
             .collect()
+    }
+
+    #[test]
+    fn legacy_migration_preserves_dotted_provider_alias() {
+        let converted = convert_legacy_to_current(serde_json::json!({
+            "model_provider": "custom.gw.v2", "channel": "discord.work.v2"
+        }));
+        assert_eq!(converted["zeroclaw"]["model_provider_alias"], "gw.v2");
+        assert_eq!(converted["zeroclaw"]["channel_alias"], "work.v2");
     }
 
     #[test]

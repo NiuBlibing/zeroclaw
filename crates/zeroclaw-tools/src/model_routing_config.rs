@@ -88,16 +88,10 @@ pub struct ModelRoutingConfigTool {
 #[serde(rename_all = "snake_case")]
 enum ModelProbeOutcome {
     Verified,
-    SkippedNoModelChange,
     SkippedNoModel,
     SkippedNoCredentials,
+    SkippedDecryption,
     DeferredRetryableFailure,
-}
-
-#[derive(Debug)]
-enum ModelProbeFailure {
-    Construction(anyhow::Error),
-    Request(anyhow::Error),
 }
 
 impl ModelRoutingConfigTool {
@@ -673,8 +667,6 @@ impl ModelRoutingConfigTool {
         let provider_update = Self::parse_optional_string_update(args, "model_provider")?;
         let model_update = Self::parse_optional_string_update(args, "model")?;
         let temperature_update = Self::parse_optional_f64_update(args, "temperature")?;
-        let model_changed =
-            !matches!(model_update, MaybeSet::Unset) || !matches!(provider_update, MaybeSet::Unset);
 
         let any_update = !matches!(provider_update, MaybeSet::Unset)
             || !matches!(model_update, MaybeSet::Unset)
@@ -824,64 +816,60 @@ impl ModelRoutingConfigTool {
         let current_model = cfg
             .resolve_model_selection(&provider_name)
             .and_then(|selection| selection.model_id);
-        let mut probe = if model_changed {
-            ModelProbeOutcome::SkippedNoModel
-        } else {
-            ModelProbeOutcome::SkippedNoModelChange
-        };
-        if model_changed && let Some(model_name) = current_model {
-            match self.probe_candidate(cfg.clone(), provider_name).await {
-                Ok(outcome) => probe = outcome,
-                Err(failure) => {
-                    let (probe_err, reject) = match failure {
-                        ModelProbeFailure::Construction(error) => (error, true),
-                        ModelProbeFailure::Request(error) => {
-                            let reject = zeroclaw_providers::reliable::is_non_retryable(&error);
-                            (error, reject)
-                        }
+        // Hydrate and probe even for temperature-only edits: environment
+        // overrides may supply the only effective model or change its identity.
+        let probe = match self.probe_model(&cfg, &provider_name).await {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                let model_name = failure
+                    .model()
+                    .or(current_model.as_deref())
+                    .unwrap_or("environment-effective model");
+                let probe_error = zeroclaw_providers::sanitize_api_error(&failure.to_string());
+                if failure.is_fatal() {
+                    let reverted_model = if let Some(model_alias) = target_model_alias.as_deref() {
+                        previous_provider_entry
+                            .as_ref()
+                            .and_then(|e| e.models.get(model_alias))
+                            .and_then(|m| m.id.as_deref())
+                            .unwrap_or("(none)")
+                            .to_string()
+                    } else {
+                        previous_provider_entry
+                            .as_ref()
+                            .and_then(|e| e.model.as_deref())
+                            .unwrap_or("(none)")
+                            .to_string()
                     };
-                    let probe_error =
-                        zeroclaw_providers::sanitize_api_error(&probe_err.to_string());
-                    if reject {
-                        let reverted_model =
-                            if let Some(model_alias) = target_model_alias.as_deref() {
-                                previous_provider_entry
-                                    .as_ref()
-                                    .and_then(|e| e.models.get(model_alias))
-                                    .and_then(|m| m.id.as_deref())
-                                    .unwrap_or("(none)")
-                                    .to_string()
-                            } else {
-                                previous_provider_entry
-                                    .as_ref()
-                                    .and_then(|e| e.model.as_deref())
-                                    .unwrap_or("(none)")
-                                    .to_string()
-                            };
 
-                        return Ok(ToolResult {
-                    success: false,
-                    output: format!(
-                        "Model '{model_name}' is not available: {probe_error}. Reverted to '{reverted_model}'.",
-                    ).into(),
-                    error: None,
-                });
-                    }
-                    // Retryable errors (e.g. transient network issues) — keep the
-                    // new config and let the resilient wrapper handle retries.
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"model": model_name, "probe_err": probe_error})
-                            ),
-                        "Model probe returned retryable error (keeping new config)"
-                    );
-                    probe = ModelProbeOutcome::DeferredRetryableFailure;
+                    let rollback = if previous_provider_entry.is_some() {
+                        format!("Reverted to '{reverted_model}'.")
+                    } else {
+                        "Removed the newly created alias.".to_string()
+                    };
+                    return Ok(ToolResult {
+                        success: false,
+                        output: format!(
+                            "Model '{model_name}' is not available: {probe_error}. {rollback}",
+                        )
+                        .into(),
+                        error: Some(probe_error),
+                    });
                 }
+                // Retryable errors (e.g. transient network issues) — keep the
+                // new config and let the resilient wrapper handle retries.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"model": model_name, "probe_err": probe_error})
+                        ),
+                    "Model probe returned retryable error (keeping new config)"
+                );
+                ModelProbeOutcome::DeferredRetryableFailure
             }
-        }
+        };
 
         cfg.save().await?;
         Ok(ToolResult {
@@ -894,23 +882,6 @@ impl ModelRoutingConfigTool {
             .into(),
             error: None,
         })
-    }
-
-    async fn probe_candidate(
-        &self,
-        config: Config,
-        provider_name: String,
-    ) -> Result<ModelProbeOutcome, ModelProbeFailure> {
-        self.probe_model(&config, &provider_name)
-            .await
-            .map_err(|failure| {
-                if failure.is_fatal() {
-                    ModelProbeFailure::Construction(anyhow::Error::msg(failure.to_string()))
-                } else {
-                    ModelProbeFailure::Request(anyhow::Error::msg(failure.to_string()))
-                }
-            })?;
-        Ok(ModelProbeOutcome::Verified)
     }
 
     async fn effective_config_for_probe(cfg: &Config) -> Result<Config, ProbeConfigFailure> {
@@ -944,7 +915,7 @@ impl ModelRoutingConfigTool {
     /// The model is taken from the effective alias entry alone, so it is
     /// always the one a reload would serve.
     ///
-    /// Returns `Ok(())` if the probe succeeds **or** if no API key or model
+    /// Returns an explicit outcome if the probe succeeds or if no credential or model
     /// resolves for the effective alias, or the saved config's secrets cannot
     /// be decrypted. Those skips let an operator configure an alias while
     /// offline without turning an unrelated auth/decryption condition into
@@ -956,38 +927,59 @@ impl ModelRoutingConfigTool {
     ///
     /// Errors are classified via [`ProbeFailure`] so the caller can tell a
     /// local construction failure from a request failure.
-    async fn probe_model(&self, cfg: &Config, provider_name: &str) -> Result<(), ProbeFailure> {
+    async fn probe_model(
+        &self,
+        cfg: &Config,
+        provider_name: &str,
+    ) -> Result<ModelProbeOutcome, ProbeFailure> {
         // Resolve alias identity, endpoint, credentials, and runtime options
         // from the effective post-reload view of what was just saved — disk
         // decrypted, then the `ZEROCLAW_*` layer applied on top — rather than
         // from the pre-update runtime snapshot or from disk alone.
         let effective = match Self::effective_config_for_probe(cfg).await {
             Ok(effective) => effective,
-            Err(ProbeConfigFailure::Decryption) => return Ok(()),
+            Err(ProbeConfigFailure::Decryption) => return Ok(ModelProbeOutcome::SkippedDecryption),
             Err(
                 ProbeConfigFailure::EnvironmentOverride(error) | ProbeConfigFailure::Task(error),
             ) => {
                 return Err(ProbeFailure::Construction { model: None, error });
             }
         };
-        let (family, alias) = effective
-            .providers
-            .models
-            .profile_ref(provider_name)
-            .unwrap_or((provider_name, "default"));
-
         // The freshly reconstructed configuration is the sole credential
         // authority, including current environment overrides. A missing key
         // must stay missing: the startup snapshot may retain a credential the
         // operator has since removed from disk or the environment.
-        if effective
-            .providers
-            .models
-            .find(family, alias)
-            .and_then(|entry| entry.api_key.as_deref())
-            .is_none_or(|key| key.trim().is_empty())
+        let selection = match effective.resolve_model_selection(provider_name) {
+            Some(selection) => selection,
+            None if effective
+                .providers
+                .models
+                .find_by_name(provider_name)
+                .is_none()
+                && effective
+                    .providers
+                    .models
+                    .profile_ref(provider_name)
+                    .and_then(|(family, alias)| effective.providers.models.find(family, alias))
+                    .is_none() =>
+            {
+                return Ok(ModelProbeOutcome::SkippedNoCredentials);
+            }
+            None => {
+                return Err(ProbeFailure::Construction {
+                    model: None,
+                    error: anyhow::Error::msg("model probe selection does not exist"),
+                });
+            }
+        };
+        // The factory knows which endpoint families allow keyless/local or
+        // OAuth authentication. A URI alone does not replace a required key;
+        // configured headers can supply authentication for a compatible API.
+        if selection.entry.extra_headers.is_empty()
+            && !zeroclaw_providers::model::selection_auth_ready(&effective, provider_name)
+                .map_err(|error| ProbeFailure::Construction { model: None, error })?
         {
-            return Ok(());
+            return Ok(ModelProbeOutcome::SkippedNoCredentials);
         }
 
         // Probe the model the post-reload runtime will actually serve, and
@@ -1003,21 +995,20 @@ impl ModelRoutingConfigTool {
         // alias (such an entry is only usable through routes that carry their
         // own model), so there is nothing to validate and the probe stops
         // before dispatch instead of failing the update.
-        let Some(probe_model_name) = effective
-            .resolve_model_selection(provider_name)
-            .and_then(|selection| selection.model_id)
-            .filter(|value| !value.trim().is_empty())
+        let Some(probe_model_name) = selection.model_id.filter(|value| !value.trim().is_empty())
         else {
-            return Ok(());
+            return Ok(ModelProbeOutcome::SkippedNoModel);
         };
 
-        let model_provider =
-            zeroclaw_providers::create_model_provider_from_ref(&effective, provider_name).map_err(
-                |error| ProbeFailure::Construction {
-                    model: Some(probe_model_name.clone()),
-                    error,
-                },
-            )?;
+        let selection_ref = provider_name.to_string();
+        let model_provider = zeroclaw_providers::model::build_nonblocking(move || {
+            zeroclaw_providers::create_model_provider_from_ref(&effective, &selection_ref)
+        })
+        .await
+        .map_err(|error| ProbeFailure::Construction {
+            model: Some(probe_model_name.clone()),
+            error,
+        })?;
 
         // Greedy sampling: the ping is a liveness check, not a generation task.
         const PING_TEMPERATURE: f64 = 0.0;
@@ -1034,7 +1025,7 @@ impl ModelRoutingConfigTool {
                 error,
             })?;
 
-        Ok(())
+        Ok(ModelProbeOutcome::Verified)
     }
 
     async fn handle_upsert_scenario(&self, args: &Value) -> anyhow::Result<ToolResult> {
@@ -1923,11 +1914,7 @@ mod tests {
     }
 
     async fn env_override_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
-        use std::sync::OnceLock;
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await
+        CONFIG_EDIT_TESTS.lock().await
     }
 
     /// Panic-safe owner for one process-wide environment mutation. Requiring
@@ -2004,6 +1991,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_model_verifies_keyless_endpoint() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, method},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"model": "local-model"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "OK"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "keyless").unwrap();
+        profile.uri = Some(format!("{}/v1", server.uri()));
+        profile.model = Some("local-model".into());
+        let tool = ModelRoutingConfigTool::new(Arc::new(config.clone()), test_security());
+        assert_eq!(
+            tool.probe_model(&config, "custom.keyless").await.unwrap(),
+            ModelProbeOutcome::Verified
+        );
+    }
+
+    #[tokio::test]
     async fn candidate_probe_uses_nested_model_and_profile_headers() {
         let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         use wiremock::{
@@ -2039,7 +2053,7 @@ mod tests {
         );
         assert_eq!(
             ModelRoutingConfigTool::new(Arc::new(config.clone()), test_security())
-                .probe_candidate(config, "custom.probe.nested".into())
+                .probe_model(&config, "custom.probe.nested")
                 .await
                 .unwrap(),
             ModelProbeOutcome::Verified
@@ -3259,7 +3273,10 @@ mod tests {
         let against_stale = tool
             .probe_model(stale_snapshot.as_ref(), "openai.default")
             .await;
-        assert!(against_stale.is_ok(), "{against_stale:?}");
+        assert_eq!(
+            against_stale.unwrap(),
+            ModelProbeOutcome::SkippedNoCredentials
+        );
 
         // A config that has since been saved carries a credential the stale
         // snapshot never had (mismatched on purpose, so construction fails
