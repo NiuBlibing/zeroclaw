@@ -2050,7 +2050,7 @@ impl zeroclaw_kernel::session::engine::EngineSessionAuthority for RpcHistoryAuth
 
 struct RpcHistoryReader {
     dispatcher: RpcDispatcher,
-    agent_alias: Option<String>,
+    agent_alias: String,
     record: Option<crate::rpc::session::SessionRecord>,
     principal: zeroclaw_api::principal::PrincipalId,
     stream: zeroclaw_api::session_events::SessionStreamId,
@@ -2111,20 +2111,21 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryReader {
             .map_err(|error| {
                 zeroclaw_kernel::session::SessionError::PermissionDenied(error.message)
             })?;
-        if let (Some(grants), Some(alias)) = (grants.as_ref(), self.agent_alias.as_ref()) {
+        if let Some(grants) = grants.as_ref() {
             self.dispatcher
-                .selector_session_agent_with_grants(self.method, grants, alias)
+                .selector_session_agent_with_grants(self.method, grants, &self.agent_alias)
                 .map_err(|error| {
                     zeroclaw_kernel::session::SessionError::PermissionDenied(error.message)
                 })?;
         }
-        if let Some(alias) = &self.agent_alias {
-            let config = self.dispatcher.ctx.config.read();
-            if config.agent(alias).is_none_or(|agent| !agent.enabled) {
-                return Err(zeroclaw_kernel::session::SessionError::PermissionDenied(
-                    "RPC history agent revoked".into(),
-                ));
-            }
+        let config = self.dispatcher.ctx.config.read();
+        if config
+            .agent(&self.agent_alias)
+            .is_none_or(|agent| !agent.enabled)
+        {
+            return Err(zeroclaw_kernel::session::SessionError::PermissionDenied(
+                "RPC history agent revoked".into(),
+            ));
         }
         Ok(())
     }
@@ -3084,6 +3085,7 @@ impl RpcDispatcher {
                     }
                     continue;
                 }
+                #[cfg(test)]
                 if let Some(meta) = self
                     .ctx
                     .session_backend
@@ -3715,41 +3717,6 @@ impl RpcDispatcher {
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())
-    }
-
-    async fn resolve_reaped_session_mode(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<ChatMode>, JsonRpcError> {
-        let store = self.ctx.session_repository.clone();
-        let backend = self.ctx.session_backend.clone();
-        let sid = session_id.to_string();
-        let (has_acp, has_chat) = run_blocking_rpc(
-            move || {
-                let has_acp = match store {
-                    Some(store) => store.contains_session(&sid)?,
-                    None => false,
-                };
-                let has_chat = backend.is_some_and(|backend| {
-                    [sid.clone(), format!("rpc_{sid}"), format!("gw_{sid}")]
-                        .iter()
-                        .any(|key| backend.session_exists(key))
-                });
-                Ok((has_acp, has_chat))
-            },
-            "Failed to identify durable session owner",
-        )
-        .await?;
-
-        match (has_acp, has_chat) {
-            (true, false) => Ok(Some(ChatMode::Acp)),
-            (false, true) => Ok(Some(ChatMode::Chat)),
-            (true, true) => Err(rpc_err(
-                INVALID_PARAMS,
-                "Session ID matches both ACP and Chat durable history; reconnect the intended session before mutating it",
-            )),
-            (false, false) => Ok(None),
-        }
     }
 
     /// Commit one prepared config snapshot.
@@ -4673,12 +4640,14 @@ impl RpcDispatcher {
         };
         // Count persisted sessions (channel-originated) that aren't already
         // in the in-memory RPC store.
-        let persisted_count = self
-            .ctx
-            .session_backend
-            .as_ref()
-            .map(|b| b.list_sessions_with_metadata().len())
-            .unwrap_or(0);
+        let persisted_count = match self.ctx.native_sessions.as_ref() {
+            Some(source) => source
+                .families()
+                .await
+                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
+                .len(),
+            None => 0,
+        };
         let total = ids.len().max(persisted_count);
         to_result(StatusResult {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -5453,16 +5422,6 @@ impl RpcDispatcher {
         // gateway exposes for this agent; ACP (Code) sessions skip it to keep
         // `session/new` prompt
         let initialize_mcp = session_should_initialize_mcp(&chat_mode);
-        let session_repository = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
-            Some(
-                self.ctx
-                    .session_repository
-                    .clone()
-                    .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?,
-            )
-        } else {
-            None
-        };
         let execution_capability =
             crate::live_config_authority::AgentExecutionCapability::from_parts(
                 self.ctx.config.clone(),
@@ -5481,7 +5440,6 @@ impl RpcDispatcher {
                 self.ctx.sop_audit.clone(),
                 self.principal_tool_narrowing(),
                 Some(execution_capability),
-                session_repository,
             ),
         )
         .await
@@ -5836,7 +5794,9 @@ impl RpcDispatcher {
                                 }, "session_restore_trim").await.map_err(|error|rpc_err(INTERNAL_ERROR,error.to_string()))?;
                             }
                         }
-                    } else if let Some(ref backend) = self.ctx.session_backend {
+                    } else {
+                        #[cfg(test)]
+                        if let Some(ref backend) = self.ctx.session_backend {
                         let session_key = format!("rpc_{session_id}");
                         let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
                         // Fail closed: an unreadable transcript must not become
@@ -5929,6 +5889,7 @@ impl RpcDispatcher {
                                 }
                             }
                         }
+                        }
                     }
                 }
             }
@@ -6004,6 +5965,7 @@ impl RpcDispatcher {
         // so a session never reports success and then reappears after a
         // restart as nobody's. An unscoped creator's stamp is attribution
         // only, so its failure is logged and creation proceeds.
+        #[cfg(test)]
         if let (Some(owner), Some(backend)) =
             (effective_owner.clone(), self.ctx.session_backend.as_ref())
             && !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
@@ -6354,10 +6316,11 @@ impl RpcDispatcher {
             Some(mode) => mode,
             None => match self.ctx.sessions.chat_mode(sid).await {
                 Some(mode) => mode,
-                None => self
-                    .resolve_reaped_session_mode(sid)
-                    .await?
-                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?,
+                None => match admitted.as_ref().and_then(|record| record.durable.as_ref()) {
+                    Some(super::session::DurableSession::Acp) => ChatMode::Acp,
+                    Some(super::session::DurableSession::Chat { .. }) => ChatMode::Chat,
+                    None => return Err(rpc_err(SESSION_NOT_FOUND, "Session not found")),
+                },
             },
         };
 
@@ -6714,7 +6677,6 @@ impl RpcDispatcher {
                 self.ctx.sop_audit.clone(),
                 self.principal_tool_narrowing(),
                 Some(execution_capability),
-                Some(Arc::clone(&store)),
             ),
         )
         .await
@@ -7637,6 +7599,7 @@ impl RpcDispatcher {
         // session's retained `rpc_{sid}` row — making a stale Chat record
         // report `running`/`idle`/`error` from an ACP turn, and surfacing it
         // in stuck-session queries. ACP state belongs to `SessionRepository`.
+        #[cfg(test)]
         let persist_session_state = !matches!(chat_mode, crate::rpc::types::ChatMode::Acp);
         let session_key = admitted
             .as_ref()
@@ -7709,6 +7672,7 @@ impl RpcDispatcher {
         } else {
             None
         };
+        #[cfg(test)]
         if native_session.is_none()
             && persist_session_state
             && let Some(ref backend) = self.ctx.session_backend
@@ -8123,6 +8087,7 @@ impl RpcDispatcher {
             crate::rpc::types::ChatMode::Chat => {
                 // A refused turn never touched the Agent, so there is nothing
                 // of it to persist.
+                #[cfg(test)]
                 if native_session.is_none()
                     && !matches!(outcome, Err(crate::rpc::turn::TurnError::Refused(_)))
                     && let Some(ref backend) = self.ctx.session_backend
@@ -8147,25 +8112,13 @@ impl RpcDispatcher {
             }
         }
 
-        // Keep the terminal count aligned with session/new and session/messages:
-        // it is the durable projected conversation length, not the number of
-        // visible TUI bubbles or local user turns. The store maintains this
-        // counter as turns are appended, so reading it here avoids hydrating
-        // the whole history on every turn end.
-        let message_count = match chat_mode {
-            crate::rpc::types::ChatMode::Acp => {
-                self.ctx.session_repository.as_ref().and_then(|store| {
-                    store
-                        .projected_message_count(&req.session_id)
-                        .ok()
-                        .flatten()
-                })
-            }
-            crate::rpc::types::ChatMode::Chat => self
-                .ctx
-                .session_backend
-                .as_ref()
-                .map(|backend| backend.load(&session_key).len()),
+        // The live Agent holds the context installed by this turn, including
+        // compaction and cancellation. Count that projection without reading
+        // an archived transcript backend.
+        let message_count = if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
+            Some(agent.lock().await.history().len())
+        } else {
+            None
         };
 
         match outcome {
@@ -8175,6 +8128,7 @@ impl RpcDispatcher {
                 final_context_limits,
                 ..
             }) => {
+                #[cfg(test)]
                 if native_session.is_none()
                     && persist_session_state
                     && let Some(ref backend) = self.ctx.session_backend
@@ -8211,6 +8165,7 @@ impl RpcDispatcher {
                 ))
             }
             Ok(TurnOutcome::Cancelled { partial_text, .. }) => {
+                #[cfg(test)]
                 if native_session.is_none()
                     && persist_session_state
                     && let Some(ref backend) = self.ctx.session_backend
@@ -8274,6 +8229,7 @@ impl RpcDispatcher {
                 // The execution task refused the caller on the Agent guard
                 // before the turn started: nothing ran, so the session is idle
                 // again and the caller receives the refusal, with no totals.
+                #[cfg(test)]
                 if native_session.is_none()
                     && persist_session_state
                     && let Some(ref backend) = self.ctx.session_backend
@@ -8289,6 +8245,7 @@ impl RpcDispatcher {
                     .await)
             }
             Err(e) => {
+                #[cfg(test)]
                 if native_session.is_none()
                     && persist_session_state
                     && let Some(ref backend) = self.ctx.session_backend
@@ -9160,11 +9117,6 @@ impl RpcDispatcher {
         let authorized = self
             .authorize_session_owner(sid, Method::SessionAppend)
             .await?;
-        let backend = self
-            .ctx
-            .session_backend
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
         // Admission orders the append between turns: a running turn replaces
         // the durable transcript with its own history when it finishes, which
         // would erase an append written underneath it.
@@ -9212,35 +9164,48 @@ impl RpcDispatcher {
                 message_count: count,
             });
         }
-        let message = zeroclaw_providers::ChatMessage::assistant(&req.content);
-        backend.append(&key, &message).map_err(|e| {
-            rpc_err(
-                INTERNAL_ERROR,
-                format!("Failed to append session message: {e}"),
-            )
-        })?;
-        // A live agent persists its own history over the durable row after
-        // its next turn, so it has to see the append too.
-        if self.ctx.sessions.get_agent(sid).await.is_some() {
-            self.ctx
-                .sessions
-                .seed_history(sid, std::slice::from_ref(&message))
-                .await;
+        #[cfg(not(test))]
+        return Err(rpc_err(
+            INTERNAL_ERROR,
+            "Native session history is unavailable",
+        ));
+        #[cfg(test)]
+        {
+            let backend = self
+                .ctx
+                .session_backend
+                .as_ref()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+            let message = zeroclaw_providers::ChatMessage::assistant(&req.content);
+            backend.append(&key, &message).map_err(|e| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Failed to append session message: {e}"),
+                )
+            })?;
+            // A live agent persists its own history over the durable row after
+            // its next turn, so it has to see the append too.
+            if self.ctx.sessions.get_agent(sid).await.is_some() {
+                self.ctx
+                    .sessions
+                    .seed_history(sid, std::slice::from_ref(&message))
+                    .await;
+            }
+            if let Some(event_tx) = self.ctx.event_tx.as_ref() {
+                let _ = event_tx.send(serde_json::json!({
+                    "type": "message",
+                    "session_id": sid,
+                    "role": "assistant",
+                    "content": req.content,
+                    "source": "rpc",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                }));
+            }
+            to_result(SessionAppendResult {
+                session_id: req.session_id.clone(),
+                message_count: backend.load(&key).len(),
+            })
         }
-        if let Some(event_tx) = self.ctx.event_tx.as_ref() {
-            let _ = event_tx.send(serde_json::json!({
-                "type": "message",
-                "session_id": sid,
-                "role": "assistant",
-                "content": req.content,
-                "source": "rpc",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }));
-        }
-        to_result(SessionAppendResult {
-            session_id: req.session_id.clone(),
-            message_count: backend.load(&key).len(),
-        })
     }
 
     /// Generate and install a summary through the native maintenance lifecycle.
@@ -9311,11 +9276,6 @@ impl RpcDispatcher {
         let record = self
             .authorize_session_owner(&req.session_id, Method::SessionRename)
             .await?;
-        let backend = self
-            .ctx
-            .session_backend
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
         let key = Self::durable_chat_key(record.clone(), Method::SessionRename)?;
         if let Some(native) = self
             .native_session_command(
@@ -9335,13 +9295,26 @@ impl RpcDispatcher {
                 name: name.into(),
             });
         }
-        backend
-            .set_session_name(&key, name)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to rename session: {e}")))?;
-        to_result(SessionRenameResult {
-            session_id: req.session_id.clone(),
-            name: name.to_string(),
-        })
+        #[cfg(not(test))]
+        return Err(rpc_err(
+            INTERNAL_ERROR,
+            "Native session history is unavailable",
+        ));
+        #[cfg(test)]
+        {
+            let backend = self
+                .ctx
+                .session_backend
+                .as_ref()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+            backend
+                .set_session_name(&key, name)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to rename session: {e}")))?;
+            to_result(SessionRenameResult {
+                session_id: req.session_id.clone(),
+                name: name.to_string(),
+            })
+        }
     }
 
     /// Create a chat session, run one prompt, and close the session: the
@@ -9461,7 +9434,9 @@ impl RpcDispatcher {
         })
     }
 
-    async fn handle_session_list(&self, params: &Value) -> RpcResult {
+    // Kept exclusively for fixtures exercising pre-upgrade transcript semantics.
+    #[cfg(test)]
+    async fn legacy_session_list_fixture(&self, params: &Value) -> RpcResult {
         let backend = self.ctx.session_backend.as_ref();
         if backend.is_none() && self.ctx.native_sessions.is_none() {
             return Err(rpc_err(INTERNAL_ERROR, "Session persistence is disabled"));
@@ -9488,16 +9463,6 @@ impl RpcDispatcher {
         } else {
             vec![]
         };
-        let native_families = if let Some(source) = &self.ctx.native_sessions {
-            source
-                .families()
-                .await
-                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-        } else {
-            vec![]
-        };
-        let native_keys: std::collections::HashSet<_> = native_families.iter().cloned().collect();
-
         // A running RPC chat session is one with a live turn: its durable
         // state row is only as fresh as the last turn that wrote it. Gateway
         // and channel sessions are judged by that durable state.
@@ -9523,7 +9488,6 @@ impl RpcDispatcher {
         let scope = self.scoped_principal_id();
         let mut sessions: Vec<SessionEntry> = all
             .into_iter()
-            .filter(|meta| !native_keys.contains(&meta.key))
             .filter(|meta| match scope.as_deref() {
                 Some(mine) => meta.principal_id.as_deref() == Some(mine),
                 None => true,
@@ -9561,6 +9525,36 @@ impl RpcDispatcher {
                 })
             })
             .collect();
+        sessions.sort_by(|left, right| {
+            right
+                .last_activity
+                .cmp(&left.last_activity)
+                .then_with(|| left.session_key.cmp(&right.session_key))
+        });
+        if let Some(limit) = req.limit {
+            sessions.truncate(limit);
+        }
+        to_result(SessionListResult { sessions })
+    }
+
+    async fn handle_session_list(&self, params: &Value) -> RpcResult {
+        #[cfg(test)]
+        if self.ctx.native_sessions.is_none() {
+            return self.legacy_session_list_fixture(params).await;
+        }
+        let source = self
+            .ctx
+            .native_sessions
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+        let req: SessionListParams = parse_params(params)?;
+        let visible_ids = self.owner_visible_session_ids().await;
+        let native_families = source
+            .families()
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+        let scope = self.scoped_principal_id();
+        let mut sessions: Vec<SessionEntry> = Vec::new();
         for family in native_families {
             // ACP has its own protocol picker and identity namespace.
             if family.starts_with("acp_") {
@@ -9678,8 +9672,8 @@ impl RpcDispatcher {
 
     /// List the ACP family namespace from the standard session repository. The Code (ACP)
     /// pane in the TUI calls this instead of `session/list` so its picker only
-    /// shows sessions in that namespace; chat-pane sessions
-    /// live in the unified `session_backend` and must not appear here.
+    /// shows sessions in that namespace; chat-pane sessions live in the
+    /// unified native session store and must not appear here.
     async fn handle_session_list_acp(&self, _params: &Value) -> RpcResult {
         let store = self
             .ctx
@@ -9776,68 +9770,20 @@ impl RpcDispatcher {
                     "Native history requires authenticated admission",
                 )
             })?;
-        let stream = source
-            .stream_id(family)
+        let Some(descriptor) = source
+            .describe(family.into())
             .await
-            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let policy = Arc::new(RpcHistoryReader {
-            dispatcher: self.spawn_handle(),
-            record: record.cloned(),
-            principal: principal.clone(),
-            stream: stream.clone(),
-            method,
-            agent_alias: None,
-        });
-        let Some(native) = source
-            .query(family.into(), principal.clone(), policy)
-            .await
-            .map_err(|error: anyhow::Error| {
-                if error.chain().any(|cause| {
-                    matches!(
-                        cause.downcast_ref::<zeroclaw_kernel::session::SessionError>(),
-                        Some(zeroclaw_kernel::session::SessionError::PermissionDenied(_))
-                    )
-                }) {
-                    rpc_err(FORBIDDEN, "Native history access denied")
-                } else {
-                    rpc_err(INTERNAL_ERROR, error.to_string())
-                }
-            })?
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
         else {
             return Ok(None);
         };
-        let root = native
-            .query
-            .read_page(
-                stream.clone(),
-                zeroclaw_api::session_events::EventCursor::beginning(stream.clone()),
-                None,
-                1,
-                4 * 1024 * 1024,
-            )
-            .await
-            .map_err(|error| match error {
-                zeroclaw_kernel::session::SessionError::PermissionDenied(message) => {
-                    rpc_err(FORBIDDEN, message)
-                }
-                zeroclaw_kernel::session::SessionError::Read(
-                    zeroclaw_api::session_events::ReadError::Gap(message),
-                ) => rpc_err(INVALID_PARAMS, message),
-                other => rpc_err(INTERNAL_ERROR, other.to_string()),
-            })?;
-        let alias = match root.events.first().map(|event| &event.body.data) {
-            Some(zeroclaw_api::session_events::EventData::SessionStarted {
-                owning_agent, ..
-            }) => owning_agent.clone(),
-            _ => return Err(rpc_err(INTERNAL_ERROR, "Native family root is missing")),
-        };
         let policy = Arc::new(RpcHistoryReader {
             dispatcher: self.spawn_handle(),
             record: record.cloned(),
             principal: principal.clone(),
-            stream,
+            stream: descriptor.stream,
             method,
-            agent_alias: Some(alias),
+            agent_alias: descriptor.owning_agent,
         });
         source
             .query(family.into(), principal, policy)
@@ -9885,22 +9831,12 @@ impl RpcDispatcher {
         let alias = match self.ctx.sessions.get_agent_alias(sid).await {
             Some(alias) => alias,
             None => {
-                if let Some(meta) = source
+                source
                     .describe(key.into())
                     .await
                     .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-                {
-                    meta.owning_agent
-                } else {
-                    self.ctx
-                        .session_backend
-                        .as_ref()
-                        .and_then(|backend| backend.get_session_metadata(key))
-                        .and_then(|meta| meta.agent_alias)
-                        .ok_or_else(|| {
-                            rpc_err(INTERNAL_ERROR, "Session agent attribution missing")
-                        })?
-                }
+                    .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session agent attribution missing"))?
+                    .owning_agent
             }
         };
         let workspace = self.ctx.sessions.get_workspace_dir(sid).await;
@@ -10458,26 +10394,34 @@ impl RpcDispatcher {
                         })
                         .collect()
                 } else {
-                    let backend = self.ctx.session_backend.as_ref().ok_or_else(|| {
-                        rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
-                    })?;
-                    backend
-                        .try_load(&key)
-                        .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-                        .into_iter()
-                        .map(|message| MessageEntry {
-                            message_id: None,
-                            file_ids: vec![],
-                            unavailable_parts: vec![],
-                            role: message.role,
-                            content: message.content,
-                            kind: MessageEntryKind::Message,
-                            tool_call_id: None,
-                            tool_name: None,
-                            tool_input: None,
-                            tool_output: None,
-                        })
-                        .collect()
+                    #[cfg(not(test))]
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        "Native session history is unavailable",
+                    ));
+                    #[cfg(test)]
+                    {
+                        let backend = self.ctx.session_backend.as_ref().ok_or_else(|| {
+                            rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
+                        })?;
+                        backend
+                            .try_load(&key)
+                            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
+                            .into_iter()
+                            .map(|message| MessageEntry {
+                                message_id: None,
+                                file_ids: vec![],
+                                unavailable_parts: vec![],
+                                role: message.role,
+                                content: message.content,
+                                kind: MessageEntryKind::Message,
+                                tool_call_id: None,
+                                tool_name: None,
+                                tool_input: None,
+                                tool_output: None,
+                            })
+                            .collect()
+                    }
                 }
             }
             None => {
@@ -10487,7 +10431,7 @@ impl RpcDispatcher {
                         "cursor pagination requires an ACP session",
                     ));
                 }
-                if self.ctx.session_backend.is_none() && self.ctx.session_repository.is_none() {
+                if self.ctx.native_sessions.is_none() && self.ctx.session_repository.is_none() {
                     return Err(rpc_err(INTERNAL_ERROR, "Session persistence is disabled"));
                 }
                 Vec::new()
@@ -10619,34 +10563,37 @@ impl RpcDispatcher {
             });
         }
 
-        // Gateway/legacy sessions that are not live in the RPC session store
-        // retain their persisted-state fallback, read from exactly the chat
-        // row the resolver authorized. Chat and ACP sessions above must never
-        // use this metadata as a live-turn barrier.
-        let backend = self
-            .ctx
-            .session_backend
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
-        if let Some(DurableSession::Chat { key }) = record.and_then(|r| r.durable) {
-            match backend.get_session_state(&key) {
-                Ok(Some(ss)) => {
-                    self.ensure_session_incarnation(&req.session_id, expected_generation)
-                        .await?;
-                    return to_result(SessionStateResult {
-                        session_id: req.session_id,
-                        state: ss.state,
-                        turn_id: ss.turn_id,
-                        turn_started_at: ss.turn_started_at.map(|t| t.to_rfc3339()),
-                        plan: None,
-                    });
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Failed to get session state: {e}"),
-                    ));
+        #[cfg(test)]
+        {
+            // Gateway/legacy sessions that are not live in the RPC session store
+            // retain their persisted-state fallback, read from exactly the chat
+            // row the resolver authorized. Chat and ACP sessions above must never
+            // use this metadata as a live-turn barrier.
+            let backend = self
+                .ctx
+                .session_backend
+                .as_ref()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+            if let Some(DurableSession::Chat { key }) = record.and_then(|r| r.durable) {
+                match backend.get_session_state(&key) {
+                    Ok(Some(ss)) => {
+                        self.ensure_session_incarnation(&req.session_id, expected_generation)
+                            .await?;
+                        return to_result(SessionStateResult {
+                            session_id: req.session_id,
+                            state: ss.state,
+                            turn_id: ss.turn_id,
+                            turn_started_at: ss.turn_started_at.map(|t| t.to_rfc3339()),
+                            plan: None,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to get session state: {e}"),
+                        ));
+                    }
                 }
             }
         }
@@ -10812,16 +10759,27 @@ impl RpcDispatcher {
                     })?
                 }
                 Some(DurableSession::Chat { key }) => {
-                    let backend = self.ctx.session_backend.as_ref().ok_or_else(|| {
-                        rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
-                    })?;
-                    match expected_owner.as_deref() {
-                        Some(owner) => backend.delete_session_owned(&key, owner),
-                        None => backend.delete_session(&key),
+                    #[cfg(not(test))]
+                    {
+                        let _ = key;
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            "Native session history is unavailable",
+                        ));
                     }
-                    .map_err(|e| {
-                        rpc_err(INTERNAL_ERROR, format!("Failed to delete session: {e}"))
-                    })?
+                    #[cfg(test)]
+                    {
+                        let backend = self.ctx.session_backend.as_ref().ok_or_else(|| {
+                            rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
+                        })?;
+                        match expected_owner.as_deref() {
+                            Some(owner) => backend.delete_session_owned(&key, owner),
+                            None => backend.delete_session(&key),
+                        }
+                        .map_err(|e| {
+                            rpc_err(INTERNAL_ERROR, format!("Failed to delete session: {e}"))
+                        })?
+                    }
                 }
                 None => false,
             }
@@ -12890,7 +12848,25 @@ impl RpcDispatcher {
         // sessions) + in-memory RPC sessions, deduped by taking the max.
         let rpc_counts = self.ctx.sessions.count_by_agent().await;
         let mut backend_counts = std::collections::HashMap::<String, usize>::new();
-        if let Some(ref backend) = self.ctx.session_backend {
+        if let Some(source) = self.ctx.native_sessions.clone() {
+            let families = source
+                .families()
+                .await
+                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+            for family in families {
+                if let Some(descriptor) = source
+                    .describe(family)
+                    .await
+                    .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
+                {
+                    *backend_counts.entry(descriptor.owning_agent).or_default() += 1;
+                }
+            }
+        }
+        #[cfg(test)]
+        if self.ctx.native_sessions.is_none()
+            && let Some(ref backend) = self.ctx.session_backend
+        {
             for meta in backend.list_sessions_with_metadata() {
                 let alias = meta.agent_alias.or_else(|| {
                     meta.channel_id
@@ -16136,6 +16112,7 @@ pub(super) async fn forward_turn_event(
 /// itself failed, so a restore-time caller can fail closed instead of
 /// letting the session go live against a store that still has the
 /// untrimmed prefix.
+#[cfg(test)]
 fn replace_rpc_chat_conversation_state(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_id: &str,
@@ -29721,6 +29698,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_session_commands_and_status_do_not_require_legacy_backend() {
+        for backend in ["sqlite", "jsonl"] {
+            let directory = tempfile::TempDir::new().expect("directory");
+            let mut config = make_acp_test_config(&directory);
+            config.channels.session_backend = backend.into();
+            config.memory.backend = "none".into();
+            let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            ));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let mut ctx = RpcContext::minimal(config, sessions);
+            let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                ctx.config.clone(),
+            ));
+            let context = Arc::get_mut(&mut ctx).expect("context");
+            context.native_sessions = Some(source);
+            context.session_backend = None;
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut dispatcher = RpcDispatcher::new(ctx, tx, "native-commands-fixture".into());
+            dispatcher.set_authenticated_for_test();
+            dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias":"test-agent", "session_id":"native-commands",
+                }))
+                .await
+                .expect("session");
+            let append = dispatcher
+                .handle_session_append(&json!({
+                    "session_id":"native-commands", "content":"unchanged assistant content",
+                }))
+                .await
+                .expect("append without legacy backend");
+            assert_eq!(append["message_count"], 1);
+            let rename = dispatcher
+                .handle_session_rename(&json!({
+                    "session_id":"native-commands", "name":"Renamed native session",
+                }))
+                .await
+                .expect("rename without legacy backend");
+            assert_eq!(rename["name"], "Renamed native session");
+            let status = dispatcher.handle_agents_status().await.expect("status");
+            let agent = status["agents"]
+                .as_array()
+                .expect("agents")
+                .iter()
+                .find(|agent| agent["alias"] == "test-agent")
+                .expect("agent");
+            assert_eq!(agent["persisted_sessions"], 1);
+            dispatcher.ctx.sessions.remove("native-commands").await;
+            let status = dispatcher.handle_status().await.expect("persisted status");
+            assert_eq!(status["active_sessions"], 1, "{backend}: {status}");
+            let listed = dispatcher
+                .handle_session_list(&json!({"query":"unchanged assistant"}))
+                .await
+                .expect("search standard history after eviction");
+            assert_eq!(listed["sessions"][0]["session_id"], "native-commands");
+            assert_eq!(listed["sessions"][0]["name"], "Renamed native session");
+            let messages = dispatcher
+                .handle_session_messages(&json!({"session_id":"native-commands"}))
+                .await
+                .expect("read standard history after eviction");
+            assert_eq!(
+                messages["messages"][0]["content"],
+                "unchanged assistant content"
+            );
+            let state = dispatcher
+                .handle_session_state(&json!({"session_id":"native-commands"}))
+                .await
+                .expect("read standard state after eviction");
+            assert_eq!(state["state"], "idle");
+        }
+    }
+
+    #[tokio::test]
     async fn session_approve_unknown_reply_is_recorded_only_in_existing_authorized_history() {
         use zeroclaw_api::session_events::{EventCursor, EventData};
         use zeroclaw_kernel::session::engine::EngineSessionSource;
@@ -32833,7 +32884,7 @@ mod tests {
             let family = "rpc_wire-fixture";
             let capability = ctx.config_authority.execution_capability();
             let authority = Arc::new(crate::live_config_authority::AgentHistoryAuthority {
-                admission: capability.admit("test-agent").expect("agent"),
+                admission: capability.admit("test-agent").expect("agent").into(),
                 actor: EventActor::Principal {
                     principal_id: principal.0.clone(),
                 },
@@ -32998,22 +33049,51 @@ mod tests {
     }
 
     async fn execute_session_tool_as(
-        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+        dispatcher: &RpcDispatcher,
         current_session_id: &str,
         tool_name: &str,
         args: Value,
     ) -> zeroclaw_api::tool::ToolResult {
-        zeroclaw_api::TOOL_LOOP_SESSION_KEY
-            .scope(Some(current_session_id.to_string()), async {
-                agent
-                    .lock()
-                    .await
-                    .execute_tool_for_test(tool_name, args)
-                    .await
-                    .unwrap_or_else(|| panic!("{tool_name} should be registered"))
-                    .unwrap_or_else(|error| panic!("{tool_name} should execute: {error}"))
-            })
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(current_session_id)
             .await
+            .expect("live agent");
+        let record = dispatcher
+            .authorize_session_owner(current_session_id, Method::SessionPrompt)
+            .await
+            .expect("owner");
+        let prefix = match dispatcher
+            .ctx
+            .sessions
+            .chat_mode(current_session_id)
+            .await
+            .expect("mode")
+        {
+            ChatMode::Acp => "acp_",
+            ChatMode::Chat => "rpc_",
+        };
+        let port = dispatcher
+            .native_session_command(
+                current_session_id,
+                &format!("{prefix}{current_session_id}"),
+                record.as_ref(),
+                Method::SessionPrompt,
+            )
+            .await
+            .expect("admission")
+            .expect("native port");
+        zeroclaw_api::session_events::capture::scope_session_execution(port, async {
+            agent
+                .lock()
+                .await
+                .execute_tool_for_test(tool_name, args)
+                .await
+                .unwrap_or_else(|| panic!("{tool_name} should be registered"))
+                .unwrap_or_else(|error| panic!("{tool_name} should execute: {error}"))
+        })
+        .await
     }
 
     #[tokio::test]
@@ -33089,8 +33169,14 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
-        let (dispatcher, sessions, _chat_backend, acp_store) =
+        let (mut dispatcher, sessions, _chat_backend, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
+        let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+            dispatcher.ctx.config.clone(),
+        ));
+        Arc::get_mut(&mut dispatcher.ctx)
+            .expect("dispatcher fixture context is uniquely owned")
+            .native_sessions = Some(source);
 
         let current = "11111111-1111-4111-8111-111111111111";
         let previous = "22222222-2222-4222-8222-222222222222";
@@ -33110,6 +33196,17 @@ mod tests {
         acp_store
             .create_session(foreign, "other-agent", "/foreign", None)
             .unwrap();
+        acp_store
+            .create_session(current, "test-agent", data_dir.to_str().unwrap(), None)
+            .unwrap();
+        acp_store
+            .append_turn(
+                current,
+                &[ConversationMessage::Chat(ChatMessage::assistant(
+                    "current RPC answer",
+                ))],
+            )
+            .unwrap();
 
         dispatcher
             .handle_session_new_for_test(&json!({
@@ -33120,35 +33217,36 @@ mod tests {
             .await
             .expect("real RPC session/new should create an ACP agent");
 
-        let fresh = sessions
+        sessions
             .get_agent(current)
             .await
             .expect("fresh RPC ACP agent should be live");
-        let listed = execute_session_tool_as(&fresh, current, "sessions_list", json!({})).await;
+        let listed =
+            execute_session_tool_as(&dispatcher, current, "sessions_list", json!({})).await;
         assert!(listed.success);
         assert!(listed.output.contains(current));
-        assert!(listed.output.contains(previous));
+        assert!(!listed.output.contains(previous));
         assert!(!listed.output.contains(foreign));
 
         let history = execute_session_tool_as(
-            &fresh,
+            &dispatcher,
             current,
             "sessions_history",
-            json!({"session_id": previous}),
+            json!({"session_id": format!("acp_{current}")}),
         )
         .await;
         assert!(history.success);
-        assert!(history.output.contains("durable prior RPC answer"));
+        assert!(history.output.contains("current RPC answer"));
 
         let foreign_history = execute_session_tool_as(
-            &fresh,
+            &dispatcher,
             current,
             "sessions_history",
             json!({"session_id": foreign}),
         )
         .await;
         let unknown_history = execute_session_tool_as(
-            &fresh,
+            &dispatcher,
             current,
             "sessions_history",
             json!({"session_id": unknown}),
@@ -33163,7 +33261,7 @@ mod tests {
         );
 
         let send = execute_session_tool_as(
-            &fresh,
+            &dispatcher,
             current,
             "sessions_send",
             json!({"session_id": previous, "message": "hello"}),
@@ -33172,34 +33270,29 @@ mod tests {
         assert!(!send.success);
         let send_error = send.error.unwrap();
         assert!(send_error.contains("sessions_send"));
-        assert!(send_error.contains("ACP"));
-        assert!(send_error.contains("Code"));
+        assert!(send_error.contains("cannot mutate native event history"));
 
         assert!(sessions.remove(current).await);
-        let rehydrated = dispatcher
+        dispatcher
             .rehydrate_reaped_session(current, dispatcher.stamped_grants())
             .await
             .expect("an operator's rehydration is never refused")
             .expect("real RPC rehydration should rebuild the ACP agent");
         let rehydrated_list =
-            execute_session_tool_as(&rehydrated, current, "sessions_list", json!({})).await;
+            execute_session_tool_as(&dispatcher, current, "sessions_list", json!({})).await;
         assert!(rehydrated_list.success);
         assert!(rehydrated_list.output.contains(current));
-        assert!(rehydrated_list.output.contains(previous));
+        assert!(!rehydrated_list.output.contains(previous));
         assert!(!rehydrated_list.output.contains(foreign));
         let rehydrated_history = execute_session_tool_as(
-            &rehydrated,
+            &dispatcher,
             current,
             "sessions_history",
-            json!({"session_id": previous}),
+            json!({"session_id": format!("acp_{current}")}),
         )
         .await;
         assert!(rehydrated_history.success);
-        assert!(
-            rehydrated_history
-                .output
-                .contains("durable prior RPC answer")
-        );
+        assert!(rehydrated_history.output.contains("current RPC answer"));
 
         let chat_id = "chat-control";
         dispatcher
@@ -33210,11 +33303,12 @@ mod tests {
             }))
             .await
             .expect("real RPC session/new should create the Chat control");
-        let chat = sessions
+        sessions
             .get_agent(chat_id)
             .await
             .expect("Chat control should be live");
-        let chat_list = execute_session_tool_as(&chat, chat_id, "sessions_list", json!({})).await;
+        let chat_list =
+            execute_session_tool_as(&dispatcher, chat_id, "sessions_list", json!({})).await;
         assert!(chat_list.success);
         assert!(!chat_list.output.contains(current));
         assert!(!chat_list.output.contains(previous));

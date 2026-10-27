@@ -20037,7 +20037,11 @@ Let me check the result."#;
             let stream = source.stream_id(family).await.unwrap();
             let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
             let authority = Arc::new(AgentHistoryAuthority {
-                admission: live.execution_capability().admit("skill-agent").unwrap(),
+                admission: live
+                    .execution_capability()
+                    .admit("skill-agent")
+                    .unwrap()
+                    .into(),
                 actor: EventActor::Principal {
                     principal_id: principal.0.clone(),
                 },
@@ -20442,7 +20446,11 @@ Let me check the result."#;
                 let stream = source.stream_id(family).await.unwrap();
                 let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
                 let authority = Arc::new(AgentHistoryAuthority {
-                    admission: live.execution_capability().admit("skill-agent").unwrap(),
+                    admission: live
+                        .execution_capability()
+                        .admit("skill-agent")
+                        .unwrap()
+                        .into(),
                     actor: EventActor::Principal {
                         principal_id: principal.0.clone(),
                     },

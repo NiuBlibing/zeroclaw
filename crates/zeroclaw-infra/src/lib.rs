@@ -31,9 +31,12 @@ macro_rules! legacy_fixture_call {
 }
 
 use std::net::SocketAddr;
+#[cfg(any(test, feature = "test-util"))]
 use std::path::Path;
+#[cfg(any(test, feature = "test-util"))]
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "test-util"))]
 use crate::session_backend::SessionBackend;
 
 pub fn effective_gateway_bind_socket_addr(host: &str, port: u16) -> SocketAddr {
@@ -52,6 +55,8 @@ pub fn fallback_gateway_bind_socket_addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
+/// Constructs pre-upgrade fixtures only. Production opens the installation's native event store.
+#[cfg(any(test, feature = "test-util"))]
 pub fn make_session_backend(
     workspace_dir: &Path,
     backend: &str,
@@ -94,6 +99,7 @@ pub fn make_session_backend(
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 fn open_sqlite_with_jsonl_import(
     workspace_dir: &Path,
     guard: session_events::installation::InstallationGuard,

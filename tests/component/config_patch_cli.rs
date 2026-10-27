@@ -117,7 +117,6 @@ fn test_state(config: Config) -> AppState {
         mdns_peer_registry: gateway::nodes::mdns::MdnsPeerRegistry::default(),
         path_prefix: String::new(),
         web_dist_dir: None,
-        session_backend: None,
         native_sessions: None,
         session_queue: Arc::new(gateway::session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry: None,

@@ -1354,7 +1354,7 @@ async fn run_agent_job_for_occurrence(
                     component: "cron_scheduler".into(),
                 };
                 let authority = Arc::new(crate::live_config_authority::AgentHistoryAuthority {
-                    admission,
+                    admission: admission.clone().into(),
                     actor,
                     stream: source.stream_id(&family).await?,
                     origin: zeroclaw_api::ingress::TurnOrigin::Cron,

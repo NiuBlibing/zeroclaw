@@ -10259,7 +10259,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     std::sync::Arc::new(move |alias, stream| {
                         Ok(std::sync::Arc::new(
                             zeroclaw_runtime::live_config_authority::AgentHistoryAuthority {
-                                admission: capability.admit(alias)?,
+                                admission: capability.admit(alias)?.into(),
                                 actor: zeroclaw_api::session_events::EventActor::Principal {
                                     principal_id:
                                         zeroclaw_api::principal::PrincipalId::shared_operator().0,

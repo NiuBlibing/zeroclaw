@@ -48,6 +48,32 @@ impl SessionQuery {
                     None
                 };
                 reducer.apply(event, seed_count)?;
+                if let EventData::TurnAccepted { ingress_ref, .. } = &event.body.data {
+                    let reference_index = event
+                        .body
+                        .data
+                        .stored_refs()
+                        .map_err(AppendError::from)?
+                        .iter()
+                        .position(|reference| reference == ingress_ref)
+                        .ok_or_else(|| ReadError::Corrupt("ingress reference missing".into()))?;
+                    let PayloadRead::Present(record) = self
+                        .read_payload(
+                            stream.clone(),
+                            PayloadSelector {
+                                event_sequence: event.sequence,
+                                reference_path: vec![reference_index],
+                            },
+                            64 * 1024 * 1024,
+                        )
+                        .await?
+                    else {
+                        return Err(ReadError::Corrupt("ingress unavailable".into()).into());
+                    };
+                    let value = serde_json::from_slice(&record.body)
+                        .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+                    reducer.observe_ingress(&value)?;
+                }
             }
             after = page
                 .events

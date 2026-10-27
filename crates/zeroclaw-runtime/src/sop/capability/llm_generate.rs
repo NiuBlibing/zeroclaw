@@ -329,7 +329,7 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
                 let component = "sop_llm_generate";
                 let admission = capability.admit("default")?;
                 let authority = Arc::new(crate::live_config_authority::AgentHistoryAuthority {
-                    admission,
+                    admission: admission.clone().into(),
                     actor: EventActor::System {
                         component: component.into(),
                     },

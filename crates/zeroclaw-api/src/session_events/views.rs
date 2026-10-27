@@ -11,6 +11,8 @@ pub struct PayloadSelector {
 #[derive(Clone, Debug)]
 pub struct HistoricalMessage {
     pub message_id: MessageId,
+    /// Original message time in milliseconds; unknown legacy/seed times stay absent.
+    pub created_at: Option<Timestamp>,
     pub role: String,
     pub text: String,
     pub files: Vec<String>,

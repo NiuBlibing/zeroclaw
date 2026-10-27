@@ -1040,7 +1040,8 @@ pub mod upgrade;
 pub use jsonl::JsonlEventStore;
 
 /// Construct the selected native event backend.  This is deliberately separate
-/// from `make_session_backend`, which remains the legacy ChatMessage adapter.
+/// from the native installation backend; legacy ChatMessage adapters are kept
+/// only for migration compatibility and focused regression fixtures.
 pub fn open_event_store(
     workspace_dir: &Path,
     backend: &str,

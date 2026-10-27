@@ -2,7 +2,7 @@
 //! The caller holds the installation or CLI source lease until publication.
 use super::installation::{NativeBackend, family_identity};
 use super::*;
-use zeroclaw_api::model_provider::ChatMessage;
+use crate::session_backend::TimestampedMessage;
 use zeroclaw_api::session_events::*;
 
 pub struct LegacyImport<'a> {
@@ -16,7 +16,7 @@ pub struct LegacyImport<'a> {
 }
 
 pub struct LegacySnapshot {
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<TimestampedMessage>,
     pub history_has_trim_breadcrumb: Option<bool>,
     pub metadata: Vec<(String, serde_json::Value)>,
 }
@@ -52,8 +52,16 @@ pub(super) fn import_snapshot(
     }
     let messages = snapshot.messages;
     let metadata = snapshot.metadata;
+    // Keep the original content commitment stable for interrupted older imports;
+    // new imports additionally bind the source clocks before committing chunks.
+    let message_times_digest = Digest::from_bytes(&canonical_json(
+        &messages
+            .iter()
+            .map(|message| message.created_at.map(|time| time.timestamp_millis()))
+            .collect::<Vec<_>>(),
+    )?);
     let source_digest = Digest::from_bytes(&canonical_json(&serde_json::json!({
-        "messages": messages, "history_has_trim_breadcrumb": snapshot.history_has_trim_breadcrumb,
+        "messages": messages.iter().map(|message| &message.message).collect::<Vec<_>>(), "history_has_trim_breadcrumb": snapshot.history_has_trim_breadcrumb,
         "metadata": metadata,
     }))?);
     let root_key = format!("legacy-import-root:{}", command.stream);
@@ -96,6 +104,9 @@ pub(super) fn import_snapshot(
                 != Some(&command.branch)
             || value["source_digest"] != serde_json::json!(source_digest)
             || value["source_kind"] != command.source_kind
+            || value
+                .get("message_times_digest")
+                .is_some_and(|digest| digest != &serde_json::json!(message_times_digest))
         {
             return Err(AppendError::Corrupt(
                 "frozen legacy source or import scope changed".into(),
@@ -117,6 +128,7 @@ pub(super) fn import_snapshot(
             &serde_json::json!({
                 "source_kind": command.source_kind, "source_digest": source_digest,
                 "source_message_count": messages.len(), "capture_mode": "legacy_message_only",
+                "message_times_digest": message_times_digest,
             }),
         )?;
         let mut imported = SessionEvent::typed(
@@ -168,7 +180,8 @@ pub(super) fn import_snapshot(
     let mut payloads = Vec::new();
     let mut bytes = 0usize;
     let mut chunk = 0usize;
-    for (index, message) in messages.into_iter().enumerate() {
+    for (index, source) in messages.into_iter().enumerate() {
+        let message = source.message;
         let mut parts = Vec::new();
         let mut start = 0;
         while start < message.content.len() || (start == 0 && message.content.is_empty()) {
@@ -205,8 +218,11 @@ pub(super) fn import_snapshot(
             })?,
         )?;
         bytes += content.body.len();
-        let entry =
+        let mut entry =
             serde_json::json!({"role":message.role,"content_ref":StoredPayloadRef::from(&content)});
+        if let Some(time) = source.created_at {
+            entry["created_at"] = serde_json::json!(time.timestamp_millis());
+        }
         entries.push(entry.clone());
         chunk_entries.push(entry);
         payloads.push(content);

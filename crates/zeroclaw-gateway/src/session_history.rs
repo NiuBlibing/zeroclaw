@@ -381,7 +381,7 @@ pub(crate) async fn open_ingress(
         AgentExecutionCapability::from_parts(state.config.clone(), state.agent_lifecycle.clone());
     let authority = Arc::new(IngressAuthority {
         base: Arc::new(AgentHistoryAuthority {
-            admission: capability.admit(alias)?,
+            admission: capability.admit(alias)?.into(),
             actor: EventActor::System {
                 component: component.into(),
             },
@@ -540,7 +540,8 @@ pub(crate) fn authority(
         base: Arc::new(AgentHistoryAuthority {
             admission: capability
                 .admit(alias)
-                .map_err(|error| SessionError::PermissionDenied(error.to_string()))?,
+                .map_err(|error| SessionError::PermissionDenied(error.to_string()))?
+                .into(),
             actor: EventActor::Principal {
                 principal_id: PrincipalId::shared_operator().0,
             },
@@ -718,13 +719,9 @@ pub(crate) async fn list(
         if summary.closed || (running_only && !summary.running) {
             continue;
         }
-        let descriptor = source
-            .describe(family.clone())
-            .await?
-            .ok_or_else(|| anyhow::Error::msg("native_session_family_disappeared"))?;
         let timestamp =
             |millis| chrono::DateTime::from_timestamp_millis(millis).map(|time| time.to_rfc3339());
-        sessions.push(serde_json::json!({"session_id":family.strip_prefix("gw_").unwrap_or(&family),"session_key":family,"name":summary.title().map(str::to_owned),"agent_alias":descriptor.owning_agent,"channel_id":summary.channel_id().map(str::to_owned),"message_count":summary.message_count,"created_at":timestamp(summary.created_at),"last_activity":timestamp(summary.last_activity),"source_cursor":summary.head}));
+        sessions.push(serde_json::json!({"session_id":family.strip_prefix("gw_").unwrap_or(&family),"session_key":family,"name":summary.title().map(str::to_owned),"agent_alias":summary.owning_agent,"channel_id":summary.channel_id().map(str::to_owned),"message_count":summary.message_count,"created_at":timestamp(summary.created_at),"last_activity":timestamp(summary.last_activity),"source_cursor":summary.head}));
     }
     verify_history_subject(&state.pairing, subject)?;
     Ok(serde_json::json!({"sessions":sessions}))
@@ -1059,6 +1056,7 @@ pub(crate) mod tests {
             .expect("json");
             assert_eq!(value["messages"][0]["content"], "historical notice");
             assert!(value["messages"][0]["message_id"].is_string());
+            assert!(value["messages"][0]["created_at"].is_string());
             assert_eq!(
                 list(&state, None, false).await.expect("list")["sessions"][0]["name"],
                 "native title"
@@ -1200,6 +1198,139 @@ pub(crate) mod tests {
             assert!(!serialized.contains(&hash));
         }
     }
+    #[tokio::test]
+    async fn native_http_mutations_resolve_ids_preserve_history_and_cancel_exact_session() {
+        use axum::{
+            Json,
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        use tokio_util::sync::CancellationToken;
+        for backend in ["sqlite", "jsonl"] {
+            for family in ["gw_team_alpha", "gw_team.alpha"] {
+                let directory = tempfile::tempdir().expect("directory");
+                let mut config = zeroclaw_config::schema::Config {
+                    data_dir: directory.path().into(),
+                    ..Default::default()
+                };
+                config
+                    .risk_profiles
+                    .insert("fixture".into(), Default::default());
+                config.agents.insert(
+                    "web".into(),
+                    zeroclaw_config::schema::AliasedAgentConfig {
+                        risk_profile: "fixture".into(),
+                        ..Default::default()
+                    },
+                );
+                let mut state = crate::api::tests::test_state(config);
+                let source = Source::new(directory.path(), backend, family);
+                state.native_sessions = Some(source.clone());
+                let port = open(&state, family, "web", None)
+                    .await
+                    .expect("open")
+                    .expect("port");
+                port.append_assistant("original").await.expect("seed");
+                let display = family.strip_prefix("gw_").expect("display");
+                let mut rx = state.event_tx.subscribe();
+                for id in [display, family] {
+                    let response = crate::api::handle_api_session_message_post(
+                        State(state.clone()),
+                        HeaderMap::new(),
+                        Path(id.into()),
+                        Json(
+                            serde_json::from_value(
+                                serde_json::json!({"content":"raw API content"}),
+                            )
+                            .expect("body"),
+                        ),
+                    )
+                    .await
+                    .into_response();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let event = rx.try_recv().expect("broadcast");
+                    assert_eq!(event["session_id"], display);
+                    assert_eq!(event["content"], "raw API content");
+                    let rename = crate::api::handle_api_session_rename(
+                        State(state.clone()),
+                        HeaderMap::new(),
+                        Path(id.into()),
+                        Json(serde_json::json!({"name":"renamed"})),
+                    )
+                    .await
+                    .into_response();
+                    assert_eq!(rename.status(), StatusCode::OK);
+                    let status = crate::api::handle_api_session_state(
+                        State(state.clone()),
+                        HeaderMap::new(),
+                        Path(id.into()),
+                    )
+                    .await
+                    .into_response();
+                    assert_eq!(status.status(), StatusCode::OK);
+                }
+                let empty = crate::api::handle_api_session_message_post(
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    Path(display.into()),
+                    Json(serde_json::from_value(serde_json::json!({"content":" "})).expect("body")),
+                )
+                .await
+                .into_response();
+                assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+                let missing = crate::api::handle_api_session_message_post(
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    Path("missing".into()),
+                    Json(
+                        serde_json::from_value(serde_json::json!({"content":"must not create"}))
+                            .expect("body"),
+                    ),
+                )
+                .await
+                .into_response();
+                assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+                let active = CancellationToken::new();
+                let other = CancellationToken::new();
+                {
+                    let mut tokens = state.cancel_tokens.lock().expect("tokens");
+                    tokens.insert(family.into(), Arc::new(active.clone()));
+                    tokens.insert(format!("{family}-other"), Arc::new(other.clone()));
+                }
+                let deletion = crate::api::handle_api_session_delete(
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    Path(display.into()),
+                )
+                .await
+                .into_response();
+                assert_eq!(deletion.status(), StatusCode::OK);
+                assert!(active.is_cancelled());
+                assert!(!other.is_cancelled());
+                let query = source.owner.query(
+                    PrincipalId::shared_operator(),
+                    Arc::new(UnrestrictedFixture),
+                );
+                assert_eq!(
+                    query
+                        .messages(source.stream.clone())
+                        .await
+                        .expect("retained history")
+                        .len(),
+                    3
+                );
+                assert!(
+                    query
+                        .summary(source.stream.clone())
+                        .await
+                        .expect("summary")
+                        .closed
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn native_http_delivery_records_body_production_only_when_polled() {
         use http_body_util::BodyExt;

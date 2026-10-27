@@ -60,6 +60,30 @@ pub(crate) fn has_committed_jsonl_import_receipts(workspace_dir: &Path) -> Resul
 }
 
 impl SqliteSessionBackend {
+    /// Read original rows and clocks without swallowing migration errors.
+    pub(crate) fn upgrade_messages(
+        &self,
+        session_key: &str,
+    ) -> Result<Vec<crate::session_backend::TimestampedMessage>> {
+        let conn = self.conn.lock();
+        let mut statement = conn.prepare(
+            "SELECT role, content, created_at FROM sessions WHERE session_key=?1 ORDER BY id ASC",
+        )?;
+        let rows = statement.query_map(params![session_key], |row| {
+            let raw: Option<String> = row.get(2)?;
+            Ok(crate::session_backend::TimestampedMessage {
+                message: ChatMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                },
+                created_at: raw
+                    .as_deref()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|time| time.with_timezone(&Utc)),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
     pub(crate) fn upgrade_keys(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock();
         let mut statement = conn.prepare("SELECT session_key FROM session_metadata UNION SELECT session_key FROM sessions ORDER BY session_key")?;

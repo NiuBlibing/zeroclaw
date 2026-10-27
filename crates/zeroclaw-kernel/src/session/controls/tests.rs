@@ -855,6 +855,7 @@ async fn idle_commands_project_canonical_messages_and_recheck_revocation() {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, id);
         assert_eq!(messages[0].role, "assistant");
+        assert!(messages[0].created_at.is_some());
         assert_eq!(
             session
                 .restore_context()

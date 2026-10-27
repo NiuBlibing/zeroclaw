@@ -458,7 +458,18 @@ impl SessionQuery {
                             .get("role")
                             .and_then(serde_json::Value::as_str)
                             .ok_or_else(|| ReadError::Corrupt("legacy role absent".into()))?;
-                        imported.push((event.sequence, vec![0, index], role.to_owned()));
+                        let created_at = match entry.get("created_at") {
+                            None | Some(serde_json::Value::Null) => None,
+                            Some(value) => Some(value.as_i64().ok_or_else(|| {
+                                ReadError::Corrupt("legacy message timestamp invalid".into())
+                            })?),
+                        };
+                        imported.push((
+                            event.sequence,
+                            vec![0, index],
+                            role.to_owned(),
+                            created_at,
+                        ));
                     }
                 }
                 EventData::ContextProjectionCreated { reason_key, .. }
@@ -466,20 +477,26 @@ impl SessionQuery {
                 {
                     seeds.extend(self.seed_messages_at(&stream, event).await?)
                 }
-                EventData::UserContentRecorded { .. } => {
-                    messages.push((event.event_id.clone(), event.sequence, "user"))
-                }
-                EventData::AssistantContentRecorded { .. } => {
-                    messages.push((event.event_id.clone(), event.sequence, "assistant"))
-                }
+                EventData::UserContentRecorded { .. } => messages.push((
+                    event.event_id.clone(),
+                    event.sequence,
+                    "user",
+                    event.occurred_at,
+                )),
+                EventData::AssistantContentRecorded { .. } => messages.push((
+                    event.event_id.clone(),
+                    event.sequence,
+                    "assistant",
+                    event.occurred_at,
+                )),
                 EventData::ContentSuperseded {
                     target_event_ids, ..
-                } => messages.retain(|(id, _, _)| !target_event_ids.contains(id)),
+                } => messages.retain(|(id, _, _, _)| !target_event_ids.contains(id)),
                 _ => {}
             }
         }
-        for (_, sequence, role) in messages {
-            imported.push((sequence, vec![0], role.into()));
+        for (_, sequence, role, time) in messages {
+            imported.push((sequence, vec![0], role.into(), Some(time)));
         }
         let total = seeds.len() + imported.len();
         let end = before.unwrap_or(total);
@@ -496,9 +513,11 @@ impl SessionQuery {
             }
         }
         let seed_count = total - imported.len();
-        for (index, (sequence, path, role)) in imported.into_iter().enumerate() {
+        for (index, (sequence, path, role, created_at)) in imported.into_iter().enumerate() {
             if (start..end).contains(&(seed_count + index)) {
-                selected.push(self.message_at(&stream, sequence, path, &role).await?);
+                let mut message = self.message_at(&stream, sequence, path, &role).await?;
+                message.created_at = created_at;
+                selected.push(message);
             }
         }
         self.policy
@@ -591,6 +610,7 @@ impl SessionQuery {
                             .into());
                         }
                         messages.push(HistoricalMessage {
+                            created_at: None,
                             message_id,
                             role: role.into(),
                             text: String::new(),
@@ -627,6 +647,7 @@ impl SessionQuery {
                         );
                     }
                     messages.push(HistoricalMessage {
+                        created_at: None,
                         message_id,
                         role: chat.role.clone(),
                         text: chat.content.clone(),
@@ -738,6 +759,7 @@ impl SessionQuery {
             }
         }
         Ok(HistoricalMessage {
+            created_at: None,
             message_id: content.message_id,
             role: role.into(),
             text,

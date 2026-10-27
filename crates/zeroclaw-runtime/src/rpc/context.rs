@@ -11,6 +11,7 @@ use zeroclaw_api::channel::{ApprovalReplyResult, ChannelApprovalResponse};
 use zeroclaw_config::cost::tracker::CostTracker;
 use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
+#[cfg(test)]
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_infra::session_repository::SessionRepository;
 
@@ -276,8 +277,8 @@ pub struct RpcContext {
     /// In-memory session store for active RPC sessions.
     pub sessions: Arc<SessionStore>,
 
-    /// Persistent session backend (SQLite / JSONL) for history and
-    /// session metadata. `None` when persistence is disabled.
+    /// Legacy transcript backend used only by compatibility fixtures.
+    #[cfg(test)]
     pub session_backend: Option<Arc<dyn SessionBackend>>,
 
     /// Injected application composition; this transport cannot construct a
@@ -400,6 +401,7 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
             native_sessions: None,
             memory: None,
@@ -450,6 +452,7 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
             native_sessions: None,
             memory: None,
@@ -483,6 +486,7 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
             native_sessions: None,
             memory: None,
@@ -525,6 +529,7 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
             native_sessions: None,
             memory: None,
@@ -608,6 +613,7 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
             native_sessions: None,
             memory: None,
@@ -645,6 +651,7 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
             native_sessions: None,
             memory: None,
@@ -688,6 +695,7 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
             native_sessions: None,
             memory: None,
@@ -724,6 +732,7 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
             native_sessions: None,
             memory: Some(memory),
@@ -761,6 +770,7 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
             native_sessions: None,
             memory: None,
@@ -837,6 +847,7 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
+            #[cfg(test)]
             session_backend: None,
             native_sessions: None,
             memory: None,

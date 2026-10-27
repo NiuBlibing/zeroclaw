@@ -47,6 +47,67 @@ use zeroclaw_api::{
     session_events::{EventData, StoredPayloadRef},
 };
 
+#[test]
+fn sqlite_message_timestamps_survive_upgrade_to_each_native_backend() {
+    for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+        let directory = tempfile::tempdir().expect("directory");
+        let source = SqliteSessionBackend::new(directory.path()).expect("source");
+        source
+            .append("gw_clocks", &ChatMessage::user("first"))
+            .expect("first");
+        source
+            .append("gw_clocks", &ChatMessage::assistant("second"))
+            .expect("second");
+        let conn =
+            rusqlite::Connection::open(directory.path().join("sessions/sessions.db")).expect("db");
+        conn.execute("UPDATE sessions SET created_at=CASE role WHEN 'user' THEN '2020-01-02T03:04:05Z' ELSE '2021-02-03T04:05:06Z' END", []).expect("clocks");
+        drop(conn);
+        drop(source);
+        upgrade_installation(directory.path(), target, |_| "fixture".into()).expect("upgrade");
+        let store = open_event_store(directory.path(), target.name()).expect("store");
+        let stream = stream_id("gw_clocks").expect("stream");
+        let page = store
+            .read_page(
+                &stream,
+                &EventCursor::beginning(stream.clone()),
+                None,
+                100,
+                MAX_PAGE_BYTES,
+            )
+            .expect("events");
+        let times = page
+            .events
+            .iter()
+            .filter_map(|event| match &event.body.data {
+                EventData::ContextProjectionCreated {
+                    reason_key,
+                    result_ref,
+                    ..
+                } if reason_key == "legacy_import" => {
+                    let PayloadRead::Present(payload) =
+                        store.read_payload(&result_ref.payload_id).expect("payload")
+                    else {
+                        panic!("context missing")
+                    };
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&payload.body).expect("context");
+                    Some(
+                        value["legacy_messages"]
+                            .as_array()
+                            .expect("messages")
+                            .iter()
+                            .map(|entry| entry["created_at"].as_i64().expect("time"))
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(times, vec![1_577_934_245_000, 1_612_325_106_000]);
+    }
+}
+
 fn old_source(directory: &Path, sqlite: bool, count: usize) -> Box<dyn SessionBackend> {
     let source: Box<dyn SessionBackend> = if sqlite {
         Box::new(SqliteSessionBackend::new(directory).expect("SQLite source"))

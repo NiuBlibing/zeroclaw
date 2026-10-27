@@ -118,6 +118,10 @@ impl SessionQuery<'_> {
                     None
                 };
                 reducer.apply(event, seed_count)?;
+                if let EventData::TurnAccepted { ingress_ref, .. } = &event.body.data {
+                    let value = self.metadata_value(ingress_ref)?;
+                    reducer.observe_ingress(&value)?;
+                }
             }
             if !page.has_more {
                 break;

@@ -569,7 +569,11 @@ mod tests {
                             "alpha".into(),
                             principal.clone(),
                             Arc::new(AgentHistoryAuthority {
-                                admission: authority.execution_capability().admit("alpha").unwrap(),
+                                admission: authority
+                                    .execution_capability()
+                                    .admit("alpha")
+                                    .unwrap()
+                                    .into(),
                                 actor: EventActor::Principal {
                                     principal_id: principal.0,
                                 },

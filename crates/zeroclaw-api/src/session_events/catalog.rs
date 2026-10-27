@@ -67,6 +67,7 @@ pub struct SessionReducer {
     importing: bool,
     include_context: bool,
     last_activity_sequence: u64,
+    channel_sequence: u64,
     sequence: u64,
     history: projection::HistoryProjection,
     imported_messages: usize,
@@ -83,6 +84,7 @@ impl SessionReducer {
             importing: false,
             include_context,
             last_activity_sequence: 0,
+            channel_sequence: 0,
             sequence: 0,
         }
     }
@@ -216,11 +218,50 @@ impl SessionReducer {
             .map(|(field, (sequence, reference, _))| (field.as_str(), *sequence, reference))
     }
 
+    /// Channel attribution is derived from accepted ingress, without another
+    /// persisted metadata record. Unknown transports leave existing facts intact.
+    pub fn observe_ingress(&mut self, ingress: &Value) -> Result<(), ReadError> {
+        let Some(channel) = ingress.get("transport").and_then(|v| v.get("channel")) else {
+            return Ok(());
+        };
+        let (Some(kind), Some(alias)) = (
+            channel.get("kind").and_then(Value::as_str),
+            channel.get("alias").and_then(Value::as_str),
+        ) else {
+            return Ok(());
+        };
+        let state = &mut self
+            .record
+            .as_mut()
+            .ok_or_else(|| ReadError::Corrupt("session root missing".into()))?
+            .session;
+        self.channel_sequence = self.sequence;
+        state.fields.insert(
+            "channel_id".into(),
+            Value::String(if alias.is_empty() {
+                kind.into()
+            } else {
+                format!("{kind}.{alias}")
+            }),
+        );
+        state.fields.insert(
+            "sender_id".into(),
+            ingress.get("sender").cloned().unwrap_or(Value::Null),
+        );
+        Ok(())
+    }
+
     pub fn resolve_metadata(&mut self, field: &str, value: Value) -> Result<(), ReadError> {
-        let (sequence, _, _) = self
+        let (sequence, _, imported) = self
             .metadata
             .remove(field)
             .ok_or_else(|| ReadError::Corrupt("unexpected metadata resolution".into()))?;
+        if matches!(field, "channel_id" | "sender_id")
+            && self.channel_sequence != 0
+            && (imported || sequence < self.channel_sequence)
+        {
+            return Ok(());
+        }
         let state = &mut self
             .record
             .as_mut()
@@ -334,6 +375,65 @@ mod tests {
                 .expect("resolve");
         }
         reducer.finish().expect("finish").expect("session")
+    }
+
+    #[test]
+    fn ingress_attribution_preserves_order_and_ignores_late_legacy_metadata() {
+        for explicit_override in [false, true] {
+            let stream = SessionStreamId::new();
+            let mut reducer = SessionReducer::new(stream.clone(), false);
+            reducer.apply(&root(&stream, false), None).expect("root");
+            let (old, old_value) = metadata(&stream, 2, "channel_id", serde_json::json!("old"));
+            reducer.apply(&old, None).expect("old metadata");
+            let payload =
+                PayloadRecord::json("session.ingress/v1", &serde_json::json!({})).expect("ingress");
+            let mut accepted = event(
+                &stream,
+                3,
+                EventData::TurnAccepted {
+                    input_ref: StoredPayloadRef::from(&payload),
+                    ingress_ref: StoredPayloadRef::from(&payload),
+                    reply_route_ref: None,
+                },
+            );
+            accepted.turn_id = Some(TurnId::new());
+            reducer.apply(&accepted, None).expect("accepted");
+            reducer
+                .observe_ingress(&serde_json::json!({
+                    "transport":{"channel":{"kind":"discord","alias":"work"}},
+                    "sender":"alice"
+                }))
+                .expect("channel attribution");
+            let (mut late, late_value) =
+                metadata(&stream, 4, "sender_id", serde_json::json!("legacy"));
+            late.actor = EventActor::System {
+                component: "session_upgrade".into(),
+            };
+            reducer.apply(&late, None).expect("late import");
+            let mut values = BTreeMap::from([(2, old_value), (4, late_value)]);
+            if explicit_override {
+                let (later, value) =
+                    metadata(&stream, 5, "channel_id", serde_json::json!("explicit"));
+                reducer.apply(&later, None).expect("new metadata");
+                values.insert(5, value);
+            }
+            reducer
+                .observe_ingress(&serde_json::json!({}))
+                .expect("unknown");
+            reducer
+                .observe_ingress(&serde_json::json!({"transport":"internal"}))
+                .expect("nonchannel");
+            let summary = finish(reducer, values);
+            assert_eq!(
+                summary.channel_id(),
+                Some(if explicit_override {
+                    "explicit"
+                } else {
+                    "discord.work"
+                })
+            );
+            assert_eq!(summary.fields["sender_id"], "alice");
+        }
     }
 
     #[test]

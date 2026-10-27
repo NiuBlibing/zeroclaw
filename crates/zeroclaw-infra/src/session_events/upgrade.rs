@@ -104,7 +104,7 @@ pub fn upgrade_installation(
                 target,
                 "legacy-sqlite",
                 LegacySnapshot {
-                    messages: source.try_load(&family).map_err(storage)?,
+                    messages: source.upgrade_messages(&family).map_err(storage)?,
                     history_has_trim_breadcrumb: source
                         .get_session_trim_breadcrumb(&family)
                         .map_err(storage)?,
@@ -192,7 +192,13 @@ pub fn upgrade_installation(
                 target,
                 "legacy-jsonl",
                 LegacySnapshot {
-                    messages,
+                    messages: messages
+                        .into_iter()
+                        .map(|message| crate::session_backend::TimestampedMessage {
+                            message,
+                            created_at: None,
+                        })
+                        .collect(),
                     history_has_trim_breadcrumb: jsonl_source
                         .get_trim_breadcrumb(family)
                         .map_err(storage)?,

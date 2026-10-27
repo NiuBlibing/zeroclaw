@@ -133,7 +133,7 @@ pub(super) async fn open(
     let family = format!("peer-inbox:{task}");
     let capability = admission.capability();
     let base = Arc::new(crate::live_config_authority::AgentHistoryAuthority {
-        admission,
+        admission: admission.into(),
         actor: EventActor::System {
             component: "peer_inbox".into(),
         },
@@ -199,7 +199,7 @@ mod tests {
         let stream = SessionStreamId::new();
         let peer = PeerAuthority {
             base: Arc::new(crate::live_config_authority::AgentHistoryAuthority {
-                admission: capability.admit("recipient").expect("admission"),
+                admission: capability.admit("recipient").expect("admission").into(),
                 actor: EventActor::System {
                     component: "peer_inbox".into(),
                 },

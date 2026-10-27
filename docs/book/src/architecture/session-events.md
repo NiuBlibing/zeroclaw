@@ -22,11 +22,25 @@ Live configuration and permissions remain owned by `LiveConfigAuthority` and
 the existing authorization resolvers. Task execution ownership remains with
 the task registry. A historical approval, policy observation or cursor grants
 no permission. Bound effect handles retain identities, not policy snapshots.
+History authority retains the admitted alias generation and live resolver,
+without retaining a turn lease or configuration snapshot. Execution keeps its
+own lease for the actual turn. Idle readers therefore cannot block agent
+deletion, and deleted or closing generations still fail authorization.
 
 The synchronous legacy conversation-binding owner refuses native session
 access without execution admission. It must not acknowledge a cache-only
 exchange that is absent from the event store. Native callers use the session
 execution and authorized history ports.
+
+Session inspection tools obtain their reader from the current execution port;
+constructing an ACP agent does not grant access to a second history store.
+Daemon and standalone channel startup use the same native session host when no
+source was injected. Storage initialization and migration failures propagate
+instead of falling back to a legacy writer. Channels with persistence disabled
+keep their working context in memory.
+Gateway HTTP and WebSocket history use this same source. They do not maintain
+a legacy backend handle, transcript watermark or post-turn transcript rewrite.
+Legacy backend factories are available only to explicit test fixtures.
 
 ## Execution and recovery
 
@@ -439,6 +453,13 @@ files renamed with a `.backup` suffix and the ready state published. Sources
 are not deleted or reopened for writes. Conflicting source histories fail
 explicitly. Migration preserves original payload content without credential
 filtering. Configuration credentials retain their existing encryption.
+SQLite message timestamps are retained in imported context entries; native
+message history uses each content event's observation time. Sources without
+message timestamps remain unknown rather than acquiring the migration time.
+Channel and sender attribution are derived from accepted ingress in the common
+session projection. Later legacy imports cannot replace these native facts.
+Channel-specific room and thread details remain in the original reply route;
+the generic catalog does not duplicate that adapter-owned schema.
 
 ACP sessions use the same configured session backend. Ownership, workspace,
 interaction surface, plans, usage and lifecycle observations are metadata
@@ -479,6 +500,19 @@ prefix; no cache or persistent secondary index is introduced.
 Agent rename, deletion and interrupted-rename residue checks use this standard
 repository across all families. Deletion appends closure events and retains
 historical attribution; these operations never write archived legacy backends.
+
+Production RPC contexts contain only the standard session source. History
+search, messages, state, rename, append and deletion use its authorized query
+and command ports. The old transcript backend and its fallback behavior are
+compiled only for explicit compatibility fixtures, not daemon execution.
+
+Channels restore persisted context through the admitted standard session port
+before building a provider request. Their bounded in-memory conversation buffer
+only supplies working context; it never rewrites legacy transcripts, guesses
+breadcrumb ownership from text, or creates a second persistent history.
+Disabling persistence retains this in-memory mode. A missing cache in that mode
+has no durable fallback; with persistence enabled, the standard context and its
+breadcrumb provenance are restored before the next message is appended.
 
 Changing the configured backend drains all installation executors and escaped
 observations, freezes writes, transfers the whole verified image including

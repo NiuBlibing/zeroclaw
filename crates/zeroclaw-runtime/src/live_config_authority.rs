@@ -1515,10 +1515,40 @@ impl From<zeroclaw_config::live::LiveConfigError> for ConfigCommitError {
     }
 }
 
-/// History adapter for a runtime-owned target admission. The admission and live
-/// config remain canonical; this handle binds only actor, stream and origin.
+/// Generation-bound history scope. Execution owns its own turn lease; retaining
+/// an idle reader or coordinator must not keep an alias permanently busy.
+pub struct AgentHistoryAdmission {
+    capability: AgentExecutionCapability,
+    alias: String,
+    generation: u64,
+}
+impl From<AgentExecutionAdmission> for AgentHistoryAdmission {
+    fn from(admission: AgentExecutionAdmission) -> Self {
+        Self {
+            capability: admission.capability.clone(),
+            alias: admission.alias.clone(),
+            generation: admission.generation,
+        }
+    }
+}
+impl AgentHistoryAdmission {
+    fn capability(&self) -> &AgentExecutionCapability {
+        &self.capability
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+    fn revalidate(&self) -> Result<(), AgentExecutionError> {
+        self.capability
+            .agent_lifecycle
+            .validate_turn_at(&self.alias, self.generation)
+            .map_err(AgentExecutionError::Admission)
+    }
+}
+
+/// History authority resolves live configuration for its bound generation.
 pub struct AgentHistoryAuthority {
-    pub admission: AgentExecutionAdmission,
+    pub admission: AgentHistoryAdmission,
     pub actor: zeroclaw_api::session_events::EventActor,
     pub stream: zeroclaw_api::session_events::SessionStreamId,
     pub origin: zeroclaw_api::ingress::TurnOrigin,
@@ -1706,9 +1736,14 @@ impl zeroclaw_kernel::session::PermissionResolver for AgentHistoryAuthority {
     > {
         self.check_history()?;
         let child = Self {
-            admission: self.admission.capability().admit(target).map_err(|error| {
-                zeroclaw_kernel::session::SessionError::PermissionDenied(error.to_string())
-            })?,
+            admission: self
+                .admission
+                .capability()
+                .admit(target)
+                .map_err(|error| {
+                    zeroclaw_kernel::session::SessionError::PermissionDenied(error.to_string())
+                })?
+                .into(),
             actor: self.actor.clone(),
             stream: stream.clone(),
             origin: zeroclaw_api::ingress::TurnOrigin::SubTurn,
@@ -1749,6 +1784,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn history_scope_releases_turn_lease_and_still_rejects_revoked_generation() {
+        let mut config = Config::default();
+        config.agents.insert("history".into(), Default::default());
+        let authority = LiveConfigAuthority::new(config);
+        let scope: AgentHistoryAdmission = authority
+            .execution_capability()
+            .admit("history")
+            .expect("admission")
+            .into();
+        scope.revalidate().expect("current scope");
+        let deletion = authority
+            .agent_lifecycle()
+            .begin_delete("history")
+            .expect("history is not an active turn");
+        assert!(scope.revalidate().is_err());
+        drop(deletion);
+        scope.revalidate().expect("abandoned deletion");
+        let mut deletion = authority
+            .agent_lifecycle()
+            .begin_delete("history")
+            .expect("reserve replacement");
+        deletion.commit_destructive_mutation();
+        drop(deletion);
+        assert!(
+            scope.revalidate().is_err(),
+            "old alias generation is revoked"
+        );
+        let replacement: AgentHistoryAdmission = authority
+            .execution_capability()
+            .admit("history")
+            .expect("new alias generation")
+            .into();
+        replacement.revalidate().expect("replacement scope");
+        authority.agent_lifecycle().close_generation();
+        assert!(replacement.revalidate().is_err());
+    }
+
+    #[test]
     fn history_binding_records_admitted_workspace_and_child_policy() {
         let mut config = Config::default();
         for alias in ["parent", "child"] {
@@ -1766,7 +1839,11 @@ mod tests {
             .insert("fixture-policy".into(), Default::default());
         let authority = LiveConfigAuthority::new(config);
         let history = AgentHistoryAuthority {
-            admission: authority.execution_capability().admit("parent").unwrap(),
+            admission: authority
+                .execution_capability()
+                .admit("parent")
+                .unwrap()
+                .into(),
             actor: zeroclaw_api::session_events::EventActor::System {
                 component: "fixture".into(),
             },

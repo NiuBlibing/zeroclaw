@@ -442,72 +442,35 @@ impl AcpServer {
         workspace_dir: &std::path::Path,
         enable_mcp: bool,
     ) -> Result<Agent> {
-        let Some(store) = self.store.as_ref() else {
-            return if let ConfigSource::Live(live_config) = &self.config_source {
-                Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
-                    live_config.clone(),
-                    agent_alias,
-                    Some(workspace_dir),
-                    enable_mcp,
-                    true,
-                    true,
-                    self.sop_engine.clone(),
-                    self.sop_audit.clone(),
-                    self.canvas_store.clone(),
-                    Some(zeroclaw_runtime::AgentExecutionCapability::from_parts(
-                        live_config.clone(),
-                        self.agent_lifecycle.clone(),
-                    )),
-                )
-                .await
-            } else {
-                Agent::from_config_with_session_cwd_and_mcp_backchannel(
-                    config,
-                    agent_alias,
-                    Some(workspace_dir),
-                    enable_mcp,
-                    true,
-                    true,
-                    self.sop_engine.clone(),
-                    self.sop_audit.clone(),
-                    self.canvas_store.clone(),
-                )
-                .await
-            };
-        };
         if let ConfigSource::Live(live_config) = &self.config_source {
             let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
                 live_config.clone(),
                 self.agent_lifecycle.clone(),
             );
-            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
+            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
                 live_config.clone(),
                 agent_alias,
                 Some(workspace_dir),
                 enable_mcp,
                 true,
-                // ACP turns transport the typed file attachment `deliver_file` emits.
                 true,
                 self.sop_engine.clone(),
                 self.sop_audit.clone(),
                 self.canvas_store.clone(),
-                Arc::clone(store),
                 Some(execution_capability),
             )
             .await
         } else {
-            Agent::from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
+            Agent::from_config_with_session_cwd_and_mcp_backchannel(
                 config,
                 agent_alias,
                 Some(workspace_dir),
                 enable_mcp,
                 true,
-                // ACP turns transport the typed file attachment `deliver_file` emits.
                 true,
                 self.sop_engine.clone(),
                 self.sop_audit.clone(),
                 self.canvas_store.clone(),
-                Arc::clone(store),
             )
             .await
         }
@@ -7670,7 +7633,7 @@ mod tests {
                     Arc::new(move |alias, stream| {
                         Ok(Arc::new(
                             zeroclaw_runtime::live_config_authority::AgentHistoryAuthority {
-                                admission: capability.admit(alias)?,
+                                admission: capability.admit(alias)?.into(),
                                 actor: EventActor::Principal {
                                     principal_id:
                                         zeroclaw_api::principal::PrincipalId::shared_operator().0,

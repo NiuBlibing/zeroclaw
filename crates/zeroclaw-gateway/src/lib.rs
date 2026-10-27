@@ -159,7 +159,6 @@ use zeroclaw_channels::nextcloud_talk::NextcloudTalkChannel;
 use zeroclaw_channels::whatsapp::WhatsAppChannel;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
-use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, ModelProvider};
 use zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy;
@@ -760,9 +759,7 @@ pub struct AppState {
     pub path_prefix: String,
     /// Filesystem path to `web/dist/` for serving the dashboard (None = API-only)
     pub web_dist_dir: Option<std::path::PathBuf>,
-    /// Session backend for persisting gateway WS chat sessions
-    pub session_backend: Option<Arc<dyn SessionBackend>>,
-    /// Injected history service; native families never use the legacy writer.
+    /// Unified execution and history service for persisted gateway sessions.
     pub native_sessions: Option<Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource>>,
     /// Per-session actor queue for serializing concurrent turns
     pub session_queue: Arc<session_queue::SessionActorQueue>,
@@ -2015,7 +2012,6 @@ pub async fn run_gateway_with_plugin_webhooks(
             );
         }
     }
-    let session_backend: Option<Arc<dyn SessionBackend>> = None;
 
     // ── Pairing guard ──────────────────────────────────────
     // Supervised runs share the daemon's live authority so pairing and
@@ -2413,11 +2409,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         reload_tx,
         node_registry,
         mdns_peer_registry,
-        session_backend: if native_sessions.is_some() {
-            None
-        } else {
-            session_backend
-        },
+
         native_sessions,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
@@ -6373,7 +6365,7 @@ mod tests {
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -9164,7 +9156,7 @@ path = "{trigger_path}"
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -9254,7 +9246,7 @@ path = "{trigger_path}"
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -9935,7 +9927,7 @@ path = "{trigger_path}"
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -11605,10 +11597,10 @@ data: [DONE]\n\n";
         let tmp = tempfile::tempdir().expect("legacy-resume temp dir");
         let (mut state, _) =
             production_sse_state(&tmp, "http://127.0.0.1:9/v1/chat/completions", 1.0, false);
-        let session_db = tempfile::tempdir().expect("legacy-resume session db");
+        let session_directory = state.config.read().data_dir.clone();
         let backend: std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
             std::sync::Arc::new(
-                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_db.path())
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&session_directory)
                     .expect("sqlite session backend"),
             );
         // Seed the transcript under the legacy raw gateway key: dot-bearing
@@ -11621,7 +11613,13 @@ data: [DONE]\n\n";
                 &zeroclaw_providers::ChatMessage::user("seeded legacy turn"),
             )
             .expect("seed legacy transcript");
-        state.session_backend = Some(backend);
+        backend
+            .set_session_agent_alias(&legacy_key, "web")
+            .expect("legacy attribution");
+        drop(backend);
+        state.native_sessions = Some(Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+            state.config.clone(),
+        )));
 
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
         let session_id = "transport.legacy-resume";
@@ -11679,12 +11677,9 @@ data: [DONE]\n\n";
         let tmp = tempfile::tempdir().expect("api-delivery temp dir");
         let (mut state, _) =
             production_sse_state(&tmp, "http://127.0.0.1:9/v1/chat/completions", 1.0, false);
-        let session_db = tempfile::tempdir().expect("api-delivery session db");
-        state.session_backend = Some(std::sync::Arc::new(
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_db.path())
-                .expect("sqlite session backend"),
-        )
-            as std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>);
+        state.native_sessions = Some(Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+            state.config.clone(),
+        )));
 
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
         let session_id = "transport.api-delivery";
@@ -11924,7 +11919,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -12847,7 +12842,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -12972,7 +12967,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -13076,7 +13071,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -13286,7 +13281,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -13377,7 +13372,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -13473,7 +13468,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -13574,7 +13569,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -13670,7 +13665,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -13774,7 +13769,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -13929,7 +13924,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -14818,7 +14813,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -14907,7 +14902,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -15523,7 +15518,7 @@ data: [DONE]\n\n";
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
             native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
