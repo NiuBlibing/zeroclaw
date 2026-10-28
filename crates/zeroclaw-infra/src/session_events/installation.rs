@@ -242,7 +242,7 @@ pub fn families(
             let store = SqliteEventStore::open(data_dir)?;
             let streams = {
                 let conn = store.conn.lock();
-                let mut stmt = conn.prepare("SELECT stream_id FROM session_events WHERE sequence=1 AND json_extract(event_json,'$.body.kind')='session_started'").map_err(map_sqlite)?;
+                let mut stmt = conn.prepare("SELECT stream_id FROM session_events WHERE sequence=1 AND json_extract(event_json,'$.kind')='session_started'").map_err(map_sqlite)?;
                 let rows = stmt
                     .query_map([], |row| row.get::<_, String>(0))
                     .map_err(map_sqlite)?;

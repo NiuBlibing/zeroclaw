@@ -318,7 +318,7 @@ fn migration_preserves_future_event_bytes_and_its_explicit_payload_references() 
     event.sequence = 3;
     event.committed_at = now_millis();
     let mut value = serde_json::to_value(&event).expect("json");
-    value["body"]["kind"] = serde_json::json!("future_observation");
+    value["kind"] = serde_json::json!("future_observation");
     value["body"]["fields"]["future_extension"] =
         serde_json::json!({"preserve":"opaque spacing and extension"});
     // Noncanonical formatting is deliberate: transfer must not reserialize.

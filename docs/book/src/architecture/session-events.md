@@ -392,6 +392,11 @@ uses the same kernel settlement rule.
 
 ## Storage
 
+The event envelope exposes `kind` alongside the session, turn and sequence
+coordinates. The body contains `codec_version` and event-specific `fields`.
+SQLite indexes the outer kind for latest-event lookup; typed `EventData`
+remains the sole source of the kind in memory.
+
 Unknown event types and unsupported body codecs retain the original type,
 fields and body extensions when decoded and serialized again. Readers skip
 their semantics; they cannot be authored through the typed append interface.

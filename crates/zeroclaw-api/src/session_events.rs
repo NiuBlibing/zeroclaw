@@ -388,7 +388,7 @@ impl EventBody {
 
 /// Canonical event envelope. `sequence` and `committed_at` are assigned by the
 /// backend and must be zero/empty on an append request.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SessionEvent {
     pub schema_version: u32,
     pub event_id: EventId,
@@ -402,6 +402,95 @@ pub struct SessionEvent {
     pub committed_at: Timestamp,
     pub actor: EventActor,
     pub body: EventBody,
+}
+
+// EventData owns the type. The wire envelope exposes it without persisting a
+// second independently mutable field beside the semantic body.
+impl Serialize for SessionEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut body = serde_json::to_value(&self.body).map_err(serde::ser::Error::custom)?;
+        let kind = body
+            .as_object_mut()
+            .and_then(|body| body.remove("kind"))
+            .ok_or_else(|| serde::ser::Error::custom("event body kind missing"))?;
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            schema_version: u32,
+            event_id: &'a EventId,
+            stream_id: &'a SessionStreamId,
+            sequence: u64,
+            branch_id: &'a Option<BranchId>,
+            turn_id: &'a Option<TurnId>,
+            causation_id: &'a Option<EventId>,
+            invocation_id: &'a Option<InvocationId>,
+            occurred_at: Timestamp,
+            committed_at: Timestamp,
+            actor: &'a EventActor,
+            kind: Value,
+            body: Value,
+        }
+        Wire {
+            schema_version: self.schema_version,
+            event_id: &self.event_id,
+            stream_id: &self.stream_id,
+            sequence: self.sequence,
+            branch_id: &self.branch_id,
+            turn_id: &self.turn_id,
+            causation_id: &self.causation_id,
+            invocation_id: &self.invocation_id,
+            occurred_at: self.occurred_at,
+            committed_at: self.committed_at,
+            actor: &self.actor,
+            kind,
+            body,
+        }
+        .serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for SessionEvent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            schema_version: u32,
+            event_id: EventId,
+            stream_id: SessionStreamId,
+            sequence: u64,
+            branch_id: Option<BranchId>,
+            turn_id: Option<TurnId>,
+            causation_id: Option<EventId>,
+            invocation_id: Option<InvocationId>,
+            occurred_at: Timestamp,
+            committed_at: Timestamp,
+            actor: EventActor,
+            kind: String,
+            body: Value,
+        }
+        let mut wire = Wire::deserialize(deserializer)?;
+        let body = wire
+            .body
+            .as_object_mut()
+            .ok_or_else(|| serde::de::Error::custom("event body is not an object"))?;
+        if body.contains_key("kind") {
+            return Err(serde::de::Error::custom(
+                "event type must occur only in the envelope",
+            ));
+        }
+        body.insert("kind".into(), Value::String(wire.kind));
+        Ok(Self {
+            schema_version: wire.schema_version,
+            event_id: wire.event_id,
+            stream_id: wire.stream_id,
+            sequence: wire.sequence,
+            branch_id: wire.branch_id,
+            turn_id: wire.turn_id,
+            causation_id: wire.causation_id,
+            invocation_id: wire.invocation_id,
+            occurred_at: wire.occurred_at,
+            committed_at: wire.committed_at,
+            actor: wire.actor,
+            body: serde_json::from_value(wire.body).map_err(serde::de::Error::custom)?,
+        })
+    }
 }
 
 impl SessionEvent {
@@ -936,6 +1025,37 @@ pub fn canonical_json(value: &impl Serialize) -> Result<Vec<u8>, ContractError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_kind_is_in_the_outer_envelope() {
+        let event = SessionEvent::typed(
+            SessionStreamId::new(),
+            EventData::SessionStarted {
+                session_id: SessionId::new(),
+                owning_agent: "fixture".into(),
+                capture_mode: CaptureMode::Native,
+            },
+            EventActor::default(),
+        )
+        .expect("event");
+        let value = serde_json::to_value(&event).expect("envelope");
+        assert_eq!(value["kind"], "session_started");
+        assert!(value["body"].get("kind").is_none());
+        assert_eq!(
+            serde_json::from_value::<SessionEvent>(value.clone()).expect("round trip"),
+            event
+        );
+        let mut future = value.clone();
+        future["kind"] = serde_json::json!("future_observation");
+        future["body"]["codec_version"] = serde_json::json!(9);
+        future["body"]["extension"] = serde_json::json!({"preserve": true});
+        let decoded: SessionEvent = serde_json::from_value(future.clone()).expect("future event");
+        assert_eq!(decoded.body.raw_kind(), "future_observation");
+        assert_eq!(serde_json::to_value(decoded).expect("round trip"), future);
+        let mut duplicate = value;
+        duplicate["body"]["kind"] = serde_json::json!("session_closed");
+        assert!(serde_json::from_value::<SessionEvent>(duplicate).is_err());
+    }
 
     #[test]
     fn unknown_types_and_codecs_keep_their_original_body() {

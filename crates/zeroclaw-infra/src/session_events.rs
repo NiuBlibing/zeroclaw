@@ -236,9 +236,9 @@ impl SqliteEventStore {
              );
              DROP INDEX IF EXISTS session_events_stream_seq;
              CREATE INDEX IF NOT EXISTS session_events_latest_by_branch_kind
-               ON session_events(stream_id, json_extract(event_json, '$.branch_id'), json_extract(event_json, '$.body.kind'), sequence DESC);
+               ON session_events(stream_id, json_extract(event_json, '$.branch_id'), json_extract(event_json, '$.kind'), sequence DESC);
              CREATE INDEX IF NOT EXISTS session_events_latest_by_turn_kind
-               ON session_events(stream_id, json_extract(event_json, '$.branch_id'), json_extract(event_json, '$.turn_id'), json_extract(event_json, '$.body.kind'), sequence DESC);
+               ON session_events(stream_id, json_extract(event_json, '$.branch_id'), json_extract(event_json, '$.turn_id'), json_extract(event_json, '$.kind'), sequence DESC);
              PRAGMA user_version=1;
              COMMIT;",
         )
@@ -382,7 +382,7 @@ impl SessionEventStore for SqliteEventStore {
         let id: Option<String> = {
             let conn = self.conn.lock();
 
-            let common = "SELECT event_id FROM session_events WHERE stream_id=?1 AND json_extract(event_json, '$.branch_id')=?2 AND json_extract(event_json, '$.body.kind')=?3";
+            let common = "SELECT event_id FROM session_events WHERE stream_id=?1 AND json_extract(event_json, '$.branch_id')=?2 AND json_extract(event_json, '$.kind')=?3 AND json_extract(event_json, '$.body.codec_version')=1";
             if let Some(turn) = turn {
                 conn.query_row(&format!("{common} AND json_extract(event_json, '$.turn_id')=?4 ORDER BY sequence DESC LIMIT 1"), params![stream.as_str(),branch.as_str(),kind_tag,turn.as_str()], |row|row.get(0)).optional().map_err(read_error)?
             } else {
@@ -868,6 +868,54 @@ mod tests {
     use zeroclaw_api::session_events::{EventActor, EventKind};
 
     #[test]
+    fn latest_typed_lookup_skips_unsupported_body_codecs() {
+        use zeroclaw_api::session_events::*;
+        let dir = TempDir::new().expect("dir");
+        let store = SqliteEventStore::open(dir.path()).expect("store");
+        let stream = SessionStreamId::new();
+        let mut batch = request(&stream, "fixture", 0);
+        let branch = batch.events[0].branch_id.clone().expect("branch");
+        let title = PayloadRecord::new(
+            PayloadId::new(),
+            "session.text/v1".into(),
+            b"title".to_vec(),
+        )
+        .expect("title");
+        for _ in 0..2 {
+            let mut event = SessionEvent::typed(
+                stream.clone(),
+                EventData::SessionMetadataChanged {
+                    field: "title".into(),
+                    new_value_ref: StoredPayloadRef::from(&title),
+                },
+                EventActor::default(),
+            )
+            .expect("event");
+            event.branch_id = Some(branch.clone());
+            batch.events.push(event);
+        }
+        let previous = batch.events[1].event_id.clone();
+        batch.payloads.push(title);
+        store.append_batch(batch).expect("append");
+        let conn =
+            Connection::open(dir.path().join("sessions/session-events.db")).expect("connection");
+        conn.execute("UPDATE session_events SET event_json=CAST(json_set(event_json, '$.body.codec_version', 9) AS BLOB) WHERE sequence=3", []).expect("future codec");
+        let raw = store
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 10, MAX_PAGE_BYTES)
+            .expect("raw page");
+        assert_eq!(raw.events[2].body.kind(), EventKind::Unknown);
+        assert_eq!(raw.events[2].body.raw_kind(), "session_metadata_changed");
+        assert_eq!(
+            store
+                .read_latest_event(&stream, &branch, None, &EventKind::SessionMetadataChanged)
+                .expect("lookup")
+                .expect("known event")
+                .event_id,
+            previous
+        );
+    }
+
+    #[test]
     fn sqlite_body_projection_uses_shared_codec_classification() {
         use zeroclaw_api::session_events::payloads::{content_leaf, content_leaf_codecs};
         let conn = Connection::open_in_memory().expect("connection");
@@ -1038,11 +1086,11 @@ mod tests {
                     .expect("connection");
                 for (sql, index_name) in [
                     (
-                        "EXPLAIN QUERY PLAN SELECT event_id FROM session_events WHERE stream_id='fixture' AND json_extract(event_json, '$.branch_id')='branch' AND json_extract(event_json, '$.body.kind')='turn_accepted' ORDER BY sequence DESC LIMIT 1",
+                        "EXPLAIN QUERY PLAN SELECT event_id FROM session_events WHERE stream_id='fixture' AND json_extract(event_json, '$.branch_id')='branch' AND json_extract(event_json, '$.kind')='turn_accepted' ORDER BY sequence DESC LIMIT 1",
                         "session_events_latest_by_branch_kind",
                     ),
                     (
-                        "EXPLAIN QUERY PLAN SELECT event_id FROM session_events WHERE stream_id='fixture' AND json_extract(event_json, '$.branch_id')='branch' AND json_extract(event_json, '$.turn_id')='turn' AND json_extract(event_json, '$.body.kind')='turn_accepted' ORDER BY sequence DESC LIMIT 1",
+                        "EXPLAIN QUERY PLAN SELECT event_id FROM session_events WHERE stream_id='fixture' AND json_extract(event_json, '$.branch_id')='branch' AND json_extract(event_json, '$.turn_id')='turn' AND json_extract(event_json, '$.kind')='turn_accepted' ORDER BY sequence DESC LIMIT 1",
                         "session_events_latest_by_turn_kind",
                     ),
                 ] {
