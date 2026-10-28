@@ -270,11 +270,10 @@ impl SessionCoordinator {
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
-        max_bytes: usize,
     ) -> Result<zeroclaw_api::session_events::EventPage, SessionError> {
         Ok(self
             .store
-            .read_page(stream_id, after, through, max_events, max_bytes)?)
+            .read_page(stream_id, after, through, max_events)?)
     }
 
     /// Resolve current permission and durably append the start boundary before
@@ -503,13 +502,7 @@ mod tests {
             Err(SessionError::Append(AppendError::InvalidTransition(_)))
         ));
         let page = coordinator
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                10,
-                1_000_000,
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 10)
             .expect("read");
         assert_eq!(page.events.len(), 3);
     }

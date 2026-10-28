@@ -67,13 +67,7 @@ fn sqlite_message_timestamps_survive_upgrade_to_each_native_backend() {
         let store = open_event_store(directory.path(), target.name()).expect("store");
         let stream = stream_id("gw_clocks").expect("stream");
         let page = store
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                100,
-                MAX_PAGE_BYTES,
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
             .expect("events");
         let times = page
             .events
@@ -224,13 +218,7 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
         let stream = stream_id("acp_live").unwrap();
         let store = open_event_store(directory.path(), target.name()).unwrap();
         let root = store
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                100,
-                MAX_PAGE_BYTES,
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
             .unwrap();
         let mut recovered = Vec::new();
         let mut checkpoint_found = false;
@@ -752,13 +740,7 @@ fn earlier_native_acp_installation_merges_protocol_data_without_replacing_newer_
             serde_json::to_value(&messages).unwrap()
         );
         let page = store
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                100,
-                MAX_PAGE_BYTES,
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
             .unwrap();
         assert_eq!(
             page.events
@@ -895,13 +877,7 @@ fn native_sqlite_schema_zero_upgrades_without_rewriting_events_and_future_schema
         .append_batch(super::super::tests::request(&stream, "root", 0))
         .expect("root");
     let before = store
-        .read_page(
-            &stream,
-            &EventCursor::beginning(stream.clone()),
-            None,
-            10,
-            65536,
-        )
+        .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 10)
         .expect("before")
         .raw_events;
     drop(store);
@@ -913,13 +889,7 @@ fn native_sqlite_schema_zero_upgrades_without_rewriting_events_and_future_schema
     assert_eq!(
         before,
         store
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                10,
-                65536
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 10)
             .expect("after")
             .raw_events
     );

@@ -265,7 +265,7 @@ pub fn families(
         let mut through = None;
         loop {
             let page = store
-                .read_page(&stream, &after, through.as_ref(), 256, MAX_PAGE_BYTES)
+                .read_page(&stream, &after, through.as_ref(), 256)
                 .map_err(|error| AppendError::Corrupt(error.to_string()))?;
             through = Some(page.through.clone());
             let mut found = false;

@@ -9932,10 +9932,6 @@ impl RpcDispatcher {
                 .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing reference_path"))?,
         )
         .map_err(|_| rpc_err(INVALID_PARAMS, "invalid reference_path"))?;
-        let max_bytes = params
-            .get("max_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(1024 * 1024);
         let read = native
             .query
             .read_payload(
@@ -9944,8 +9940,6 @@ impl RpcDispatcher {
                     event_sequence: sequence,
                     reference_path: path,
                 },
-                usize::try_from(max_bytes)
-                    .map_err(|_| rpc_err(INVALID_PARAMS, "invalid max_bytes"))?,
             )
             .await
             .map_err(|error| match error {
@@ -9994,14 +9988,7 @@ impl RpcDispatcher {
                 .unwrap_or(256),
         )
         .map_err(|_| rpc_err(INVALID_PARAMS, "invalid max_events"))?;
-        let bytes = usize::try_from(
-            params
-                .get("max_bytes")
-                .and_then(Value::as_u64)
-                .unwrap_or(4 * 1024 * 1024),
-        )
-        .map_err(|_| rpc_err(INVALID_PARAMS, "invalid max_bytes"))?;
-        if events == 0 || events > 10_000 || bytes == 0 || bytes > 64 * 1024 * 1024 {
+        if events == 0 || events > 10_000 {
             return Err(rpc_err(INVALID_PARAMS, "invalid event page bounds"));
         }
         if !subscribe {
@@ -10012,7 +9999,7 @@ impl RpcDispatcher {
                 .map_err(|_| rpc_err(INVALID_PARAMS, "invalid through cursor"))?;
             let page = native
                 .query
-                .read_page(native.stream, after, through, events, bytes)
+                .read_page(native.stream, after, through, events)
                 .await
                 .map_err(|error| match error {
                     zeroclaw_kernel::session::SessionError::PermissionDenied(message) => {
@@ -10051,7 +10038,7 @@ impl RpcDispatcher {
         let wire_id = id.clone();
         zeroclaw_spawn::spawn!(async move {
             loop {
-                let update = tokio::select! {biased;_ = cancellation.cancelled()=>break,_=dispatcher.rpc.closed()=>break,result=subscription.next(events,bytes)=>result};
+                let update = tokio::select! {biased;_ = cancellation.cancelled()=>break,_=dispatcher.rpc.closed()=>break,result=subscription.next(events)=>result};
                 let (value, cursor) = match update {
                     Ok(zeroclaw_kernel::session::query::SubscriptionUpdate::Page(page)) => {
                         let cursor = page
@@ -29817,7 +29804,6 @@ mod tests {
                     EventCursor::beginning(query.stream),
                     None,
                     64,
-                    1024 * 1024,
                 )
                 .await
                 .expect("events");
@@ -32453,13 +32439,7 @@ mod tests {
             )
             .expect("canonical store");
             let page = store
-                .read_page(
-                    &stream,
-                    &EventCursor::beginning(stream.clone()),
-                    None,
-                    256,
-                    4 * 1024 * 1024,
-                )
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                 .expect("events");
             let observations: Vec<_> = page
                 .events
@@ -32664,7 +32644,6 @@ mod tests {
                         EventCursor::beginning(query.stream.clone()),
                         None,
                         256,
-                        4 * 1024 * 1024,
                     )
                     .await
                     .expect("page");
@@ -32761,7 +32740,6 @@ mod tests {
                         &EventCursor::beginning(source.stream_id(&family).await.expect("stream")),
                         None,
                         256,
-                        4 * 1024 * 1024,
                     )
                     .expect("summary events");
                 assert!(compact_events.events.iter().any(|event| matches!(
@@ -32841,7 +32819,6 @@ mod tests {
                         &EventCursor::beginning(descriptor.stream.clone()),
                         None,
                         256,
-                        4 * 1024 * 1024,
                     )
                     .expect("retained events");
                 assert!(
@@ -42878,7 +42855,6 @@ mod tests {
                         EventCursor::beginning(query.stream.clone()),
                         None,
                         128,
-                        1024 * 1024,
                     )
                     .await
                     .expect("events");
@@ -42919,7 +42895,6 @@ mod tests {
                             event_sequence: control.sequence,
                             reference_path: vec![0],
                         },
-                        64 * 1024,
                     )
                     .await
                     .expect("request payload");

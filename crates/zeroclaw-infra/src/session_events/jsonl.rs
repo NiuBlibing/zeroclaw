@@ -269,7 +269,7 @@ impl JsonlEventStore {
                 raw.extend(event);
                 raw.push(b'\n');
             }
-            if raw.len() > MAX_PAGE_BYTES {
+            if raw.len() > MAX_BATCH_BYTES {
                 return Err(AppendError::Corrupt("migration segment too large".into()));
             }
             let segment = self.write_file("segments", "jsonl", &raw)?;
@@ -369,17 +369,12 @@ impl JsonlEventStore {
     ) -> Result<Vec<u8>, AppendError> {
         let mut raw = Vec::new();
         filesystem::reader(&self.path(directory, &reference.id, extension)?)
-            .and_then(|file| file.take(MAX_PAGE_BYTES as u64 + 1).read_to_end(&mut raw))
+            .and_then(|mut file| file.read_to_end(&mut raw))
             .map_err(|error| {
                 AppendError::Corrupt(format!(
                     "committed {directory} file missing or unreadable: {error}"
                 ))
             })?;
-        if raw.len() > MAX_PAGE_BYTES {
-            return Err(AppendError::Corrupt(
-                "committed file exceeds size limit".into(),
-            ));
-        }
         Ok(raw)
     }
     fn write_file(
@@ -572,17 +567,10 @@ impl JsonlEventStore {
                 let body = if zeroclaw_api::session_events::payloads::content_leaf(&payload.codec) {
                     None
                 } else {
-                    let file = filesystem::reader(&self.payload_path(&payload.payload_id)?)
+                    let mut file = filesystem::reader(&self.payload_path(&payload.payload_id)?)
                         .map_err(storage)?;
                     let mut bytes = Vec::new();
-                    file.take(MAX_PAGE_BYTES as u64 + 1)
-                        .read_to_end(&mut bytes)
-                        .map_err(storage)?;
-                    if bytes.len() > MAX_PAGE_BYTES {
-                        return Err(AppendError::Corrupt(
-                            "structural payload exceeds size limit".into(),
-                        ));
-                    }
+                    file.read_to_end(&mut bytes).map_err(storage)?;
                     Some(bytes)
                 };
                 committed_payloads.push(zeroclaw_api::session_events::payloads::StoredPayload {
@@ -845,9 +833,8 @@ impl SessionEventStore for JsonlEventStore {
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
-        max_bytes: usize,
     ) -> Result<EventPage, ReadError> {
-        validate_page_limits(max_events, max_bytes)?;
+        validate_page_limits(max_events)?;
         let _guard = self.lock().map_err(as_read)?;
         let snapshot = self.snapshot().map_err(as_read)?;
         let rows = snapshot.rows.get(stream_id.as_str());
@@ -917,7 +904,6 @@ impl SessionEventStore for JsonlEventStore {
             through,
             materialized,
             max_events,
-            max_bytes,
             has_more,
         )
     }
@@ -1002,14 +988,7 @@ impl SessionEventStore for JsonlEventStore {
         zeroclaw_api::session_events::payloads::erasure_scope(&history, &payloads, targets)
     }
 
-    fn read_payload_bounded(
-        &self,
-        payload_id: &PayloadId,
-        max_bytes: usize,
-    ) -> Result<PayloadRead, ReadError> {
-        if max_bytes == 0 || max_bytes > MAX_PAGE_BYTES {
-            return Err(ReadError::TooLarge);
-        }
+    fn read_payload(&self, payload_id: &PayloadId) -> Result<PayloadRead, ReadError> {
         let _guard = self.lock().map_err(as_read)?;
         let snapshot = self.snapshot().map_err(as_read)?;
         let meta = snapshot
@@ -1027,22 +1006,17 @@ impl SessionEventStore for JsonlEventStore {
             PayloadDisposition::Redacted => return Ok(PayloadRead::Redacted),
             PayloadDisposition::Present => {}
         }
-        let file = filesystem::reader(&self.payload_path(payload_id).map_err(as_read)?).map_err(
-            |error| {
+        let mut file = filesystem::reader(&self.payload_path(payload_id).map_err(as_read)?)
+            .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     ReadError::PayloadMissing(payload_id.to_string())
                 } else {
                     ReadError::StorageUnavailable(error.to_string())
                 }
-            },
-        )?;
+            })?;
         let mut body = Vec::new();
-        file.take(max_bytes as u64 + 1)
-            .read_to_end(&mut body)
+        file.read_to_end(&mut body)
             .map_err(|error| ReadError::StorageUnavailable(error.to_string()))?;
-        if body.len() > max_bytes {
-            return Err(ReadError::TooLarge);
-        }
         let record = PayloadRecord {
             payload_id: payload_id.clone(),
             codec: meta.codec.clone(),

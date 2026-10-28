@@ -13,9 +13,7 @@ impl SessionCoordinator {
         let mut after = EventCursor::beginning(stream.clone());
         let mut events = Vec::new();
         loop {
-            let page = self
-                .store
-                .read_page(stream, &after, Some(&head), 256, 4 * 1024 * 1024)?;
+            let page = self.store.read_page(stream, &after, Some(&head), 256)?;
             if let Some(last) = page.events.last() {
                 after.sequence = last.sequence;
             }

@@ -3493,13 +3493,7 @@ mod tests {
             )
             .expect("family");
             let page = store
-                .read_page(
-                    &stream,
-                    &EventCursor::beginning(stream.clone()),
-                    None,
-                    256,
-                    4 * 1024 * 1024,
-                )
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                 .expect("events");
             let count = |kind| {
                 page.events

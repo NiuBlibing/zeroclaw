@@ -1071,7 +1071,6 @@ pub(crate) mod tests {
                     EventCursor::beginning(source.stream.clone()),
                     None,
                     100,
-                    4 * 1024 * 1024,
                 )
                 .await
                 .expect("events");
@@ -1087,7 +1086,6 @@ pub(crate) mod tests {
                         event_sequence: message.sequence,
                         reference_path: vec![0, 0],
                     },
-                    4096,
                 )
                 .await
                 .expect("leaf")
@@ -1188,7 +1186,6 @@ pub(crate) mod tests {
                     EventCursor::beginning(source.stream.clone()),
                     None,
                     256,
-                    4 * 1024 * 1024,
                 )
                 .await
                 .expect("events");
@@ -1381,7 +1378,6 @@ pub(crate) mod tests {
                     EventCursor::beginning(source.stream.clone()),
                     None,
                     256,
-                    4 * 1024 * 1024,
                 )
                 .await
                 .expect("before")
@@ -1393,13 +1389,7 @@ pub(crate) mod tests {
             ));
             assert!(
                 query
-                    .read_page(
-                        source.stream.clone(),
-                        head.clone(),
-                        None,
-                        256,
-                        4 * 1024 * 1024
-                    )
+                    .read_page(source.stream.clone(), head.clone(), None, 256)
                     .await
                     .expect("dropped body")
                     .events
@@ -1426,7 +1416,7 @@ pub(crate) mod tests {
                     PrincipalId::shared_operator(),
                     Arc::new(UnrestrictedFixture),
                 )
-                .read_page(source.stream.clone(), head, None, 256, 4 * 1024 * 1024)
+                .read_page(source.stream.clone(), head, None, 256)
                 .await
                 .expect("events");
             assert_eq!(page.events.len(), 2);

@@ -31007,13 +31007,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .expect("store");
             let stream = source.stream_id(&family).await.expect("stream");
             let events = store
-                .read_page(
-                    &stream,
-                    &EventCursor::beginning(stream.clone()),
-                    None,
-                    256,
-                    4 * 1024 * 1024,
-                )
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                 .expect("events")
                 .events;
             assert_eq!(
@@ -31295,13 +31289,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     .unwrap();
                     let stream = source.stream_id(&family).await.unwrap();
                     let events = store
-                        .read_page(
-                            &stream,
-                            &EventCursor::beginning(stream.clone()),
-                            None,
-                            256,
-                            4 * 1024 * 1024,
-                        )
+                        .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                         .unwrap()
                         .events;
                     let rejected = events

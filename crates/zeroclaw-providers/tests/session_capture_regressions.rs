@@ -181,7 +181,6 @@ impl Harness {
                 &EventCursor::beginning(self.stream.clone()),
                 None,
                 1000,
-                4 * 1024 * 1024,
             )
             .expect("events")
             .events
@@ -309,7 +308,6 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for RevokeAfterAccepte
                 &EventCursor::beginning(self.stream.clone()),
                 None,
                 1000,
-                4 * 1024 * 1024,
             )?
             .events;
         if matches!(
@@ -605,7 +603,6 @@ async fn audit_replay_disclosure(backend: &str) {
                 event_sequence: completed.sequence,
                 reference_path: vec![0, 0],
             },
-            1024 * 1024,
         )
         .await;
     assert!(matches!(read, Err(SessionError::PermissionDenied(_))));
@@ -967,7 +964,6 @@ async fn cancelled_provider_attempts_retain_durable_partial_and_never_retry() {
                     &EventCursor::beginning(h.stream.clone()),
                     None,
                     1000,
-                    4 * 1024 * 1024,
                 )
                 .expect("replay");
             assert_eq!(
@@ -1099,7 +1095,6 @@ async fn audit_request_reasoning_disclosure(backend: &str) {
                 event_sequence: prepared.sequence,
                 reference_path: vec![0, 0],
             },
-            1024 * 1024,
         )
         .await;
     assert!(matches!(read, Err(SessionError::PermissionDenied(_))));
@@ -1883,7 +1878,6 @@ async fn codex_done_only_and_mixed_parts_preserve_order_both_backends() {
                         &EventCursor::beginning(h.stream.clone()),
                         None,
                         1000,
-                        4 * 1024 * 1024,
                     )
                     .expect("reopened capture history");
                 assert_eq!(replay.events.len(), events.len());

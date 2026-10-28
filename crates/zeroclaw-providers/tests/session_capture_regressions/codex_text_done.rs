@@ -298,7 +298,6 @@ async fn codex_crlf_frames_are_durable_before_connection_close_both_backends() {
                         &EventCursor::beginning(h.stream.clone()),
                         None,
                         1000,
-                        4 * 1024 * 1024,
                     )
                     .expect("reopened events");
                 assert_eq!(replay.events, events);
@@ -603,7 +602,6 @@ async fn audit(backend: &str, mode: &'static str, ending: &str, streaming: bool)
             &EventCursor::beginning(h.stream.clone()),
             None,
             1000,
-            4 * 1024 * 1024,
         )
         .expect("reopened events");
     assert_eq!(replay.events, events);

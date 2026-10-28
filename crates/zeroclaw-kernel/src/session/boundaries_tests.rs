@@ -469,15 +469,9 @@ async fn read_authorization_is_current_and_payload_paths_are_bounded() {
             event_sequence: 2,
             reference_path: vec![0],
         };
-        assert!(matches!(
-            query
-                .read_payload(stream.clone(), selector.clone(), 3)
-                .await,
-            Err(SessionError::Read(ReadError::TooLarge))
-        ));
         assert_eq!(
             query
-                .read_payload(stream.clone(), selector.clone(), 128)
+                .read_payload(stream.clone(), selector.clone())
                 .await
                 .expect("read"),
             PayloadRead::Present(title)
@@ -489,26 +483,19 @@ async fn read_authorization_is_current_and_payload_paths_are_bounded() {
                     PayloadSelector {
                         event_sequence: 2,
                         reference_path: vec![1]
-                    },
-                    128
+                    }
                 )
                 .await,
             Err(SessionError::Read(ReadError::AccessDenied(_)))
         ));
         policy.allowed.store(false, Ordering::SeqCst);
         assert!(matches!(
-            query.read_payload(stream.clone(), selector, 128).await,
+            query.read_payload(stream.clone(), selector).await,
             Err(SessionError::PermissionDenied(_))
         ));
         assert!(matches!(
             query
-                .read_page(
-                    stream.clone(),
-                    EventCursor::beginning(stream),
-                    None,
-                    10,
-                    4096
-                )
+                .read_page(stream.clone(), EventCursor::beginning(stream), None, 10)
                 .await,
             Err(SessionError::PermissionDenied(_))
         ));
@@ -591,8 +578,7 @@ async fn shared_leaf_erasure_requires_every_scope_and_freezes_indirect_reads() {
                     PayloadSelector {
                         event_sequence: 2,
                         reference_path: vec![0, 0]
-                    },
-                    4096
+                    }
                 )
                 .await
                 .expect("pending"),
@@ -630,13 +616,11 @@ async fn subscription_uses_history_and_requires_acknowledgement() {
         .append_async(batch(&*store, &stream, vec![root(&stream)], vec![]))
         .await
         .expect("publish after subscribe");
-    let SubscriptionUpdate::Page(first) = subscription.next(10, 4096).await.expect("first") else {
+    let SubscriptionUpdate::Page(first) = subscription.next(10).await.expect("first") else {
         panic!("expected page")
     };
-    let SubscriptionUpdate::Page(repeated) = subscription
-        .next(10, 4096)
-        .await
-        .expect("repeat before ack")
+    let SubscriptionUpdate::Page(repeated) =
+        subscription.next(10).await.expect("repeat before ack")
     else {
         panic!("expected page")
     };
@@ -652,7 +636,7 @@ async fn subscription_uses_history_and_requires_acknowledgement() {
     subscription.acknowledge(first.through).expect("ack");
     policy.allowed.store(false, Ordering::SeqCst);
     assert!(matches!(
-        subscription.next(10, 4096).await,
+        subscription.next(10).await,
         Err(SessionError::PermissionDenied(_))
     ));
 }
@@ -709,8 +693,7 @@ async fn ordinary_history_permission_does_not_disclose_reasoning_leaves() {
                     PayloadSelector {
                         event_sequence: 2,
                         reference_path: vec![0]
-                    },
-                    4096
+                    }
                 )
                 .await
                 .is_ok()
@@ -722,8 +705,7 @@ async fn ordinary_history_permission_does_not_disclose_reasoning_leaves() {
                     PayloadSelector {
                         event_sequence: 2,
                         reference_path: vec![0, 0]
-                    },
-                    4096
+                    }
                 )
                 .await,
             Err(SessionError::PermissionDenied(_))
@@ -749,7 +731,6 @@ impl SessionEventStore for FutureResponseStore {
         after: &EventCursor,
         through: Option<&EventCursor>,
         _: usize,
-        _: usize,
     ) -> Result<EventPage, ReadError> {
         Ok(EventPage {
             stream_id: stream.clone(),
@@ -773,14 +754,11 @@ impl SessionEventStore for FutureResponseStore {
     ) -> Result<Option<AppendReceipt>, ReadError> {
         Ok(None)
     }
-    fn read_payload_bounded(&self, id: &PayloadId, limit: usize) -> Result<PayloadRead, ReadError> {
+    fn read_payload(&self, id: &PayloadId) -> Result<PayloadRead, ReadError> {
         let record = [&self.response, &self.text]
             .into_iter()
             .find(|record| &record.payload_id == id)
             .ok_or_else(|| ReadError::PayloadMissing(id.to_string()))?;
-        if record.body.len() > limit {
-            return Err(ReadError::TooLarge);
-        }
         Ok(PayloadRead::Present(record.clone()))
     }
     fn erasure_scope(
@@ -834,7 +812,7 @@ async fn future_response_blocks_do_not_hide_later_text_or_grant_payload_access()
         reference_path: path,
     };
     let PayloadRead::Present(text) = query
-        .read_payload(stream.clone(), read(vec![0, 1]), 4096)
+        .read_payload(stream.clone(), read(vec![0, 1]))
         .await
         .expect("known block after unknown")
     else {
@@ -842,13 +820,11 @@ async fn future_response_blocks_do_not_hide_later_text_or_grant_payload_access()
     };
     assert_eq!(text.body, b"after");
     assert!(matches!(
-        query
-            .read_payload(stream.clone(), read(vec![0, 0]), 4096)
-            .await,
+        query.read_payload(stream.clone(), read(vec![0, 0])).await,
         Err(SessionError::Read(ReadError::AccessDenied(_)))
     ));
     assert!(matches!(
-        query.read_payload(stream, read(vec![0]), 4096).await,
+        query.read_payload(stream, read(vec![0])).await,
         Err(SessionError::PermissionDenied(_))
     ));
 }

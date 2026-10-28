@@ -10865,7 +10865,6 @@ data: [DONE]\n\n";
                     EventCursor::beginning(native.stream.clone()),
                     None,
                     256,
-                    4 * 1024 * 1024,
                 )
                 .await
                 .expect("events");

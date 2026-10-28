@@ -455,7 +455,6 @@ impl PreparedToolPort for PreparedTool {
                             },
                             Some(&receipt.last),
                             1,
-                            1024 * 1024,
                         )?;
                         Some(
                             page.events

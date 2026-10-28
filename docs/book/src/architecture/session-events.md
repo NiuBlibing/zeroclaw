@@ -413,8 +413,10 @@ and codec. Manual changes outside the program are not a tamper-detection surface
 
 Both backends apply the shared 64 MiB batch budget to payloads and the final
 committed event encoding, including assigned sequence fields and JSONL
-framing. An oversized batch publishes neither history nor a receipt. Successful
-append cannot create an event larger than the bounded reader can consume.
+framing. An oversized batch publishes neither history nor a receipt.
+Reads have no byte budget or total-history count cap. Event pages retain their
+per-request limit of 1 through 10,000 events, and message/search pages retain
+their own per-page limits. Payload reads return the complete stored body.
 
 JSONL publishes immutable batch segments and commits through an atomic root
 manifest. Files and directories are synchronized before returning a receipt.

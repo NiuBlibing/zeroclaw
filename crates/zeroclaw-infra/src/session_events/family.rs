@@ -180,13 +180,7 @@ impl FamilyEventStore {
             }
             let mut page = self
                 .store
-                .read_page(
-                    &stream,
-                    &EventCursor::beginning(stream.clone()),
-                    None,
-                    1,
-                    MAX_PAGE_BYTES,
-                )
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 1)
                 .map_err(|error| AppendError::Corrupt(error.to_string()))?;
             let origin = page
                 .events
@@ -255,9 +249,8 @@ impl SessionEventStore for FamilyEventStore {
         after: &EventCursor,
         through: Option<&EventCursor>,
         events: usize,
-        bytes: usize,
     ) -> Result<EventPage, ReadError> {
-        self.store.read_page(stream, after, through, events, bytes)
+        self.store.read_page(stream, after, through, events)
     }
     fn head(&self, stream: &SessionStreamId) -> Result<EventCursor, ReadError> {
         self.store.head(stream)
@@ -269,8 +262,8 @@ impl SessionEventStore for FamilyEventStore {
     ) -> Result<Option<AppendReceipt>, ReadError> {
         self.store.lookup_receipt(stream, key)
     }
-    fn read_payload_bounded(&self, id: &PayloadId, bytes: usize) -> Result<PayloadRead, ReadError> {
-        self.store.read_payload_bounded(id, bytes)
+    fn read_payload(&self, id: &PayloadId) -> Result<PayloadRead, ReadError> {
+        self.store.read_payload(id)
     }
     fn erasure_scope(
         &self,

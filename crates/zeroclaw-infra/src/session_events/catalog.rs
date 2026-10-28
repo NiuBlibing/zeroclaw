@@ -84,10 +84,10 @@ impl SessionQuery<'_> {
         let mut reducer = SessionReducer::new(stream.clone(), include_context);
         let mut after = EventCursor::beginning(stream.clone());
         loop {
-            let page =
-                self.catalog
-                    .store
-                    .read_page(stream, &after, Some(&head), 256, MAX_PAGE_BYTES)?;
+            let page = self
+                .catalog
+                .store
+                .read_page(stream, &after, Some(&head), 256)?;
             for event in &page.events {
                 let seed_count = if let EventData::ContextProjectionCreated {
                     reason_key,

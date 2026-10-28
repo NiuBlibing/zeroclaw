@@ -1859,7 +1859,6 @@ mod tests {
                 &zeroclaw_api::session_events::EventCursor::beginning(stream.clone()),
                 None,
                 256,
-                4 * 1024 * 1024,
             )
             .expect("events");
             assert!(page.events.iter().any(|event| event.body.kind()
@@ -1954,7 +1953,6 @@ mod tests {
                 &zeroclaw_api::session_events::EventCursor::beginning(stream.clone()),
                 None,
                 256,
-                4 * 1024 * 1024,
             )
             .expect("events");
             assert_eq!(

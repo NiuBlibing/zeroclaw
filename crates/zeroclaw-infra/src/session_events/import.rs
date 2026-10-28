@@ -75,7 +75,6 @@ pub(super) fn import_snapshot(
                 &EventCursor::beginning(command.stream.clone()),
                 Some(&receipt.last),
                 32,
-                MAX_PAGE_BYTES,
             )
             .map_err(corrupt)?;
         let evidence = page

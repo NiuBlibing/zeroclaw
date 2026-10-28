@@ -83,7 +83,7 @@ fn import_existing(
     let mut closed = false;
     loop {
         let page = store
-            .read_page(stream, &after, Some(&head), 256, MAX_PAGE_BYTES)
+            .read_page(stream, &after, Some(&head), 256)
             .map_err(storage)?;
         for event in &page.events {
             match &event.body.data {

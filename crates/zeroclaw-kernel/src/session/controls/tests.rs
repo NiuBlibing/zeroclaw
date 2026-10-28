@@ -221,7 +221,6 @@ async fn execution_metadata_serializes_with_commands_and_rechecks_live_authority
                 &EventCursor::beginning(session.stream.clone()),
                 None,
                 128,
-                1024 * 1024,
             )
             .expect("events");
         let mut counts = Vec::new();
@@ -374,8 +373,7 @@ async fn complete_context_restores_tool_pairing_and_reasoning_without_disclosure
                     PayloadSelector {
                         event_sequence: projection.sequence,
                         reference_path: vec![0, 0],
-                    },
-                    1024 * 1024
+                    }
                 )
                 .await
                 .is_err(),
@@ -991,7 +989,6 @@ async fn late_child_terminal_reconciles_unknown_without_second_outcome_or_replay
                 EventCursor::beginning(session.stream.clone()),
                 None,
                 100,
-                4 * 1024 * 1024,
             )
             .await
             .expect("page");
@@ -1144,7 +1141,6 @@ async fn system_actor_is_explicitly_admitted_and_never_becomes_a_principal() {
                 EventCursor::beginning(session.stream.clone()),
                 None,
                 256,
-                4 * 1024 * 1024,
             )
             .await
             .expect("history");
@@ -1255,7 +1251,6 @@ async fn context_only_input_preserves_identity_without_engine_or_model_output() 
                 EventCursor::beginning(session.stream.clone()),
                 None,
                 256,
-                4 * 1024 * 1024,
             )
             .await
             .expect("events");
@@ -1360,7 +1355,6 @@ async fn child_session_close_cannot_be_reported_as_execution_completion() {
                 &EventCursor::beginning(session.stream.clone()),
                 None,
                 100,
-                4 * 1024 * 1024,
             )
             .expect("parent history");
         let request = page
@@ -1384,13 +1378,7 @@ async fn child_session_close_cannot_be_reported_as_execution_completion() {
         let child_page = session
             .owner
             .store
-            .read_page(
-                &child,
-                &EventCursor::beginning(child.clone()),
-                None,
-                100,
-                4 * 1024 * 1024,
-            )
+            .read_page(&child, &EventCursor::beginning(child.clone()), None, 100)
             .expect("child history");
         close.branch_id = child_page.events[0].branch_id.clone();
         let closed = session
@@ -1468,7 +1456,6 @@ async fn child_completion_and_actual_consumption_are_separate_and_retry_safe() {
                 EventCursor::beginning(session.stream.clone()),
                 None,
                 100,
-                4 * 1024 * 1024,
             )
             .await
             .expect("page");
@@ -1513,7 +1500,6 @@ async fn delivery_admission_is_durable_and_uncertain_network_errors_remain_unkno
                             EventCursor::beginning(session.stream.clone()),
                             None,
                             100,
-                            4 * 1024 * 1024,
                         )
                         .await?;
                     assert_eq!(
@@ -1605,7 +1591,6 @@ async fn rejected_approval_reply_is_audit_only_and_survives_both_backends() {
                 EventCursor::beginning(session.stream.clone()),
                 None,
                 100,
-                4 * 1024 * 1024,
             )
             .await
             .expect("page");
@@ -1683,7 +1668,6 @@ async fn active_engine_context_replacement_uses_its_owned_lane_without_deadlock(
                 EventCursor::beginning(session.stream.clone()),
                 None,
                 256,
-                4 * 1024 * 1024,
             )
             .await
             .expect("events");
@@ -1750,10 +1734,8 @@ impl SessionEventStore for ContextWriteFailureStore {
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
-        max_bytes: usize,
     ) -> Result<EventPage, ReadError> {
-        self.inner
-            .read_page(stream, after, through, max_events, max_bytes)
+        self.inner.read_page(stream, after, through, max_events)
     }
     fn head(&self, stream: &SessionStreamId) -> Result<EventCursor, ReadError> {
         self.inner.head(stream)
@@ -1765,12 +1747,8 @@ impl SessionEventStore for ContextWriteFailureStore {
     ) -> Result<Option<AppendReceipt>, ReadError> {
         self.inner.lookup_receipt(stream, key)
     }
-    fn read_payload_bounded(
-        &self,
-        id: &PayloadId,
-        max_bytes: usize,
-    ) -> Result<PayloadRead, ReadError> {
-        self.inner.read_payload_bounded(id, max_bytes)
+    fn read_payload(&self, id: &PayloadId) -> Result<PayloadRead, ReadError> {
+        self.inner.read_payload(id)
     }
     fn erasure_scope(
         &self,
@@ -2600,7 +2578,6 @@ async fn elicitation_records_input_and_one_resolution_without_taking_foreground_
                 EventCursor::beginning(port.stream.clone()),
                 None,
                 256,
-                4 * 1024 * 1024,
             )
             .await
             .expect("history");
@@ -2698,7 +2675,6 @@ async fn recovery_settles_pending_elicitation_once_and_rejects_late_answer() {
                 EventCursor::beginning(port.stream.clone()),
                 None,
                 256,
-                4 * 1024 * 1024,
             )
             .await
             .expect("events");
@@ -2795,7 +2771,6 @@ async fn unknown_delivery_stops_same_turn_provider_and_child_admission() {
                 EventCursor::beginning(session.stream.clone()),
                 None,
                 256,
-                4 * 1024 * 1024,
             )
             .await
             .expect("history");
@@ -2864,7 +2839,6 @@ async fn ordered_opaque_input_round_trips_and_retry_does_not_execute() {
                 EventCursor::beginning(session.stream.clone()),
                 None,
                 256,
-                4 * 1024 * 1024,
             )
             .await
             .expect("page");
@@ -2881,7 +2855,6 @@ async fn ordered_opaque_input_round_trips_and_retry_does_not_execute() {
                     event_sequence: event.sequence,
                     reference_path: vec![0],
                 },
-                4 * 1024 * 1024,
             )
             .await
             .expect("content")
@@ -2901,7 +2874,6 @@ async fn ordered_opaque_input_round_trips_and_retry_does_not_execute() {
                     event_sequence: event.sequence,
                     reference_path: vec![0, 1],
                 },
-                4 * 1024 * 1024,
             )
             .await
             .expect("opaque")
@@ -2975,7 +2947,6 @@ async fn file_owner_identity_and_bytes_survive_idle_registration_and_retry() {
                 EventCursor::beginning(session.stream.clone()),
                 None,
                 256,
-                4 * 1024 * 1024,
             )
             .await
             .expect("page");
@@ -2992,7 +2963,6 @@ async fn file_owner_identity_and_bytes_survive_idle_registration_and_retry() {
                     event_sequence: registered.sequence,
                     reference_path: vec![0, 1],
                 },
-                1024,
             )
             .await
             .expect("bytes")
@@ -3013,7 +2983,6 @@ async fn file_owner_identity_and_bytes_survive_idle_registration_and_retry() {
                 EventCursor::beginning(session.stream.clone()),
                 None,
                 256,
-                4 * 1024 * 1024,
             )
             .await
             .expect("page");
@@ -3083,7 +3052,6 @@ async fn cooperative_turn_stop_retains_uncertain_effects_without_claiming_remote
                     EventCursor::beginning(session.stream.clone()),
                     None,
                     256,
-                    4 * 1024 * 1024,
                 )
                 .await
                 .expect("page");
@@ -3211,7 +3179,6 @@ async fn native_search_uses_visible_messages_and_current_authority_and_erasure()
                 &EventCursor::beginning(session.stream.clone()),
                 None,
                 100,
-                1024 * 1024,
             )
             .expect("events");
         let event = page
@@ -4386,10 +4353,8 @@ async fn child_initialization_failure_settles_parent_without_a_child_handle() {
             after: &EventCursor,
             through: Option<&EventCursor>,
             max_events: usize,
-            max_bytes: usize,
         ) -> Result<EventPage, ReadError> {
-            self.inner
-                .read_page(stream, after, through, max_events, max_bytes)
+            self.inner.read_page(stream, after, through, max_events)
         }
 
         fn head(&self, stream: &SessionStreamId) -> Result<EventCursor, ReadError> {
@@ -4404,12 +4369,8 @@ async fn child_initialization_failure_settles_parent_without_a_child_handle() {
             self.inner.lookup_receipt(stream, key)
         }
 
-        fn read_payload_bounded(
-            &self,
-            id: &PayloadId,
-            max_bytes: usize,
-        ) -> Result<PayloadRead, ReadError> {
-            self.inner.read_payload_bounded(id, max_bytes)
+        fn read_payload(&self, id: &PayloadId) -> Result<PayloadRead, ReadError> {
+            self.inner.read_payload(id)
         }
 
         fn erasure_scope(

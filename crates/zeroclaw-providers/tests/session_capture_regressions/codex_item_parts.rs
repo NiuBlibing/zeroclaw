@@ -148,7 +148,6 @@ fn assert_reopened(
             &EventCursor::beginning(h.stream.clone()),
             None,
             1000,
-            4 * 1024 * 1024,
         )
         .unwrap();
     assert_eq!(page.events, events);

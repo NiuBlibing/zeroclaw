@@ -19634,13 +19634,7 @@ model_provider = "custom.only"
                 )
                 .unwrap();
                 let events = store
-                    .read_page(
-                        &stream,
-                        &EventCursor::beginning(stream.clone()),
-                        None,
-                        1024,
-                        16 * 1024 * 1024,
-                    )
+                    .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 1024)
                     .unwrap()
                     .events;
                 let frozen = events
@@ -19796,13 +19790,7 @@ model_provider = "custom.only"
             )
             .unwrap();
             let events = store
-                .read_page(
-                    &stream,
-                    &EventCursor::beginning(stream.clone()),
-                    None,
-                    256,
-                    4 * 1024 * 1024,
-                )
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                 .unwrap()
                 .events;
             assert_eq!(
@@ -20697,13 +20685,7 @@ model_provider = "custom.only"
                 )
                 .unwrap();
                 let events = store
-                    .read_page(
-                        &stream,
-                        &EventCursor::beginning(stream.clone()),
-                        None,
-                        512,
-                        8 * 1024 * 1024,
-                    )
+                    .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 512)
                     .unwrap()
                     .events;
                 assert_eq!(

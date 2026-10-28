@@ -618,13 +618,7 @@ async fn drained_family_migration_preserves_derived_streams_and_receipts_in_both
         let stream = NativeSessionHub::stream_id("child-fixture").expect("root");
         let source = FamilyEventStore::open(directory.path(), "child-fixture").expect("source");
         let parent = source
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                256,
-                4 * 1024 * 1024,
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
             .expect("parent");
         let terminal = parent
             .events
@@ -643,7 +637,6 @@ async fn drained_family_migration_preserves_derived_streams_and_receipts_in_both
                 &EventCursor::beginning(terminal.stream_id.clone()),
                 None,
                 256,
-                4 * 1024 * 1024,
             )
             .expect("child");
         let root_receipt = source
@@ -661,13 +654,7 @@ async fn drained_family_migration_preserves_derived_streams_and_receipts_in_both
         migrate_installation(directory.path(), target).expect("migration");
         let migrated = FamilyEventStore::open(directory.path(), "child-fixture").expect("target");
         let after = migrated
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                256,
-                4 * 1024 * 1024,
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
             .expect("parent after");
         let child_after = migrated
             .read_page(
@@ -675,7 +662,6 @@ async fn drained_family_migration_preserves_derived_streams_and_receipts_in_both
                 &EventCursor::beginning(terminal.stream_id.clone()),
                 None,
                 256,
-                4 * 1024 * 1024,
             )
             .expect("child after");
         assert_eq!(parent.raw_events, after.raw_events);
@@ -774,13 +760,7 @@ async fn family_startup_resumes_root_and_derived_erasure_without_reexecuting_wor
             Arc::new(FamilyEventStore::open(directory.path(), family).expect("family store"));
         let root = NativeSessionHub::stream_id(family).expect("root stream");
         let before = store
-            .read_page(
-                &root,
-                &EventCursor::beginning(root.clone()),
-                None,
-                256,
-                4 * 1024 * 1024,
-            )
+            .read_page(&root, &EventCursor::beginning(root.clone()), None, 256)
             .expect("parent history");
         let child = before
             .events
@@ -923,13 +903,7 @@ async fn family_startup_resumes_root_and_derived_erasure_without_reexecuting_wor
             }
         }
         let after = store
-            .read_page(
-                &root,
-                &EventCursor::beginning(root.clone()),
-                None,
-                256,
-                4 * 1024 * 1024,
-            )
+            .read_page(&root, &EventCursor::beginning(root.clone()), None, 256)
             .expect("after cleanup");
         assert_eq!(
             before
@@ -1057,7 +1031,6 @@ async fn host_seed_preserves_canonical_context_and_stable_public_ids_without_rea
                 EventCursor::beginning(native.stream.clone()),
                 None,
                 20,
-                4 * 1024 * 1024,
             )
             .await
             .expect("events");
@@ -1074,8 +1047,7 @@ async fn host_seed_preserves_canonical_context_and_stable_public_ids_without_rea
                     PayloadSelector {
                         event_sequence: context.sequence,
                         reference_path: vec![0, 0]
-                    },
-                    1024 * 1024
+                    }
                 )
                 .await
                 .is_err()
@@ -1119,7 +1091,6 @@ async fn host_seed_preserves_canonical_context_and_stable_public_ids_without_rea
                 EventCursor::beginning(native.stream.clone()),
                 None,
                 100,
-                4 * 1024 * 1024,
             )
             .await
             .expect("events");

@@ -87,13 +87,10 @@ fn has_prior_reply(scope: &ToolScope, requested: &SessionEvent) -> anyhow::Resul
         sequence: requested.sequence,
     };
     while after.sequence < through.sequence {
-        let page = scope.owner.store.read_page(
-            &scope.stream,
-            &after,
-            Some(&through),
-            256,
-            64 * 1024 * 1024,
-        )?;
+        let page = scope
+            .owner
+            .store
+            .read_page(&scope.stream, &after, Some(&through), 256)?;
         let last = page
             .events
             .last()

@@ -93,8 +93,8 @@ opaque_id!(EventId);
 opaque_id!(MessageId);
 opaque_id!(PayloadId);
 
-/// Maximum native append-batch and event-page byte budget.
-pub const MAX_PAGE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum native append-batch byte budget. Reads have no byte budget.
+pub const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 /// A stream-local durable cursor. Sequence zero denotes the empty prefix.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -706,7 +706,7 @@ impl AppendRequest {
                 .checked_add(payload.body.len())
                 .ok_or_else(|| ContractError::InvalidRequest("batch size overflow".to_owned()))?;
         }
-        if bytes > MAX_PAGE_BYTES {
+        if bytes > MAX_BATCH_BYTES {
             return Err(ContractError::InvalidRequest(
                 "batch byte limit exceeded".to_owned(),
             ));
@@ -899,32 +899,8 @@ pub trait SessionEventStore: Send + Sync {
                 stream_id: stream.clone(),
                 sequence: through.sequence.saturating_sub(256),
             };
-            let page = self.read_page(stream, &after, Some(&through), 256, MAX_PAGE_BYTES)?;
-            if page.has_more {
-                // A byte-bounded page may not reach the requested upper bound.
-                // Continue forward inside this window before searching backward.
-                let mut cursor = after.clone();
-                let mut latest = None;
-                loop {
-                    let page =
-                        self.read_page(stream, &cursor, Some(&through), 256, MAX_PAGE_BYTES)?;
-                    for event in page.events {
-                        cursor.sequence = event.sequence;
-                        if event.branch_id.as_ref() == Some(branch)
-                            && turn.is_none_or(|turn| event.turn_id.as_ref() == Some(turn))
-                            && event.body.kind() == *kind
-                        {
-                            latest = Some(event);
-                        }
-                    }
-                    if !page.has_more {
-                        break;
-                    }
-                }
-                if latest.is_some() {
-                    return Ok(latest);
-                }
-            } else if let Some(event) = page.events.into_iter().rev().find(|event| {
+            let page = self.read_page(stream, &after, Some(&through), 256)?;
+            if let Some(event) = page.events.into_iter().rev().find(|event| {
                 event.branch_id.as_ref() == Some(branch)
                     && turn.is_none_or(|turn| event.turn_id.as_ref() == Some(turn))
                     && event.body.kind() == *kind
@@ -941,7 +917,6 @@ pub trait SessionEventStore: Send + Sync {
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
-        max_bytes: usize,
     ) -> Result<EventPage, ReadError>;
     fn head(&self, stream_id: &SessionStreamId) -> Result<EventCursor, ReadError>;
     fn lookup_receipt(
@@ -949,14 +924,7 @@ pub trait SessionEventStore: Send + Sync {
         stream: &SessionStreamId,
         key: &str,
     ) -> Result<Option<AppendReceipt>, ReadError>;
-    fn read_payload(&self, payload_id: &PayloadId) -> Result<PayloadRead, ReadError> {
-        self.read_payload_bounded(payload_id, MAX_PAGE_BYTES)
-    }
-    fn read_payload_bounded(
-        &self,
-        payload_id: &PayloadId,
-        max_bytes: usize,
-    ) -> Result<PayloadRead, ReadError>;
+    fn read_payload(&self, payload_id: &PayloadId) -> Result<PayloadRead, ReadError>;
     /// Freeze all scopes reaching the leaves under the backend snapshot lock.
     fn erasure_scope(
         &self,

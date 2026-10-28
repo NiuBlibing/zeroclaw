@@ -707,7 +707,7 @@ async fn native_codex_buffered_api_checkpoints_wire_reasoning_and_never_retries_
                                     // earlier deltas are durable, while chat() is pending.
                                     tokio::time::timeout(std::time::Duration::from_secs(10), async {
                                         loop {
-                                            let page=store.read_page(&stream_id,&EventCursor::beginning(stream_id.clone()),None,100,4*1024*1024).expect("history");
+                                            let page=store.read_page(&stream_id,&EventCursor::beginning(stream_id.clone()),None,100).expect("history");
                                             if page.events.iter().filter(|e|e.body.kind()==EventKind::ProviderResponseProgressObserved).count() >= 3 { break; }
                                             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                                         }
@@ -1085,7 +1085,6 @@ impl Harness {
                 &EventCursor::beginning(self.stream.clone()),
                 None,
                 1000,
-                4 * 1024 * 1024,
             )
             .expect("events")
             .events
@@ -1147,7 +1146,6 @@ impl ModelProvider for Leaf {
             &EventCursor::beginning(self.stream.clone()),
             None,
             1000,
-            4 * 1024 * 1024,
         )?;
         assert_eq!(
             events
@@ -2351,7 +2349,7 @@ async fn native_stream_does_not_dispatch_before_durable_admission_or_when_unpoll
         let app = axum::Router::new().route("/chat/completions", axum::routing::post(move || {
             let calls=seen.clone(); let store=store.clone(); let stream=stream.clone();
             async move {
-                let events=store.read_page(&stream,&EventCursor::beginning(stream.clone()),None,100,4*1024*1024).expect("history");
+                let events=store.read_page(&stream,&EventCursor::beginning(stream.clone()),None,100).expect("history");
                 assert!(events.events.iter().any(|e| e.body.kind()==EventKind::ProviderAttemptStarted), "request must follow durable start");
                 calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
                 "data: {\"choices\":[{\"delta\":{\"content\":\"fixture\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"

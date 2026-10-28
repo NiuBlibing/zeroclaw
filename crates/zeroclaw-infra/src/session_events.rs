@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_api::session_events::{
     AppendError, AppendReceipt, AppendRequest, ContractError, Digest, EventCursor, EventId,
-    EventPage, MAX_PAGE_BYTES, PayloadId, PayloadRead, PayloadRecord, ReadError, SessionEvent,
+    EventPage, MAX_BATCH_BYTES, PayloadId, PayloadRead, PayloadRecord, ReadError, SessionEvent,
     SessionEventStore, SessionStreamId,
 };
 
@@ -17,12 +17,12 @@ const MAX_PAGE_EVENTS: usize = 10_000;
 
 fn committed_event_bytes(used: usize, event_len: usize) -> Result<usize, AppendError> {
     // Include JSONL framing in both backends so a successful append always
-    // fits the largest supported event page and immutable segment reader.
+    // respects the same committed batch budget.
     let next = used
         .checked_add(event_len)
         .and_then(|bytes| bytes.checked_add(1))
         .ok_or_else(|| ContractError::InvalidRequest("committed batch size overflow".into()))?;
-    if next > MAX_PAGE_BYTES {
+    if next > MAX_BATCH_BYTES {
         return Err(
             ContractError::InvalidRequest("committed batch byte limit exceeded".into()).into(),
         );
@@ -33,7 +33,7 @@ fn committed_event_bytes(used: usize, event_len: usize) -> Result<usize, AppendE
 pub mod catalog;
 pub mod search;
 
-type SqlitePayloadRow = (String, String, Option<Vec<u8>>, Option<u64>);
+type SqlitePayloadRow = (String, String, Option<Vec<u8>>);
 
 fn content_leaf_sql_list() -> String {
     zeroclaw_api::session_events::payloads::content_leaf_codecs()
@@ -50,12 +50,8 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-fn validate_page_limits(max_events: usize, max_bytes: usize) -> Result<(), ReadError> {
-    if max_events == 0
-        || max_events > MAX_PAGE_EVENTS
-        || max_bytes == 0
-        || max_bytes > MAX_PAGE_BYTES
-    {
+fn validate_page_limits(max_events: usize) -> Result<(), ReadError> {
+    if max_events == 0 || max_events > MAX_PAGE_EVENTS {
         return Err(ReadError::TooLarge);
     }
     Ok(())
@@ -108,7 +104,6 @@ fn event_page(
     through: EventCursor,
     rows: Vec<(Vec<u8>, SessionEvent)>,
     max_events: usize,
-    max_bytes: usize,
     has_more: bool,
 ) -> Result<EventPage, ReadError> {
     let mut expected_sequence = after
@@ -135,23 +130,7 @@ fn event_page(
     }
     let mut events = Vec::with_capacity(rows.len().min(max_events));
     let mut raw_events = Vec::with_capacity(rows.len().min(max_events));
-    let mut used = 0usize;
     for (raw, event) in rows.into_iter().take(max_events) {
-        let size = raw.len();
-        if events.is_empty() && size > max_bytes {
-            return Err(ReadError::TooLarge);
-        }
-        if used.saturating_add(size) > max_bytes {
-            return Ok(EventPage {
-                stream_id,
-                after,
-                through,
-                events,
-                raw_events,
-                has_more: true,
-            });
-        }
-        used += size;
         raw_events.push(raw);
         events.push(event);
     }
@@ -440,7 +419,6 @@ impl SessionEventStore for SqliteEventStore {
                 sequence,
             }),
             1,
-            MAX_PAGE_BYTES,
         )?;
         let event = page
             .events
@@ -644,9 +622,8 @@ impl SessionEventStore for SqliteEventStore {
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
-        max_bytes: usize,
     ) -> Result<EventPage, ReadError> {
-        validate_page_limits(max_events, max_bytes)?;
+        validate_page_limits(max_events)?;
         if &after.stream_id != stream_id {
             return Err(ReadError::Gap(
                 "after cursor belongs to another stream".to_owned(),
@@ -667,7 +644,7 @@ impl SessionEventStore for SqliteEventStore {
         }
         let mut statement = conn
             .prepare(
-                "SELECT event_json,event_id,sequence,length(event_json) FROM session_events
+                "SELECT event_json,event_id,sequence FROM session_events
              WHERE stream_id=?1 AND sequence>?2 AND sequence<=?3 ORDER BY sequence LIMIT ?4",
             )
             .map_err(read_error)?;
@@ -680,14 +657,9 @@ impl SessionEventStore for SqliteEventStore {
             ])
             .map_err(read_error)?;
         let mut rows = Vec::new();
-        let mut used = 0usize;
         let mut has_more = false;
         while let Some(row) = mapped.next().map_err(read_error)? {
-            let size: usize = row.get(3).map_err(read_error)?;
-            if rows.is_empty() && size > max_bytes {
-                return Err(ReadError::TooLarge);
-            }
-            if rows.len() == max_events || size > max_bytes - used {
+            if rows.len() == max_events {
                 has_more = true;
                 break;
             }
@@ -700,7 +672,6 @@ impl SessionEventStore for SqliteEventStore {
                     "event index disagrees with envelope".into(),
                 ));
             }
-            used += size;
             rows.push((raw, event));
         }
         event_page(
@@ -712,7 +683,6 @@ impl SessionEventStore for SqliteEventStore {
             },
             rows,
             max_events,
-            max_bytes,
             has_more,
         )
     }
@@ -781,25 +751,18 @@ impl SessionEventStore for SqliteEventStore {
         zeroclaw_api::session_events::payloads::erasure_scope(&history, &payloads, targets)
     }
 
-    fn read_payload_bounded(
-        &self,
-        payload_id: &PayloadId,
-        max_bytes: usize,
-    ) -> Result<PayloadRead, ReadError> {
-        if max_bytes == 0 || max_bytes > MAX_PAGE_BYTES {
-            return Err(ReadError::TooLarge);
-        }
+    fn read_payload(&self, payload_id: &PayloadId) -> Result<PayloadRead, ReadError> {
         let mut connection = self.conn.lock();
         let conn = connection.transaction().map_err(read_error)?;
         let row: Option<SqlitePayloadRow> = conn
             .query_row(
-                "SELECT payload_id, codec, CASE WHEN length(body)<=?2 THEN body ELSE NULL END, length(body) FROM event_payloads WHERE payload_id=?1",
-                params![payload_id.as_str(), max_bytes as u64],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                "SELECT payload_id, codec, body FROM event_payloads WHERE payload_id=?1",
+                params![payload_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(read_error)?;
-        let Some((id, codec, body, content_size)) = row else {
+        let Some((id, codec, body)) = row else {
             return Err(ReadError::PayloadMissing(payload_id.to_string()));
         };
         let history = Self::verified_history(&conn)?;
@@ -808,9 +771,6 @@ impl SessionEventStore for SqliteEventStore {
             PayloadDisposition::ErasurePending => return Ok(PayloadRead::ErasurePending),
             PayloadDisposition::Redacted => return Ok(PayloadRead::Redacted),
             PayloadDisposition::Present => {}
-        }
-        if content_size.is_some_and(|size| size > max_bytes as u64) {
-            return Err(ReadError::TooLarge);
         }
         let body = body.ok_or_else(|| {
             ReadError::Corrupt("body missing without erasure evidence".to_owned())
@@ -901,7 +861,7 @@ mod tests {
             Connection::open(dir.path().join("sessions/session-events.db")).expect("connection");
         conn.execute("UPDATE session_events SET event_json=CAST(json_set(event_json, '$.body.codec_version', 9) AS BLOB) WHERE sequence=3", []).expect("future codec");
         let raw = store
-            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 10, MAX_PAGE_BYTES)
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 10)
             .expect("raw page");
         assert_eq!(raw.events[2].body.kind(), EventKind::Unknown);
         assert_eq!(raw.events[2].body.raw_kind(), "session_metadata_changed");
@@ -971,13 +931,7 @@ mod tests {
             .expect_err("head conflict");
         assert!(matches!(error, AppendError::HeadConflict { .. }));
         let page = store
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                10,
-                1024 * 1024,
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 10)
             .expect("page");
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.raw_events.len(), 1);
@@ -1147,6 +1101,65 @@ mod conformance {
             test(&*store, &dir, backend);
         }
     }
+
+    #[test]
+    fn payload_reads_have_no_byte_budget() {
+        with_backends(|store, dir, backend| {
+            let stream = SessionStreamId::new();
+            let payload = PayloadRecord::new(
+                PayloadId::new(),
+                "session.text/v1".into(),
+                b"title".to_vec(),
+            )
+            .expect("payload");
+            let event = SessionEvent::typed(
+                stream.clone(),
+                EventData::SessionMetadataChanged {
+                    field: "title".into(),
+                    new_value_ref: StoredPayloadRef::from(&payload),
+                },
+                EventActor::default(),
+            )
+            .expect("event");
+            store
+                .append_batch(batch(
+                    store,
+                    &stream,
+                    vec![root(&stream), event],
+                    vec![payload.clone()],
+                ))
+                .expect("append");
+            // Expand the persisted leaf independently of the write-batch budget:
+            // readers must return the full stored content without a size cap.
+            let size = MAX_BATCH_BYTES + 1;
+            if backend == "sqlite" {
+                let conn = Connection::open(dir.path().join("sessions/session-events.db"))
+                    .expect("connection");
+                conn.execute(
+                    "UPDATE event_payloads SET body=zeroblob(?1) WHERE payload_id=?2",
+                    params![size, payload.payload_id.as_str()],
+                )
+                .expect("expand payload");
+            } else {
+                let path = dir
+                    .path()
+                    .join("sessions/session-events-jsonl/payloads")
+                    .join(format!("{}.bin", payload.payload_id));
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .expect("payload file")
+                    .set_len(size as u64)
+                    .expect("expand payload");
+            }
+            let PayloadRead::Present(record) =
+                store.read_payload(&payload.payload_id).expect("read")
+            else {
+                panic!("present payload");
+            };
+            assert_eq!(record.body.len(), size);
+        });
+    }
     #[test]
     fn sqlite_reads_edited_event_without_a_content_hash() {
         let dir = TempDir::new().expect("dir");
@@ -1169,13 +1182,7 @@ mod conformance {
         )
         .expect("edit");
         let page = store
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                10,
-                4096,
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 10)
             .expect("page");
         assert!(
             matches!(&page.events[0].body.data, EventData::SessionStarted { owning_agent, .. } if owning_agent == "edited")
@@ -1183,7 +1190,7 @@ mod conformance {
     }
 
     #[test]
-    fn byte_limited_pages_return_every_committed_event() {
+    fn count_limited_pages_return_every_committed_event() {
         with_backends(|store, _, _| {
             let stream = SessionStreamId::new();
             store
@@ -1210,22 +1217,26 @@ mod conformance {
                     .expect("append");
             }
             let full = store
-                .read_page(
-                    &stream,
-                    &EventCursor::beginning(stream.clone()),
-                    None,
-                    10,
-                    65536,
-                )
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 10)
                 .expect("full");
-            let limit = full.raw_events.iter().map(Vec::len).max().expect("size");
+            for limit in [0, MAX_PAGE_EVENTS + 1] {
+                assert!(matches!(
+                    store.read_page(
+                        &stream,
+                        &EventCursor::beginning(stream.clone()),
+                        None,
+                        limit
+                    ),
+                    Err(ReadError::TooLarge)
+                ));
+            }
             let mut cursor = EventCursor::beginning(stream.clone());
             let mut seen = Vec::new();
             loop {
                 let page = store
-                    .read_page(&stream, &cursor, Some(&full.through), 10, limit)
+                    .read_page(&stream, &cursor, Some(&full.through), 2)
                     .expect("bounded page");
-                assert!(page.raw_events.iter().map(Vec::len).sum::<usize>() <= limit);
+                assert!(page.events.len() <= 2);
                 let last = page.events.last().expect("progress");
                 cursor.sequence = last.sequence;
                 seen.extend(page.events.iter().map(|event| event.event_id.clone()));
@@ -1313,7 +1324,7 @@ mod conformance {
                     .map(|event| event.canonical_bytes().expect("committed bytes").len() + 1)
                     .sum();
                 let envelope_growth = framed - original;
-                let oversized = sized(template.clone(), MAX_PAGE_BYTES - payload_bytes);
+                let oversized = sized(template.clone(), MAX_BATCH_BYTES - payload_bytes);
                 oversized
                     .validate()
                     .expect("input fits the pre-commit budget");
@@ -1333,13 +1344,7 @@ mod conformance {
                 );
                 assert!(
                     store
-                        .read_page(
-                            &stream,
-                            &EventCursor::beginning(stream.clone()),
-                            None,
-                            10,
-                            MAX_PAGE_BYTES
-                        )
+                        .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 10)
                         .expect("empty history")
                         .events
                         .is_empty()
@@ -1347,7 +1352,7 @@ mod conformance {
 
                 let accepted = sized(
                     template.clone(),
-                    MAX_PAGE_BYTES - payload_bytes - envelope_growth,
+                    MAX_BATCH_BYTES - payload_bytes - envelope_growth,
                 );
                 let receipt = store
                     .append_batch(accepted)
@@ -1357,13 +1362,7 @@ mod conformance {
                 let store =
                     open_event_store(directory.path(), backend).expect("reopen boundary batch");
                 let page = store
-                    .read_page(
-                        &stream,
-                        &EventCursor::beginning(stream.clone()),
-                        None,
-                        10,
-                        MAX_PAGE_BYTES,
-                    )
+                    .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 10)
                     .expect("maximum-budget page remains readable");
                 assert_eq!(page.events.len(), event_count);
                 assert!(!page.has_more);
@@ -1371,7 +1370,7 @@ mod conformance {
                     page.raw_events.iter().map(Vec::len).sum::<usize>()
                         + event_count
                         + payload_bytes,
-                    MAX_PAGE_BYTES
+                    MAX_BATCH_BYTES
                 );
                 for payload in &template.payloads {
                     assert_eq!(
@@ -1418,13 +1417,7 @@ mod conformance {
                 ))
                 .expect("create");
             let page = store
-                .read_page(
-                    &stream,
-                    &EventCursor::beginning(stream.clone()),
-                    None,
-                    100,
-                    1_000_000,
-                )
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
                 .expect("page");
             let existing = vec![StoredPayload {
                 reference: reference.clone(),
@@ -1539,13 +1532,7 @@ mod conformance {
             ))
             .expect("seed");
         let page = store
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                100,
-                1_000_000,
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
             .expect("events");
         let (_, commitment) = erasure_scope(
             &page.events,
@@ -1709,13 +1696,7 @@ mod conformance {
                     .expect("metadata append");
             }
             let first = store
-                .read_page(
-                    &stream,
-                    &EventCursor::beginning(stream.clone()),
-                    None,
-                    1,
-                    1_000_000,
-                )
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 1)
                 .expect("page1");
             assert!(first.has_more);
             assert_eq!(first.through.sequence, 6);
@@ -1737,7 +1718,7 @@ mod conformance {
             let mut seen = vec![1];
             loop {
                 let page = store
-                    .read_page(&stream, &after, Some(&first.through), 2, 1_000_000)
+                    .read_page(&stream, &after, Some(&first.through), 2)
                     .expect("next page");
                 seen.extend(page.events.iter().map(|event| event.sequence));
                 after.sequence = page.events.last().expect("page event").sequence;

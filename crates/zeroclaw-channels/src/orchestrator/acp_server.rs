@@ -7665,13 +7665,7 @@ mod tests {
             )
             .expect("store");
             let page = native
-                .read_page(
-                    &stream,
-                    &EventCursor::beginning(stream.clone()),
-                    None,
-                    256,
-                    4 * 1024 * 1024,
-                )
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                 .expect("events");
             assert_eq!(
                 page.events

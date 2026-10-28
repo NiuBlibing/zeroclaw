@@ -1,4 +1,4 @@
-//! Authorized bounded reads and durable-cursor subscriptions.
+//! Authorized paginated reads and durable-cursor subscriptions.
 use super::*;
 mod summary;
 use zeroclaw_api::principal::PrincipalId;
@@ -195,7 +195,6 @@ impl SessionQuery {
                     projection.source_cursor.clone(),
                     through.clone(),
                     256,
-                    4 * 1024 * 1024,
                 )
                 .await?;
             through = Some(page.through.clone());
@@ -222,7 +221,6 @@ impl SessionQuery {
                                 },
                                 Some(&terminal),
                                 1,
-                                4 * 1024 * 1024,
                             )?;
                             let event = page
                                 .events
@@ -378,13 +376,7 @@ impl SessionQuery {
         let mut through = frozen;
         loop {
             let page = self
-                .read_page(
-                    stream.clone(),
-                    after.clone(),
-                    through.clone(),
-                    256,
-                    4 * 1024 * 1024,
-                )
+                .read_page(stream.clone(), after.clone(), through.clone(), 256)
                 .await?;
             through = Some(page.through.clone());
             if let Some(last) = page.events.last() {
@@ -437,7 +429,6 @@ impl SessionQuery {
                                 event_sequence: event.sequence,
                                 reference_path: vec![0],
                             },
-                            64 * 1024 * 1024,
                         )
                         .await?
                     else {
@@ -554,8 +545,7 @@ impl SessionQuery {
         let messages = self
             .coordinator
             .blocking(move || {
-                let structure =
-                    store.read_payload_bounded(&reference.payload_id, 64 * 1024 * 1024)?;
+                let structure = store.read_payload(&reference.payload_id)?;
                 verify_reference(&reference, &structure)?;
                 let PayloadRead::Present(structure) = structure else {
                     return Err(SessionError::StaleTarget("seed context unavailable".into()));
@@ -567,7 +557,7 @@ impl SessionQuery {
                         || ReadError::Corrupt("seed messages reference missing".into()),
                     )?)
                     .map_err(|error| ReadError::Corrupt(error.to_string()))?;
-                let raw = store.read_payload_bounded(&reference.payload_id, 64 * 1024 * 1024)?;
+                let raw = store.read_payload(&reference.payload_id)?;
                 verify_reference(&reference, &raw)?;
                 let (conversation, unavailable) = match raw {
                     PayloadRead::Present(raw) => (
@@ -679,7 +669,6 @@ impl SessionQuery {
                     event_sequence: sequence,
                     reference_path: path.clone(),
                 },
-                64 * 1024 * 1024,
             )
             .await?
         else {
@@ -712,7 +701,6 @@ impl SessionQuery {
                                 event_sequence: sequence,
                                 reference_path: leaf,
                             },
-                            64 * 1024 * 1024,
                         )
                         .await?;
                     match content {
@@ -797,7 +785,6 @@ impl SessionQuery {
         after: EventCursor,
         through: Option<EventCursor>,
         max_events: usize,
-        max_bytes: usize,
     ) -> Result<EventPage, SessionError> {
         self.policy
             .authorize_actor(&self.actor, &stream, SessionAccess::Read)?;
@@ -805,9 +792,7 @@ impl SessionQuery {
         let scope = stream.clone();
         let page = self
             .coordinator
-            .blocking(move || {
-                Ok(store.read_page(&scope, &after, through.as_ref(), max_events, max_bytes)?)
-            })
+            .blocking(move || Ok(store.read_page(&scope, &after, through.as_ref(), max_events)?))
             .await?;
         self.policy
             .authorize_actor(&self.actor, &stream, SessionAccess::Read)?;
@@ -818,13 +803,10 @@ impl SessionQuery {
         &self,
         stream: SessionStreamId,
         selector: PayloadSelector,
-        max_bytes: usize,
     ) -> Result<PayloadRead, SessionError> {
         if selector.event_sequence == 0
             || selector.reference_path.is_empty()
             || selector.reference_path.len() > 32
-            || max_bytes == 0
-            || max_bytes > 64 * 1024 * 1024
         {
             return Err(ReadError::TooLarge.into());
         }
@@ -845,7 +827,7 @@ impl SessionQuery {
                     stream_id: scope.clone(),
                     sequence: selector.event_sequence - 1,
                 };
-                let page = store.read_page(&scope, &after, Some(&cursor), 1, 64 * 1024 * 1024)?;
+                let page = store.read_page(&scope, &after, Some(&cursor), 1)?;
                 let event = page
                     .events
                     .first()
@@ -870,7 +852,7 @@ impl SessionQuery {
                         reasoning = true;
                         policy.authorize_reasoning(&actor, &scope)?;
                     }
-                    let content = store.read_payload_bounded(&reference.payload_id, max_bytes)?;
+                    let content = store.read_payload(&reference.payload_id)?;
                     verify_reference(reference, &content)?;
                     let PayloadRead::Present(record) = content else {
                         return Ok((content, reasoning));
@@ -997,7 +979,6 @@ impl SessionSubscription {
                 self.cursor.clone(),
                 Some(self.cursor.clone()),
                 1,
-                1024,
             )
             .await?;
         Ok(())
@@ -1030,11 +1011,7 @@ impl SessionSubscription {
         Ok(())
     }
 
-    pub async fn next(
-        &mut self,
-        max_events: usize,
-        max_bytes: usize,
-    ) -> Result<SubscriptionUpdate, SessionError> {
+    pub async fn next(&mut self, max_events: usize) -> Result<SubscriptionUpdate, SessionError> {
         loop {
             let page = match self
                 .query
@@ -1043,7 +1020,6 @@ impl SessionSubscription {
                     self.cursor.clone(),
                     None,
                     max_events,
-                    max_bytes,
                 )
                 .await
             {

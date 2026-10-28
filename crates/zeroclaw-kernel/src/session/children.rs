@@ -779,7 +779,6 @@ impl ChildBinding {
                     },
                     Some(&terminal),
                     1,
-                    4 * 1024 * 1024,
                 )?;
                 let event = page.events.first().ok_or_else(|| {
                     SessionError::StoreUnhealthy("child terminal event missing".into())
@@ -802,13 +801,10 @@ impl ChildBinding {
                 };
                 let mut unknown = None;
                 loop {
-                    let page = owner.store.read_page(
-                        &parent.stream_id,
-                        &after,
-                        Some(&head),
-                        256,
-                        4 * 1024 * 1024,
-                    )?;
+                    let page =
+                        owner
+                            .store
+                            .read_page(&parent.stream_id, &after, Some(&head), 256)?;
                     for observed in &page.events {
                         if observed.invocation_id != parent.invocation_id {
                             continue;
@@ -970,7 +966,7 @@ impl SessionCoordinator {
             let mut outcome = None;
             let mut consumer_terminated = false;
             loop {
-                let page = owner.store.read_page(&stream, &after, Some(&head), 256, 4 * 1024 * 1024)?;
+                let page = owner.store.read_page(&stream, &after, Some(&head), 256)?;
                 for event in &page.events {
                     if event.branch_id.as_ref() != Some(&branch) { continue; }
                     if event.turn_id.as_ref() == Some(&turn)

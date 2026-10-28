@@ -633,13 +633,7 @@ mod tests {
                     )
                     .unwrap();
                     let events = store
-                        .read_page(
-                            &stream,
-                            &EventCursor::beginning(stream.clone()),
-                            None,
-                            256,
-                            8 * 1024 * 1024,
-                        )
+                        .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                         .unwrap()
                         .events;
                     let started = events

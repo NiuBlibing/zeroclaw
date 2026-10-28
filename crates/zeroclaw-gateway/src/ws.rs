@@ -3165,7 +3165,6 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                         EventCursor::beginning(native.stream.clone()),
                         None,
                         256,
-                        4 * 1024 * 1024,
                     )
                     .await
                     .expect("settled events");
@@ -3192,7 +3191,6 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                                     event_sequence: terminals[0].sequence,
                                     reference_path: vec![0],
                                 },
-                                1024 * 1024,
                             )
                             .await
                             .expect("completion")
@@ -3265,7 +3263,6 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                             ),
                             None,
                             256,
-                            4 * 1024 * 1024,
                         )
                         .await
                         .expect("page");
@@ -3350,7 +3347,6 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                     zeroclaw_api::session_events::EventCursor::beginning(native.stream.clone()),
                     None,
                     256,
-                    4 * 1024 * 1024,
                 )
                 .await
                 .expect("event page");

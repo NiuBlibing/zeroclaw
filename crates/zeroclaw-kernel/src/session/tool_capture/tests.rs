@@ -57,10 +57,8 @@ impl SessionEventStore for RejectionFailureStore {
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
-        max_bytes: usize,
     ) -> Result<EventPage, ReadError> {
-        self.inner
-            .read_page(stream, after, through, max_events, max_bytes)
+        self.inner.read_page(stream, after, through, max_events)
     }
     fn head(&self, stream: &SessionStreamId) -> Result<EventCursor, ReadError> {
         self.inner.head(stream)
@@ -72,12 +70,8 @@ impl SessionEventStore for RejectionFailureStore {
     ) -> Result<Option<AppendReceipt>, ReadError> {
         self.inner.lookup_receipt(stream, key)
     }
-    fn read_payload_bounded(
-        &self,
-        id: &PayloadId,
-        max_bytes: usize,
-    ) -> Result<PayloadRead, ReadError> {
-        self.inner.read_payload_bounded(id, max_bytes)
+    fn read_payload(&self, id: &PayloadId) -> Result<PayloadRead, ReadError> {
+        self.inner.read_payload(id)
     }
     fn erasure_scope(
         &self,
@@ -196,7 +190,6 @@ impl Harness {
                 &EventCursor::beginning(self.stream.clone()),
                 None,
                 100,
-                4 * 1024 * 1024,
             )
             .expect("events")
             .events
@@ -538,7 +531,6 @@ impl zeroclaw_api::channel::Channel for ApprovalOwnerChannel {
             &EventCursor::beginning(self.stream.clone()),
             None,
             100,
-            4 * 1024 * 1024,
         )?;
         assert!(
             events.events.iter().any(|event| matches!(

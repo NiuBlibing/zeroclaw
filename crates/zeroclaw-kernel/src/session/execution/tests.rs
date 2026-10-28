@@ -549,13 +549,7 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
             Err(SessionError::Append(AppendError::IdempotencyConflict(_)))
         ));
         let file_events = coordinator
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                256,
-                4 * 1024 * 1024,
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
             .expect("file events")
             .events;
         assert_eq!(
@@ -674,7 +668,6 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
                 },
                 Some(&context_receipt.last),
                 256,
-                4 * 1024 * 1024,
             )
             .expect("context outcome");
         let EventData::TurnCommitted { completion_ref } = &context_outcome
@@ -749,13 +742,7 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
             "interrupted effects cannot execute again"
         );
         let page = coordinator
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                256,
-                4 * 1024 * 1024,
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
             .expect("recovered history");
         let interrupted_events: Vec<_> = page
             .events
@@ -777,13 +764,7 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
             EventKind::TurnOutcomeUnknown
         );
         let events = coordinator
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                256,
-                4 * 1024 * 1024,
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
             .expect("history")
             .events;
         let selections: Vec<_> = events
@@ -873,7 +854,6 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
                 },
                 Some(&receipt.last),
                 256,
-                4 * 1024 * 1024,
             )
             .expect("panic outcome");
         assert!(

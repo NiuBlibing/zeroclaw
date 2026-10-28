@@ -101,8 +101,7 @@ async fn assert_reasoning_requires_disclosure(h: &Harness) {
                 PayloadSelector {
                     event_sequence: completed.sequence,
                     reference_path: vec![root_index, nested_index],
-                },
-                1024 * 1024
+                }
             )
             .await,
         Err(SessionError::PermissionDenied(_))

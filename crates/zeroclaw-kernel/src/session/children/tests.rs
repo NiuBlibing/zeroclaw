@@ -85,10 +85,8 @@ impl SessionEventStore for PausedChildStore {
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
-        max_bytes: usize,
     ) -> Result<EventPage, ReadError> {
-        self.inner
-            .read_page(stream, after, through, max_events, max_bytes)
+        self.inner.read_page(stream, after, through, max_events)
     }
     fn head(&self, stream: &SessionStreamId) -> Result<EventCursor, ReadError> {
         self.inner.head(stream)
@@ -100,12 +98,8 @@ impl SessionEventStore for PausedChildStore {
     ) -> Result<Option<AppendReceipt>, ReadError> {
         self.inner.lookup_receipt(stream, key)
     }
-    fn read_payload_bounded(
-        &self,
-        id: &PayloadId,
-        max_bytes: usize,
-    ) -> Result<PayloadRead, ReadError> {
-        self.inner.read_payload_bounded(id, max_bytes)
+    fn read_payload(&self, id: &PayloadId) -> Result<PayloadRead, ReadError> {
+        self.inner.read_payload(id)
     }
     fn erasure_scope(
         &self,

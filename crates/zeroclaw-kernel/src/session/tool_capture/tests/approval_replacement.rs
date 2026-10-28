@@ -385,16 +385,12 @@ async fn replacement_uses_live_payload_authorization_and_erasure_blocks_adoption
             reference_path: vec![0, 0],
         };
         assert!(matches!(
-            query
-                .read_payload(h.stream.clone(), selector.clone(), 4096)
-                .await,
+            query.read_payload(h.stream.clone(), selector.clone()).await,
             Ok(PayloadRead::Present(_))
         ));
         h.authority.0.store(false, Ordering::SeqCst);
         assert!(matches!(
-            query
-                .read_payload(h.stream.clone(), selector.clone(), 4096)
-                .await,
+            query.read_payload(h.stream.clone(), selector.clone()).await,
             Err(SessionError::PermissionDenied(_))
         ));
         h.authority.0.store(true, Ordering::SeqCst);
@@ -433,7 +429,7 @@ async fn replacement_uses_live_payload_authorization_and_erasure_blocks_adoption
             "storage independently rejects a replacement frozen by erasure"
         );
         assert!(matches!(
-            query.read_payload(h.stream.clone(), selector, 4096).await,
+            query.read_payload(h.stream.clone(), selector).await,
             Ok(PayloadRead::ErasurePending)
         ));
         assert!(
@@ -486,13 +482,7 @@ async fn replacement_uses_live_payload_authorization_and_erasure_blocks_adoption
         assert_eq!(reply.decision, ApprovalReplyDecision::Replace);
         assert!(
             !reopened
-                .read_page(
-                    &stream,
-                    &EventCursor::beginning(stream.clone()),
-                    None,
-                    100,
-                    4 * 1024 * 1024,
-                )
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
                 .expect("reopened history")
                 .events
                 .iter()

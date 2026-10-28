@@ -187,7 +187,6 @@ async fn audit(backend: &str, adapter: &str, field: &str, reasoning: &str) {
                     event_sequence: completed.sequence,
                     reference_path: vec![response_index, index],
                 },
-                1024 * 1024,
             )
             .await;
         assert!(

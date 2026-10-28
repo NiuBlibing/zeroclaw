@@ -54,13 +54,9 @@ impl SessionCoordinator {
                 let limit = through.clone();
                 let page = self
                     .blocking(move || {
-                        Ok(owner.store.read_page(
-                            &scope,
-                            &cursor,
-                            limit.as_ref(),
-                            256,
-                            4 * 1024 * 1024,
-                        )?)
+                        Ok(owner
+                            .store
+                            .read_page(&scope, &cursor, limit.as_ref(), 256)?)
                     })
                     .await?;
                 through = Some(page.through.clone());
@@ -79,11 +75,6 @@ impl SessionCoordinator {
                             child
                         };
                         if self.head(&child)?.sequence > 0 && visited.insert(child.clone()) {
-                            if streams.len() >= 100_000 {
-                                return Err(SessionError::InvalidAdmission(
-                                    "session family recovery limit exceeded".into(),
-                                ));
-                            }
                             streams.push(child.clone());
                             pending.push(child);
                         }
@@ -154,9 +145,7 @@ impl SessionCoordinator {
                     &stream,
                     &projection.source_cursor,
                     Some(&through),
-                    256,
-                    4 * 1024 * 1024,
-                )?;
+                    256)?;
                 for event in &page.events {
                     approvals.observe(event, owner.store.as_ref())?;
                     match &event.body.data {
@@ -225,9 +214,7 @@ impl SessionCoordinator {
                     &stream,
                     &EventCursor::beginning(stream.clone()),
                     Some(&through),
-                    1,
-                    4 * 1024 * 1024,
-                )?
+                    1)?
                 .events
                 .first()
                 .and_then(|event| event.branch_id.clone());
@@ -391,7 +378,6 @@ impl SessionCoordinator {
                     &projection.source_cursor,
                     Some(&head),
                     256,
-                    4 * 1024 * 1024,
                 )?;
                 projection.apply_page(&page)?;
                 if !page.has_more {

@@ -529,7 +529,6 @@ impl EngineSession {
                     event_sequence: event.sequence,
                     reference_path: path,
                 },
-                64 * 1024 * 1024,
             )
         };
         let PayloadRead::Present(context) = read(vec![0]).await? else {

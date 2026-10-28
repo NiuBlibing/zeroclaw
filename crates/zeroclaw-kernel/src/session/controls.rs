@@ -38,7 +38,7 @@ impl EngineSession {
             authority.authorize_context(&stream,&branch)?;
             let key=format!("file-observation:{}:{operation}",file.file_id);
             if let Some(receipt)=owner.store.lookup_receipt(&stream,&key)? {
-                let page=owner.store.read_page(&stream,&EventCursor {stream_id:stream.clone(),sequence:receipt.first.sequence-1},Some(&receipt.last),16,4*1024*1024)?;
+                let page=owner.store.read_page(&stream,&EventCursor {stream_id:stream.clone(),sequence:receipt.first.sequence-1},Some(&receipt.last),16)?;
                 let previous=page.events.iter().find_map(|event|match &event.body.data {
                     EventData::FileUsed {representation_ref,..}=>Some(representation_ref),_=>None
                 }).ok_or_else(||SessionError::StoreUnhealthy("file receipt missing rendition".into()))?;
@@ -59,7 +59,7 @@ impl EngineSession {
             let through=owner.store.head(&stream)?;
             let mut registered=false;
             loop {
-                let page=owner.store.read_page(&stream,&cursor,Some(&through),256,4*1024*1024)?;
+                let page=owner.store.read_page(&stream,&cursor,Some(&through),256)?;
                 registered |= page.events.iter().any(|event|matches!(&event.body.data,EventData::FileRegistered {file_id,..} if file_id==&file.file_id));
                 if registered || !page.has_more {break;}
                 cursor.sequence=page.events.last().ok_or_else(||SessionError::StoreUnhealthy("file scan empty page".into()))?.sequence;
@@ -248,7 +248,6 @@ impl EngineSession {
                     },
                     Some(receipt.last),
                     8,
-                    4 * 1024 * 1024,
                 )
                 .await?;
             let projection = page
@@ -263,7 +262,6 @@ impl EngineSession {
                         event_sequence: projection.sequence,
                         reference_path: vec![0],
                     },
-                    64 * 1024 * 1024,
                 )
                 .await?
             else {

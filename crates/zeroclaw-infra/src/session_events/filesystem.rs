@@ -57,15 +57,7 @@ pub(super) fn reader(path: &Path) -> std::io::Result<File> {
 
 pub(super) fn read(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    reader(path)?
-        .take(MAX_PAGE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_PAGE_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "session file exceeds read limit",
-        ));
-    }
+    reader(path)?.read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 

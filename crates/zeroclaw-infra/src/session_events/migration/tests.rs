@@ -51,13 +51,7 @@ fn native_roundtrip_preserves_raw_bytes_receipts_and_stale_writer_fence() {
         let (root, request, store) = seed(dir.path(), source);
         let old = family::FamilyEventStore::open(dir.path(), "fixture").expect("old handle");
         let before = store
-            .read_page(
-                &root,
-                &EventCursor::beginning(root.clone()),
-                None,
-                100,
-                4096,
-            )
+            .read_page(&root, &EventCursor::beginning(root.clone()), None, 100)
             .expect("before");
         let receipt = store.lookup_receipt(&root, "root").expect("receipt");
         migrate_installation(dir.path(), target).expect("migrate");
@@ -67,13 +61,7 @@ fn native_roundtrip_preserves_raw_bytes_receipts_and_stale_writer_fence() {
         );
         let migrated = family::FamilyEventStore::open(dir.path(), "fixture").expect("target");
         let after = migrated
-            .read_page(
-                &root,
-                &EventCursor::beginning(root.clone()),
-                None,
-                100,
-                4096,
-            )
+            .read_page(&root, &EventCursor::beginning(root.clone()), None, 100)
             .expect("after");
         assert_eq!(before.raw_events, after.raw_events);
         assert_eq!(
@@ -97,13 +85,7 @@ fn native_roundtrip_preserves_raw_bytes_receipts_and_stale_writer_fence() {
         assert_eq!(
             before.raw_events,
             reopened
-                .read_page(
-                    &root,
-                    &EventCursor::beginning(root.clone()),
-                    None,
-                    100,
-                    4096
-                )
+                .read_page(&root, &EventCursor::beginning(root.clone()), None, 100)
                 .expect("roundtrip bytes")
                 .raw_events
         );
@@ -344,13 +326,7 @@ fn migration_preserves_future_event_bytes_and_its_explicit_payload_references() 
     migrate_installation(dir.path(), NativeBackend::Jsonl).expect("migration");
     let store = family::FamilyEventStore::open(dir.path(), "fixture").expect("target");
     let page = store
-        .read_page(
-            &root,
-            &EventCursor::beginning(root.clone()),
-            None,
-            10,
-            64 * 1024,
-        )
+        .read_page(&root, &EventCursor::beginning(root.clone()), None, 10)
         .expect("page");
     assert_eq!(page.raw_events[2], raw);
     assert_eq!(

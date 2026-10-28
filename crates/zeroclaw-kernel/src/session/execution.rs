@@ -411,9 +411,7 @@ impl SessionCoordinator {
                         sequence: receipt.first.sequence - 1,
                     },
                     Some(&receipt.first),
-                    1,
-                    4 * 1024 * 1024,
-                )?;
+                    1)?;
                 let accepted = page
                     .events
                     .first()
@@ -469,11 +467,15 @@ impl SessionCoordinator {
                     EngineInputPart::Text(_) | EngineInputPart::Opaque {..} => None,
                 }).collect();
                 if !files.is_empty() {
-                    let recorded = owner.store.read_page(&command.stream_id,
-                        &EventCursor {stream_id:command.stream_id.clone(),sequence:receipt.first.sequence-1},
-                        Some(&receipt.last), 10_000, 64*1024*1024)?;
-                    if recorded.has_more { return Err(ReadError::TooLarge.into()); }
-                    let uses: Vec<_> = recorded.events.iter().filter_map(|event| {
+                    let mut after = EventCursor {stream_id: command.stream_id.clone(), sequence: receipt.first.sequence.saturating_sub(1)};
+                    let mut recorded = Vec::new();
+                    loop {
+                        let page = owner.store.read_page(&command.stream_id, &after, Some(&receipt.last), 10_000)?;
+                        after.sequence = page.events.last().map_or(after.sequence, |event| event.sequence);
+                        recorded.extend(page.events);
+                        if !page.has_more { break; }
+                    }
+                    let uses: Vec<_> = recorded.iter().filter_map(|event| {
                         if let EventData::FileUsed { file_id, representation_ref, policy_evidence_ref, .. } = &event.body.data {
                             Some((file_id, representation_ref, policy_evidence_ref))
                         } else { None }
@@ -584,8 +586,7 @@ impl SessionCoordinator {
                 let mut through=owner.store.head(&command.stream_id)?;
                 while through.sequence>0 && !wanted.is_subset(&registered) {
                     let after=EventCursor {stream_id:command.stream_id.clone(),sequence:through.sequence.saturating_sub(256)};
-                    let page=owner.store.read_page(&command.stream_id,&after,Some(&through),256,64*1024*1024)?;
-                    if page.has_more {return Err(ReadError::TooLarge.into());}
+                    let page=owner.store.read_page(&command.stream_id,&after,Some(&through),256)?;
                     for event in page.events {
                         if let EventData::FileRegistered {file_id,..}=event.body.data {registered.insert(file_id);}
                     }
@@ -706,9 +707,7 @@ impl SessionCoordinator {
                     &command.stream_id,
                     &projection.source_cursor,
                     Some(&head),
-                    256,
-                    4 * 1024 * 1024,
-                )?;
+                    256)?;
                 for event in &page.events {
                     match &event.body.data {
                         EventData::ElicitationRequested { request_id, .. }

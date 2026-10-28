@@ -20194,13 +20194,7 @@ Let me check the result."#;
                 zeroclaw_infra::session_events::family::FamilyEventStore::open(&data_dir, family)
                     .unwrap();
             let parent = store
-                .read_page(
-                    &stream,
-                    &EventCursor::beginning(stream.clone()),
-                    None,
-                    256,
-                    4 * 1024 * 1024,
-                )
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                 .unwrap();
             let requested: Vec<_> = parent
                 .events
@@ -20247,13 +20241,7 @@ Let me check the result."#;
             assert_eq!(children.len(), 2);
             for (index, child) in children.into_iter().enumerate() {
                 let page = store
-                    .read_page(
-                        &child,
-                        &EventCursor::beginning(child.clone()),
-                        None,
-                        256,
-                        4 * 1024 * 1024,
-                    )
+                    .read_page(&child, &EventCursor::beginning(child.clone()), None, 256)
                     .unwrap();
                 assert!(
                     page.events
@@ -20539,13 +20527,7 @@ Let me check the result."#;
                 )
                 .unwrap();
                 let parent = store
-                    .read_page(
-                        &stream,
-                        &EventCursor::beginning(stream.clone()),
-                        None,
-                        256,
-                        4 * 1024 * 1024,
-                    )
+                    .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                     .unwrap();
                 let expected_children = if prepare_fails { 1 } else { 2 };
                 let requested: Vec<_> = parent
@@ -20619,7 +20601,6 @@ Let me check the result."#;
                             &EventCursor::beginning(cursor.stream_id.clone()),
                             Some(&cursor),
                             256,
-                            4 * 1024 * 1024,
                         )
                         .unwrap();
                     if let Some(evidence) = cancellation_evidence {

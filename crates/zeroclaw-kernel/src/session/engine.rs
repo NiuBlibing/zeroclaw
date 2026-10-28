@@ -650,7 +650,6 @@ impl SessionExecutionPort for EngineSession {
                 },
                 Some(receipt.last),
                 256,
-                4 * 1024 * 1024,
             )
             .await?;
         let terminal = page
@@ -664,7 +663,6 @@ impl SessionExecutionPort for EngineSession {
                     event_sequence: terminal.sequence,
                     reference_path: vec![0],
                 },
-                4 * 1024 * 1024,
             )
             .await?
         else {
@@ -695,7 +693,6 @@ impl SessionExecutionPort for EngineSession {
                     event_sequence: content_event.sequence,
                     reference_path: vec![0],
                 },
-                4 * 1024 * 1024,
             )
             .await?
         else {
@@ -712,7 +709,6 @@ impl SessionExecutionPort for EngineSession {
                             event_sequence: content_event.sequence,
                             reference_path: vec![0, index],
                         },
-                        4 * 1024 * 1024,
                     )
                     .await?
                 else {

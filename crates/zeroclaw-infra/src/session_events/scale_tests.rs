@@ -103,7 +103,7 @@ fn million_event_append_read_and_index_reconstruction() {
         let mut read = 0;
         loop {
             let page = store
-                .read_page(&stream, &cursor, Some(&through), 1000, MAX_PAGE_BYTES)
+                .read_page(&stream, &cursor, Some(&through), 1000)
                 .expect("page");
             read += page.events.len();
             if let Some(last) = page.events.last() {
@@ -220,8 +220,8 @@ fn legacy_append_read_and_reopen_baseline() {
 }
 
 #[test]
-#[ignore = "bounded large payload measurement"]
-fn payload_read_peak_and_bounded_rejection() {
+#[ignore = "large payload measurement"]
+fn payload_read_peak_and_complete_content() {
     use std::time::Instant;
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::TempDir::new().expect("directory");
@@ -257,14 +257,8 @@ fn payload_read_peak_and_bounded_rejection() {
             })
             .expect("append");
         let before = memory_kib("VmRSS:");
-        assert!(matches!(
-            store.read_payload_bounded(&id, 1024),
-            Err(ReadError::TooLarge)
-        ));
         let started = Instant::now();
-        let body = store
-            .read_payload_bounded(&id, 32 * 1024 * 1024)
-            .expect("read");
+        let body = store.read_payload(&id).expect("read");
         assert!(matches!(&body,PayloadRead::Present(record) if record.body.len()==32*1024*1024));
         eprintln!(
             "payload_backend={backend} bytes={} read={:?} rss_before_kib={before:?} rss_after_kib={:?} process_peak_rss_kib={:?}",

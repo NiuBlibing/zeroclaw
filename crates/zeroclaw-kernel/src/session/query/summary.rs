@@ -10,7 +10,7 @@ impl SessionQuery {
         let mut through = None;
         loop {
             let page = self
-                .read_page(stream.clone(), after, through.clone(), 256, 4 * 1024 * 1024)
+                .read_page(stream.clone(), after, through.clone(), 256)
                 .await?;
             through = Some(page.through.clone());
             for event in &page.events {
@@ -25,7 +25,6 @@ impl SessionQuery {
                                 event_sequence: event.sequence,
                                 reference_path: vec![0],
                             },
-                            64 * 1024 * 1024,
                         )
                         .await?
                     else {
@@ -64,7 +63,6 @@ impl SessionQuery {
                                 event_sequence: event.sequence,
                                 reference_path: vec![reference_index],
                             },
-                            64 * 1024 * 1024,
                         )
                         .await?
                     else {
@@ -98,7 +96,6 @@ impl SessionQuery {
                         event_sequence: sequence,
                         reference_path: vec![0],
                     },
-                    64 * 1024 * 1024,
                 )
                 .await?
             {
@@ -142,13 +139,7 @@ impl SessionQuery {
         let mut history = Vec::new();
         loop {
             let page = self
-                .read_page(
-                    stream.clone(),
-                    after.clone(),
-                    through.clone(),
-                    256,
-                    4 * 1024 * 1024,
-                )
+                .read_page(stream.clone(), after.clone(), through.clone(), 256)
                 .await?;
             through = Some(page.through.clone());
             if let Some(last) = page.events.last() {
@@ -225,7 +216,6 @@ impl SessionQuery {
                     event_sequence: control.sequence,
                     reference_path: vec![0],
                 },
-                1024 * 1024,
             )
             .await?
         else {

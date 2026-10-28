@@ -118,7 +118,6 @@ fn power_loss_worker() {
                 &EventCursor::beginning(request.stream_id.clone()),
                 None,
                 10,
-                MAX_PAGE_BYTES,
             )
             .expect("complete page");
         assert_eq!(page.events.len(), 3);
