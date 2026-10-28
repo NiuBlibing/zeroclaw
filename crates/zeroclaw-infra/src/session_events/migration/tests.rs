@@ -317,9 +317,6 @@ fn migration_preserves_future_event_bytes_and_its_explicit_payload_references() 
     .expect("event");
     event.sequence = 3;
     event.committed_at = now_millis();
-    let raw_root = &image.batches[0].raw[1];
-    let prior = parse_event(raw_root).expect("root");
-    event.previous_hash = hash_raw(&prior.previous_hash, raw_root);
     let mut value = serde_json::to_value(&event).expect("json");
     value["body"]["kind"] = serde_json::json!("future_observation");
     value["body"]["fields"]["future_extension"] =

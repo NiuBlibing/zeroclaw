@@ -115,7 +115,6 @@ async fn new_replacement_reply_requires_content_but_legacy_history_is_readable_a
         incoming.event_id = EventId::new();
         incoming.sequence = 0;
         incoming.committed_at = 0;
-        incoming.previous_hash = Digest::zero();
         let error = h
             .store
             .append_batch(AppendRequest {

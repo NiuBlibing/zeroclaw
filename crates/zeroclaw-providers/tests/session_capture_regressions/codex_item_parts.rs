@@ -345,7 +345,7 @@ async fn codex_later_item_parts_preserve_media_and_unknown_updates_both_backends
                                 let expected = offsets.entry((position, component)).or_insert(0);
                                 assert_eq!(byte_offset, *expected);
                                 let block: ResponseBlock = h.payload(&segment_ref);
-                                *expected += block.component().1.byte_len;
+                                *expected += h.payload_len(block.component().1);
                             }
                         }
                     }

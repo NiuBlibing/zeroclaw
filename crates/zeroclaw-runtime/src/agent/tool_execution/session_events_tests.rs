@@ -27,7 +27,6 @@ impl ToolObservationPort for CaptureFixture {
                 sequence: 1,
             },
             event_ids: vec![EventId::new()],
-            head_hash: Digest::zero(),
         })
     }
 }

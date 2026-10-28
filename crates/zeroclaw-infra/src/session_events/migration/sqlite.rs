@@ -44,19 +44,16 @@ impl SqliteEventStore {
         }
         let mut payloads = Vec::new();
         {
-            let mut statement=tx.prepare("SELECT payload_id,codec,body_digest,byte_len FROM event_payloads ORDER BY payload_id").map_err(map_sqlite)?;
+            let mut statement = tx
+                .prepare("SELECT payload_id,codec FROM event_payloads ORDER BY payload_id")
+                .map_err(map_sqlite)?;
             let rows = statement
                 .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, u64>(3)?,
-                    ))
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
                 .map_err(map_sqlite)?;
             for row in rows {
-                let (id, codec, digest, byte_len) = row.map_err(map_sqlite)?;
+                let (id, codec) = row.map_err(map_sqlite)?;
                 // Codec ownership comes from the API registry. Content bodies
                 // are hydrated only after selecting the migrating family.
                 let body = if zeroclaw_api::session_events::payloads::content_leaf(&codec) {
@@ -73,8 +70,6 @@ impl SqliteEventStore {
                     reference: StoredPayloadRef {
                         payload_id: PayloadId::parse(id)?,
                         codec,
-                        body_digest: Digest::from(digest),
-                        byte_len,
                     },
                     body,
                 });
@@ -103,9 +98,9 @@ impl SqliteEventStore {
             }
         }
         for (stream, tail) in tails {
-            let head = Self::verified_head(&tx, &stream)
+            let head = Self::current_head(&tx, &stream)
                 .map_err(|error| AppendError::Corrupt(error.to_string()))?;
-            if head.0 != tail {
+            if head != tail {
                 return Err(AppendError::Corrupt(
                     "migration receipt coverage gap".into(),
                 ));
@@ -145,10 +140,7 @@ impl SqliteEventStore {
                 } else {
                     tx.execute("INSERT INTO session_events(stream_id,sequence,event_id,event_json) VALUES(?1,?2,?3,?4)",params![event.stream_id.as_str(),event.sequence,event.event_id.as_str(),raw]).map_err(map_sqlite)?;
                 }
-                heads.insert(
-                    event.stream_id.clone(),
-                    (event.sequence, hash_raw(&event.previous_hash, raw)),
-                );
+                heads.insert(event.stream_id.clone(), event.sequence);
             }
             let first = parse_event(
                 batch
@@ -179,25 +171,29 @@ impl SqliteEventStore {
         }
         for payload in &image.payloads {
             let r = &payload.reference;
-            let existing:Option<(String,String,u64,Option<Vec<u8>>)>=tx.query_row("SELECT codec,body_digest,byte_len,body FROM event_payloads WHERE payload_id=?1",params![r.payload_id.as_str()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(map_sqlite)?;
+            let existing: Option<(String, Option<Vec<u8>>)> = tx
+                .query_row(
+                    "SELECT codec,body FROM event_payloads WHERE payload_id=?1",
+                    params![r.payload_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(map_sqlite)?;
             if let Some(existing) = existing {
-                if existing
-                    != (
-                        r.codec.clone(),
-                        r.body_digest.as_str().to_owned(),
-                        r.byte_len,
-                        payload.body.clone(),
-                    )
-                {
+                if existing != (r.codec.clone(), payload.body.clone()) {
                     return Err(AppendError::Corrupt(
                         "migration target payload conflict".into(),
                     ));
                 }
             } else {
-                tx.execute("INSERT INTO event_payloads(payload_id,codec,body,body_digest,byte_len) VALUES(?1,?2,?3,?4,?5)",params![r.payload_id.as_str(),r.codec,payload.body,r.body_digest.as_str(),r.byte_len]).map_err(map_sqlite)?;
+                tx.execute(
+                    "INSERT INTO event_payloads(payload_id,codec,body) VALUES(?1,?2,?3)",
+                    params![r.payload_id.as_str(), r.codec, payload.body],
+                )
+                .map_err(map_sqlite)?;
             }
         }
-        for (stream, (sequence, hash)) in heads {
+        for (stream, sequence) in heads {
             let tail: u64 = tx
                 .query_row(
                     "SELECT MAX(sequence) FROM session_events WHERE stream_id=?1",
@@ -210,7 +206,6 @@ impl SqliteEventStore {
                     "migration target has additional events".into(),
                 ));
             }
-            tx.execute("INSERT INTO session_event_stream_heads(stream_id,head_seq,head_hash) VALUES(?1,?2,?3) ON CONFLICT(stream_id) DO UPDATE SET head_seq=excluded.head_seq,head_hash=excluded.head_hash",params![stream.as_str(),sequence,hash.as_str()]).map_err(map_sqlite)?;
         }
         tx.commit()
             .map_err(|error| AppendError::CommitOutcomeUnknown(error.to_string()))?;

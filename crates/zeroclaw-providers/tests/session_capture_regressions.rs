@@ -196,6 +196,16 @@ impl Harness {
         };
         serde_json::from_slice(&record.body).expect("decode")
     }
+    fn payload_len(&self, reference: &StoredPayloadRef) -> u64 {
+        let PayloadRead::Present(record) = self
+            .store
+            .read_payload(&reference.payload_id)
+            .expect("payload")
+        else {
+            panic!("present")
+        };
+        record.body.len() as u64
+    }
 }
 
 struct Mixed;
@@ -1849,7 +1859,7 @@ async fn codex_done_only_and_mixed_parts_preserve_order_both_backends() {
                                     byte_offset, *expected,
                                     "canonical component offsets remain continuous after classification"
                                 );
-                                *expected += block.component().1.byte_len;
+                                *expected += h.payload_len(block.component().1);
                                 protocol_segments += 1;
                             }
                         }

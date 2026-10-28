@@ -34,8 +34,6 @@ impl NativeImage {
         // second JSON tree merely to compute its commitment.
         #[derive(Serialize)]
         struct Reference<'a> {
-            body_digest: &'a Digest,
-            byte_len: u64,
             codec: &'a str,
             payload_id: &'a PayloadId,
         }
@@ -75,8 +73,6 @@ impl NativeImage {
                 .map(|p| Payload {
                     body: &p.body,
                     reference: Reference {
-                        body_digest: &p.reference.body_digest,
-                        byte_len: p.reference.byte_len,
                         codec: &p.reference.codec,
                         payload_id: &p.reference.payload_id,
                     },
@@ -115,19 +111,14 @@ impl NativeImage {
                     "empty or duplicate migration receipt".into(),
                 ));
             }
-            let head = heads
-                .entry(batch.stream.clone())
-                .or_insert((0_u64, Digest::zero()));
+            let head = heads.entry(batch.stream.clone()).or_insert(0_u64);
             for raw in &batch.raw {
                 let event =
                     parse_event(raw).map_err(|error| AppendError::Corrupt(error.to_string()))?;
-                if event.stream_id != batch.stream
-                    || event.sequence != head.0 + 1
-                    || event.previous_hash != head.1
-                {
+                if event.stream_id != batch.stream || event.sequence != *head + 1 {
                     return Err(AppendError::Corrupt("migration event chain differs".into()));
                 }
-                *head = (event.sequence, hash_raw(&event.previous_hash, raw));
+                *head = event.sequence;
             }
         }
         let events = self.events()?;
@@ -137,18 +128,11 @@ impl NativeImage {
             if !payload_ids.insert(payload.reference.payload_id.clone()) {
                 return Err(AppendError::Corrupt("duplicate migration payload".into()));
             }
-            if let Some(body) = &payload.body {
-                if body.len() as u64 != payload.reference.byte_len
-                    || Digest::from_bytes(body) != payload.reference.body_digest
-                {
-                    return Err(AppendError::Corrupt(
-                        "migration payload integrity failure".into(),
-                    ));
-                }
-            } else if zeroclaw_api::session_events::payloads::disposition(
-                &events,
-                &payload.reference.payload_id,
-            ) == zeroclaw_api::session_events::payloads::PayloadDisposition::Present
+            if payload.body.is_none()
+                && zeroclaw_api::session_events::payloads::disposition(
+                    &events,
+                    &payload.reference.payload_id,
+                ) == zeroclaw_api::session_events::payloads::PayloadDisposition::Present
             {
                 return Err(AppendError::Corrupt(
                     "migration live payload missing".into(),

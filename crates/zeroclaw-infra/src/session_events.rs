@@ -33,7 +33,7 @@ fn committed_event_bytes(used: usize, event_len: usize) -> Result<usize, AppendE
 pub mod catalog;
 pub mod search;
 
-type SqlitePayloadRow = (String, String, Option<Vec<u8>>, String, i64);
+type SqlitePayloadRow = (String, String, Option<Vec<u8>>, Option<u64>);
 
 fn content_leaf_sql_list() -> String {
     zeroclaw_api::session_events::payloads::content_leaf_codecs()
@@ -48,18 +48,6 @@ fn now_millis() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
         .unwrap_or(0)
-}
-
-fn chain_hash(previous: &Digest, event: &SessionEvent) -> Result<Digest, ContractError> {
-    let bytes = event.canonical_bytes()?;
-    Ok(hash_raw(previous, &bytes))
-}
-
-fn hash_raw(previous: &Digest, bytes: &[u8]) -> Digest {
-    let mut input = Vec::with_capacity(previous.as_str().len() + bytes.len());
-    input.extend_from_slice(previous.as_str().as_bytes());
-    input.extend_from_slice(bytes);
-    Digest::from_bytes(&input)
 }
 
 fn validate_page_limits(max_events: usize, max_bytes: usize) -> Result<(), ReadError> {
@@ -118,8 +106,7 @@ fn event_page(
     stream_id: SessionStreamId,
     after: EventCursor,
     through: EventCursor,
-    rows: Vec<(Vec<u8>, SessionEvent, Digest)>,
-    anchor: Digest,
+    rows: Vec<(Vec<u8>, SessionEvent)>,
     max_events: usize,
     max_bytes: usize,
     has_more: bool,
@@ -128,14 +115,7 @@ fn event_page(
         .sequence
         .checked_add(1)
         .ok_or_else(|| ReadError::Gap("cursor overflow".to_owned()))?;
-    let mut previous_hash = anchor;
-    for (raw, event, hash) in &rows {
-        if event.previous_hash != previous_hash || hash_raw(&previous_hash, raw) != *hash {
-            return Err(ReadError::Corrupt(
-                "invalid contiguous event chain".to_owned(),
-            ));
-        }
-        previous_hash = hash.clone();
+    for (_, event) in &rows {
         if event.stream_id != stream_id || event.sequence != expected_sequence {
             return Err(ReadError::Gap(format!(
                 "expected contiguous sequence {}, found {}",
@@ -156,7 +136,7 @@ fn event_page(
     let mut events = Vec::with_capacity(rows.len().min(max_events));
     let mut raw_events = Vec::with_capacity(rows.len().min(max_events));
     let mut used = 0usize;
-    for (raw, event, stored_hash) in rows.into_iter().take(max_events) {
+    for (raw, event) in rows.into_iter().take(max_events) {
         let size = raw.len();
         if events.is_empty() && size > max_bytes {
             return Err(ReadError::TooLarge);
@@ -170,13 +150,6 @@ fn event_page(
                 raw_events,
                 has_more: true,
             });
-        }
-        let calculated = hash_raw(&event.previous_hash, &raw);
-        if calculated != stored_hash {
-            return Err(ReadError::Corrupt(format!(
-                "event {} has an invalid chain digest",
-                event.event_id
-            )));
         }
         used += size;
         raw_events.push(raw);
@@ -241,11 +214,6 @@ impl SqliteEventStore {
         if schema_version == 0 {
             conn.execute_batch(
             "BEGIN IMMEDIATE;
-             CREATE TABLE IF NOT EXISTS session_event_stream_heads(
-               stream_id TEXT PRIMARY KEY,
-               head_seq INTEGER NOT NULL,
-               head_hash TEXT NOT NULL
-             );
              CREATE TABLE IF NOT EXISTS session_events(
                stream_id TEXT NOT NULL,
                sequence INTEGER NOT NULL CHECK(sequence > 0),
@@ -256,9 +224,7 @@ impl SqliteEventStore {
              CREATE TABLE IF NOT EXISTS event_payloads(
                payload_id TEXT PRIMARY KEY,
                codec TEXT NOT NULL,
-               body BLOB,
-               body_digest TEXT NOT NULL,
-               byte_len INTEGER NOT NULL CHECK(byte_len >= 0)
+               body BLOB
              );
              CREATE TABLE IF NOT EXISTS session_append_receipts(
                stream_id TEXT NOT NULL,
@@ -313,79 +279,13 @@ impl SqliteEventStore {
         })
     }
 
-    // Heads are a disposable index. A missing or inconsistent index fails
-    // closed rather than presenting a non-empty stream as an empty history.
-    fn verified_head(
-        conn: &Connection,
-        stream: &SessionStreamId,
-    ) -> Result<(u64, Digest), ReadError> {
-        let indexed: Option<(u64, String)> = conn
-            .query_row(
-                "SELECT head_seq,head_hash FROM session_event_stream_heads WHERE stream_id=?1",
-                params![stream.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(read_error)?;
-        let last: Option<(u64, String, Vec<u8>)> = conn.query_row(
-            "SELECT sequence,event_id,event_json FROM session_events WHERE stream_id=?1 ORDER BY sequence DESC LIMIT 1",
-            params![stream.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).optional().map_err(read_error)?;
-        match (indexed, last) {
-            (None, None) => Ok((0, Digest::zero())),
-            (Some((seq, hash)), Some((actual, id, raw))) => {
-                let event = parse_event(&raw)?;
-                let digest = hash_raw(&event.previous_hash, &raw);
-                if seq == actual
-                    && event.sequence == actual
-                    && event.stream_id == *stream
-                    && event.event_id.as_str() == id
-                    && digest.as_str() == hash
-                {
-                    Ok((seq, digest))
-                } else {
-                    Err(ReadError::Corrupt(
-                        "stream head disagrees with committed tail".into(),
-                    ))
-                }
-            }
-            _ => Err(ReadError::Corrupt(
-                "stream head index missing or orphaned".into(),
-            )),
-        }
-    }
-
-    fn verify_boundary(
-        conn: &Connection,
-        stream: &SessionStreamId,
-        sequence: u64,
-        hash: &Digest,
-        head: u64,
-        head_hash: &Digest,
-    ) -> Result<(), ReadError> {
-        if sequence == head {
-            if hash != head_hash {
-                return Err(ReadError::Corrupt("event tail digest mismatch".into()));
-            }
-        } else {
-            let raw: Vec<u8> = conn
-                .query_row(
-                    "SELECT event_json FROM session_events WHERE stream_id=?1 AND sequence=?2",
-                    params![stream.as_str(), sequence + 1],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(read_error)?
-                .ok_or_else(|| ReadError::Gap("successor missing".into()))?;
-            let next = parse_event(&raw)?;
-            if next.stream_id != *stream
-                || next.sequence != sequence + 1
-                || next.previous_hash != *hash
-            {
-                return Err(ReadError::Corrupt("event successor digest mismatch".into()));
-            }
-        }
-        Ok(())
+    fn current_head(conn: &Connection, stream: &SessionStreamId) -> Result<u64, ReadError> {
+        conn.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM session_events WHERE stream_id=?1",
+            params![stream.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(read_error)
     }
 
     fn receipt_range(
@@ -397,30 +297,10 @@ impl SqliteEventStore {
         if first == 0 || last < first {
             return Err(ReadError::Corrupt("receipt range invalid".into()));
         }
-        let (head, head_hash) = Self::verified_head(conn, stream)?;
+        let head = Self::current_head(conn, stream)?;
         if last > head {
             return Err(ReadError::Corrupt("receipt beyond head".into()));
         }
-        let mut hash = if first == 1 {
-            Digest::zero()
-        } else {
-            let raw: Vec<u8> = conn
-                .query_row(
-                    "SELECT event_json FROM session_events WHERE stream_id=?1 AND sequence=?2",
-                    params![stream.as_str(), first - 1],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(read_error)?
-                .ok_or_else(|| ReadError::Gap("receipt anchor missing".into()))?;
-            let event = parse_event(&raw)?;
-            if event.stream_id != *stream || event.sequence != first - 1 {
-                return Err(ReadError::Corrupt(
-                    "receipt anchor identity mismatch".into(),
-                ));
-            }
-            hash_raw(&event.previous_hash, &raw)
-        };
         let mut stmt = conn.prepare("SELECT sequence,event_id,event_json FROM session_events WHERE stream_id=?1 AND sequence>=?2 AND sequence<=?3 ORDER BY sequence").map_err(read_error)?;
         let mut rows = stmt
             .query(params![stream.as_str(), first, last])
@@ -436,13 +316,9 @@ impl SqliteEventStore {
                 || event.sequence != sequence
                 || event.event_id.as_str() != id
                 || event.stream_id != *stream
-                || event.previous_hash != hash
             {
-                return Err(ReadError::Corrupt(
-                    "receipt event identity or chain mismatch".into(),
-                ));
+                return Err(ReadError::Corrupt("receipt event identity mismatch".into()));
             }
-            hash = hash_raw(&hash, &raw);
             ids.push(event.event_id);
             expected = expected
                 .checked_add(1)
@@ -451,7 +327,6 @@ impl SqliteEventStore {
         if expected - 1 != last {
             return Err(ReadError::Gap("receipt range missing".into()));
         }
-        Self::verify_boundary(conn, stream, last, &hash, head, &head_hash)?;
         Ok(AppendReceipt {
             first: EventCursor {
                 stream_id: stream.clone(),
@@ -462,39 +337,30 @@ impl SqliteEventStore {
                 sequence: last,
             },
             event_ids: ids,
-            head_hash: hash,
         })
     }
 
-    fn current_head(
-        tx: &rusqlite::Transaction<'_>,
-        stream_id: &SessionStreamId,
-    ) -> Result<(u64, Digest), AppendError> {
-        Self::verified_head(tx, stream_id).map_err(|error| AppendError::Corrupt(error.to_string()))
-    }
-
     fn receipt(
-        tx: &rusqlite::Transaction<'_>,
+        conn: &Connection,
         request: &AppendRequest,
     ) -> Result<Option<AppendReceipt>, AppendError> {
-        let row: Option<(String, i64, i64)> = tx.query_row(
-            "SELECT request_commitment, first_seq, last_seq FROM session_append_receipts WHERE stream_id=?1 AND idempotency_key=?2",
-            params![request.stream_id.as_str(), request.idempotency_key], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
-            .optional().map_err(map_sqlite)?;
-        let Some((commitment, first, last)) = row else {
+        let row: Option<(String, u64, u64)> = conn
+            .query_row(
+                "SELECT request_commitment,first_seq,last_seq FROM session_append_receipts WHERE stream_id=?1 AND idempotency_key=?2",
+                params![request.stream_id.as_str(), request.idempotency_key.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(map_sqlite)?;
+        let Some((stored, first, last)) = row else {
             return Ok(None);
         };
-        let expected = request.commitment()?.as_str().to_owned();
-        if commitment != expected {
+        if stored != request.commitment()?.as_str() {
             return Err(AppendError::IdempotencyConflict(
                 request.idempotency_key.clone(),
             ));
         }
-        let first =
-            u64::try_from(first).map_err(|_| AppendError::Corrupt("negative receipt".into()))?;
-        let last =
-            u64::try_from(last).map_err(|_| AppendError::Corrupt("negative receipt".into()))?;
-        Self::receipt_range(tx, &request.stream_id, first, last)
+        Self::receipt_range(conn, &request.stream_id, first, last)
             .map(Some)
             .map_err(|error| AppendError::Corrupt(error.to_string()))
     }
@@ -515,7 +381,7 @@ impl SessionEventStore for SqliteEventStore {
             .ok_or_else(|| ReadError::Corrupt("event kind is not a string".into()))?;
         let id: Option<String> = {
             let conn = self.conn.lock();
-            Self::verified_head(&conn, stream)?;
+
             let common = "SELECT event_id FROM session_events WHERE stream_id=?1 AND json_extract(event_json, '$.branch_id')=?2 AND json_extract(event_json, '$.body.kind')=?3";
             if let Some(turn) = turn {
                 conn.query_row(&format!("{common} AND json_extract(event_json, '$.turn_id')=?4 ORDER BY sequence DESC LIMIT 1"), params![stream.as_str(),branch.as_str(),kind_tag,turn.as_str()], |row|row.get(0)).optional().map_err(read_error)?
@@ -606,7 +472,8 @@ impl SessionEventStore for SqliteEventStore {
             }
             return Ok(receipt);
         }
-        let (head_seq, head_hash) = Self::current_head(&tx, &request.stream_id)?;
+        let head_seq = Self::current_head(&tx, &request.stream_id)
+            .map_err(|e| AppendError::Corrupt(e.to_string()))?;
         if request.expected_head.sequence != head_seq {
             return Err(AppendError::HeadConflict {
                 expected: request.expected_head.sequence,
@@ -626,7 +493,7 @@ impl SessionEventStore for SqliteEventStore {
             let existing = {
                 let leaf_codecs = content_leaf_sql_list();
                 let query = format!(
-                    "SELECT payload_id, codec, CASE WHEN codec IN ({leaf_codecs}) THEN NULL ELSE body END, body_digest, byte_len FROM event_payloads"
+                    "SELECT payload_id, codec, CASE WHEN codec IN ({leaf_codecs}) THEN NULL ELSE body END FROM event_payloads"
                 );
                 let mut statement = tx.prepare(&query).map_err(map_sqlite)?;
                 let rows = statement
@@ -635,22 +502,16 @@ impl SessionEventStore for SqliteEventStore {
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, Option<Vec<u8>>>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, i64>(4)?,
                         ))
                     })
                     .map_err(map_sqlite)?;
                 let mut out = Vec::new();
                 for row in rows {
-                    let (id, codec, body, digest, len) = row.map_err(map_sqlite)?;
+                    let (id, codec, body) = row.map_err(map_sqlite)?;
                     out.push(zeroclaw_api::session_events::payloads::StoredPayload {
                         reference: zeroclaw_api::session_events::StoredPayloadRef {
                             payload_id: PayloadId::from(id),
                             codec,
-                            body_digest: Digest::from(digest),
-                            byte_len: u64::try_from(len).map_err(|_| {
-                                AppendError::Corrupt("negative payload size".to_owned())
-                            })?,
                         },
                         body,
                     });
@@ -674,7 +535,6 @@ impl SessionEventStore for SqliteEventStore {
         let payload_delta = cache.payloads.plan(&cache.history, &request)?;
         let deleting = payload_delta.deleting().to_vec();
 
-        let mut previous_hash = head_hash;
         let first_seq = head_seq
             .checked_add(1)
             .ok_or_else(|| AppendError::Corrupt("sequence overflow".into()))?;
@@ -692,10 +552,8 @@ impl SessionEventStore for SqliteEventStore {
                 )
                 .ok_or_else(|| AppendError::Corrupt("sequence overflow".into()))?;
             event.committed_at = committed_at;
-            event.previous_hash = previous_hash.clone();
             let raw = event.canonical_bytes()?;
             committed_bytes = committed_event_bytes(committed_bytes, raw.len())?;
-            let event_hash = chain_hash(&previous_hash, &event)?;
             tx.execute(
                 "INSERT INTO session_events(stream_id, sequence, event_id, event_json)
                  VALUES(?1, ?2, ?3, ?4)",
@@ -709,23 +567,19 @@ impl SessionEventStore for SqliteEventStore {
                 ],
             )
             .map_err(map_sqlite)?;
-            previous_hash = event_hash;
             committed_events.push(event);
         }
         for payload in &request.payloads {
-            let existing: Option<(String, i64, Option<Vec<u8>>)> = tx
+            let existing: Option<(String, Option<Vec<u8>>)> = tx
                 .query_row(
-                    "SELECT body_digest, byte_len, body FROM event_payloads WHERE payload_id=?1",
+                    "SELECT codec, body FROM event_payloads WHERE payload_id=?1",
                     params![payload.payload_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
                 .map_err(map_sqlite)?;
-            if let Some((digest, len, body)) = existing {
-                if digest != payload.body_digest.as_str()
-                    || u64::try_from(len).ok() != Some(payload.byte_len)
-                    || body.as_deref() != Some(payload.body.as_slice())
-                {
+            if let Some((codec, body)) = existing {
+                if codec != payload.codec || body.as_deref() != Some(payload.body.as_slice()) {
                     return Err(AppendError::Contract(ContractError::PayloadConflict(
                         payload.payload_id.to_string(),
                     )));
@@ -733,16 +587,9 @@ impl SessionEventStore for SqliteEventStore {
                 continue;
             }
             tx.execute(
-                "INSERT INTO event_payloads(payload_id, codec, body, body_digest, byte_len)
-                 VALUES(?1, ?2, ?3, ?4, ?5)",
-                params![
-                    payload.payload_id.as_str(),
-                    payload.codec,
-                    payload.body,
-                    payload.body_digest.as_str(),
-                    i64::try_from(payload.byte_len)
-                        .map_err(|_| AppendError::Corrupt("payload too large".to_owned()))?,
-                ],
+                "INSERT INTO event_payloads(payload_id, codec, body)
+                 VALUES(?1, ?2, ?3)",
+                params![payload.payload_id.as_str(), payload.codec, payload.body],
             )
             .map_err(map_sqlite)?;
         }
@@ -756,13 +603,6 @@ impl SessionEventStore for SqliteEventStore {
                     .map_err(|_| AppendError::Corrupt("sequence overflow".to_owned()))?,
             )
             .ok_or_else(|| AppendError::Corrupt("sequence overflow".into()))?;
-        tx.execute(
-            "INSERT INTO session_event_stream_heads(stream_id, head_seq, head_hash)
-             VALUES(?1, ?2, ?3)
-             ON CONFLICT(stream_id) DO UPDATE SET head_seq=excluded.head_seq, head_hash=excluded.head_hash",
-            params![request.stream_id.as_str(), i64::try_from(last_seq).map_err(|_| AppendError::Corrupt("sequence exceeds SQLite integer".to_owned()))?, previous_hash.as_str()],
-        )
-        .map_err(map_sqlite)?;
         tx.execute("INSERT INTO session_append_receipts(stream_id,idempotency_key,request_commitment,first_seq,last_seq) VALUES(?1,?2,?3,?4,?5)", params![request.stream_id.as_str(),request.idempotency_key,commitment.as_str(),i64::try_from(first_seq).map_err(|_|AppendError::Corrupt("sequence overflow".to_owned()))?,i64::try_from(last_seq).map_err(|_|AppendError::Corrupt("sequence overflow".to_owned()))?]).map_err(map_sqlite)?;
         let erased = !deleting.is_empty();
         for id in deleting {
@@ -795,7 +635,6 @@ impl SessionEventStore for SqliteEventStore {
                 sequence: last_seq,
             },
             event_ids,
-            head_hash: previous_hash,
         })
     }
 
@@ -815,7 +654,7 @@ impl SessionEventStore for SqliteEventStore {
         }
         let mut connection = self.conn.lock();
         let conn = connection.transaction().map_err(read_error)?;
-        let (head, head_hash) = Self::verified_head(&conn, stream_id)?;
+        let head = Self::current_head(&conn, stream_id)?;
         let through_seq = through.map_or(head, |cursor| {
             if &cursor.stream_id == stream_id {
                 cursor.sequence
@@ -861,35 +700,9 @@ impl SessionEventStore for SqliteEventStore {
                     "event index disagrees with envelope".into(),
                 ));
             }
-            let hash = hash_raw(&event.previous_hash, &raw);
             used += size;
-            rows.push((raw, event, hash));
+            rows.push((raw, event));
         }
-        if let Some((_, last, hash)) = rows.last() {
-            Self::verify_boundary(&conn, stream_id, last.sequence, hash, head, &head_hash)?;
-        }
-        let anchor = if after.sequence == 0 {
-            Digest::zero()
-        } else {
-            let raw: Vec<u8> = conn
-                .query_row(
-                    "SELECT event_json FROM session_events WHERE stream_id=?1 AND sequence=?2",
-                    params![
-                        stream_id.as_str(),
-                        i64::try_from(after.sequence)
-                            .map_err(|_| ReadError::Gap("cursor overflow".into()))?
-                    ],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(read_error)?
-                .ok_or_else(|| ReadError::Gap("page anchor missing".into()))?;
-            let event = parse_event(&raw)?;
-            if event.stream_id != *stream_id || event.sequence != after.sequence {
-                return Err(ReadError::Corrupt("anchor identity mismatch".into()));
-            }
-            hash_raw(&event.previous_hash, &raw)
-        };
         event_page(
             stream_id.clone(),
             after.clone(),
@@ -898,7 +711,6 @@ impl SessionEventStore for SqliteEventStore {
                 sequence: through_seq,
             },
             rows,
-            anchor,
             max_events,
             max_bytes,
             has_more,
@@ -908,7 +720,7 @@ impl SessionEventStore for SqliteEventStore {
     fn head(&self, stream_id: &SessionStreamId) -> Result<EventCursor, ReadError> {
         let mut connection = self.conn.lock();
         let conn = connection.transaction().map_err(read_error)?;
-        let (sequence, _) = Self::verified_head(&conn, stream_id)?;
+        let sequence = Self::current_head(&conn, stream_id)?;
         Ok(EventCursor {
             stream_id: stream_id.clone(),
             sequence,
@@ -943,7 +755,7 @@ impl SessionEventStore for SqliteEventStore {
             Self::verified_history(&tx).map_err(|error| AppendError::Corrupt(error.to_string()))?;
         let leaf_codecs = content_leaf_sql_list();
         let query = format!(
-            "SELECT payload_id,codec,CASE WHEN codec IN ({leaf_codecs}) THEN NULL ELSE body END,body_digest,byte_len FROM event_payloads"
+            "SELECT payload_id,codec,CASE WHEN codec IN ({leaf_codecs}) THEN NULL ELSE body END FROM event_payloads"
         );
         let mut stmt = tx.prepare(&query).map_err(map_sqlite)?;
         let mut payloads = Vec::new();
@@ -953,20 +765,15 @@ impl SessionEventStore for SqliteEventStore {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<Vec<u8>>>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
                 ))
             })
             .map_err(map_sqlite)?
         {
-            let (id, codec, body, digest, len) = row.map_err(map_sqlite)?;
+            let (id, codec, body) = row.map_err(map_sqlite)?;
             payloads.push(zeroclaw_api::session_events::payloads::StoredPayload {
                 reference: zeroclaw_api::session_events::StoredPayloadRef {
                     payload_id: id.into(),
                     codec,
-                    body_digest: digest.into(),
-                    byte_len: u64::try_from(len)
-                        .map_err(|_| AppendError::Corrupt("negative payload size".into()))?,
                 },
                 body,
             });
@@ -986,13 +793,13 @@ impl SessionEventStore for SqliteEventStore {
         let conn = connection.transaction().map_err(read_error)?;
         let row: Option<SqlitePayloadRow> = conn
             .query_row(
-                "SELECT payload_id, codec, CASE WHEN byte_len<=?2 AND length(body)<=?2 THEN body ELSE NULL END, body_digest, byte_len FROM event_payloads WHERE payload_id=?1",
-                params![payload_id.as_str(), i64::try_from(max_bytes).map_err(|_| ReadError::TooLarge)?],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                "SELECT payload_id, codec, CASE WHEN length(body)<=?2 THEN body ELSE NULL END, length(body) FROM event_payloads WHERE payload_id=?1",
+                params![payload_id.as_str(), max_bytes as u64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(read_error)?;
-        let Some((id, codec, body, digest, byte_len)) = row else {
+        let Some((id, codec, body, content_size)) = row else {
             return Err(ReadError::PayloadMissing(payload_id.to_string()));
         };
         let history = Self::verified_history(&conn)?;
@@ -1002,23 +809,16 @@ impl SessionEventStore for SqliteEventStore {
             PayloadDisposition::Redacted => return Ok(PayloadRead::Redacted),
             PayloadDisposition::Present => {}
         }
-        if u64::try_from(byte_len)
-            .map_err(|_| ReadError::Corrupt("negative payload size".into()))?
-            > max_bytes as u64
-        {
+        if content_size.is_some_and(|size| size > max_bytes as u64) {
             return Err(ReadError::TooLarge);
         }
         let body = body.ok_or_else(|| {
             ReadError::Corrupt("body missing without erasure evidence".to_owned())
         })?;
-        let byte_len = u64::try_from(byte_len)
-            .map_err(|_| ReadError::Corrupt("negative payload length".to_owned()))?;
         let record = PayloadRecord {
             payload_id: PayloadId::from(id),
             codec,
             body,
-            body_digest: Digest::from(digest),
-            byte_len,
         };
         record
             .validate()
@@ -1300,47 +1100,38 @@ mod conformance {
         }
     }
     #[test]
-    fn sqlite_corrupt_tail_and_missing_head_never_look_empty() {
-        for corrupt_tail in [true, false] {
-            let dir = TempDir::new().expect("dir");
-            let store = SqliteEventStore::open(dir.path()).expect("store");
-            let stream = SessionStreamId::new();
-            let request = batch(&store, &stream, vec![root(&stream)], vec![]);
-            let key = request.idempotency_key.clone();
-            store.append_batch(request).expect("append");
-            let conn =
-                Connection::open(dir.path().join("sessions/session-events.db")).expect("conn");
-            if corrupt_tail {
-                let raw: Vec<u8> = conn
-                    .query_row("SELECT event_json FROM session_events", [], |row| {
-                        row.get(0)
-                    })
-                    .expect("raw");
-                let mut value: serde_json::Value = serde_json::from_slice(&raw).expect("json");
-                value["actor"] = serde_json::json!({"kind":"system","component":"modified"});
-                conn.execute(
-                    "UPDATE session_events SET event_json=?1",
-                    params![serde_json::to_vec(&value).expect("json")],
-                )
-                .expect("tamper");
-            } else {
-                conn.execute("DELETE FROM session_event_stream_heads", [])
-                    .expect("delete head");
-            }
-            assert!(matches!(store.head(&stream), Err(ReadError::Corrupt(_))));
-            assert!(
-                store
-                    .read_page(
-                        &stream,
-                        &EventCursor::beginning(stream.clone()),
-                        None,
-                        10,
-                        4096
-                    )
-                    .is_err()
-            );
-            assert!(store.lookup_receipt(&stream, &key).is_err());
-        }
+    fn sqlite_reads_edited_event_without_a_content_hash() {
+        let dir = TempDir::new().expect("dir");
+        let store = SqliteEventStore::open(dir.path()).expect("store");
+        let stream = SessionStreamId::new();
+        store
+            .append_batch(batch(&store, &stream, vec![root(&stream)], vec![]))
+            .expect("append");
+        let conn = Connection::open(dir.path().join("sessions/session-events.db")).expect("conn");
+        let raw: Vec<u8> = conn
+            .query_row("SELECT event_json FROM session_events", [], |row| {
+                row.get(0)
+            })
+            .expect("raw");
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        value["body"]["fields"]["owning_agent"] = serde_json::json!("edited");
+        conn.execute(
+            "UPDATE session_events SET event_json=?1",
+            params![serde_json::to_vec(&value).expect("json")],
+        )
+        .expect("edit");
+        let page = store
+            .read_page(
+                &stream,
+                &EventCursor::beginning(stream.clone()),
+                None,
+                10,
+                4096,
+            )
+            .expect("page");
+        assert!(
+            matches!(&page.events[0].body.data, EventData::SessionStarted { owning_agent, .. } if owning_agent == "edited")
+        );
     }
 
     #[test]
@@ -1820,7 +1611,7 @@ mod conformance {
             )
             .expect("payload");
             let mut reference = StoredPayloadRef::from(&payload);
-            reference.byte_len += 1;
+            reference.codec = "session.other/v1".into();
             let event = SessionEvent::typed(
                 stream.clone(),
                 EventData::SessionMetadataChanged {

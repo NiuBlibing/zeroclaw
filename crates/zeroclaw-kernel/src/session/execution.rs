@@ -9,8 +9,8 @@ use zeroclaw_api::session_events::capture::{
 };
 use zeroclaw_api::session_events::projection::{HistoryProjection, InvocationStatus};
 use zeroclaw_api::session_events::{
-    ContentPayload, ContextMessageSource, Digest, EventData, EventId, MessageId, PayloadId,
-    PayloadRead, RecordedContentPart, StoredPayloadRef, TurnCompletion, canonical_json,
+    ContentPayload, ContextMessageSource, EventData, EventId, MessageId, PayloadId, PayloadRead,
+    RecordedContentPart, StoredPayloadRef, TurnCompletion, canonical_json,
 };
 
 #[cfg(test)]
@@ -490,10 +490,11 @@ impl SessionCoordinator {
                             .map_err(|error|ReadError::Corrupt(error.to_string()))?;
                         let metadata: StoredPayloadRef = serde_json::from_value(policy["observed_file_metadata_ref"].clone())
                             .map_err(|error|ReadError::Corrupt(error.to_string()))?;
-                        let expected_metadata = canonical_json(&file.registration.clone())
-                            .map_err(AppendError::from)?;
+                        let PayloadRead::Present(metadata) = owner.store.read_payload(&metadata.payload_id)? else {
+                            return Err(SessionError::StaleTarget("accepted file metadata unavailable".into()));
+                        };
                         if file_id != &file.file_id || representation != &StoredPayloadRef::from(&file.representation)
-                            || metadata.body_digest != Digest::from_bytes(&expected_metadata)
+                            || metadata.body != canonical_json(&file.registration).map_err(AppendError::from)?
                             || policy.get("policy") != Some(&file.policy_evidence.clone()) {
                             return Err(AppendError::IdempotencyConflict(command.ingress_key).into());
                         }

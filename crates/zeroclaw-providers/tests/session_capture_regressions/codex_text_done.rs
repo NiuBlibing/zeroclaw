@@ -541,7 +541,7 @@ async fn audit(backend: &str, mode: &'static str, ending: &str, streaming: bool)
                     assert_eq!(component, block.component().0);
                     let next = offsets.entry((position, component)).or_insert(0);
                     assert_eq!(byte_offset, *next);
-                    *next += block.component().1.byte_len;
+                    *next += h.payload_len(block.component().1);
                     if matches!(block, ResponseBlock::Text { .. }) {
                         segments += 1;
                     }

@@ -813,7 +813,6 @@ fn earlier_native_acp_installation_merges_protocol_data_without_replacing_newer_
                 }
                 let reference: StoredPayloadRef =
                     serde_json::from_value(body["items"][0]["conversation_ref"].clone()).unwrap();
-                assert!(reference.byte_len <= 8 * 1024 * 1024);
                 let rows: Vec<ConversationMessage> = serde_json::from_slice(
                     &context_read::present(store.as_ref(), &reference)
                         .unwrap()

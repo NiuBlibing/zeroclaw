@@ -92,7 +92,6 @@ impl SessionCoordinator {
                 event = prior;
                 event.sequence = 0;
                 event.committed_at = 0;
-                event.previous_hash = Digest::zero();
             }
             // Retrying completed confirmations also resumes a SQLite WAL
             // checkpoint that failed after the redaction transaction.

@@ -49,13 +49,13 @@ struct Segment {
 
 #[derive(Default)]
 pub(super) struct ObservationIndex {
-    components: HashMap<ComponentKey, u64>,
+    components: HashMap<ComponentKey, Option<u64>>,
     segments: HashMap<(InvocationId, usize), Segment>,
     lengths: HashMap<InvocationId, usize>,
     legacy: HashMap<(InvocationId, usize), LegacyBlock>,
 }
 pub(super) struct ObservationDelta {
-    components: HashMap<ComponentKey, u64>,
+    components: HashMap<ComponentKey, Option<u64>>,
     segments: HashMap<(InvocationId, usize), Segment>,
     lengths: HashMap<InvocationId, usize>,
     legacy: HashMap<(InvocationId, usize), LegacyBlock>,
@@ -80,6 +80,32 @@ fn decode<T: serde::de::DeserializeOwned>(
             .ok_or_else(|| AppendError::Corrupt("provider observation structure missing".into()))?,
     )
     .map_err(|error| AppendError::InvalidReference(error.to_string()))
+}
+
+fn payload_len(
+    payloads: &OverlayMap<'_, PayloadId, StoredPayload>,
+    reference: &StoredPayloadRef,
+) -> Result<Option<u64>, AppendError> {
+    let row = payloads
+        .get(&reference.payload_id)
+        .ok_or_else(|| AppendError::InvalidReference("provider payload missing".into()))?;
+    row.body
+        .as_ref()
+        .map(|body| {
+            u64::try_from(body.len())
+                .map_err(|_| AppendError::InvalidReference("provider payload is too large".into()))
+        })
+        .transpose()
+}
+
+fn component_end(offset: u64, length: Option<u64>) -> Result<Option<u64>, AppendError> {
+    length
+        .map(|length| {
+            offset.checked_add(length).ok_or_else(|| {
+                AppendError::InvalidReference("provider component offset overflow".into())
+            })
+        })
+        .transpose()
 }
 
 impl ObservationIndex {
@@ -145,17 +171,13 @@ impl ObservationIndex {
                                 BlockKey::Protocol(position.clone()),
                                 declared,
                             );
-                            let expected = components.get(&key).copied().unwrap_or(0);
-                            if byte_offset != expected {
+                            let expected = components.get(&key).copied().unwrap_or(Some(0));
+                            if expected.is_some_and(|expected| byte_offset != expected) {
                                 return Err(AppendError::InvalidTransition(
                                     "provider component gap or overlap".into(),
                                 ));
                             }
-                            let end = expected.checked_add(bytes.byte_len).ok_or_else(|| {
-                                AppendError::InvalidReference(
-                                    "provider component offset overflow".into(),
-                                )
-                            })?;
+                            let end = component_end(byte_offset, payload_len(payloads, bytes)?)?;
                             components.insert(key, end);
                             (Some(position), segment_ref)
                         }
@@ -215,18 +237,15 @@ impl ObservationIndex {
                             }
                             let component_key =
                                 (invocation.clone(), BlockKey::Legacy(block_index), declared);
-                            let expected = components.get(&component_key).copied().unwrap_or(0);
-                            if strict && byte_offset != expected {
+                            let expected =
+                                components.get(&component_key).copied().unwrap_or(Some(0));
+                            if strict && expected.is_some_and(|expected| byte_offset != expected) {
                                 return Err(AppendError::InvalidTransition(
                                     "provider component gap or overlap".into(),
                                 ));
                             }
                             let end =
-                                byte_offset.checked_add(bytes_ref.byte_len).ok_or_else(|| {
-                                    AppendError::InvalidReference(
-                                        "provider component offset overflow".into(),
-                                    )
-                                })?;
+                                component_end(byte_offset, payload_len(payloads, &bytes_ref)?)?;
                             components.insert(component_key, end);
                             continue;
                         }
@@ -261,8 +280,8 @@ impl ObservationIndex {
                                             kind.into(),
                                         ))
                                         .copied()
-                                        .unwrap_or(0)
-                                        != bytes.byte_len
+                                        .unwrap_or(Some(0))
+                                        != payload_len(payloads, bytes)?
                                 {
                                     return Err(AppendError::InvalidTransition(
                                         "provider finalized component is incomplete".into(),

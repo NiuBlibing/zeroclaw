@@ -941,7 +941,6 @@ mod tests {
                     first: cursor.clone(),
                     last: cursor,
                     event_ids: vec![EventId::new()],
-                    head_hash: Digest::zero(),
                 })
             }
         }

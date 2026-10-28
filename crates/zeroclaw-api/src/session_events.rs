@@ -113,7 +113,7 @@ impl EventCursor {
     }
 }
 
-/// Hex encoded SHA-256 digest used for chain and payload integrity.
+/// Hex encoded SHA-256 value used for request commitments and migration identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Digest(String);
@@ -342,7 +342,7 @@ impl EventBody {
         }
         for reference in self.data.stored_refs()? {
             validate_id(reference.payload_id.as_str())?;
-            if reference.codec.is_empty() || !valid_digest(&reference.body_digest) {
+            if reference.codec.is_empty() {
                 return Err(ContractError::InvalidPayload(
                     "invalid stored payload reference".to_owned(),
                 ));
@@ -352,8 +352,8 @@ impl EventBody {
     }
 }
 
-/// Canonical event envelope.  `sequence`, `committed_at`, and `previous_hash`
-/// are assigned by the backend and must be zero/empty on an append request.
+/// Canonical event envelope. `sequence` and `committed_at` are assigned by the
+/// backend and must be zero/empty on an append request.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionEvent {
     pub schema_version: u32,
@@ -367,7 +367,6 @@ pub struct SessionEvent {
     pub occurred_at: Timestamp,
     pub committed_at: Timestamp,
     pub actor: EventActor,
-    pub previous_hash: Digest,
     pub body: EventBody,
 }
 
@@ -378,11 +377,7 @@ impl SessionEvent {
         if self.schema_version != 1 {
             return Err(ContractError::UnsupportedSchema(self.schema_version));
         }
-        if self.sequence == 0
-            || self.committed_at <= 0
-            || self.occurred_at < 0
-            || !valid_digest(&self.previous_hash)
-        {
+        if self.sequence == 0 || self.committed_at <= 0 || self.occurred_at < 0 {
             return Err(ContractError::InvalidEnvelope(
                 "invalid committed envelope".into(),
             ));
@@ -414,7 +409,6 @@ impl SessionEvent {
             occurred_at: now_millis(),
             committed_at: 0,
             actor,
-            previous_hash: Digest::zero(),
             body: EventBody {
                 codec_version: 1,
                 data,
@@ -442,7 +436,6 @@ impl SessionEvent {
             occurred_at: now_millis(),
             committed_at: 0,
             actor,
-            previous_hash: Digest::zero(),
             body: EventBody {
                 codec_version: 1,
                 data: serde_json::from_value(serde_json::json!({"kind": kind, "fields": fields}))
@@ -460,9 +453,9 @@ impl SessionEvent {
         if self.schema_version != 1 {
             return Err(ContractError::UnsupportedSchema(self.schema_version));
         }
-        if self.sequence != 0 || self.committed_at != 0 || self.previous_hash != Digest::zero() {
+        if self.sequence != 0 || self.committed_at != 0 {
             return Err(ContractError::InvalidEnvelope(
-                "backend-owned sequence, commit time, or chain hash was supplied".to_owned(),
+                "backend-owned sequence or commit time was supplied".to_owned(),
             ));
         }
         validate_id(self.event_id.as_str())?;
@@ -517,7 +510,7 @@ impl SessionEvent {
         self.body.validate()
     }
 
-    /// Canonical bytes used for request commitments and chain hashing.  The
+    /// Canonical bytes used for request commitments and export.  The
     /// serde struct field order is fixed by this source type and is covered by
     /// backend conformance fixtures.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ContractError> {
@@ -530,8 +523,6 @@ pub struct PayloadRecord {
     pub payload_id: PayloadId,
     pub codec: String,
     pub body: Vec<u8>,
-    pub body_digest: Digest,
-    pub byte_len: u64,
 }
 
 impl PayloadRecord {
@@ -542,14 +533,10 @@ impl PayloadRecord {
         if codec.trim().is_empty() {
             return Err(ContractError::InvalidPayload("codec is empty".to_owned()));
         }
-        let byte_len = u64::try_from(body.len())
-            .map_err(|_| ContractError::InvalidPayload("payload is too large".to_owned()))?;
         Ok(Self {
             payload_id,
             codec,
-            body_digest: Digest::from_bytes(&body),
             body,
-            byte_len,
         })
     }
 
@@ -557,11 +544,6 @@ impl PayloadRecord {
         validate_id(self.payload_id.as_str())?;
         if self.codec.trim().is_empty() {
             return Err(ContractError::InvalidPayload("codec is empty".to_owned()));
-        }
-        let actual_len = u64::try_from(self.body.len())
-            .map_err(|_| ContractError::InvalidPayload("payload is too large".to_owned()))?;
-        if actual_len != self.byte_len || Digest::from_bytes(&self.body) != self.body_digest {
-            return Err(ContractError::PayloadConflict(self.payload_id.to_string()));
         }
         Ok(())
     }
@@ -648,9 +630,8 @@ impl AppendRequest {
     }
 
     pub fn commitment(&self) -> Result<Digest, ContractError> {
-        // Validate bytes against their digest before binding only metadata.
-        // Serializing binary bodies as JSON number arrays would materialize
-        // one serde Value per byte and defeat bounded payload memory.
+        // Bind retry bytes directly without storing a content digest in each
+        // payload or reference. Hash binary bodies as bytes, not JSON arrays.
         #[derive(Serialize)]
         struct Commitment<'a> {
             stream_id: &'a SessionStreamId,
@@ -662,15 +643,22 @@ impl AppendRequest {
         for event in &mut events {
             event.sequence = 0;
             event.committed_at = 0;
-            event.previous_hash = Digest::zero();
         }
         self.validate_events(&events)?;
-        Ok(Digest::from_bytes(&canonical_json(&Commitment {
+        let mut hash = Sha256::new();
+        hash.update(canonical_json(&Commitment {
             stream_id: &self.stream_id,
             idempotency_key: &self.idempotency_key,
             events,
             payloads: self.payloads.iter().map(StoredPayloadRef::from).collect(),
-        })?))
+        })?);
+        for payload in &self.payloads {
+            // Frame each body so different payload boundaries cannot share
+            // the same concatenated bytes. Length is derived, never stored.
+            hash.update((payload.body.len() as u64).to_le_bytes());
+            hash.update(&payload.body);
+        }
+        Ok(Digest::from(hex_encode(&hash.finalize())))
     }
 }
 
@@ -679,7 +667,6 @@ pub struct AppendReceipt {
     pub first: EventCursor,
     pub last: EventCursor,
     pub event_ids: Vec<EventId>,
-    pub head_hash: Digest,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -842,8 +829,6 @@ pub trait SessionEventStore: Send + Sync {
     fn read_payload(&self, payload_id: &PayloadId) -> Result<PayloadRead, ReadError> {
         self.read_payload_bounded(payload_id, MAX_PAGE_BYTES)
     }
-    /// Bound allocation before reading bytes. Latest erasure facts override any
-    /// historic cursor; this internal port never grants viewer access by ID.
     fn read_payload_bounded(
         &self,
         payload_id: &PayloadId,
@@ -856,13 +841,6 @@ pub trait SessionEventStore: Send + Sync {
     ) -> Result<(Vec<SessionStreamId>, Digest), AppendError>;
 }
 
-fn valid_digest(digest: &Digest) -> bool {
-    digest.as_str().len() == 64
-        && digest
-            .as_str()
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
 fn validate_id(value: &str) -> Result<(), ContractError> {
     if value.is_empty()
         || value.len() > 256
@@ -926,11 +904,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn payload_digest_and_length_are_derived() {
+    fn payload_body_is_validated() {
         let payload = PayloadRecord::new(PayloadId::new(), "text".to_owned(), b"hello".to_vec())
             .expect("valid payload");
-        assert_eq!(payload.byte_len, 5);
-        payload.validate().expect("digest is valid");
+        assert_eq!(payload.body, b"hello");
+        payload.validate().expect("valid payload");
+        let record = serde_json::to_value(&payload).expect("record");
+        let reference = serde_json::to_value(StoredPayloadRef::from(&payload)).expect("reference");
+        for value in [record, reference] {
+            assert!(value.get("body_digest").is_none());
+            assert!(value.get("byte_len").is_none());
+        }
     }
 
     #[test]
@@ -947,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn request_commitment_binds_verified_payload_metadata_and_rejects_forged_bytes() {
+    fn request_commitment_binds_payload_metadata() {
         let stream = SessionStreamId::new();
         let payload =
             PayloadRecord::new(PayloadId::new(), "session.bytes/v1".into(), vec![1; 1024])
@@ -973,10 +957,16 @@ mod tests {
         let original = request.commitment().expect("commitment");
         let mut forged = request.clone();
         forged.payloads[0].body[0] = 2;
-        assert!(matches!(
-            forged.commitment(),
-            Err(ContractError::PayloadConflict(_))
-        ));
+        assert_ne!(original, forged.commitment().expect("changed bytes"));
+        let mut split = request.clone();
+        split.payloads = vec![
+            PayloadRecord::new(PayloadId::new(), "session.bytes/v1".into(), b"ab".to_vec()).expect("first"),
+            PayloadRecord::new(PayloadId::new(), "session.bytes/v1".into(), b"c".to_vec()).expect("second"),
+        ];
+        let mut shifted = split.clone();
+        shifted.payloads[0].body = b"a".to_vec();
+        shifted.payloads[1].body = b"bc".to_vec();
+        assert_ne!(split.commitment().expect("split"), shifted.commitment().expect("shifted"));
         let mut changed = request.clone();
         changed.payloads[0] = PayloadRecord::new(
             changed.payloads[0].payload_id.clone(),
@@ -1011,7 +1001,6 @@ mod tests {
         let first = request.commitment().expect("commitment");
         event.sequence = 99;
         event.committed_at = 42;
-        event.previous_hash = Digest::from_bytes(b"different");
         let changed = AppendRequest {
             events: vec![event],
             ..request

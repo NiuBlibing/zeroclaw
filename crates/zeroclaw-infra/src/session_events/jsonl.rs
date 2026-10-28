@@ -11,8 +11,6 @@ use zeroclaw_api::session_events::canonical_json;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct FileRef {
     id: EventId,
-    digest: Digest,
-    byte_len: u64,
 }
 #[derive(Serialize, Deserialize)]
 struct Root {
@@ -34,8 +32,6 @@ struct Commit {
 struct PayloadMeta {
     payload_id: PayloadId,
     codec: String,
-    digest: Digest,
-    byte_len: u64,
 }
 // Raw event bytes remain canonical in verified immutable segments. Retain
 // coordinates instead of a second in-memory copy of every serialized row.
@@ -44,7 +40,7 @@ struct RawSpan {
     offset: usize,
     len: usize,
 }
-type Row = (RawSpan, EventId, Digest);
+type Row = (RawSpan, EventId);
 #[derive(Default)]
 struct Snapshot {
     initialized: bool,
@@ -81,7 +77,7 @@ impl JsonlEventStore {
         let snapshot = self.snapshot()?;
         let mut result = Vec::new();
         for rows in snapshot.rows.values() {
-            if let Some((_, id, _)) = rows.first() {
+            if let Some((_, id)) = rows.first() {
                 let event = snapshot
                     .history
                     .get_event(id)
@@ -143,8 +139,6 @@ impl JsonlEventStore {
                 reference: zeroclaw_api::session_events::StoredPayloadRef {
                     payload_id: meta.payload_id.clone(),
                     codec: meta.codec.clone(),
-                    body_digest: meta.digest.clone(),
-                    byte_len: meta.byte_len,
                 },
                 body,
             });
@@ -187,10 +181,7 @@ impl JsonlEventStore {
         for payload in &image.payloads {
             let r = &payload.reference;
             if let Some(existing) = snapshot.payloads.get(r.payload_id.as_str()) {
-                if existing.codec != r.codec
-                    || existing.digest != r.body_digest
-                    || existing.byte_len != r.byte_len
-                {
+                if existing.codec != r.codec {
                     return Err(AppendError::Corrupt(
                         "migration target payload conflict".into(),
                     ));
@@ -216,8 +207,6 @@ impl JsonlEventStore {
             payloads.push(PayloadMeta {
                 payload_id: r.payload_id.clone(),
                 codec: r.codec.clone(),
-                digest: r.body_digest.clone(),
-                byte_len: r.byte_len,
             });
         }
         sync_directory(&self.root.join("payloads"))?;
@@ -378,27 +367,18 @@ impl JsonlEventStore {
         reference: &FileRef,
         extension: &str,
     ) -> Result<Vec<u8>, AppendError> {
-        let limit = reference
-            .byte_len
-            .checked_add(1)
-            .ok_or_else(|| AppendError::Corrupt("committed file size overflow".into()))?;
-        if reference.byte_len > MAX_PAGE_BYTES as u64 {
-            return Err(AppendError::Corrupt(
-                "committed file exceeds size limit".into(),
-            ));
-        }
         let mut raw = Vec::new();
         filesystem::reader(&self.path(directory, &reference.id, extension)?)
-            .and_then(|file| file.take(limit).read_to_end(&mut raw))
+            .and_then(|file| file.take(MAX_PAGE_BYTES as u64 + 1).read_to_end(&mut raw))
             .map_err(|error| {
                 AppendError::Corrupt(format!(
                     "committed {directory} file missing or unreadable: {error}"
                 ))
             })?;
-        if raw.len() as u64 != reference.byte_len || Digest::from_bytes(&raw) != reference.digest {
-            return Err(AppendError::Corrupt(format!(
-                "invalid {directory} file digest"
-            )));
+        if raw.len() > MAX_PAGE_BYTES {
+            return Err(AppendError::Corrupt(
+                "committed file exceeds size limit".into(),
+            ));
         }
         Ok(raw)
     }
@@ -414,11 +394,7 @@ impl JsonlEventStore {
         write_synced(&temporary, bytes)?;
         fs::rename(&temporary, target).map_err(storage)?;
         sync_directory(&self.root.join(directory))?;
-        Ok(FileRef {
-            id,
-            digest: Digest::from_bytes(bytes),
-            byte_len: bytes.len() as u64,
-        })
+        Ok(FileRef { id })
     }
     fn publish_root(&self, root: &Root) -> Result<(), AppendError> {
         let tmp = self.path("staging", &EventId::new(), "tmp")?;
@@ -499,16 +475,12 @@ impl JsonlEventStore {
             {
                 let event =
                     parse_event(line).map_err(|error| AppendError::Corrupt(error.to_string()))?;
-                let previous = rows
-                    .last()
-                    .map_or_else(Digest::zero, |(_, _, hash)| hash.clone());
                 if event.stream_id != commit.stream_id
                     || event.sequence
                         != commit
                             .first
                             .checked_add(event_ids.len() as u64)
                             .ok_or_else(|| AppendError::Corrupt("sequence overflow".into()))?
-                    || event.previous_hash != previous
                     || snapshot.positions.contains_key(&event.event_id)
                 {
                     return Err(AppendError::Corrupt(
@@ -555,7 +527,6 @@ impl JsonlEventStore {
                         commit_reference.clone(),
                     ),
                 );
-                let hash = hash_raw(&previous, line);
                 event_ids.push(event.event_id.clone());
                 committed_events.push(event.clone());
                 rows.push((
@@ -564,10 +535,9 @@ impl JsonlEventStore {
                         len: line.len(),
                     },
                     event.event_id,
-                    hash,
                 ));
             }
-            let Some((_, _, hash)) = rows.last() else {
+            let Some((_, _)) = rows.last() else {
                 return Err(AppendError::Corrupt("empty segment".to_owned()));
             };
             if event_ids.is_empty() || rows.len() as u64 != commit.last {
@@ -583,7 +553,6 @@ impl JsonlEventStore {
                     sequence: commit.last,
                 },
                 event_ids,
-                head_hash: hash.clone(),
             };
             if snapshot
                 .receipts
@@ -605,20 +574,13 @@ impl JsonlEventStore {
                 } else {
                     let file = filesystem::reader(&self.payload_path(&payload.payload_id)?)
                         .map_err(storage)?;
-                    if payload.byte_len > MAX_PAGE_BYTES as u64 {
-                        return Err(AppendError::Corrupt(
-                            "structural payload exceeds size limit".into(),
-                        ));
-                    }
                     let mut bytes = Vec::new();
-                    file.take(payload.byte_len + 1)
+                    file.take(MAX_PAGE_BYTES as u64 + 1)
                         .read_to_end(&mut bytes)
                         .map_err(storage)?;
-                    if bytes.len() as u64 != payload.byte_len
-                        || Digest::from_bytes(&bytes) != payload.digest
-                    {
+                    if bytes.len() > MAX_PAGE_BYTES {
                         return Err(AppendError::Corrupt(
-                            "structural payload integrity failure".into(),
+                            "structural payload exceeds size limit".into(),
                         ));
                     }
                     Some(bytes)
@@ -627,16 +589,11 @@ impl JsonlEventStore {
                     reference: zeroclaw_api::session_events::StoredPayloadRef {
                         payload_id: payload.payload_id.clone(),
                         codec: payload.codec.clone(),
-                        body_digest: payload.digest.clone(),
-                        byte_len: payload.byte_len,
                     },
                     body,
                 });
                 if let Some(old) = snapshot.payloads.get(payload.payload_id.as_str()) {
-                    if old.codec != payload.codec
-                        || old.digest != payload.digest
-                        || old.byte_len != payload.byte_len
-                    {
+                    if old.codec != payload.codec {
                         return Err(AppendError::Corrupt(
                             "conflicting committed payload".to_owned(),
                         ));
@@ -728,7 +685,7 @@ impl SessionEventStore for JsonlEventStore {
             .get(stream.as_str())
             .into_iter()
             .flat_map(|rows| rows.iter().rev())
-            .filter_map(|(_, id, _)| snapshot.history.get_event(id))
+            .filter_map(|(_, id)| snapshot.history.get_event(id))
             .find(|event| {
                 event.branch_id.as_ref() == Some(branch)
                     && turn.is_none_or(|turn| event.turn_id.as_ref() == Some(turn))
@@ -767,12 +724,9 @@ impl SessionEventStore for JsonlEventStore {
         self.verify_events(
             &snapshot,
             rows.and_then(|rows| rows.last())
-                .and_then(|(_, id, _)| snapshot.history.get_event(id)),
+                .and_then(|(_, id)| snapshot.history.get_event(id)),
         )?;
         let sequence = rows.map_or(0, |rows| rows.len() as u64);
-        let mut hash = rows
-            .and_then(|rows| rows.last())
-            .map_or_else(Digest::zero, |(_, _, hash)| hash.clone());
         if sequence != request.expected_head.sequence {
             return Err(AppendError::HeadConflict {
                 expected: request.expected_head.sequence,
@@ -803,10 +757,8 @@ impl SessionEventStore for JsonlEventStore {
                 .checked_add(offset as u64)
                 .ok_or_else(|| AppendError::Corrupt("sequence overflow".to_owned()))?;
             event.committed_at = timestamp;
-            event.previous_hash = hash.clone();
             let bytes = event.canonical_bytes()?;
             committed_event_bytes(payload_bytes + raw.len(), bytes.len())?;
-            hash = hash_raw(&hash, &bytes);
             raw.extend_from_slice(&bytes);
             raw.push(b'\n');
             event_ids.push(event.event_id);
@@ -814,10 +766,7 @@ impl SessionEventStore for JsonlEventStore {
         let mut payloads = Vec::new();
         for payload in &request.payloads {
             if let Some(existing) = snapshot.payloads.get(payload.payload_id.as_str()) {
-                if existing.codec != payload.codec
-                    || existing.digest != payload.body_digest
-                    || existing.byte_len != payload.byte_len
-                {
+                if existing.codec != payload.codec {
                     return Err(
                         ContractError::PayloadConflict(payload.payload_id.to_string()).into(),
                     );
@@ -840,8 +789,6 @@ impl SessionEventStore for JsonlEventStore {
             payloads.push(PayloadMeta {
                 payload_id: payload.payload_id.clone(),
                 codec: payload.codec.clone(),
-                digest: payload.body_digest.clone(),
-                byte_len: payload.byte_len,
             });
         }
         let segment = self.write_file("segments", "jsonl", &raw)?;
@@ -890,7 +837,6 @@ impl SessionEventStore for JsonlEventStore {
                 sequence: last,
             },
             event_ids,
-            head_hash: hash,
         })
     }
     fn read_page(
@@ -931,13 +877,13 @@ impl SessionEventStore for JsonlEventStore {
             &snapshot,
             selected
                 .iter()
-                .filter_map(|(_, id, _)| snapshot.history.get_event(id)),
+                .filter_map(|(_, id)| snapshot.history.get_event(id)),
         )
         .map_err(as_read)?;
         let has_more = selected.len() > max_events;
         let mut segments = BTreeMap::new();
         let mut materialized = Vec::with_capacity(selected.len());
-        for (span, id, hash) in selected {
+        for (span, id) in selected {
             let event = snapshot
                 .history
                 .get_event(&id)
@@ -963,25 +909,13 @@ impl SessionEventStore for JsonlEventStore {
                 .and_then(|raw| raw.get(span.offset..end))
                 .ok_or_else(|| ReadError::Corrupt("event span outside committed segment".into()))?
                 .to_vec();
-            materialized.push((bytes, event, hash));
+            materialized.push((bytes, event));
         }
-        let anchor_row = rows.and_then(|rows| {
-            usize::try_from(after.sequence.checked_sub(1)?)
-                .ok()
-                .and_then(|position| rows.get(position))
-        });
-        self.verify_events(
-            &snapshot,
-            anchor_row.and_then(|(_, id, _)| snapshot.history.get_event(id)),
-        )
-        .map_err(as_read)?;
-        let anchor = anchor_row.map_or_else(Digest::zero, |(_, _, hash)| hash.clone());
         event_page(
             stream_id.clone(),
             after.clone(),
             through,
             materialized,
-            anchor,
             max_events,
             max_bytes,
             has_more,
@@ -996,7 +930,7 @@ impl SessionEventStore for JsonlEventStore {
                 .rows
                 .get(stream_id.as_str())
                 .and_then(|rows| rows.last())
-                .and_then(|(_, id, _)| snapshot.history.get_event(id)),
+                .and_then(|(_, id)| snapshot.history.get_event(id)),
         )
         .map_err(as_read)?;
         Ok(EventCursor {
@@ -1031,7 +965,7 @@ impl SessionEventStore for JsonlEventStore {
                             .get(stream)
                             .and_then(|rows| rows.get(*position))
                     })
-                    .filter_map(|(_, id, _)| snapshot.history.get_event(id)),
+                    .filter_map(|(_, id)| snapshot.history.get_event(id)),
             )
             .map_err(as_read)?;
         }
@@ -1048,7 +982,7 @@ impl SessionEventStore for JsonlEventStore {
             .rows
             .values()
             .flatten()
-            .filter_map(|(_, id, _)| snapshot.history.get_event(id).cloned())
+            .filter_map(|(_, id)| snapshot.history.get_event(id).cloned())
             .collect();
         let mut payloads = Vec::new();
         for meta in snapshot.payloads.values() {
@@ -1061,8 +995,6 @@ impl SessionEventStore for JsonlEventStore {
                 reference: zeroclaw_api::session_events::StoredPayloadRef {
                     payload_id: meta.payload_id.clone(),
                     codec: meta.codec.clone(),
-                    body_digest: meta.digest.clone(),
-                    byte_len: meta.byte_len,
                 },
                 body,
             });
@@ -1095,9 +1027,6 @@ impl SessionEventStore for JsonlEventStore {
             PayloadDisposition::Redacted => return Ok(PayloadRead::Redacted),
             PayloadDisposition::Present => {}
         }
-        if meta.byte_len > max_bytes as u64 {
-            return Err(ReadError::TooLarge);
-        }
         let file = filesystem::reader(&self.payload_path(payload_id).map_err(as_read)?).map_err(
             |error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
@@ -1118,8 +1047,6 @@ impl SessionEventStore for JsonlEventStore {
             payload_id: payload_id.clone(),
             codec: meta.codec.clone(),
             body,
-            body_digest: meta.digest.clone(),
-            byte_len: meta.byte_len,
         };
         record
             .validate()

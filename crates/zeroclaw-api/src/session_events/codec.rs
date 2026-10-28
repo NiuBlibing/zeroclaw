@@ -7,16 +7,12 @@ use std::marker::PhantomData;
 pub struct StoredPayloadRef {
     pub payload_id: PayloadId,
     pub codec: String,
-    pub body_digest: Digest,
-    pub byte_len: u64,
 }
 impl From<&PayloadRecord> for StoredPayloadRef {
     fn from(record: &PayloadRecord) -> Self {
         Self {
             payload_id: record.payload_id.clone(),
             codec: record.codec.clone(),
-            body_digest: record.body_digest.clone(),
-            byte_len: record.byte_len,
         }
     }
 }

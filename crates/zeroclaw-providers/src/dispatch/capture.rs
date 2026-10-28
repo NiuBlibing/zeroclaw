@@ -178,6 +178,18 @@ pub(super) struct Recorder {
 struct CapturedSegment {
     block: ResponseBlock,
     position: Option<zeroclaw_api::model_provider::ProviderContentPosition>,
+    // Transient coordinate cursor derived from the captured bytes, never a
+    // field in the durable payload reference.
+    component_end: u64,
+}
+
+fn payload_len(payloads: &[PayloadRecord], reference: &StoredPayloadRef) -> anyhow::Result<u64> {
+    let payload = payloads
+        .iter()
+        .find(|payload| payload.payload_id == reference.payload_id)
+        .ok_or_else(|| anyhow::Error::msg("session_capture_payload_missing"))?;
+    u64::try_from(payload.body.len())
+        .map_err(|_| anyhow::Error::msg("session_capture_payload_size_overflow"))
 }
 
 impl Recorder {
@@ -191,6 +203,7 @@ impl Recorder {
         self.blocks.push(CapturedSegment {
             block,
             position: None,
+            component_end: 0,
         });
         Ok(())
     }
@@ -1014,17 +1027,17 @@ impl Recorder {
             }
             StreamEvent::ReasoningFinalized(text) => {
                 let already_captured = matches!(
-                    signed_projection.and_then(|index| self.blocks.get(index)).map(|segment| &segment.block),
+                    signed_projection
+                        .and_then(|index| self.blocks.get(index))
+                        .map(|segment| &segment.block),
                     Some(ResponseBlock::Reasoning {
                         representation_kind,
-                        payload_ref,
                         completion: ContentCompletion::Complete,
                         replay_requirement,
+                        ..
                     }) if replay_requirement == "provider_defined"
-                        && ((representation_kind == crate::anthropic::SIGNED_REPLAY_REPRESENTATION
-                            && payload_ref.body_digest == Digest::from_bytes(text.as_bytes()))
-                            || (representation_kind == "redacted_thinking"
-                                && payload_ref.body_digest == Digest::from_bytes(text.strip_prefix('\n').unwrap_or(text).as_bytes())))
+                        && (representation_kind == crate::anthropic::SIGNED_REPLAY_REPRESENTATION
+                            || representation_kind == "redacted_thinking")
                 );
                 if !already_captured {
                     blocks.push(self.reasoning(text, true, &mut payloads)?);
@@ -1106,12 +1119,13 @@ impl Recorder {
                         segment.position.as_ref() == Some(position)
                             && segment.block.component().0 == component
                     })
-                    .try_fold(0u64, |offset, segment| {
-                        offset
-                            .checked_add(segment.block.component().1.byte_len)
-                            .ok_or_else(|| {
-                                anyhow::Error::msg("session_capture_component_offset_overflow")
-                            })
+                    .map(|segment| segment.component_end)
+                    .next_back()
+                    .unwrap_or(0);
+                let component_end = byte_offset
+                    .checked_add(payload_len(&payloads, block.component().1)?)
+                    .ok_or_else(|| {
+                        anyhow::Error::msg("session_capture_component_offset_overflow")
                     })?;
                 operations.push(ProviderObservation::ProtocolSegmentObserved {
                     position: position.clone(),
@@ -1123,6 +1137,7 @@ impl Recorder {
                 self.retain_block(block)?;
                 if let Some(segment) = self.blocks.last_mut() {
                     segment.position = Some(position.clone());
+                    segment.component_end = component_end;
                 }
                 continue;
             }

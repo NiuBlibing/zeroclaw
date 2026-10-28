@@ -42,7 +42,13 @@ impl EngineSession {
                 let previous=page.events.iter().find_map(|event|match &event.body.data {
                     EventData::FileUsed {representation_ref,..}=>Some(representation_ref),_=>None
                 }).ok_or_else(||SessionError::StoreUnhealthy("file receipt missing rendition".into()))?;
-                if previous.body_digest!=file.representation.body_digest || previous.codec!=file.representation.codec || previous.byte_len!=file.representation.byte_len {
+                if previous.codec != file.representation.codec {
+                    return Err(SessionError::InvalidAdmission("file rendition retry conflict".into()));
+                }
+                let PayloadRead::Present(recorded)=owner.store.read_payload(&previous.payload_id)? else {
+                    return Err(SessionError::StaleTarget("recorded file rendition unavailable".into()));
+                };
+                if recorded.body!=file.representation.body {
                     return Err(SessionError::InvalidAdmission("file rendition retry conflict".into()));
                 }
                 return Ok(());

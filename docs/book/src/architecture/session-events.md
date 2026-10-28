@@ -395,20 +395,21 @@ uses the same kernel settlement rule.
 SQLite stores canonical event bytes and payloads in one immediate transaction.
 Sequence and event ID columns are checked against those bytes. WAL durability,
 head comparison and immutable append receipts determine committed visibility.
-Erasure disposition and cold append admission verify the complete stored hash
-chain in the same transaction before deriving decisions. External changes
-invalidate the hot append cache; a forged middle event cannot authorize an
-append or hide content behind a fabricated erasure observation.
+Erasure disposition and cold append admission derive decisions from committed
+events in the same transaction. Recovery uses transaction boundaries, ordered
+sequences and published roots. Events and payloads have no content hash chain,
+stored digest or stored byte length; payload references contain their identity
+and codec. Manual changes outside the program are not a tamper-detection surface.
 
 Both backends apply the shared 64 MiB batch budget to payloads and the final
-committed event encoding, including assigned sequence and hash fields and JSONL
+committed event encoding, including assigned sequence fields and JSONL
 framing. An oversized batch publishes neither history nor a receipt. Successful
 append cannot create an event larger than the bounded reader can consume.
 
 JSONL publishes immutable batch segments and commits through an atomic root
 manifest. Files and directories are synchronized before returning a receipt.
-Staging or orphan files do not become history. A missing committed segment,
-payload or invalid digest is an error, never an empty or truncated conversation.
+Staging or orphan files do not become history. A missing committed segment or
+payload is an error, never an empty or truncated conversation.
 Disposable indexes are reconstructed from committed facts and do not own state.
 The native writer currently requires Unix directory synchronization. On other
 platforms publication fails explicitly instead of reporting an unproven durable
@@ -608,4 +609,5 @@ main database while WAL writers run is not a valid backup. Back up JSONL's
 published root, immutable commits, segments, and referenced content under the
 installation ownership lock. Operators must apply their retention policy to
 all copies and exports before claiming installation-wide content removal.
-The hash chain detects inconsistency; it is not an external audit signature.
+Append request commitments identify retries, and migration commitments identify
+the transferred snapshot; neither forms a content-integrity chain.
