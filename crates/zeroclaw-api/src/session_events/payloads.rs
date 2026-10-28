@@ -302,6 +302,7 @@ impl PayloadIndex {
             &super::rules::HistoryIndex::from_history(history)?,
             history,
             existing,
+            &|_| Ok(None),
         )
     }
 
@@ -311,6 +312,7 @@ impl PayloadIndex {
         facts: &super::rules::HistoryIndex,
         history: &[SessionEvent],
         existing: &[StoredPayload],
+        body_length: &dyn Fn(&PayloadId) -> Result<Option<u64>, AppendError>,
     ) -> Result<Self, AppendError> {
         let mut index = Self::default();
         index.records.extend(
@@ -318,7 +320,7 @@ impl PayloadIndex {
                 .iter()
                 .map(|row| (row.reference.payload_id.clone(), row.clone())),
         );
-        index.observe(history, facts)?;
+        index.observe(history, facts, body_length)?;
         Ok(index)
     }
     pub fn commit(&mut self, delta: PayloadDelta) {
@@ -345,21 +347,23 @@ impl PayloadIndex {
         events: &[SessionEvent],
         records: Vec<StoredPayload>,
         history: &super::rules::HistoryIndex,
+        body_length: &dyn Fn(&PayloadId) -> Result<Option<u64>, AppendError>,
     ) -> Result<(), AppendError> {
         self.records.extend(
             records
                 .into_iter()
                 .map(|row| (row.reference.payload_id.clone(), row)),
         );
-        self.observe(events, history)
+        self.observe(events, history, body_length)
     }
     fn observe(
         &mut self,
         events: &[SessionEvent],
         history: &super::rules::HistoryIndex,
+        body_length: &dyn Fn(&PayloadId) -> Result<Option<u64>, AppendError>,
     ) -> Result<(), AppendError> {
         self.provider_observations
-            .observe_committed(events, &self.records)?;
+            .observe_committed(events, &self.records, body_length)?;
         for event in events {
             match &event.body.data {
                 EventData::UserContentRecorded { content_ref, .. }
@@ -698,7 +702,7 @@ pub fn validate_payload_batch(
     request: &AppendRequest,
 ) -> Result<Vec<PayloadId>, AppendError> {
     let facts = super::rules::HistoryIndex::from_history(history)?;
-    let index = PayloadIndex::from_index(&facts, history, existing)?;
+    let index = PayloadIndex::from_index(&facts, history, existing, &|_| Ok(None))?;
     Ok(index.plan(&facts, request)?.deleting)
 }
 fn validate_semantic_payloads(

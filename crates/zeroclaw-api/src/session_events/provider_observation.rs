@@ -85,17 +85,23 @@ fn decode<T: serde::de::DeserializeOwned>(
 fn payload_len(
     payloads: &OverlayMap<'_, PayloadId, StoredPayload>,
     reference: &StoredPayloadRef,
+    body_length: &dyn Fn(&PayloadId) -> Result<Option<u64>, AppendError>,
 ) -> Result<Option<u64>, AppendError> {
     let row = payloads
         .get(&reference.payload_id)
         .ok_or_else(|| AppendError::InvalidReference("provider payload missing".into()))?;
-    row.body
+    let length = row
+        .body
         .as_ref()
         .map(|body| {
             u64::try_from(body.len())
                 .map_err(|_| AppendError::InvalidReference("provider payload is too large".into()))
         })
-        .transpose()
+        .transpose()?;
+    match length {
+        Some(length) => Ok(Some(length)),
+        None => body_length(&reference.payload_id),
+    }
 }
 
 fn component_end(offset: u64, length: Option<u64>) -> Result<Option<u64>, AppendError> {
@@ -113,8 +119,9 @@ impl ObservationIndex {
         &mut self,
         events: &[SessionEvent],
         payloads: &HashMap<PayloadId, StoredPayload>,
+        body_length: &dyn Fn(&PayloadId) -> Result<Option<u64>, AppendError>,
     ) -> Result<(), AppendError> {
-        let delta = self.plan_inner(events, &OverlayMap::new(payloads), false)?;
+        let delta = self.plan_inner(events, &OverlayMap::new(payloads), false, body_length)?;
         self.commit(delta);
         Ok(())
     }
@@ -129,13 +136,14 @@ impl ObservationIndex {
         events: &[SessionEvent],
         payloads: &OverlayMap<'_, PayloadId, StoredPayload>,
     ) -> Result<ObservationDelta, AppendError> {
-        self.plan_inner(events, payloads, true)
+        self.plan_inner(events, payloads, true, &|_| Ok(None))
     }
     fn plan_inner(
         &self,
         events: &[SessionEvent],
         payloads: &OverlayMap<'_, PayloadId, StoredPayload>,
         strict: bool,
+        body_length: &dyn Fn(&PayloadId) -> Result<Option<u64>, AppendError>,
     ) -> Result<ObservationDelta, AppendError> {
         let mut components = OverlayMap::new(&self.components);
         let mut segments = OverlayMap::new(&self.segments);
@@ -172,12 +180,20 @@ impl ObservationIndex {
                                 declared,
                             );
                             let expected = components.get(&key).copied().unwrap_or(Some(0));
+                            if strict && expected.is_none() {
+                                return Err(AppendError::InvalidReference(
+                                    "provider component bytes unavailable".into(),
+                                ));
+                            }
                             if expected.is_some_and(|expected| byte_offset != expected) {
                                 return Err(AppendError::InvalidTransition(
                                     "provider component gap or overlap".into(),
                                 ));
                             }
-                            let end = component_end(byte_offset, payload_len(payloads, bytes)?)?;
+                            let end = component_end(
+                                byte_offset,
+                                payload_len(payloads, bytes, body_length)?,
+                            )?;
                             components.insert(key, end);
                             (Some(position), segment_ref)
                         }
@@ -239,13 +255,20 @@ impl ObservationIndex {
                                 (invocation.clone(), BlockKey::Legacy(block_index), declared);
                             let expected =
                                 components.get(&component_key).copied().unwrap_or(Some(0));
+                            if strict && expected.is_none() {
+                                return Err(AppendError::InvalidReference(
+                                    "provider component bytes unavailable".into(),
+                                ));
+                            }
                             if strict && expected.is_some_and(|expected| byte_offset != expected) {
                                 return Err(AppendError::InvalidTransition(
                                     "provider component gap or overlap".into(),
                                 ));
                             }
-                            let end =
-                                component_end(byte_offset, payload_len(payloads, &bytes_ref)?)?;
+                            let end = component_end(
+                                byte_offset,
+                                payload_len(payloads, &bytes_ref, body_length)?,
+                            )?;
                             components.insert(component_key, end);
                             continue;
                         }
@@ -281,7 +304,7 @@ impl ObservationIndex {
                                         ))
                                         .copied()
                                         .unwrap_or(Some(0))
-                                        != payload_len(payloads, bytes)?
+                                        != payload_len(payloads, bytes, body_length)?
                                 {
                                     return Err(AppendError::InvalidTransition(
                                         "provider finalized component is incomplete".into(),

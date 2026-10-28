@@ -152,6 +152,7 @@ impl NativeImage {
                     },
                 )
                 .collect::<Vec<_>>(),
+            &|_| Ok(None),
         )?;
         Ok(())
     }

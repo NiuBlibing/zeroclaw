@@ -2076,7 +2076,8 @@ async fn provider_observation_append_rejects_gaps_overlap_and_reordering_both_ba
                 assert!(
                     observe(port.as_ref(), invalid, second_payloads.clone())
                         .await
-                        .is_err()
+                        .is_err(),
+                    "backend={backend} coordinates={coordinates} offset={offset}"
                 );
                 assert_eq!(h.store.head(&h.stream).expect("unchanged head"), before);
             }

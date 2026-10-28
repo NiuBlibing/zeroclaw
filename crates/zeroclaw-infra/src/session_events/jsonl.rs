@@ -593,10 +593,21 @@ impl JsonlEventStore {
                 }
             }
             snapshot.history.extend_committed(&committed_events)?;
+            let erased = &snapshot.erased;
             snapshot.payload_index.extend_committed(
                 &committed_events,
                 committed_payloads,
                 &snapshot.history,
+                &|id| match filesystem::reader(&self.payload_path(id)?) {
+                    Ok(file) => Ok(Some(file.metadata().map_err(storage)?.len())),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            && erased.contains_key(id) =>
+                    {
+                        Ok(None)
+                    }
+                    Err(error) => Err(storage(error)),
+                },
             )?;
         }
         snapshot.tip = target_tip;

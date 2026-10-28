@@ -498,7 +498,17 @@ impl SessionEventStore for SqliteEventStore {
             };
             let facts = zeroclaw_api::session_events::rules::HistoryIndex::from_history(&history)?;
             let payloads = zeroclaw_api::session_events::payloads::PayloadIndex::from_index(
-                &facts, &history, &existing,
+                &facts,
+                &history,
+                &existing,
+                &|id| {
+                    tx.query_row(
+                        "SELECT length(body) FROM event_payloads WHERE payload_id=?1",
+                        params![id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .map_err(map_sqlite)
+                },
             )?;
             *cached = Some(ValidationSnapshot {
                 data_version,

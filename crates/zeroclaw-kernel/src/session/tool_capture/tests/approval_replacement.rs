@@ -171,6 +171,7 @@ async fn new_replacement_reply_requires_content_but_legacy_history_is_readable_a
             &facts,
             &history,
             &existing.into_values().collect::<Vec<_>>(),
+            &|_| Ok(None),
         )
         .expect("old reply reconstructs without inventing content");
         assert!(
