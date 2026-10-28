@@ -284,11 +284,28 @@ impl EventKind {
 /// Versioned, object-shaped event payload.  Concrete coordinators construct
 /// these objects from their typed command/event variants; the store never
 /// accepts arbitrary event tags or mutates fields.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EventBody {
     pub codec_version: u32,
-    #[serde(flatten)]
     pub data: EventData,
+}
+impl Serialize for EventBody {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if let EventData::Unknown { raw_body, .. } = &self.data {
+            return raw_body.serialize(serializer);
+        }
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            codec_version: u32,
+            #[serde(flatten)]
+            data: &'a EventData,
+        }
+        Wire {
+            codec_version: self.codec_version,
+            data: &self.data,
+        }
+        .serialize(serializer)
+    }
 }
 impl<'de> Deserialize<'de> for EventBody {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -311,7 +328,7 @@ impl<'de> Deserialize<'de> for EventBody {
         let data = if version == 1 && !kind.is_unknown() {
             serde_json::from_value(value).map_err(serde::de::Error::custom)?
         } else {
-            EventData::Unknown
+            EventData::Unknown { raw_body: value }
         };
         Ok(Self {
             codec_version: version,
@@ -323,7 +340,24 @@ impl EventBody {
     pub fn kind(&self) -> EventKind {
         self.data.kind()
     }
+    /// Exact event type, including types this binary cannot interpret.
+    pub fn raw_kind(&self) -> String {
+        match &self.data {
+            EventData::Unknown { raw_body } => raw_body
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            _ => serde_json::to_value(self.kind())
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".to_owned()),
+        }
+    }
     pub fn fields(&self) -> Value {
+        if let EventData::Unknown { raw_body, .. } = &self.data {
+            return raw_body.get("fields").cloned().unwrap_or(Value::Null);
+        }
         serde_json::to_value(&self.data)
             .ok()
             .and_then(|value| value.get("fields").cloned())
@@ -904,6 +938,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unknown_types_and_codecs_keep_their_original_body() {
+        for (kind, codec_version) in [("future_observation", 1), ("session_started", 9)] {
+            let body = serde_json::json!({
+                "codec_version": codec_version, "kind": kind,
+                "fields": {"opaque": [1, 2, 3]}, "extension": {"future": true}
+            });
+            let decoded: EventBody = serde_json::from_value(body.clone()).expect("future body");
+            assert_eq!(decoded.kind(), EventKind::Unknown);
+            assert_eq!(decoded.raw_kind(), kind);
+            assert_eq!(decoded.fields()["opaque"], serde_json::json!([1, 2, 3]));
+            assert_eq!(serde_json::to_value(&decoded).expect("round trip"), body);
+            assert!(
+                decoded.validate().is_err(),
+                "unknown bodies remain read-only"
+            );
+        }
+    }
+
+    #[test]
     fn payload_body_is_validated() {
         let payload = PayloadRecord::new(PayloadId::new(), "text".to_owned(), b"hello".to_vec())
             .expect("valid payload");
@@ -960,13 +1013,18 @@ mod tests {
         assert_ne!(original, forged.commitment().expect("changed bytes"));
         let mut split = request.clone();
         split.payloads = vec![
-            PayloadRecord::new(PayloadId::new(), "session.bytes/v1".into(), b"ab".to_vec()).expect("first"),
-            PayloadRecord::new(PayloadId::new(), "session.bytes/v1".into(), b"c".to_vec()).expect("second"),
+            PayloadRecord::new(PayloadId::new(), "session.bytes/v1".into(), b"ab".to_vec())
+                .expect("first"),
+            PayloadRecord::new(PayloadId::new(), "session.bytes/v1".into(), b"c".to_vec())
+                .expect("second"),
         ];
         let mut shifted = split.clone();
         shifted.payloads[0].body = b"a".to_vec();
         shifted.payloads[1].body = b"bc".to_vec();
-        assert_ne!(split.commitment().expect("split"), shifted.commitment().expect("shifted"));
+        assert_ne!(
+            split.commitment().expect("split"),
+            shifted.commitment().expect("shifted")
+        );
         let mut changed = request.clone();
         changed.payloads[0] = PayloadRecord::new(
             changed.payloads[0].payload_id.clone(),

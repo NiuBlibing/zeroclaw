@@ -164,7 +164,7 @@ impl HistoryProjection {
             } => self
                 .content
                 .retain(|item| !target_event_ids.contains(&item.event_id)),
-            EventData::Unknown => self.unknown_event_ids.push(event.event_id.clone()),
+            EventData::Unknown { .. } => self.unknown_event_ids.push(event.event_id.clone()),
             _ => {}
         }
     }

@@ -392,6 +392,11 @@ uses the same kernel settlement rule.
 
 ## Storage
 
+Unknown event types and unsupported body codecs retain the original type,
+fields and body extensions when decoded and serialized again. Readers skip
+their semantics; they cannot be authored through the typed append interface.
+Migration keeps the original event bytes and follows explicit raw references.
+
 SQLite stores canonical event bytes and payloads in one immediate transaction.
 Sequence and event ID columns are checked against those bytes. WAL durability,
 head comparison and immutable append receipts determine committed visibility.

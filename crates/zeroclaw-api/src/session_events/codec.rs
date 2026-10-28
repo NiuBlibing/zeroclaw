@@ -119,9 +119,9 @@ macro_rules! event_data {
     ($($name:ident { $($field:ident : $type:ty),* $(,)? }),* $(,)?) => {
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
         #[serde(tag="kind", content="fields", rename_all="snake_case")]
-        pub enum EventData { $( $name { $( $field : $type ),* }, )* #[serde(other)] Unknown }
+        pub enum EventData { $( $name { $( $field : $type ),* }, )* #[serde(skip)] Unknown { raw_body: Value } }
         impl EventData {
-            pub fn kind(&self) -> EventKind { match self { $(Self::$name { .. } => EventKind::$name,)* Self::Unknown => EventKind::Unknown } }
+            pub fn kind(&self) -> EventKind { match self { $(Self::$name { .. } => EventKind::$name,)* Self::Unknown { .. } => EventKind::Unknown } }
         }
     }
 }
@@ -201,6 +201,11 @@ pub struct UnavailableContentPart {
 
 impl EventData {
     pub fn stored_refs(&self) -> Result<Vec<StoredPayloadRef>, ContractError> {
+        if matches!(self, Self::Unknown { .. }) {
+            // Unknown events are retained for readers. Their semantics cannot
+            // authorize writes or erasure; migration follows the raw envelope.
+            return Ok(Vec::new());
+        }
         fn collect(value: &Value, out: &mut Vec<StoredPayloadRef>) -> Result<(), ContractError> {
             match value {
                 Value::Object(object) if object.contains_key("payload_id") => {
