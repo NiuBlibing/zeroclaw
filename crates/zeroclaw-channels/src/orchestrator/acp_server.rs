@@ -6561,12 +6561,14 @@ mod tests {
         assert_eq!(restored, expected);
         assert_eq!(std::fs::read(&uploads[0]).unwrap(), b"original bytes");
         std::fs::remove_file(&uploads[0]).unwrap();
-        let mut corrupt = parts.clone();
-        let EngineInputPart::File(file) = &mut corrupt[1] else {
+        let mut unsupported = parts.clone();
+        let EngineInputPart::File(file) = &mut unsupported[1] else {
             panic!("file")
         };
-        file.representation.body.push(b'!');
-        assert!(AcpServer::materialize_history_parts(&corrupt, Some(directory.path())).is_err());
+        file.representation.codec = "session.unsupported/v1".into();
+        assert!(
+            AcpServer::materialize_history_parts(&unsupported, Some(directory.path())).is_err()
+        );
         assert!(!uploads[0].exists());
         assert!(AcpServer::materialize_history_parts(&parts, None).is_err());
     }
