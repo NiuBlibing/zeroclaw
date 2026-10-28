@@ -548,13 +548,7 @@ async fn existing_agent_executes_through_coordinator_and_does_not_replay_effects
         assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
         assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
         let events = store
-            .read_page(
-                &stream,
-                &EventCursor::beginning(stream.clone()),
-                None,
-                100,
-                4 * 1024 * 1024,
-            )
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
             .expect("events")
             .events;
         assert_eq!(
@@ -916,7 +910,6 @@ async fn child_capture_uses_a_distinct_stream_and_parent_receipt_never_replays()
                 EventCursor::beginning(native.stream.clone()),
                 None,
                 100,
-                4 * 1024 * 1024,
             )
             .await
             .expect("parent events")
@@ -959,7 +952,6 @@ async fn child_capture_uses_a_distinct_stream_and_parent_receipt_never_replays()
                 &EventCursor::beginning(completed.stream_id.clone()),
                 Some(&completed),
                 100,
-                4 * 1024 * 1024,
             )
             .expect("child events")
             .events;
@@ -1155,13 +1147,7 @@ async fn interrupted_child_is_recovered_without_replay(cli: bool) {
             .await
             .expect("root");
         let parent = store
-            .read_page(
-                &root,
-                &EventCursor::beginning(root.clone()),
-                None,
-                256,
-                4 * 1024 * 1024,
-            )
+            .read_page(&root, &EventCursor::beginning(root.clone()), None, 256)
             .expect("parent")
             .events;
         let invocation = parent
@@ -1171,13 +1157,7 @@ async fn interrupted_child_is_recovered_without_replay(cli: bool) {
             .expect("child invocation");
         let child = SessionStreamId::parse(format!("child-{invocation}")).expect("child stream");
         let events = store
-            .read_page(
-                &child,
-                &EventCursor::beginning(child.clone()),
-                None,
-                256,
-                4 * 1024 * 1024,
-            )
+            .read_page(&child, &EventCursor::beginning(child.clone()), None, 256)
             .expect("child")
             .events;
         assert_eq!(

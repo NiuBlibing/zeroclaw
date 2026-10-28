@@ -294,7 +294,7 @@ pub async fn open_cli_session(
             Some(lease) => Arc::new(FamilyEventStore::open_with_cli_lease(&data_dir, &family, Arc::new(lease))?),
             None => Arc::new(FamilyEventStore::open_with_execution_lease(&data_dir, &family, Arc::new(zeroclaw_infra::session_events::ownership::FamilyExecutionLease::acquire(&data_dir,&family)?))?),
         };
-        let page=store.read_page(&stream,&EventCursor::beginning(stream.clone()),None,4,4*1024*1024)?;
+        let page=store.read_page(&stream,&EventCursor::beginning(stream.clone()),None,4)?;
         anyhow::ensure!(matches!(page.events.first().map(|event|&event.body.data),Some(EventData::SessionStarted {owning_agent,..}) if owning_agent==&alias),"CLI persisted owning agent differs");
         anyhow::ensure!(store.read_latest_event(&stream, &branch, None, &EventKind::ContextProjectionCreated)?.is_some(),"CLI initial context missing");
         Ok(CliSession {owner:Arc::new(SessionCoordinator::new(store).with_search(Arc::new(zeroclaw_infra::session_events::search::FullTextSearch))),authority:Arc::new(CliAuthority {capability,alias,stream,origin:zeroclaw_api::ingress::TurnOrigin::Interactive,parent_alias:None}),branch})

@@ -864,7 +864,7 @@ mod tests {
             scope_engine_input, scope_provider_capture, scope_session_execution,
         };
         use zeroclaw_api::session_events::{
-            AppendReceipt, Digest, EventCursor, EventData, EventId, PayloadRecord, SessionStreamId,
+            AppendReceipt, EventCursor, EventData, EventId, PayloadRecord, SessionStreamId,
         };
 
         struct EchoProvider(Arc<StdMutex<Vec<String>>>);

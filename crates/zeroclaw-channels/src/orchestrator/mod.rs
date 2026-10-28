@@ -36231,13 +36231,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .expect("published family");
                 let stream = source.stream_id(&family).await.expect("stream");
                 let events = store
-                    .read_page(
-                        &stream,
-                        &EventCursor::beginning(stream.clone()),
-                        None,
-                        256,
-                        4 * 1024 * 1024,
-                    )
+                    .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                     .expect("events")
                     .events;
                 let count = |kind| {
@@ -36322,13 +36316,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .expect("family");
                 let stream = source.stream_id(&family).await.expect("stream");
                 let events = store
-                    .read_page(
-                        &stream,
-                        &EventCursor::beginning(stream.clone()),
-                        None,
-                        256,
-                        4 * 1024 * 1024,
-                    )
+                    .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                     .expect("events")
                     .events;
                 let count = |kind| {
