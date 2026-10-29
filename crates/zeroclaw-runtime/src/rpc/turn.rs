@@ -62,9 +62,13 @@ pub type TurnAdmission = Box<dyn FnMut(&mut Agent) -> Result<(), TurnRefusal> + 
 pub type TurnRecovery = Box<
     dyn Fn(
             zeroclaw_api::session_events::capture::EngineTurnInput,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>
-        + Send
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = anyhow::Result<zeroclaw_api::model_provider::ChatMessage>,
+                    > + Send,
+            >,
+        > + Send
         + Sync,
 >;
 
@@ -107,7 +111,7 @@ pub struct TurnAttribution {
 
 pub async fn execute_turn<F, Fut>(
     agent: Arc<Mutex<Agent>>,
-    prompt: String,
+    prompt: impl Into<zeroclaw_api::model_provider::ChatMessage>,
     cancel: CancellationToken,
     attribution: TurnAttribution,
     cost_context: Option<ToolLoopCostTrackingContext>,
@@ -121,6 +125,7 @@ where
     F: Fn(TurnEvent) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
+    let prompt = prompt.into();
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
@@ -1036,7 +1041,7 @@ mod tests {
                     input("new", "new request"),
                     execute_turn(
                         Arc::new(Mutex::new(agent)),
-                        "new request".into(),
+                        "new request",
                         CancellationToken::new(),
                         TurnAttribution {
                             session_key: Some("recovery-session".into()),
@@ -1064,15 +1069,17 @@ mod tests {
                                 if revoked {
                                     allowed.store(false, Ordering::SeqCst);
                                 }
-                                Ok(input
-                                    .parts
-                                    .into_iter()
-                                    .filter_map(|part| match part {
-                                        EngineInputPart::Text(text) => Some(text),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n"))
+                                Ok(zeroclaw_api::model_provider::ChatMessage::user(
+                                    input
+                                        .parts
+                                        .into_iter()
+                                        .filter_map(|part| match part {
+                                            EngineInputPart::Text(text) => Some(text),
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
+                                ))
                             })
                         })),
                         move |event| {

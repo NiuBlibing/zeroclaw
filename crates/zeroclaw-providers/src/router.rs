@@ -1287,6 +1287,10 @@ mod tests {
         );
 
         let messages = vec![ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
+            attachments: Vec::new(),
             role: "user".to_string(),
             content: "use tools".to_string(),
         }];
@@ -1318,6 +1322,10 @@ mod tests {
         );
 
         let messages = vec![ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
+            attachments: Vec::new(),
             role: "user".to_string(),
             content: "reason about this".to_string(),
         }];

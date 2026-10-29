@@ -34,6 +34,7 @@ pub mod router;
 pub mod safeguard_notice;
 pub(crate) mod stream_guard;
 pub mod telnyx;
+mod tool_protocol;
 pub mod traits;
 pub mod vision_override;
 
@@ -759,17 +760,17 @@ pub struct ModelProviderRuntimeOptions {
     pub tls_ca_cert_path: Option<String>,
     /// The configured `[multimodal]` policy.
     ///
-    /// Providers normalize image markers on their own boundary (a channel can
-    /// call `chat` with raw `[IMAGE:<path>]` markers that never passed through
+    /// Providers normalize image references on their own boundary (a channel can
+    /// call `chat` with raw image references that never passed through
     /// the runtime), and that normalization now decodes pixels and applies
     /// `max_images` / `max_image_size_mb`. Carrying the configured policy here
     /// keeps that second pass on the same rules the runtime already applied,
     /// instead of silently reverting to defaults and re-trimming history a
     /// configured request had legitimately accepted.
     pub multimodal: zeroclaw_config::schema::MultimodalConfig,
-    /// How compatible chat-completions providers handle images a native
-    /// role=`tool` result declared in its `attachments` array; legacy tool
-    /// results (no array key) pass verbatim under both settings.
+    /// How compatible chat-completions providers handle images a structured
+    /// role=`tool` result declares in its `attachments` array; results without
+    /// attachments pass their text verbatim under both settings.
     pub tool_result_image_policy: zeroclaw_config::schema::ToolResultImagePolicy,
 }
 
@@ -3100,7 +3101,7 @@ mod tests {
             Some(&ModelProviderConfig::default()),
         );
 
-        // Operator limits must reach the adapter that expands `[IMAGE:...]`
+        // Operator limits must reach the adapter that expands image references
         // markers; library defaults here mean the section is inert.
         assert_eq!(opts.multimodal.max_images, 1);
         assert_eq!(opts.multimodal.max_image_size_mb, 2);
@@ -4113,22 +4114,23 @@ mod tests {
             0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
             0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
-        let mut markers = Vec::new();
+        let mut prompts = Vec::new();
         for index in 0..2 {
             let path = temp.path().join(format!("bare-{index}.png"));
             std::fs::write(&path, DECODABLE_PNG).unwrap();
-            markers.push(format!("[IMAGE:{}]", path.display()));
+            prompts.push(ChatMessage::user("look").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: path.display().to_string(),
+                },
+            ]));
         }
         // One image per message: `trim_old_images` evicts whole messages, so
         // co-locating both would measure that eviction granularity instead of
         // whether the operator policy reached this adapter at all.
-        let prompts: Vec<String> = markers
-            .iter()
-            .map(|marker| format!("look {marker}"))
-            .collect();
 
         // Same server, same ref, same messages; only the operator policy differs.
-        let outbound_images = |max_images: usize, prompts: Vec<String>| async move {
+        let outbound_images = |max_images: usize, messages: Vec<ChatMessage>| async move {
             let capture: Capture = Arc::new(Mutex::new(None));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -4150,7 +4152,6 @@ mod tests {
             )
             .expect("bare custom:<url> ref builds a provider");
 
-            let messages: Vec<ChatMessage> = prompts.into_iter().map(ChatMessage::user).collect();
             let _ = resolved
                 .provider
                 .chat(

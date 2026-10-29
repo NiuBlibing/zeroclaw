@@ -968,6 +968,8 @@ async fn host_seed_preserves_canonical_context_and_stable_public_ids_without_rea
                     reasoning_content: Some("private reasoning".into()),
                 },
                 ConversationMessage::ToolResults(vec![ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "call-1".into(),
                     tool_name: "file_read".into(),
                     content: "bytes".into(),

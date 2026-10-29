@@ -128,12 +128,15 @@ struct InlineData {
     data: String,
 }
 
-/// Build Gemini Parts from a message content string.
-/// If the content contains [IMAGE:data:...] markers (already normalized by the
-/// multimodal pipeline), they are extracted as inline_data parts. The remaining
-/// text becomes a text part. Falls back to a single text part if no markers.
-fn build_parts(content: &str) -> Vec<Part> {
-    let (text, image_refs) = crate::multimodal::parse_user_message_image_refs(content);
+/// Build Gemini Parts from body text and explicit image attachments.
+/// Images normalized by the multimodal pipeline become inline_data parts.
+/// Falls back to a single text part when no image attachment is present.
+fn build_parts(message: &ChatMessage) -> Vec<Part> {
+    let content = message.content.as_str();
+    let (text, image_refs) = (
+        message.content.clone(),
+        crate::multimodal::message_image_refs(message),
+    );
     let mut parts = Vec::new();
     let trimmed = text.trim();
     if !trimmed.is_empty() {
@@ -1091,6 +1094,10 @@ impl GeminiModelProvider {
         messages: &[ChatMessage],
         tool_instructions: Option<&str>,
     ) -> anyhow::Result<(Vec<Content>, Option<Content>)> {
+        let mut messages = messages.to_vec();
+        crate::tool_protocol::render_text_tool_protocol(&mut messages)?;
+        let projected = crate::multimodal::project_attachment_metadata(&messages);
+        let messages = projected.as_ref();
         let mut system_parts: Vec<&str> = Vec::new();
         let mut contents: Vec<Content> = Vec::new();
         for msg in messages {
@@ -1098,7 +1105,7 @@ impl GeminiModelProvider {
                 "system" => system_parts.push(&msg.content),
                 "user" => contents.push(Content {
                     role: Some("user".to_string()),
-                    parts: build_parts(&msg.content),
+                    parts: build_parts(msg),
                 }),
                 "assistant" => contents.push(Content {
                     role: Some("model".to_string()),
@@ -1503,7 +1510,7 @@ impl ModelProvider for GeminiModelProvider {
 
         let contents = vec![Content {
             role: Some("user".to_string()),
-            parts: build_parts(message),
+            parts: build_parts(&ChatMessage::user(message)),
         }];
 
         let (text, _usage, _blocks) = self
@@ -2676,7 +2683,7 @@ mod tests {
 
     #[test]
     fn build_parts_plain_text_returns_single_text_part() {
-        let parts = build_parts("Hello, world!");
+        let parts = build_parts(&ChatMessage::user("Hello, world!"));
         assert_eq!(parts.len(), 1);
         assert_eq!(
             serde_json::to_value(&parts[0]).unwrap(),
@@ -2686,7 +2693,7 @@ mod tests {
 
     #[test]
     fn build_parts_empty_string_returns_single_text_part() {
-        let parts = build_parts("");
+        let parts = build_parts(&ChatMessage::user(""));
         assert_eq!(parts.len(), 1);
         // Falls back to original content when no markers and trimmed is empty
         assert_eq!(
@@ -2697,8 +2704,11 @@ mod tests {
 
     #[test]
     fn build_parts_extracts_data_uri_as_inline_part() {
-        let content = "Check this [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
-        let parts = build_parts(content);
+        let message = ChatMessage::user("Check this").with_attachments(vec![zeroclaw_api::media::AttachmentReference {
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+            target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".into(),
+        }]);
+        let parts = build_parts(&message);
         assert_eq!(parts.len(), 2);
         // First part is text
         assert_eq!(
@@ -2714,8 +2724,16 @@ mod tests {
 
     #[test]
     fn build_parts_multiple_images() {
-        let content = "Image A: [IMAGE:data:image/png;base64,AAAA] Image B: [IMAGE:data:image/jpeg;base64,BBBB]";
-        let parts = build_parts(content);
+        let message = ChatMessage::user("Compare images A and B").with_attachments(
+            ["data:image/png;base64,AAAA", "data:image/jpeg;base64,BBBB"]
+                .into_iter()
+                .map(|target| zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: target.into(),
+                })
+                .collect(),
+        );
+        let parts = build_parts(&message);
         assert_eq!(parts.len(), 3); // text + 2 images
         // Verify both inline parts
         let inline_parts: Vec<_> = parts
@@ -2726,13 +2744,13 @@ mod tests {
     }
 
     #[test]
-    fn build_parts_ignores_non_data_uri_markers() {
-        // File paths and URLs are not data URIs — build_parts should only
-        // extract data: URIs, leaving non-data markers as stripped text.
+    fn build_parts_preserves_marker_text() {
         let content = "Look [IMAGE:/tmp/photo.png]";
-        let parts = build_parts(content);
-        // parse_image_markers extracts the marker, but build_parts only
-        // converts data: URIs to inline parts. The text remains.
+        let parts = build_parts(&ChatMessage::user(content));
+        assert_eq!(
+            serde_json::to_value(&parts[0]).unwrap(),
+            serde_json::json!({"text": content})
+        );
         for part in &parts {
             assert!(matches!(part, Part::Text { .. }));
         }
@@ -2740,9 +2758,13 @@ mod tests {
 
     #[test]
     fn build_parts_image_only_still_produces_inline_part() {
-        let content = "[IMAGE:data:image/gif;base64,R0lGODlh]";
-        let parts = build_parts(content);
-        // Should have just the inline part (text is empty after marker removal)
+        let message = ChatMessage::user("").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/gif;base64,R0lGODlh".into(),
+            },
+        ]);
+        let parts = build_parts(&message);
         assert_eq!(parts.len(), 1);
         assert!(matches!(&parts[0], Part::Inline { .. }));
     }
@@ -2753,7 +2775,12 @@ mod tests {
     fn chat_with_history_maps_roles_correctly() {
         let messages = vec![
             ChatMessage::system("You are helpful"),
-            ChatMessage::user("Hello [IMAGE:data:image/png;base64,AA==]"),
+            ChatMessage::user("Hello").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/png;base64,AA==".to_string(),
+                },
+            ]),
         ];
 
         let (contents, system_instruction) =

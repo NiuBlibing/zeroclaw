@@ -87,17 +87,50 @@ impl IngressProof {
     }
 }
 
-fn recovery_prompt(input: &EngineTurnInput) -> anyhow::Result<String> {
+fn recovery_prompt(
+    input: &EngineTurnInput,
+) -> anyhow::Result<zeroclaw_api::model_provider::ChatMessage> {
     use zeroclaw_api::session_events::capture::EngineInputPart;
     let mut text = Vec::new();
+    let mut attachments = Vec::new();
     for part in &input.parts {
         match part {
             EngineInputPart::Text(value) => text.push(value.as_str()),
             EngineInputPart::Opaque { .. } => {}
-            EngineInputPart::File(_) => anyhow::bail!("gateway_recovery_file_unsupported"),
+            EngineInputPart::File(file) => {
+                anyhow::ensure!(
+                    file.registration["source"] == "gateway_attachment"
+                        && file.representation.codec == "session.attachment-reference/v1",
+                    "gateway_recovery_file_unsupported"
+                );
+                attachments.push(serde_json::from_slice(&file.representation.body)?);
+            }
         }
     }
-    Ok(text.join("\n"))
+    Ok(
+        zeroclaw_api::model_provider::ChatMessage::user(text.join("\n"))
+            .with_attachments(attachments),
+    )
+}
+
+/// Register explicit media references separately from the user's literal text.
+pub(crate) fn with_attachments(
+    mut input: EngineTurnInput,
+    attachments: &[zeroclaw_api::media::AttachmentReference],
+) -> anyhow::Result<EngineTurnInput> {
+    use zeroclaw_api::session_events::{
+        PayloadRecord,
+        capture::{EngineFileInput, EngineInputPart},
+    };
+    for reference in attachments {
+        input.parts.push(EngineInputPart::File(EngineFileInput {
+            file_id: uuid::Uuid::new_v4().to_string(),
+            registration: serde_json::json!({"source":"gateway_attachment"}),
+            representation: PayloadRecord::json("session.attachment-reference/v1", reference)?,
+            policy_evidence: serde_json::json!({"source":"authenticated_gateway"}),
+        }));
+    }
+    Ok(input)
 }
 
 /// The caller owns the transport's session queue. Rebuild each engine from
@@ -856,7 +889,30 @@ pub(crate) mod tests {
             .push(zeroclaw_api::session_events::capture::EngineInputPart::Text("after".into()));
         assert!(proof.validates_recovery(&accepted));
         assert!(!IngressProof::Paired { subject: None }.validates_recovery(&accepted));
-        assert_eq!(recovery_prompt(&accepted).unwrap(), "before\nafter");
+        assert_eq!(recovery_prompt(&accepted).unwrap().content, "before\nafter");
+    }
+
+    #[test]
+    fn gateway_recovery_preserves_typed_media_and_literal_text_separately() {
+        use zeroclaw_api::media::{AttachmentKind, AttachmentReference};
+        let references = vec![AttachmentReference {
+            kind: AttachmentKind::Image,
+            target: "/workspace/webui_uploads/photo.png".into(),
+        }];
+        let accepted = with_attachments(
+            input(
+                "turn".into(),
+                "web".into(),
+                "literal [IMAGE:/example]".into(),
+                "provider".into(),
+                "model".into(),
+            ),
+            &references,
+        )
+        .unwrap();
+        let recovered = recovery_prompt(&accepted).unwrap();
+        assert_eq!(recovered.content, "literal [IMAGE:/example]");
+        assert_eq!(recovered.attachments, references);
     }
 
     // Test composition uses the real coordinator and both physical stores.

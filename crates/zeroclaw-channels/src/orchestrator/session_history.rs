@@ -245,6 +245,14 @@ pub(super) async fn open(
     ))
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ChannelFileRegistration {
+    source: String,
+    filename: String,
+    mime_type: Option<String>,
+    reference: Option<zeroclaw_api::media::AttachmentReference>,
+}
+
 /// The ingress registration creates attachment identity until the shared file
 /// owner supplies FileId. It uses the immutable transport message/part position,
 /// never a hash of private bytes or a mutable filename.
@@ -266,8 +274,12 @@ pub(super) fn input(
         )?;
         files.push(EngineFileInput {
             file_id,
-            registration:serde_json::json!({"source":"channel_ingress_registration","filename":file.file_name,
-                "mime_type":file.mime_type,"rendered_marker":file.marker,"byte_len":file.data.len()}),
+            registration:serde_json::to_value(ChannelFileRegistration {
+                source: "channel_ingress_registration".into(),
+                filename: file.file_name.clone(),
+                mime_type: file.mime_type.clone(),
+                reference: file.reference.clone(),
+            })?,
             representation,
             policy_evidence:serde_json::json!({"source":"admitted_channel_lane","channel":msg.channel,"alias":msg.channel_alias}),
         });
@@ -368,23 +380,14 @@ pub(super) fn recover_message(
         "channel_recovery_turn_mismatch"
     );
 
-    #[derive(serde::Deserialize)]
-    struct FileRegistration {
-        source: String,
-        filename: String,
-        mime_type: Option<String>,
-        rendered_marker: Option<zeroclaw_api::media::RenderedMarker>,
-        byte_len: usize,
-    }
     for part in &input.parts {
         match part {
             EngineInputPart::Text(text) => message.content.push_str(text),
             EngineInputPart::File(file) => {
-                let registration: FileRegistration =
+                let registration: ChannelFileRegistration =
                     serde_json::from_value(file.registration.clone())?;
                 anyhow::ensure!(
-                    registration.source == "channel_ingress_registration"
-                        && registration.byte_len == file.representation.body.len(),
+                    registration.source == "channel_ingress_registration",
                     "channel_recovery_file_metadata_mismatch"
                 );
                 message
@@ -393,7 +396,7 @@ pub(super) fn recover_message(
                         file_name: registration.filename,
                         data: file.representation.body.clone(),
                         mime_type: registration.mime_type,
-                        marker: registration.rendered_marker,
+                        reference: registration.reference,
                     });
             }
             EngineInputPart::Opaque { .. } => {}

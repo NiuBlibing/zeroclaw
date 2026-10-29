@@ -498,6 +498,7 @@ mod tests {
                         role: "user".into(),
                         text: "native event history".into(),
                         files: vec![],
+                        attachments: vec![],
                         unresolved_parts: vec![],
                         unavailable_parts: vec![],
                         content_source: None,

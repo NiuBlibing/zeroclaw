@@ -455,11 +455,23 @@ impl SessionQuery {
                                 ReadError::Corrupt("legacy message timestamp invalid".into())
                             })?),
                         };
+                        let attachments = entry
+                            .get("attachments")
+                            .cloned()
+                            .map(
+                                serde_json::from_value::<
+                                    Vec<zeroclaw_api::media::AttachmentReference>,
+                                >,
+                            )
+                            .transpose()
+                            .map_err(|error| ReadError::Corrupt(error.to_string()))?
+                            .unwrap_or_default();
                         imported.push((
                             event.sequence,
                             vec![0, index],
                             role.to_owned(),
                             created_at,
+                            attachments,
                         ));
                     }
                 }
@@ -487,7 +499,7 @@ impl SessionQuery {
             }
         }
         for (_, sequence, role, time) in messages {
-            imported.push((sequence, vec![0], role.into(), Some(time)));
+            imported.push((sequence, vec![0], role.into(), Some(time), Vec::new()));
         }
         let total = seeds.len() + imported.len();
         let end = before.unwrap_or(total);
@@ -504,10 +516,34 @@ impl SessionQuery {
             }
         }
         let seed_count = total - imported.len();
-        for (index, (sequence, path, role, created_at)) in imported.into_iter().enumerate() {
+        for (index, (sequence, path, role, created_at, attachments)) in
+            imported.into_iter().enumerate()
+        {
             if (start..end).contains(&(seed_count + index)) {
                 let mut message = self.message_at(&stream, sequence, path, &role).await?;
                 message.created_at = created_at;
+                message.attachments.extend(attachments);
+                if !message.files.is_empty() {
+                    // Representations belong to the original content event,
+                    // not a later use of the same file ID. Read through the
+                    // authorized payload port so erasure remains effective.
+                    let content_event_id = history
+                        .iter()
+                        .find(|event| event.sequence == sequence)
+                        .map(|event| &event.event_id);
+                    for event in &history {
+                        if let EventData::FileUsed {
+                            file_id, operation, ..
+                        } = &event.body.data
+                            && message.files.contains(file_id)
+                            && operation == "ingress_representation_captured"
+                            && event.causation_id.as_ref() == content_event_id
+                            && let Some(reference) = self.ingress_attachment(&stream, event).await?
+                        {
+                            message.attachments.push(reference);
+                        }
+                    }
+                }
                 selected.push(message);
             }
         }
@@ -526,6 +562,78 @@ impl SessionQuery {
                 None
             },
         })
+    }
+
+    /// Resolve the attachment from this input's captured representation or
+    /// metadata. Never load raw file bytes merely to build a history row.
+    async fn ingress_attachment(
+        &self,
+        stream: &SessionStreamId,
+        event: &SessionEvent,
+    ) -> Result<Option<zeroclaw_api::media::AttachmentReference>, SessionError> {
+        let EventData::FileUsed {
+            representation_ref,
+            policy_evidence_ref,
+            ..
+        } = &event.body.data
+        else {
+            return Ok(None);
+        };
+        let typed = representation_ref.codec == "session.attachment-reference/v1";
+        let reference = if typed {
+            representation_ref
+        } else {
+            policy_evidence_ref
+        };
+        let roots = event.body.data.stored_refs().map_err(AppendError::from)?;
+        let index = roots
+            .iter()
+            .position(|root| root == reference)
+            .ok_or_else(|| ReadError::Corrupt("file reference missing from event".into()))?;
+        let mut selector = PayloadSelector {
+            event_sequence: event.sequence,
+            reference_path: vec![index],
+        };
+        let PayloadRead::Present(record) =
+            self.read_payload(stream.clone(), selector.clone()).await?
+        else {
+            return Ok(None);
+        };
+        if typed {
+            return serde_json::from_slice(&record.body)
+                .map(Some)
+                .map_err(|error| ReadError::Corrupt(error.to_string()).into());
+        }
+        let evidence: serde_json::Value = serde_json::from_slice(&record.body)
+            .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+        let Some(metadata) = evidence.get("observed_file_metadata_ref") else {
+            return Ok(None);
+        };
+        let metadata: StoredPayloadRef = serde_json::from_value(metadata.clone())
+            .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+        let children = nested_refs(&StoredPayload {
+            reference: reference.clone(),
+            body: Some(record.body),
+        })?;
+        let index = children
+            .iter()
+            .position(|child| child == &metadata)
+            .ok_or_else(|| ReadError::Corrupt("file metadata reference missing".into()))?;
+        selector.reference_path.push(index);
+        let PayloadRead::Present(record) = self.read_payload(stream.clone(), selector).await?
+        else {
+            return Ok(None);
+        };
+        let metadata: serde_json::Value = serde_json::from_slice(&record.body)
+            .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+        metadata
+            .get("reference")
+            .filter(|reference| !reference.is_null())
+            .map(|reference| {
+                serde_json::from_value(reference.clone())
+                    .map_err(|error| ReadError::Corrupt(error.to_string()).into())
+            })
+            .transpose()
     }
 
     /// Materialize only chat rows from the seed, never exposing raw native
@@ -605,6 +713,7 @@ impl SessionQuery {
                             role: role.into(),
                             text: String::new(),
                             files: vec![],
+                            attachments: vec![],
                             unresolved_parts: vec![],
                             unavailable_parts: vec![
                                 zeroclaw_api::session_events::UnavailableContentPart {
@@ -642,6 +751,7 @@ impl SessionQuery {
                         role: chat.role.clone(),
                         text: chat.content.clone(),
                         files: vec![],
+                        attachments: chat.attachments.clone(),
                         unresolved_parts: vec![],
                         unavailable_parts: vec![],
                         content_source: None,
@@ -752,6 +862,7 @@ impl SessionQuery {
             role: role.into(),
             text,
             files,
+            attachments: Vec::new(),
             unresolved_parts,
             unavailable_parts,
             content_source: Some(PayloadSelector {

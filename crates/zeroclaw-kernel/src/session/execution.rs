@@ -537,7 +537,7 @@ impl SessionCoordinator {
                 &ContentPayload {
                     message_id: command.message_id.clone(),
                     parts,
-                },
+                 },
             )
             .map_err(AppendError::from)?;
             let mut accepted = SessionEvent::typed(
@@ -878,7 +878,7 @@ impl SessionCoordinator {
                             &ContentPayload {
                                 message_id: MessageId::new(),
                                 parts,
-                            },
+                             },
                         )
                         .map_err(AppendError::from)?;
                         let mut recorded = SessionEvent::typed(

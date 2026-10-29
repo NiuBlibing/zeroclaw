@@ -203,8 +203,13 @@ async fn compatible_multimodal_streams_capture_before_completion_eof_and_error()
                             ChatMessage::system("system fixture"),
                             ChatMessage::user("previous"),
                             ChatMessage {
+                                tool_calls: Vec::new(),
+                                tool_result: None,
+                                reasoning_content: None,
                                 role: "assistant".into(),
                                 content: "previous answer".into(),
+
+                                attachments: Vec::new(),
                             },
                             ChatMessage::user("current"),
                         ];

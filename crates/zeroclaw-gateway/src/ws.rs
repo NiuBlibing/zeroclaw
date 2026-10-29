@@ -50,7 +50,7 @@ const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 /// or, worse, tools route to an arbitrary seeded channel.
 const WS_CHANNEL_KEY: &str = "wss";
 
-fn gateway_steering_input(content: String) -> SteeringInput {
+fn gateway_steering_input(content: zeroclaw_api::model_provider::ChatMessage) -> SteeringInput {
     SteeringInput::new(content).with_ingress(IngressContext {
         message_id: None,
         source_class: SourceClass::External,
@@ -1005,8 +1005,8 @@ async fn handle_socket(
                     continue;
                 }
 
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
-                if content.is_empty() {
+                let content = chat_message_content(&parsed);
+                if content.is_err() {
                     let err = serde_json::json!({
                         "type": "error",
                         "message": "Message content cannot be empty",
@@ -1015,6 +1015,8 @@ async fn handle_socket(
                     let _ = sender.send(Message::Text(err.to_string().into())).await;
                     continue;
                 }
+
+                let content = match content { Ok(content) => content, Err(_) => continue };
 
                 let _turn_lease = match state
                     .reserve_agent_turn_at(agent_alias.clone(), turn_generation)
@@ -1302,11 +1304,27 @@ fn needs_onboarding_ws_error(
     }))
 }
 
-fn first_chat_message_content(text: &str) -> Option<String> {
+fn first_chat_message_content(text: &str) -> Option<zeroclaw_api::model_provider::ChatMessage> {
     let parsed = serde_json::from_str::<serde_json::Value>(text).ok()?;
     (parsed["type"].as_str() == Some("message"))
-        .then(|| parsed["content"].as_str().unwrap_or("").to_string())
-        .filter(|content| !content.is_empty())
+        .then(|| chat_message_content(&parsed).ok())
+        .flatten()
+}
+
+fn chat_message_content(
+    parsed: &serde_json::Value,
+) -> anyhow::Result<zeroclaw_api::model_provider::ChatMessage> {
+    let mut message = zeroclaw_api::model_provider::ChatMessage::user(
+        parsed["content"].as_str().unwrap_or_default(),
+    );
+    if let Some(attachments) = parsed.get("attachments") {
+        message.attachments = serde_json::from_value(attachments.clone())?;
+    }
+    anyhow::ensure!(
+        !message.content.is_empty() || !message.attachments.is_empty(),
+        "empty_message"
+    );
+    Ok(message)
 }
 
 fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
@@ -1583,7 +1601,7 @@ async fn process_chat_message(
     pending_approvals: &PendingApprovals,
     ping_interval: &mut Option<tokio::time::Interval>,
     ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
-    content: &str,
+    content: &zeroclaw_api::model_provider::ChatMessage,
     session_key: &str,
     session_id: &str,
     // Transport-authenticated approval subject (paired-token hash), threaded so a
@@ -1676,7 +1694,7 @@ async fn process_chat_message(
     let (steering_tx, mut steering_rx) =
         tokio::sync::mpsc::channel::<zeroclaw_runtime::agent::SteeringInput>(32);
 
-    let content_owned = content.to_string();
+    let content_owned = content.clone();
     let session_key_owned = session_key.to_string();
     // The shared Agent turn boundary owns safeguard attribution and returns it
     // alongside the undecorated transcript. This transport only renders the
@@ -1684,10 +1702,23 @@ async fn process_chat_message(
     let mut input = crate::session_history::input(
         turn_id.clone(),
         turn_alias.clone(),
-        content_owned.clone(),
+        content_owned.content.clone(),
         turn_provider.clone(),
         turn_model.clone(),
     );
+    input = match crate::session_history::with_attachments(input, &content_owned.attachments) {
+        Ok(input) => input,
+        Err(error) => {
+            remove_cancel_token_if_current(
+                &state.cancel_tokens,
+                &gateway_cancel_key(session_id),
+                &cancel_token,
+            );
+            let err = serde_json::json!({"type":"error","code":"INVALID_ATTACHMENTS","message":error.to_string()});
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            return false;
+        }
+    };
     input.reply_route = Some(
         crate::session_history::IngressProof::Paired {
             subject: auth_subject.map(str::to_owned),
@@ -1918,8 +1949,8 @@ async fn process_chat_message(
                                         }
                                     }
                                     Some("message") => {
-                                        let content = parsed["content"].as_str().unwrap_or("").to_string();
-                                        if content.is_empty() {
+                                        let content = chat_message_content(&parsed);
+                                        if content.is_err() {
                                             let err = serde_json::json!({
                                                 "type": "error",
                                                 "message": "Message content cannot be empty",
@@ -1928,6 +1959,7 @@ async fn process_chat_message(
                                             let _ = sender.send(Message::Text(err.to_string().into())).await;
                                             continue;
                                         }
+                                        let content = match content { Ok(content) => content, Err(_) => continue };
                                         match steering_tx.try_send(gateway_steering_input(content)) {
                                             Ok(()) => {}
                                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -2154,7 +2186,7 @@ async fn process_chat_message(
                         (provider_ref, model)
                     };
                     let memory_config = state.config.read().memory.clone();
-                    let user_msg = content.to_string();
+                    let user_msg = content.content.clone();
                     let assistant_resp = outcome.response.clone();
                     let live_config = state.config.clone();
                     zeroclaw_spawn::spawn!(async move {
@@ -2994,6 +3026,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 .expect("messages")
                 .into_iter()
                 .map(|message| zeroclaw_providers::ChatMessage {
+                    tool_calls: Vec::new(),
+                    tool_result: None,
+                    reasoning_content: None,
+                    attachments: Vec::new(),
                     role: message.role,
                     content: message.text,
                 })
@@ -3992,9 +4028,32 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         .to_string();
 
         assert_eq!(
-            first_chat_message_content(&text).as_deref(),
+            first_chat_message_content(&text)
+                .as_ref()
+                .map(|message| message.content.as_str()),
             Some("hello after an idle keepalive")
         );
+    }
+
+    #[test]
+    fn first_chat_message_accepts_attachment_only_input_without_parsing_text() {
+        let text = serde_json::json!({
+            "type":"message", "content":"",
+            "attachments":[{"kind":"image", "target":"/uploads/photo.png"}],
+        })
+        .to_string();
+        let message = first_chat_message_content(&text).unwrap();
+        assert!(message.content.is_empty());
+        assert_eq!(message.attachments[0].target, "/uploads/photo.png");
+        let literal = first_chat_message_content(
+            &serde_json::json!({
+                "type":"message", "content":"[IMAGE:/uploads/photo.png]",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(literal.attachments.is_empty());
+        assert_eq!(literal.content, "[IMAGE:/uploads/photo.png]");
     }
 
     #[test]

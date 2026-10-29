@@ -230,12 +230,13 @@ use crate::tools::scoped;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
-use regex::Regex;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex};
+#[cfg(test)]
+use std::sync::LazyLock;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
@@ -767,20 +768,8 @@ pub fn native_tool_specs_present_for_turn(
     Ok(activated.tool_names().iter().any(|name| !is_excluded(name)))
 }
 
-pub(crate) static IMAGE_DATA_URI_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\[IMAGE:data:[^\]]*\]").expect("static image data URI regex must compile")
-});
-
-fn elide_image_data(content: &str) -> String {
-    IMAGE_DATA_URI_REGEX
-        .replace_all(content, "[IMAGE:<image data elided>]")
-        .into_owned()
-}
-
 pub(crate) fn scrub_for_export(content: &str) -> String {
-    scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(
-        &elide_image_data(content),
-    ))
+    scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(content))
 }
 
 pub(crate) fn capture_llm_messages(
@@ -3917,7 +3906,7 @@ pub async fn run(
 pub async fn process_message(
     config: Config,
     agent_alias: &str,
-    message: &str,
+    message: impl Into<ChatMessage>,
     session_id: Option<&str>,
     origin: TurnOrigin,
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
@@ -3936,7 +3925,7 @@ pub async fn process_message(
 pub(crate) async fn process_message_shared(
     config: Arc<Config>,
     agent_alias: &str,
-    message: &str,
+    message: impl Into<ChatMessage>,
     session_id: Option<&str>,
     origin: TurnOrigin,
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
@@ -3960,7 +3949,7 @@ pub(crate) async fn process_message_shared(
 pub async fn process_message_with_capability(
     config: Config,
     agent_alias: &str,
-    message: &str,
+    message: impl Into<ChatMessage>,
     session_id: Option<&str>,
     origin: TurnOrigin,
     execution_capability: Option<AgentExecutionCapability>,
@@ -3986,7 +3975,7 @@ pub async fn process_message_with_capability(
 pub async fn process_message_with_admission(
     config: Config,
     agent_alias: &str,
-    message: &str,
+    message: impl Into<ChatMessage>,
     session_id: Option<&str>,
     origin: TurnOrigin,
     execution_admission: Option<AgentExecutionAdmission>,
@@ -4007,7 +3996,7 @@ pub async fn process_message_with_admission(
 pub(crate) async fn process_message_shared_with_admission(
     config: Arc<Config>,
     agent_alias: &str,
-    message: &str,
+    message: impl Into<ChatMessage>,
     session_id: Option<&str>,
     origin: TurnOrigin,
     execution_admission: Option<AgentExecutionAdmission>,
@@ -4028,7 +4017,7 @@ pub(crate) async fn process_message_shared_with_live_config_and_admission(
     config: Arc<Config>,
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     agent_alias: &str,
-    message: &str,
+    message: impl Into<ChatMessage>,
     session_id: Option<&str>,
     origin: TurnOrigin,
     execution_admission: Option<AgentExecutionAdmission>,
@@ -4050,7 +4039,7 @@ pub(crate) async fn process_message_shared_with_live_config_and_admission_and_pr
     config: Arc<Config>,
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     agent_alias: &str,
-    message: &str,
+    message: impl Into<ChatMessage>,
     session_id: Option<&str>,
     origin: TurnOrigin,
     execution_admission: Option<AgentExecutionAdmission>,
@@ -4075,7 +4064,7 @@ pub async fn process_message_with_live_config(
     config: Config,
     live_config: zeroclaw_config::live::LiveConfigHandle,
     agent_alias: &str,
-    message: &str,
+    message: impl Into<ChatMessage>,
     session_id: Option<&str>,
     origin: TurnOrigin,
 ) -> Result<String> {
@@ -4095,7 +4084,7 @@ pub async fn process_message_with_live_config_and_admission(
     config: Config,
     live_config: zeroclaw_config::live::LiveConfigHandle,
     agent_alias: &str,
-    message: &str,
+    message: impl Into<ChatMessage>,
     session_id: Option<&str>,
     origin: TurnOrigin,
     execution_admission: Option<AgentExecutionAdmission>,
@@ -4117,7 +4106,7 @@ async fn process_message_inner(
     mut config: Arc<Config>,
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     agent_alias: &str,
-    message: &str,
+    message: impl Into<ChatMessage>,
     session_id: Option<&str>,
     origin: TurnOrigin,
     execution_admission: Option<AgentExecutionAdmission>,
@@ -4167,7 +4156,7 @@ async fn process_message_inner(
         }
     };
     let __zc_alias = agent_alias.to_string();
-    let __zc_message = message.to_string();
+    let __zc_message = message.into();
     let __zc_session_id = session_id.map(str::to_string);
     let __zc_attribution_span =
         ::zeroclaw_log::attribution_span!(&crate::agent::AgentAttribution(__zc_alias.as_str()));
@@ -4181,7 +4170,7 @@ async fn process_message_inner(
     let __zc_body = async move {
         let _execution_admission = execution_admission;
         let agent_alias: &str = __zc_alias.as_str();
-        let message: &str = __zc_message.as_str();
+        let message: &str = __zc_message.content.as_str();
         let session_id: Option<&str> = __zc_session_id.as_deref();
 
         // ── Effective per-agent runtime tunables ──────────────────────
@@ -4700,7 +4689,7 @@ async fn process_message_inner(
             }
             normalize_system_messages(&mut history);
         }
-        history.push(ChatMessage::user(&enriched));
+        history.push(ChatMessage::user(&enriched).with_attachments(__zc_message.attachments));
         let mut excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
             &agent.resolved.tool_filter_groups,
@@ -5019,17 +5008,8 @@ mod tests {
 
     fn sop_started_run_id_from_history(history: &[ChatMessage]) -> Option<String> {
         history.iter().find_map(|msg| {
-            if let Some(content) = msg.content.strip_prefix("[Tool results]\n")
-                && let Some(run_id) = extract_sop_started_run_id(content)
-            {
-                return Some(run_id);
-            }
-
-            if msg.role == "tool"
-                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
-                && let Some(content) = value.get("content").and_then(|content| content.as_str())
-            {
-                return extract_sop_started_run_id(content);
+            if msg.tool_result.is_some() {
+                return extract_sop_started_run_id(&msg.content);
             }
 
             extract_sop_started_run_id(&msg.content)
@@ -5248,39 +5228,6 @@ mod tests {
         assert!(result.ends_with("yz"));
     }
 
-    // ── truncate_tool_message tests ─────────────────────────────
-
-    #[test]
-    fn truncate_tool_message_preserves_json_structure() {
-        use crate::agent::history::truncate_tool_message;
-        let big_content = "x".repeat(5000);
-        let msg = serde_json::json!({
-            "tool_call_id": "call_abc123",
-            "content": big_content,
-        })
-        .to_string();
-        let result = truncate_tool_message(&msg, 2000);
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["tool_call_id"], "call_abc123");
-        assert!(parsed["content"].as_str().unwrap().contains("[... "));
-    }
-
-    #[test]
-    fn truncate_tool_message_plain_text_fallback() {
-        use crate::agent::history::truncate_tool_message;
-        let plain = "a".repeat(5000);
-        let result = truncate_tool_message(&plain, 2000);
-        assert!(result.contains("[... "));
-        assert!(result.len() < 5000);
-    }
-
-    #[test]
-    fn truncate_tool_message_short_passthrough() {
-        use crate::agent::history::truncate_tool_message;
-        let msg = r#"{"tool_call_id":"call_1","content":"ok"}"#;
-        assert_eq!(truncate_tool_message(msg, 2000), msg);
-    }
-
     // ── estimate_history_tokens tests ─────────────────────────────
 
     #[test]
@@ -5314,10 +5261,18 @@ mod tests {
     #[test]
     fn estimate_tokens_large_tool_result() {
         let big = "x".repeat(40_000);
-        let history = vec![ChatMessage::tool(&big)];
+        let history = vec![ChatMessage::tool_result(
+            zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call-budget".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                content: big,
+                attachments: Vec::new(),
+            },
+        )];
         let est = estimate_history_tokens(&history);
-        // 40000.div_ceil(4) + 4 = 10000 + 4 = 10004
-        assert_eq!(est, 10_004);
+        // The structured tool identity contributes 16 bytes: 40016.div_ceil(4) + 4 = 10008.
+        assert_eq!(est, 10_008);
     }
 
     #[test]
@@ -5433,9 +5388,14 @@ mod tests {
     fn load_interactive_session_heals_orphaned_tool_result() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("session.json");
-        let orphan_tool = ChatMessage::tool(
-            r#"{"tool_call_id":"toolu_01OrphanFromCompaction","content":"stale result"}"#,
-        );
+        let orphan_tool =
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "toolu_01OrphanFromCompaction".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "stale result".into(),
+                attachments: Vec::new(),
+            });
         let payload = serde_json::to_string_pretty(&InteractiveSessionState {
             version: 1,
             history: vec![
@@ -5862,7 +5822,7 @@ mod tests {
         ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let marker_count =
-                zeroclaw_providers::multimodal::count_image_markers(request.messages);
+                zeroclaw_providers::multimodal::count_image_attachments(request.messages);
             if marker_count == 0 {
                 anyhow::bail!("expected image markers in request messages");
             }
@@ -6101,10 +6061,10 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             assert!(
-                request
-                    .messages
+                request.messages.iter().any(|message| message
+                    .attachments
                     .iter()
-                    .any(|message| message.content.contains(&self.original_data_uri)),
+                    .any(|attachment| attachment.target == self.original_data_uri)),
                 "every iteration must reuse the first prepared image bytes"
             );
 
@@ -6908,7 +6868,7 @@ mod tests {
     }
 
     /// Drive one denied tool call through the gate and return the
-    /// `[Tool results]` text the MODEL would see.
+    /// text-protocol representation the MODEL would see.
     async fn tool_results_for_denying_channel(
         source: ::zeroclaw_api::channel::ApprovalSource,
     ) -> String {
@@ -6998,7 +6958,7 @@ mod tests {
 
         history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .find(|msg| msg.role == "tool")
             .expect("tool results message should be present")
             .content
             .clone()
@@ -7359,9 +7319,7 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let mut history = vec![ChatMessage::user(
-            "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
-        )];
+        let mut history = vec![ChatMessage::user("please inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }])];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
@@ -7437,9 +7395,12 @@ mod tests {
         let recorded_requests = Arc::clone(&model_provider.requests);
 
         let oversized_payload = STANDARD.encode(vec![0_u8; (1024 * 1024) + 1]);
-        let mut history = vec![ChatMessage::user(format!(
-            "[IMAGE:data:image/png;base64,{oversized_payload}]"
-        ))];
+        let mut history = vec![ChatMessage::user("").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: format!("data:image/png;base64,{oversized_payload}").to_string(),
+            },
+        ])];
 
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -7559,10 +7520,12 @@ mod tests {
                 CountingTool::new("probe", Arc::clone(&invocations)),
             )]);
         let marker_path = image_path.to_string_lossy().replace('\\', "/");
-        let mut history = vec![ChatMessage::user(format!(
-            "inspect [IMAGE:{}]",
-            marker_path
-        ))];
+        let mut history = vec![ChatMessage::user("inspect").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (marker_path).to_string(),
+            },
+        ])];
         let observer = NoopObserver;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
@@ -7632,7 +7595,7 @@ mod tests {
         image_counts: Mutex<Vec<usize>>,
         resubmission: Option<(
             tokio::sync::mpsc::Sender<crate::agent::SteeringInput>,
-            String,
+            ChatMessage,
         )>,
     }
 
@@ -7682,7 +7645,7 @@ mod tests {
             let call = {
                 let mut counts = self.image_counts.lock().unwrap();
                 let call = counts.len();
-                counts.push(zeroclaw_providers::multimodal::count_image_markers(
+                counts.push(zeroclaw_providers::multimodal::count_image_attachments(
                     request.messages,
                 ));
                 call
@@ -7696,7 +7659,9 @@ mod tests {
             }
             let text = if call == 1 {
                 if let Some((tx, message)) = &self.resubmission {
-                    tx.send(message.clone().into()).await.unwrap();
+                    tx.send(crate::agent::SteeringInput::new(message.clone()))
+                        .await
+                        .unwrap();
                 }
                 r#"<tool_call>
 {"name":"probe","arguments":{"value":"ok"}}
@@ -7718,18 +7683,31 @@ mod tests {
     async fn image_recovery_continuation_requires_new_input_to_restore_images() {
         for (resubmit, max_tool_iterations) in [(false, 3), (true, 3), (false, 1)] {
             let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
-            let original = format!("inspect [IMAGE:{image}]");
+            let original = ChatMessage::user("inspect").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: format!("{image}").to_string(),
+                },
+            ]);
             let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
             let model_provider = ImageRecoveryContinuationProvider {
                 image_counts: Mutex::new(Vec::new()),
-                resubmission: resubmit.then_some((steering_tx, format!("retry [IMAGE:{image}]"))),
+                resubmission: resubmit.then_some((
+                    steering_tx,
+                    ChatMessage::user("retry").with_attachments(vec![
+                        zeroclaw_api::media::AttachmentReference {
+                            kind: zeroclaw_api::media::AttachmentKind::Image,
+                            target: format!("{image}").to_string(),
+                        },
+                    ]),
+                )),
             };
             let invocations = Arc::new(AtomicUsize::new(0));
             let tools_registry =
                 crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
                     CountingTool::new("probe", Arc::clone(&invocations)),
                 )]);
-            let mut history = vec![ChatMessage::user(original.clone())];
+            let mut history = vec![original.clone()];
             let mut history_has_trim_breadcrumb = false;
             let mut injected_memory_preamble = None;
             let observer = NoopObserver;
@@ -7809,10 +7787,8 @@ mod tests {
                 vec![1, 0, usize::from(resubmit)]
             );
             assert_eq!(invocations.load(Ordering::SeqCst), 1);
-            assert_eq!(
-                history[0].content, original,
-                "canonical image history is unchanged"
-            );
+            assert_eq!(history[0].content, original.content);
+            assert_eq!(history[0].attachments, original.attachments);
         }
     }
 
@@ -7824,9 +7800,7 @@ mod tests {
         // An earlier image turn left its marker in history; the latest user
         // message is plain text.
         let mut history = vec![
-            ChatMessage::user(
-                "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
-            ),
+            ChatMessage::user("please inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]),
             ChatMessage::user("what is WAL?".to_string()),
         ];
         let tools_registry =
@@ -7924,9 +7898,7 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let mut history = vec![ChatMessage::user(
-            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
-        )];
+        let mut history = vec![ChatMessage::user("Analyze this").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }])];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
@@ -8002,11 +7974,20 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        // Marker lives in a tool result, not a user message.
+        // The attachment is declared structurally on the tool result.
         let mut history = vec![
             ChatMessage::user("inspect the screenshot".to_string()),
-            ChatMessage::tool(
-                "File: /tmp/x.png\n[IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
+            ChatMessage::tool_result(
+                zeroclaw_api::model_provider::ToolResultMessage {
+                    tool_call_id: "call-image".into(),
+                    tool_name: "screenshot".into(),
+                    success: Some(true),
+                    content: "File: /tmp/x.png".into(),
+                    attachments: vec![zeroclaw_api::media::AttachmentReference {
+                        kind: zeroclaw_api::media::AttachmentKind::Image,
+                        target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".into(),
+                    }],
+                },
             ),
         ];
         let tools_registry =
@@ -8085,9 +8066,7 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let mut history = vec![ChatMessage::user(
-            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
-        )];
+        let mut history = vec![ChatMessage::user("inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }])];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
@@ -8570,9 +8549,7 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let mut history = vec![ChatMessage::user(
-            "look [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
-        )];
+        let mut history = vec![ChatMessage::user("look").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }])];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
@@ -8741,10 +8718,16 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let mut history = vec![ChatMessage::user(
-            "two images [IMAGE:data:image/png;base64,aQ==] and [IMAGE:data:image/png;base64,bQ==]"
-                .to_string(),
-        )];
+        let mut history = vec![ChatMessage::user("two images  and").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/png;base64,aQ==".to_string(),
+            },
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/png;base64,bQ==".to_string(),
+            },
+        ])];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
@@ -8992,17 +8975,17 @@ mod tests {
             "tools should execute successfully"
         );
 
-        let tool_results_message = history
+        let tool_results: Vec<_> = history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
-            .expect("tool results message should be present");
-        let idx_a = tool_results_message
-            .content
-            .find("name=\"delay_a\"")
+            .filter_map(|msg| msg.tool_result.as_ref())
+            .collect();
+        let idx_a = tool_results
+            .iter()
+            .position(|value| value.tool_name == "delay_a")
             .expect("delay_a result should be present");
-        let idx_b = tool_results_message
-            .content
-            .find("name=\"delay_b\"")
+        let idx_b = tool_results
+            .iter()
+            .position(|value| value.tool_name == "delay_b")
             .expect("delay_b result should be present");
         assert!(
             idx_a < idx_b,
@@ -10057,7 +10040,11 @@ mod tests {
         for (id, value) in [("call_a", "A"), ("call_b", "B"), ("call_c", "C")] {
             let msg = tool_messages
                 .iter()
-                .find(|m| m.content.contains(id))
+                .find(|m| {
+                    m.tool_result
+                        .as_ref()
+                        .is_some_and(|result| result.tool_call_id == id)
+                })
                 .unwrap_or_else(|| panic!("missing tool message for {id}: {tool_messages:?}"));
             assert!(
                 msg.content.contains(&format!("ok:{value}")),
@@ -10747,10 +10734,14 @@ mod tests {
 
         let tool_results = history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
-            .expect("prompt-mode tool result payload should be present");
+            .find(|msg| msg.role == "tool")
+            .expect("structured tool result payload should be present");
         assert!(tool_results.content.contains("counted:A"));
-        assert!(tool_results.content.contains("Skipped duplicate tool call"));
+        assert!(
+            history.iter().any(
+                |msg| msg.role == "tool" && msg.content.contains("Skipped duplicate tool call")
+            )
+        );
     }
 
     #[tokio::test]
@@ -10851,7 +10842,7 @@ mod tests {
 
         let tool_results = history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .find(|msg| msg.role == "tool")
             .expect("tool results message should be present");
         assert!(tool_results.content.contains("hello"));
         assert!(!tool_results.content.contains("Denied by user."));
@@ -10944,7 +10935,7 @@ mod tests {
 
         let tool_results = history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .find(|msg| msg.role == "tool")
             .expect("tool results message should be present");
         assert!(
             !tool_results.content.contains("Denied by user."),
@@ -11289,10 +11280,14 @@ mod tests {
 
         let tool_results = history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
-            .expect("prompt-mode tool result payload should be present");
+            .find(|msg| msg.role == "tool")
+            .expect("structured tool result payload should be present");
         assert!(tool_results.content.contains("counted:"));
-        assert!(tool_results.content.contains("Skipped duplicate tool call"));
+        assert!(
+            history.iter().any(
+                |msg| msg.role == "tool" && msg.content.contains("Skipped duplicate tool call")
+            )
+        );
     }
 
     #[tokio::test]
@@ -11500,8 +11495,8 @@ mod tests {
 
         let tool_results = history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
-            .expect("prompt-mode tool result payload should be present");
+            .find(|msg| msg.role == "tool")
+            .expect("structured tool result payload should be present");
         assert!(
             !tool_results.content.contains("Skipped duplicate tool call"),
             "exempt tool calls should not be suppressed"
@@ -11927,14 +11922,16 @@ mod tests {
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert!(
             history.iter().any(|msg| {
-                msg.role == "tool" && msg.content.contains("\"tool_call_id\":\"call_abc\"")
+                msg.tool_result
+                    .as_ref()
+                    .is_some_and(|result| result.tool_call_id == "call_abc")
             }),
             "tool result should preserve parsed fallback tool_call_id in native mode"
         );
         assert!(
             history
                 .iter()
-                .all(|msg| !(msg.role == "user" && msg.content.starts_with("[Tool results]"))),
+                .all(|msg| msg.role != "user" || !msg.content.starts_with("[Tool results]")),
             "native mode should use role=tool history instead of prompt fallback wrapper"
         );
     }
@@ -14203,16 +14200,14 @@ This is an example, not an invocation."#;
         );
         let assistant_tool_history = history
             .iter()
-            .find(|message| message.content.contains("\"tool_calls\""))
+            .find(|message| !message.tool_calls.is_empty())
             .expect("native tool-call turn should persist assistant history");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&assistant_tool_history.content).unwrap();
         assert_eq!(
-            parsed["content"].as_str(),
-            Some("Task started. Waiting 30 seconds before checking status.")
+            assistant_tool_history.content.as_str(),
+            "Task started. Waiting 30 seconds before checking status."
         );
         assert_eq!(
-            parsed["reasoning_content"].as_str(),
+            assistant_tool_history.reasoning_content.as_deref(),
             Some("provider reasoning")
         );
         assert!(
@@ -16148,10 +16143,12 @@ This is an example, not an invocation."#;
         let model_provider = RecordingModelProvider::new();
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
-        let mut history = vec![ChatMessage::user(format!(
-            "look at this [IMAGE: {}]",
-            image_path.display()
-        ))];
+        let mut history = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
         let observer = NoopObserver;
 
         let err = agent_turn(
@@ -16194,7 +16191,7 @@ This is an example, not an invocation."#;
             .expect("refusal must retain the structured capability error");
         assert_eq!(capability_error.capability, "vision");
         assert!(
-            capability_error.message.contains("1 image marker(s)"),
+            capability_error.message.contains("1 image reference(s)"),
             "refusal must count the loadable marker: {capability_error}"
         );
         assert!(
@@ -16222,10 +16219,12 @@ This is an example, not an invocation."#;
         let model_provider = RecordingModelProvider::new();
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
-        let mut history = vec![ChatMessage::user(format!(
-            "look at this [IMAGE: {}]",
-            image_path.display()
-        ))];
+        let mut history = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
         let observer = NoopObserver;
 
         let result = agent_turn(
@@ -16294,10 +16293,12 @@ This is an example, not an invocation."#;
         let model_provider = RecordingModelProvider::new();
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
-        let mut history = vec![ChatMessage::user(format!(
-            "look at this [IMAGE: {}]",
-            image_path.display()
-        ))];
+        let mut history = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
         let observer = NoopObserver;
 
         let result = agent_turn(
@@ -17330,7 +17331,15 @@ Let me check the result."#;
         ];
         for index in 0..60 {
             history.push(ChatMessage::assistant(format!("tool call {index}")));
-            history.push(ChatMessage::user(format!("[Tool results]\nresult {index}")));
+            history.push(ChatMessage::tool_result(
+                zeroclaw_api::model_provider::ToolResultMessage {
+                    tool_call_id: (format!("call-{index}")).to_string(),
+                    tool_name: (format!("tool-{index}")).to_string(),
+                    content: (format!("result {index}")).to_string(),
+                    success: Some(true),
+                    attachments: Vec::new(),
+                },
+            ));
         }
         history.push(ChatMessage::assistant("done"));
         let original: Vec<_> = history
@@ -18157,7 +18166,7 @@ Let me check the result."#;
             extra_content: None,
         }];
         let result = build_native_assistant_history("answer", &calls, Some("thinking step"));
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&result).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert_eq!(parsed["reasoning_content"].as_str(), Some("thinking step"));
         assert!(parsed["tool_calls"].is_array());
@@ -18172,7 +18181,7 @@ Let me check the result."#;
             extra_content: None,
         }];
         let result = build_native_assistant_history("answer", &calls, None);
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(&result).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
     }
@@ -18190,7 +18199,7 @@ Let me check the result."#;
             Some("deep thought"),
         );
         assert!(result.is_some());
-        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(result.as_ref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert_eq!(parsed["reasoning_content"].as_str(), Some("deep thought"));
         assert!(parsed["tool_calls"].is_array());
@@ -18205,7 +18214,7 @@ Let me check the result."#;
         }];
         let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
         assert!(result.is_some());
-        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::to_value(result.as_ref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
     }
@@ -19984,10 +19993,13 @@ Let me check the result."#;
             ChatMessage::system("test"),
             ChatMessage::user("hello"),
             ChatMessage::assistant("..."),
-            ChatMessage {
-                role: "tool".to_string(),
-                content: "ok".to_string(),
-            },
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "review-call".into(),
+                tool_name: "review".into(),
+                success: Some(true),
+                content: "ok".into(),
+                attachments: Vec::new(),
+            }),
         ]
     }
 
@@ -20822,10 +20834,13 @@ Let me check the result."#;
             ChatMessage::assistant("a2".to_string()),
             ChatMessage::user(format!("turn3 {big}")),
             ChatMessage::assistant("a3".to_string()),
-            ChatMessage {
-                role: "tool".to_string(),
-                content: "ok".to_string(),
-            },
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "review-call".into(),
+                tool_name: "review".into(),
+                success: Some(true),
+                content: "ok".into(),
+                attachments: Vec::new(),
+            }),
         ];
 
         // Turn 1: one native tool call against a real review tool, reporting
@@ -21167,23 +21182,6 @@ Let me check the result."#;
             !snap.output_tool_calls[0]
                 .arguments_json
                 .contains("ANOTHERSECRET99")
-        );
-    }
-
-    #[cfg(feature = "observability-otel")]
-    #[test]
-    fn capture_llm_messages_elides_image_data_uris() {
-        let raw = "see [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB] here";
-        let messages = vec![ChatMessage::user(raw)];
-        let snap = super::capture_llm_messages(&messages, None, &[]).expect("Some");
-        let content = &snap.input[0].content;
-        assert!(
-            !content.contains("base64,iVBOR"),
-            "image bytes not elided: {content}"
-        );
-        assert!(
-            content.contains("[IMAGE:<image data elided>]"),
-            "placeholder missing: {content}"
         );
     }
 
@@ -22120,7 +22118,7 @@ Let me check the result."#;
         let err = super::process_message(
             config,
             "process-message-vision-gate-agent",
-            &format!("look at this [IMAGE: {}]", image_path.display()),
+            &ChatMessage::user("look at this").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: image_path.display().to_string() }]),
             Some("session"),
             TurnOrigin::SubTurn,
             None,
@@ -22135,7 +22133,7 @@ Let me check the result."#;
             .expect("refusal must retain the structured capability error");
         assert_eq!(capability_error.capability, "vision");
         assert!(
-            capability_error.message.contains("1 image marker(s)"),
+            capability_error.message.contains("1 image reference(s)"),
             "refusal must count the loadable marker: {capability_error}"
         );
     }
@@ -24005,7 +24003,12 @@ Let me check the result."#;
         std::fs::write(&image_path, image_bytes).unwrap();
         let history = vec![
             ChatMessage::system("text prompt"),
-            ChatMessage::user(format!("inspect [IMAGE:{}]", image_path.display())),
+            ChatMessage::user("inspect").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: (image_path.display()).to_string(),
+                },
+            ]),
         ];
         assert!(
             estimate_history_tokens(&history) > 100,
@@ -24024,9 +24027,9 @@ Let me check the result."#;
     #[tokio::test]
     async fn dropping_an_old_multimodal_turn_does_not_report_a_false_floor() {
         // The pre-dispatch gate's internal trim loop measures a raw
-        // marker-based estimate for durable history but reserves a "growth"
+        // attachment estimate for durable history but reserves a "growth"
         // delta computed against the ACTUAL post-preparation population
-        // (which expands `[IMAGE:...]` markers into real base64 payloads).
+        // (which loads attachment references into real base64 payloads).
         // When the image-bearing turn is the one dropped, that delta is
         // stale: the image is gone, but the heuristic still reserves its
         // size and can internally conclude the request is an unsatisfiable
@@ -24099,11 +24102,14 @@ Let me check the result."#;
         const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let image_bytes = STANDARD.decode(PNG_B64).expect("valid PNG fixture");
         std::fs::write(&image_path, &image_bytes).unwrap();
-        let marker = format!("[IMAGE:{}]", image_path.display());
+        let attachment = zeroclaw_api::media::AttachmentReference {
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+            target: image_path.display().to_string(),
+        };
 
         let mut history = vec![
             ChatMessage::system("system"),
-            ChatMessage::user(format!("old turn with an attachment {marker}")),
+            ChatMessage::user("old turn with an attachment").with_attachments(vec![attachment]),
             ChatMessage::assistant("ok".to_string()),
             ChatMessage::user("run once, no attachment this time".to_string()),
         ];
@@ -24820,14 +24826,8 @@ Let me check the result."#;
         );
     }
 
-    /// The `run` seam (daemon/CLI/cron entry) carries the agent policy into
-    /// the turn through its own `ResolvedIo` wiring: same refusal as the
-    /// wrapper path. No HTTP server is needed: the gate fires before any
-    /// dispatch, so the dead endpoint is never contacted; if the gate
-    /// regressed, the connection error would fail the capability downcast
-    /// below.
     #[tokio::test]
-    async fn run_refuses_policy_readable_marker_on_non_vision_provider() {
+    async fn run_preserves_literal_media_text_without_attachment_semantics() {
         use zeroclaw_config::schema::{
             AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
         };
@@ -24883,16 +24883,11 @@ Let me check the result."#;
         )
         .await;
 
-        let err = result.expect_err(
-            "a policy-readable marker under the agent workspace must refuse through run",
-        );
-        let capability_error = err
-            .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
-            .expect("refusal must retain the structured capability error");
-        assert_eq!(capability_error.capability, "vision");
+        let err = result.expect_err("the deliberately unreachable provider must fail");
         assert!(
-            capability_error.message.contains("1 image marker(s)"),
-            "refusal must count the loadable marker: {capability_error}"
+            err.downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+                .is_none(),
+            "literal media text must not become an image attachment: {err:#}"
         );
     }
 

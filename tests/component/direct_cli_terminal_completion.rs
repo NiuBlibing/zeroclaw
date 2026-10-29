@@ -12,7 +12,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
-async fn interactive_agent_renders_image_recovery_and_next_text_turn() {
+async fn interactive_agent_keeps_literal_media_text_without_loading_images() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -40,8 +40,8 @@ async fn interactive_agent_renders_image_recovery_and_next_text_turn() {
                     "error": {"message": "image-bearing request rejected"}
                 }));
             }
-            let text = if attempt == 1 {
-                "Recovered without the image."
+            let text = if attempt == 0 {
+                "Literal media text preserved."
             } else {
                 "Next text-only turn succeeded."
             };
@@ -128,21 +128,9 @@ runtime_profile = "default"
         output.status.success(),
         "interactive CLI must recover and exit successfully\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    let notice = "1 image that had not previously succeeded with this provider was omitted after the provider rejected the request.";
-    let notice_position = stdout
-        .find(notice)
-        .expect("CLI stdout must show the notice");
-    let recovery_position = stdout
-        .find("Recovered without the image.")
-        .expect("CLI stdout must show the recovered response");
-    let next_position = stdout
-        .find("Next text-only turn succeeded.")
-        .expect("CLI stdout must show the next text-only response");
-    assert!(notice_position < recovery_position && recovery_position < next_position);
-    assert_eq!(stdout.matches(notice).count(), 1);
-    assert_eq!(stdout.matches("Recovered without the image.").count(), 1);
-    assert_eq!(stdout.matches("Next text-only turn succeeded.").count(), 1);
-    assert!(stdout.contains("Send an omitted image again in a new message to try it again."));
+    assert!(stdout.contains("Literal media text preserved."));
+    assert!(stdout.contains("Next text-only turn succeeded."));
+    assert!(!stdout.contains("was omitted after the provider rejected"));
 
     let requests = server.received_requests().await.expect("recorded requests");
     let bodies: Vec<serde_json::Value> = requests
@@ -162,25 +150,25 @@ runtime_profile = "default"
                 .count()
         })
         .collect();
-    assert_eq!(image_counts, [1, 0, 0]);
+    assert_eq!(image_counts, [0, 0]);
     assert_eq!(
         bodies
             .iter()
             .map(|body| body["stream"] == true)
             .collect::<Vec<_>>(),
-        [true, false, true],
-        "one failed stream, one image-free recovery, then the next normal stream"
+        [true, true],
+        "both literal text turns stream normally"
     );
     assert!(bodies.iter().all(|body| body["model"] == "test-model"));
     assert!(
-        bodies[2]["messages"]
+        bodies[1]["messages"]
             .as_array()
             .expect("next-turn messages")
             .last()
             .expect("newest user message")["content"]
             .as_str()
             .is_some_and(|text| text.ends_with("next text-only turn")),
-        "the third request must be the next user turn, not another recovery attempt"
+        "the second request must be the next user turn"
     );
     let lease = zeroclaw_infra::session_events::cli_state::CliStateGuard::acquire(&session_file)
         .expect("native CLI binding");
@@ -211,7 +199,7 @@ runtime_profile = "default"
             .chat_projection()
             .iter()
             .any(|message| { message.role == "user" && message.content.contains(&image_marker) }),
-        "provider-only omission must preserve the original image in canonical session history"
+        "canonical history must preserve literal marker text"
     );
     eprintln!("CLI evidence (locale=en; request image counts={image_counts:?}):\n{stdout}");
 }

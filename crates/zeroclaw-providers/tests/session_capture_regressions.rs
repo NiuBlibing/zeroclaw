@@ -1062,8 +1062,10 @@ async fn audit_request_reasoning_disclosure(backend: &str) {
     use zeroclaw_kernel::session::query::PayloadSelector;
     let h = Harness::new(backend);
     let messages = [
-        ChatMessage::assistant(
-            r#"{"tool_calls":[],"reasoning_content":"previous signed reasoning fixture"}"#,
+        ChatMessage::assistant_tool_calls(
+            String::new(),
+            vec![],
+            Some("previous signed reasoning fixture".into()),
         ),
         ChatMessage::user("fixture"),
     ];

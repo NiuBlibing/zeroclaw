@@ -553,6 +553,7 @@ pub struct SendMessage {
     /// File attachments to send with the message.
     /// Channels that don't support attachments ignore this field.
     pub attachments: Vec<MediaAttachment>,
+    pub locations: Vec<crate::media::LocationAttachment>,
     /// Message-ID to set as In-Reply-To header (email threading).
     pub in_reply_to: Option<String>,
     /// RFC 5322 References chain for email replies; ignored by non-email channels.
@@ -717,6 +718,7 @@ impl SendMessage {
             thread_ts: None,
             cancellation_token: None,
             attachments: vec![],
+            locations: vec![],
             in_reply_to: None,
             references: Vec::new(),
             suppress_voice: false,
@@ -749,6 +751,7 @@ impl SendMessage {
             thread_ts: None,
             cancellation_token: None,
             attachments: vec![],
+            locations: vec![],
             in_reply_to: None,
             references: Vec::new(),
             suppress_voice: false,
@@ -1897,7 +1900,7 @@ mod tests {
                 file_name: "test.pdf".to_string(),
                 data: vec![1, 2, 3],
                 mime_type: Some("application/pdf".to_string()),
-                marker: None,
+                reference: None,
             },
         ]);
 

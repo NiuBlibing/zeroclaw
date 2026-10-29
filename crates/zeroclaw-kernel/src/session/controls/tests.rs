@@ -343,6 +343,8 @@ async fn complete_context_restores_tool_pairing_and_reasoning_without_disclosure
                     reasoning_content: Some("fixture reasoning continuation".into()),
                 },
                 ConversationMessage::ToolResults(vec![ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "call-1".into(),
                     tool_name: "file_read".into(),
                     content: "bytes".into(),

@@ -18,8 +18,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
-use zeroclaw_api::media::{MarkerKind, RenderedMarker};
-use zeroclaw_api::tool_carrier::{classify, is_tool_result_carrier, rebuild_carrier};
+use zeroclaw_api::media::{AttachmentKind, AttachmentReference};
 use zeroclaw_config::schema::{CacheTtl, ToolResultImagePolicy};
 
 const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
@@ -59,7 +58,7 @@ pub struct OpenAiCompatibleModelProvider {
     pub auth_header: AuthStyle,
     supports_vision: bool,
     tool_result_image_policy: ToolResultImagePolicy,
-    /// Operator `[multimodal]` policy for this provider's image-marker
+    /// Operator `[multimodal]` policy for this provider's image-reference
     /// expansion pass. Resolved once at build time.
     multimodal: zeroclaw_config::schema::MultimodalConfig,
     user_agent: Option<String>,
@@ -641,7 +640,7 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
-    /// Set the policy for image markers in native role=`tool` results.
+    /// Set the policy for image references in native role=`tool` results.
     pub fn tool_result_image_policy(mut self, policy: ToolResultImagePolicy) -> Self {
         self.tool_result_image_policy = policy;
         self
@@ -1456,7 +1455,7 @@ impl OpenAiCompatibleModelProvider {
         if message.role != "assistant" {
             return None;
         }
-        let value = serde_json::from_str::<serde_json::Value>(&message.content).ok()?;
+        let value = crate::tool_protocol::tool_message_value(message)?;
         self.assistant_thinking_replay(&value).thinking_blocks
     }
 
@@ -1550,7 +1549,7 @@ impl OpenAiCompatibleModelProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: self.message_content_for_role(&m.role, &m.content, !merge),
+                content: self.message_content_for_role(m, !merge),
                 thinking_blocks: self.fallback_thinking_replay(m),
             })
             .collect();
@@ -3606,7 +3605,7 @@ impl OpenAiCompatibleModelProvider {
         }
     }
 
-    /// Normalize image markers into inline data URIs for the upstream request.
+    /// Normalize image references into inline data URIs for the upstream request.
     ///
     /// Takes the configured policy rather than `MultimodalConfig::default()`:
     /// this pass decodes pixels and applies `max_images` / `max_image_size_mb`,
@@ -3616,88 +3615,48 @@ impl OpenAiCompatibleModelProvider {
         &self,
         messages: &[ChatMessage],
     ) -> anyhow::Result<Vec<ChatMessage>> {
-        // Provider policy may strip image markers from native tool results
-        // before normalization; the normalization itself then runs under the
-        // configured `[multimodal]` policy rather than defaults.
-        let sanitized;
-        let messages = if self.tool_result_image_policy == ToolResultImagePolicy::Omit {
-            sanitized = messages
-                .iter()
-                .map(|message| {
-                    if message.role == "tool" {
-                        ChatMessage {
-                            role: message.role.clone(),
-                            content: Self::sanitize_tool_result_message(&message.content),
-                        }
-                    } else {
-                        message.clone()
-                    }
-                })
-                .collect::<Vec<_>>();
-            sanitized.as_slice()
-        } else {
-            messages
-        };
-        let prepared =
-            multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
-        Ok(prepared.messages)
+        let mut messages = messages.to_vec();
+        if self.tool_result_image_policy == ToolResultImagePolicy::Omit {
+            for message in &mut messages {
+                if message.role == "tool"
+                    && message
+                        .attachments
+                        .iter()
+                        .any(|attachment| attachment.kind == AttachmentKind::Image)
+                {
+                    message
+                        .attachments
+                        .retain(|attachment| attachment.kind != AttachmentKind::Image);
+                    message.append_note(TOOL_RESULT_IMAGE_OMITTED_NOTICE);
+                }
+            }
+        }
+        let mut messages = multimodal::prepare_messages_for_provider(&messages, &self.multimodal)
+            .await?
+            .messages;
+        // Preserve tool identity through media policy. Only this leaf's wire
+        // projection changes the role for the prompt-guided protocol.
+        if !self.native_tool_calling {
+            crate::tool_protocol::render_text_tool_protocol(&mut messages)?;
+        }
+        Ok(messages)
     }
 
-    fn to_message_content(
-        role: &str,
-        content: &str,
-        allow_user_image_parts: bool,
-    ) -> MessageContent {
-        if role != "user" || !allow_user_image_parts {
-            return MessageContent::Text(content.to_string());
-        }
-        // A prompt-mode tool carrier contributes only its declared image
-        // attachment lines; its body — and a legacy carrier's whole text —
-        // is never scanned for markers.
-        if is_tool_result_carrier(role, content) {
-            let (cleaned_text, image_refs) = multimodal::parse_user_message_image_refs(content);
-            if image_refs.is_empty() {
-                return MessageContent::Text(content.to_string());
-            }
-            let mut parts = Vec::with_capacity(image_refs.len() + 1);
-            let trimmed_text = cleaned_text.trim();
-            if !trimmed_text.is_empty() {
-                parts.push(MessagePart::Text {
-                    text: trimmed_text.to_string(),
-                    cache_control: None,
-                });
-            }
-            for image_ref in image_refs {
-                parts.push(MessagePart::ImageUrl {
-                    image_url: ImageUrlPart { url: image_ref },
-                });
-            }
-            return MessageContent::Parts(parts);
-        }
-        Self::content_with_image_parts(content)
-    }
-
-    fn content_with_image_parts(content: &str) -> MessageContent {
-        let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
+    fn content_with_image_parts(message: &ChatMessage) -> MessageContent {
+        let image_refs = multimodal::message_image_refs(message);
         if image_refs.is_empty() {
-            return MessageContent::Text(content.to_string());
+            return MessageContent::Text(message.content.clone());
         }
-
         let mut parts = Vec::with_capacity(image_refs.len() + 1);
-        let trimmed_text = cleaned_text.trim();
-        if !trimmed_text.is_empty() {
+        if !message.content.is_empty() {
             parts.push(MessagePart::Text {
-                text: trimmed_text.to_string(),
+                text: message.content.clone(),
                 cache_control: None,
             });
         }
-
-        for image_ref in image_refs {
-            parts.push(MessagePart::ImageUrl {
-                image_url: ImageUrlPart { url: image_ref },
-            });
-        }
-
+        parts.extend(image_refs.into_iter().map(|url| MessagePart::ImageUrl {
+            image_url: ImageUrlPart { url },
+        }));
         MessageContent::Parts(parts)
     }
 
@@ -3705,10 +3664,10 @@ impl OpenAiCompatibleModelProvider {
     /// declared attachments: `image_url` parts from the image entries when
     /// the provider takes them, or the fixed omission notice under the
     /// `omit` policy. The body is never scanned for markers.
-    fn tool_carrier_content(
+    fn tool_result_content(
         &self,
         body: &str,
-        attachments: &[RenderedMarker],
+        attachments: &[AttachmentReference],
         allow_image_parts: bool,
     ) -> MessageContent {
         if self.tool_result_image_policy == ToolResultImagePolicy::Omit {
@@ -3727,7 +3686,7 @@ impl OpenAiCompatibleModelProvider {
         }
         let image_refs: Vec<&str> = attachments
             .iter()
-            .filter(|marker| marker.kind == MarkerKind::Image)
+            .filter(|marker| marker.kind == AttachmentKind::Image)
             .map(|marker| marker.target.as_str())
             .collect();
         if image_refs.is_empty() {
@@ -3755,45 +3714,25 @@ impl OpenAiCompatibleModelProvider {
     /// the body verbatim and appending the fixed notice. Legacy carriers
     /// (no attachments key) pass through untouched: their bodies are text,
     /// nothing promotes from them, and there is nothing to omit.
-    fn sanitize_tool_result_message(content: &str) -> String {
-        let Some(mut parts) = classify("tool", content).filter(|parts| parts.declared) else {
-            return content.to_string();
-        };
-        if parts.attachments.is_empty() {
-            return content.to_string();
-        }
-        if !parts.text.is_empty() {
-            parts.text.push_str("\n\n");
-        }
-        parts.text.push_str(TOOL_RESULT_IMAGE_OMITTED_NOTICE);
-        rebuild_carrier("tool", content, &parts, &[])
-    }
-
     fn message_content_for_role(
         &self,
-        role: &str,
-        content: &str,
-        allow_user_image_parts: bool,
+        message: &ChatMessage,
+        allow_image_parts: bool,
     ) -> MessageContent {
-        if role == "tool"
-            && let Some(parts) = classify(role, content)
-        {
-            // `classify` never returns `None` for a tool message: raw text
-            // and a non-string payload are legacy carriers whose text is
-            // the raw content, so the raw-text fallback this arm once
-            // carried is gone. Declaredness alone decides whether
-            // attachments ride along; an envelope carrier resolves through
-            // its declared attachments (this is the path `chat_with_history`
-            // takes, where the whole envelope string arrives here) and its
-            // body is never scanned.
-            let attachments = if parts.declared {
-                parts.attachments
-            } else {
-                Vec::new()
-            };
-            return self.tool_carrier_content(&parts.text, &attachments, allow_user_image_parts);
+        let projected = multimodal::project_attachment_metadata(std::slice::from_ref(message));
+        let message = &projected[0];
+        if message.role == "tool" {
+            return self.tool_result_content(
+                &message.content,
+                &message.attachments,
+                allow_image_parts,
+            );
         }
-        Self::to_message_content(role, content, allow_user_image_parts)
+        if message.role == "user" && allow_image_parts {
+            Self::content_with_image_parts(message)
+        } else {
+            MessageContent::Text(message.content.clone())
+        }
     }
 
     fn convert_messages_for_native(
@@ -3801,6 +3740,8 @@ impl OpenAiCompatibleModelProvider {
         messages: &[ChatMessage],
         allow_user_image_parts: bool,
     ) -> Vec<NativeMessage> {
+        let projected = multimodal::project_attachment_metadata(messages);
+        let messages = projected.as_ref();
         let targets_mistral_tool_call_contract = self.targets_mistral_tool_call_contract();
         let requires_string_tool_call_content = self.requires_string_tool_call_content();
         let mut used_tool_call_ids = std::collections::HashSet::new();
@@ -3812,7 +3753,7 @@ impl OpenAiCompatibleModelProvider {
             .iter()
             .map(|message| {
                 if message.role == "assistant"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(message)
                     && let Some(tool_calls_value) = value.get("tool_calls")
                     && let Ok(parsed_calls) =
                         serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
@@ -3875,7 +3816,7 @@ impl OpenAiCompatibleModelProvider {
                 }
 
                 if message.role == "assistant"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(message)
                     && value.get("tool_calls").is_none()
                     && Self::assistant_reasoning_value(&value).is_some()
                     && matches!(
@@ -3903,7 +3844,7 @@ impl OpenAiCompatibleModelProvider {
                 }
 
                 if message.role == "tool"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(message)
                 {
                     let mut tool_call_id = value
                         .get("tool_call_id")
@@ -3931,22 +3872,15 @@ impl OpenAiCompatibleModelProvider {
                     // Declaredness comes from the one classifier, so this
                     // seam cannot drift from the adapters on what counts as
                     // a declaration.
-                    let attachments = classify("tool", &message.content)
-                        .filter(|parts| parts.declared)
-                        .map(|parts| parts.attachments)
-                        .unwrap_or_default();
+                    let attachments = &message.attachments;
                     let content = value
                         .get("content")
                         .and_then(serde_json::Value::as_str)
                         .map(|body| {
-                            self.tool_carrier_content(body, &attachments, allow_user_image_parts)
+                            self.tool_result_content(body, attachments, allow_user_image_parts)
                         })
                         .or_else(|| {
-                            Some(self.message_content_for_role(
-                                "tool",
-                                &message.content,
-                                allow_user_image_parts,
-                            ))
+                            Some(self.message_content_for_role(message, allow_user_image_parts))
                         });
 
                     // Groq native tool calling requires the tool `name` on
@@ -3978,11 +3912,7 @@ impl OpenAiCompatibleModelProvider {
 
                 NativeMessage {
                     role: message.role.clone(),
-                    content: Some(self.message_content_for_role(
-                        &message.role,
-                        &message.content,
-                        allow_user_image_parts,
-                    )),
+                    content: Some(self.message_content_for_role(message, allow_user_image_parts)),
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
@@ -4006,7 +3936,7 @@ impl OpenAiCompatibleModelProvider {
                 return None;
             }
             if msg.role == "assistant"
-                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
+                && let Some(value) = crate::tool_protocol::tool_message_value(msg)
                 && value.get("tool_calls").is_some()
             {
                 let text = value
@@ -4031,6 +3961,7 @@ impl OpenAiCompatibleModelProvider {
                         last.content.push_str("\n\n");
                     }
                     last.content.push_str(&msg.content);
+                    last.attachments.extend(msg.attachments);
                 }
                 _ => coalesced.push(msg),
             }
@@ -4507,12 +4438,17 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     ) -> anyhow::Result<String> {
         let credential = self.resolve_credential().await?;
 
-        // Normalize image markers (e.g. local file paths from channel
+        // Normalize image references (e.g. local file paths from channel
         // attachments) into base64 data URIs before this message reaches the
         // upstream provider.
         let user_msg = ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
             role: "user".to_string(),
             content: message.to_string(),
+
+            attachments: Vec::new(),
         };
         let normalized_user = self
             .normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
@@ -4531,7 +4467,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", &content, !merge),
+                content: MessageContent::Text(content),
                 thinking_blocks: None,
             });
         } else {
@@ -4544,7 +4480,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", &normalized_message, true),
+                content: MessageContent::Text(normalized_message),
                 thinking_blocks: None,
             });
         }
@@ -5002,8 +4938,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     .map(|message| Message {
                         role: message.role.clone(),
                         content: provider.message_content_for_role(
-                            &message.role,
-                            &message.content,
+                            message,
                             !merge,
                             // Streamed requests are thinking-off under
                             // passthrough (see streaming_thinking_params):
@@ -5201,12 +5136,17 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
         let parser = async move {
-            // Normalize image markers in the user-supplied message before
+            // Normalize image references in the user-supplied message before
             // forwarding upstream — seefor the OpenAI-compatible
             // remote-vs-local file path problem.
             let user_msg = ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
                 role: "user".to_string(),
                 content: message_owned,
+
+                attachments: Vec::new(),
             };
             let normalized_user = match provider
                 .normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
@@ -5231,7 +5171,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 };
                 messages.push(Message {
                     role: "user".to_string(),
-                    content: Self::to_message_content("user", &content, !merge),
+                    content: MessageContent::Text(content),
                     thinking_blocks: None,
                 });
             } else {
@@ -5244,7 +5184,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 }
                 messages.push(Message {
                     role: "user".to_string(),
-                    content: Self::to_message_content("user", &normalized_message_content, !merge),
+                    content: MessageContent::Text(normalized_message_content),
                     thinking_blocks: None,
                 });
             }
@@ -5393,7 +5333,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .iter()
                 .map(|m| Message {
                     role: m.role.clone(),
-                    content: provider.message_content_for_role(&m.role, &m.content, !merge),
+                    content: provider.message_content_for_role(m, !merge),
                     thinking_blocks: None,
                 })
                 .collect();
@@ -6208,11 +6148,12 @@ mod tests {
             ChatMessage::system("you are brief"),
             ChatMessage::user("hi"),
             ChatMessage::assistant("hello"),
-            ChatMessage::user(format!(
-                "look at this [{}:{}]",
-                "IMAGE",
-                image_path.display()
-            )),
+            ChatMessage::user("look at this").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: image_path.display().to_string(),
+                },
+            ]),
         ];
         let result = provider
             .chat(
@@ -6265,11 +6206,12 @@ mod tests {
             ChatMessage::system("you are brief"),
             ChatMessage::user("hi"),
             ChatMessage::assistant("hello"),
-            ChatMessage::user(format!(
-                "look at this [{}:{}]",
-                "IMAGE",
-                image_path.display()
-            )),
+            ChatMessage::user("look at this").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: image_path.display().to_string(),
+                },
+            ]),
         ];
         let events = provider
             .stream_chat(
@@ -6331,7 +6273,12 @@ mod tests {
             ChatMessage::system("you are brief"),
             ChatMessage::user("hi"),
             ChatMessage::assistant("hello"),
-            ChatMessage::user(format!("[{}:{}]", "IMAGE", image_path.display())),
+            ChatMessage::user("").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: image_path.display().to_string(),
+                },
+            ]),
         ];
         let result = provider
             .chat(
@@ -6453,11 +6400,12 @@ mod tests {
             ChatMessage::system("you are brief"),
             ChatMessage::user("hi"),
             ChatMessage::assistant("hello"),
-            ChatMessage::user(format!(
-                "look at this [{}:{}]",
-                "IMAGE",
-                image_path.display()
-            )),
+            ChatMessage::user("look at this").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: image_path.display().to_string(),
+                },
+            ]),
         ];
         let result = provider
             .chat(
@@ -9150,13 +9098,14 @@ mod tests {
         // Turn 2: history carries the runtime-persisted reasoning envelope;
         // the gateway rejects the schema again, so this request also goes
         // through the fallback history builder.
-        let envelope = serde_json::json!({
-            "content": "ok",
-            "reasoning_content": captured,
-        });
+
         let turn_two = vec![
             ChatMessage::user("What is the weather in SF?"),
-            ChatMessage::assistant(envelope.to_string()),
+            ChatMessage::assistant_tool_calls(
+                ("ok").to_string(),
+                Vec::new(),
+                Some((captured).to_string()),
+            ),
             ChatMessage::user("And the forecast for tomorrow?"),
         ];
         provider
@@ -9223,12 +9172,10 @@ mod tests {
         )];
         let messages = vec![
             ChatMessage::user("What is the weather in SF?"),
-            ChatMessage::assistant(
-                serde_json::json!({
-                    "content": "ok",
-                    "reasoning_content": "{\"thinking\":\"visible\",\"signature\":\"sig1\"}"
-                })
-                .to_string(),
+            ChatMessage::assistant_tool_calls(
+                ("ok").to_string(),
+                Vec::new(),
+                Some(("{\"thinking\":\"visible\",\"signature\":\"sig1\"}").to_string()),
             ),
             ChatMessage::user("And the forecast?"),
         ];
@@ -9335,21 +9282,28 @@ mod tests {
         // Two-turn regression: the captured fallback thinking must replay on
         // the next tool-loop iteration. Simulate turn 2 by appending the
         // assistant turn (as the runtime persists it) and converting.
-        let assistant_content = serde_json::json!({
-            "content": "ok",
-            "reasoning_content": response.reasoning_content,
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "name": "get_weather",
-                    "arguments": "{\"city\": \"SF\"}",
-                }
-            ],
-        });
+
         let history = vec![
             ChatMessage::user("hello"),
-            ChatMessage::assistant(assistant_content.to_string()),
-            ChatMessage::tool(r#"{"tool_call_id": "call_1", "content": "72F"}"#.to_string()),
+            ChatMessage::assistant_tool_calls(
+                ("ok").to_string(),
+                serde_json::from_value(serde_json::json!([
+                    {
+                        "id": "call_1",
+                        "name": "get_weather",
+                        "arguments": "{\"city\": \"SF\"}",
+                    }
+                ]))
+                .unwrap(),
+                response.reasoning_content.clone(),
+            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call_1".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "72F".into(),
+                attachments: Vec::new(),
+            }),
         ];
         let native = provider.convert_messages_for_native(&history, false);
         assert_eq!(
@@ -11594,8 +11548,14 @@ mod tests {
 
     #[test]
     fn convert_messages_for_native_maps_tool_result_payload() {
-        let input = vec![ChatMessage::tool(
-            r#"{"tool_call_id":"call_abc","content":"done"}"#,
+        let input = vec![ChatMessage::tool_result(
+            zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call_abc".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "done".into(),
+                attachments: Vec::new(),
+            },
         )];
 
         let provider = make_model_provider("test", "https://example.com", None);
@@ -11629,8 +11589,18 @@ mod tests {
         // co-locating both in a single message would exercise that eviction
         // granularity rather than whether the operator's cap is honoured.
         let messages = vec![
-            ChatMessage::user(format!("first [IMAGE:{}]", first.display())),
-            ChatMessage::user(format!("second [IMAGE:{}]", second.display())),
+            ChatMessage::user("first").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: (first.display()).to_string(),
+                },
+            ]),
+            ChatMessage::user("second").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: (second.display()).to_string(),
+                },
+            ]),
         ];
 
         let build = |multimodal| {
@@ -11649,7 +11619,7 @@ mod tests {
             .await
             .expect("default policy prepares both images");
         assert_eq!(
-            crate::multimodal::count_image_markers(&prepared),
+            crate::multimodal::count_image_attachments(&prepared),
             2,
             "default policy admits both images"
         );
@@ -11663,7 +11633,7 @@ mod tests {
             .await
             .expect("capped policy still prepares the message");
         assert_eq!(
-            crate::multimodal::count_image_markers(&prepared),
+            crate::multimodal::count_image_attachments(&prepared),
             1,
             "an operator capping max_images must bound the outbound request"
         );
@@ -11688,17 +11658,22 @@ mod tests {
         // tool) must serialize as structured `image_url` parts, not one large
         // text blob — vision backends count base64 bytes as text tokens and
         // reject the request as over-context otherwise
-        let input = vec![ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "call_img",
-                "content": "snapshot captured",
-                "attachments": [{
+        let input = vec![
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call_img").to_string(),
+                tool_name: String::new(),
+                content: ("snapshot captured").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            })
+            .with_attachments(
+                serde_json::from_value(serde_json::json!([{
                     "kind": "image",
                     "target": "data:image/jpeg;base64,/9j/4AAQ"
-                }],
-            })
-            .to_string(),
-        )];
+                }]))
+                .expect("typed fixture attachments"),
+            ),
+        ];
 
         let provider = make_model_provider("test", "https://example.com", None);
         assert_eq!(
@@ -11732,17 +11707,22 @@ mod tests {
 
     #[test]
     fn convert_messages_for_native_omits_tool_result_image_payloads() {
-        let input = vec![ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "call_img",
-                "content": "before, middle, after",
-                "attachments": [
+        let input = vec![
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call_img").to_string(),
+                tool_name: String::new(),
+                content: ("before, middle, after").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            })
+            .with_attachments(
+                serde_json::from_value(serde_json::json!([
                     {"kind": "image", "target": "data:image/jpeg;base64,/9j/4AAQ"},
                     {"kind": "image", "target": "https://example.com/secret.png"},
-                ],
-            })
-            .to_string(),
-        )];
+                ]))
+                .expect("typed fixture attachments"),
+            ),
+        ];
 
         let provider = OpenAiCompatibleModelProvider::builder("test")
             .display_name("test")
@@ -11777,126 +11757,6 @@ mod tests {
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_img"));
     }
 
-    #[test]
-    fn convert_messages_for_native_keeps_malformed_legacy_tool_text_verbatim() {
-        // A raw non-JSON tool message is a legacy carrier: its body is text
-        // under the attachment-identity contract, so even the omit policy
-        // leaves it byte for byte — nothing was ever promoted from it.
-        let input = vec![ChatMessage::tool(
-            "malformed result [IMAGE:/tmp/secret.png]",
-        )];
-        let provider = OpenAiCompatibleModelProvider::builder("test")
-            .display_name("test")
-            .base_url("https://example.com")
-            .credential(None)
-            .auth_style(AuthStyle::Bearer)
-            .tool_result_image_policy(ToolResultImagePolicy::Omit)
-            .build();
-
-        let converted = provider.convert_messages_for_native(&input, true);
-        let content = serde_json::to_value(
-            converted[0]
-                .content
-                .as_ref()
-                .expect("malformed tool message should carry content"),
-        )
-        .unwrap();
-        let content = content.as_str().expect("legacy tool content is text");
-
-        assert_eq!(converted[0].role, "tool");
-        assert_eq!(
-            content, "malformed result [IMAGE:/tmp/secret.png]",
-            "a legacy tool body passes through verbatim under omit"
-        );
-        assert_eq!(converted[0].tool_call_id, None);
-        assert_eq!(converted[0].name, None);
-    }
-
-    #[test]
-    fn convert_messages_for_native_keeps_non_string_legacy_content_verbatim() {
-        // A non-string `content` payload is a legacy envelope (no attachments
-        // key): the fallback renders the whole envelope as text, verbatim —
-        // the old marker strip no longer applies to bodies.
-        let input = vec![ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "call_obj",
-                "name": "read",
-                "content": {"payload": "[IMAGE:/tmp/secret.png]"}
-            })
-            .to_string(),
-        )];
-        let provider = OpenAiCompatibleModelProvider::builder("test")
-            .display_name("test")
-            .base_url("https://example.com")
-            .credential(None)
-            .auth_style(AuthStyle::Bearer)
-            .tool_result_image_policy(ToolResultImagePolicy::Omit)
-            .build();
-
-        let converted = provider.convert_messages_for_native(&input, true);
-        let content = serde_json::to_value(
-            converted[0]
-                .content
-                .as_ref()
-                .expect("non-string tool message should carry content"),
-        )
-        .unwrap();
-        let content = content.as_str().expect("legacy envelope content is text");
-
-        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_obj"));
-        assert_eq!(converted[0].name.as_deref(), Some("read"));
-        assert!(
-            content.contains("\"payload\":\""),
-            "the non-string payload renders as the envelope text"
-        );
-        assert!(
-            content.contains("[IMAGE:/tmp/secret.png]"),
-            "marker syntax inside a legacy payload stays text"
-        );
-        assert!(!content.contains(TOOL_RESULT_IMAGE_OMITTED_NOTICE));
-    }
-
-    #[test]
-    fn convert_messages_for_native_keeps_unterminated_legacy_marker_verbatim() {
-        // An unterminated marker inside a legacy body is just text now; the
-        // omit policy only drops declared attachments.
-        let input = vec![ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "call_unterminated",
-                "content": "prefix [IMAGE:/tmp/secret.png"
-            })
-            .to_string(),
-        )];
-        let provider = OpenAiCompatibleModelProvider::builder("test")
-            .display_name("test")
-            .base_url("https://example.com")
-            .credential(None)
-            .auth_style(AuthStyle::Bearer)
-            .tool_result_image_policy(ToolResultImagePolicy::Omit)
-            .build();
-
-        let converted = provider.convert_messages_for_native(&input, true);
-        let content = serde_json::to_value(
-            converted[0]
-                .content
-                .as_ref()
-                .expect("unterminated tool message should carry content"),
-        )
-        .unwrap();
-        let content = content
-            .as_str()
-            .expect("legacy tool content should be text");
-
-        assert_eq!(
-            content, "prefix [IMAGE:/tmp/secret.png",
-            "an unterminated marker in a legacy body survives verbatim"
-        );
-        assert_eq!(
-            converted[0].tool_call_id.as_deref(),
-            Some("call_unterminated")
-        );
-    }
-
     #[tokio::test]
     async fn chat_with_history_no_tools_omits_declared_tool_attachment() {
         let (mut provider, captured, server) = mock_non_streaming_response(serde_json::json!({
@@ -11905,17 +11765,22 @@ mod tests {
         .await;
         provider.tool_result_image_policy = ToolResultImagePolicy::Omit;
 
-        let messages = vec![ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "call_img",
-                "content": "history tail",
-                "attachments": [{
+        let messages = vec![
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call_img").to_string(),
+                tool_name: String::new(),
+                content: ("history tail").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            })
+            .with_attachments(
+                serde_json::from_value(serde_json::json!([{
                     "kind": "image",
                     "target": "data:image/png;base64,SECRET"
-                }],
-            })
-            .to_string(),
-        )];
+                }]))
+                .expect("typed fixture attachments"),
+            ),
+        ];
         let response = provider
             .chat_with_history(&messages, "test-model", None)
             .await
@@ -11947,18 +11812,22 @@ mod tests {
         .await;
         provider.tool_result_image_policy = ToolResultImagePolicy::Omit;
 
-        let messages = vec![ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "call_escaped",
-                "name": "inspect",
-                "content": "before after",
-                "attachments": [{
+        let messages = vec![
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call_escaped").to_string(),
+                tool_name: ("inspect").to_string(),
+                content: ("before after").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            })
+            .with_attachments(
+                serde_json::from_value(serde_json::json!([{
                     "kind": "image",
                     "target": "data:image/png;base64,SECRET"
-                }],
-            })
-            .to_string(),
-        )];
+                }]))
+                .expect("typed fixture attachments"),
+            ),
+        ];
         provider
             .chat_with_history(&messages, "test-model", None)
             .await
@@ -11990,45 +11859,51 @@ mod tests {
     #[test]
     fn convert_messages_for_native_omits_older_tool_results_across_rounds() {
         let messages = vec![
-            ChatMessage::assistant(
-                serde_json::json!({
-                    "content": "",
-                    "tool_calls": [{
-                        "id": "call_old",
-                        "name": "first",
-                        "arguments": "{}"
-                    }]
-                })
-                .to_string(),
+            ChatMessage::assistant_tool_calls(
+                ("").to_string(),
+                serde_json::from_value(serde_json::json!([{
+                    "id": "call_old",
+                    "name": "first",
+                    "arguments": "{}"
+                }]))
+                .unwrap(),
+                None,
             ),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "tool_call_id": "call_old",
-                    "content": "old result",
-                    "attachments": [{"kind": "image", "target": "/tmp/old.png"}],
-                })
-                .to_string(),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call_old").to_string(),
+                tool_name: String::new(),
+                content: ("old result").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            })
+            .with_attachments(
+                serde_json::from_value(
+                    serde_json::json!([{"kind": "image", "target": "/tmp/old.png"}]),
+                )
+                .expect("typed fixture attachments"),
             ),
-            ChatMessage::assistant(
-                serde_json::json!({
-                    "content": "",
-                    "tool_calls": [{
-                        "id": "call_new",
-                        "name": "second",
-                        "arguments": "{}"
-                    }]
-                })
-                .to_string(),
+            ChatMessage::assistant_tool_calls(
+                ("").to_string(),
+                serde_json::from_value(serde_json::json!([{
+                    "id": "call_new",
+                    "name": "second",
+                    "arguments": "{}"
+                }]))
+                .unwrap(),
+                None,
             ),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "tool_call_id": "call_new",
-                    "content": "new result",
-                    "attachments": [
-                        {"kind": "image", "target": "data:image/png;base64,NEW"}
-                    ],
-                })
-                .to_string(),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call_new").to_string(),
+                tool_name: String::new(),
+                content: ("new result").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            })
+            .with_attachments(
+                serde_json::from_value(serde_json::json!([
+                    {"kind": "image", "target": "data:image/png;base64,NEW"}
+                ]))
+                .expect("typed fixture attachments"),
             ),
         ];
 
@@ -12075,9 +11950,12 @@ mod tests {
 
     #[test]
     fn convert_messages_for_native_keeps_direct_user_images_under_omit_policy() {
-        let input = vec![ChatMessage::user(
-            "describe this [IMAGE:data:image/png;base64,USER]",
-        )];
+        let input = vec![ChatMessage::user("describe this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/png;base64,USER".to_string(),
+            },
+        ])];
         let provider = OpenAiCompatibleModelProvider::builder("test")
             .display_name("test")
             .base_url("https://example.com")
@@ -12105,23 +11983,24 @@ mod tests {
 
     #[test]
     fn convert_messages_for_native_tool_result_resolves_name_from_tool_name_map() {
-        let history_json = serde_json::json!({
-            "content": "",
-            "tool_calls": [{
-                "id": "call_abc",
-                "name": "shell",
-                "arguments": "{\"cmd\":\"pwd\"}"
-            }]
-        });
         let messages = vec![
-            ChatMessage::assistant(history_json.to_string()),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "tool_call_id": "call_abc",
-                    "content": "done"
-                })
-                .to_string(),
+            ChatMessage::assistant_tool_calls(
+                ("").to_string(),
+                serde_json::from_value(serde_json::json!([{
+                    "id": "call_abc",
+                    "name": "shell",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                }]))
+                .unwrap(),
+                None,
             ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call_abc").to_string(),
+                tool_name: String::new(),
+                content: ("done").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            }),
         ];
 
         let provider = make_model_provider("test", "https://example.com", None);
@@ -12140,21 +12019,26 @@ mod tests {
     #[test]
     fn convert_messages_for_native_keeps_tool_result_text_when_image_parts_disabled() {
         // Models that don't accept structured image parts (the same gate that
-        // keeps user image markers as text) get the tool body verbatim. The
+        // keeps user image references as text) get the tool body verbatim. The
         // declared attachment has nowhere to go as a part and no longer
         // exists as body text, so it is dropped rather than inlined as a
         // base64 text blob.
-        let input = vec![ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "call_img",
-                "content": "snapshot captured",
-                "attachments": [{
+        let input = vec![
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call_img").to_string(),
+                tool_name: String::new(),
+                content: ("snapshot captured").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            })
+            .with_attachments(
+                serde_json::from_value(serde_json::json!([{
                     "kind": "image",
                     "target": "data:image/jpeg;base64,/9j/4AAQ"
-                }],
-            })
-            .to_string(),
-        )];
+                }]))
+                .expect("typed fixture attachments"),
+            ),
+        ];
 
         let provider = make_model_provider("test", "https://example.com", None);
         let converted = provider.convert_messages_for_native(&input, false);
@@ -12178,13 +12062,14 @@ mod tests {
     fn convert_messages_for_native_tool_result_falls_back_to_content_name() {
         // When there is no paired assistant tool-call, the tool message's
         // own "name" field should be used as a fallback.
-        let messages = vec![ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "call_xyz",
-                "name": "read",
-                "content": "file contents"
-            })
-            .to_string(),
+        let messages = vec![ChatMessage::tool_result(
+            zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call_xyz").to_string(),
+                tool_name: ("read").to_string(),
+                content: ("file contents").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            },
         )];
 
         let provider = make_model_provider("test", "https://example.com", None);
@@ -12255,23 +12140,25 @@ mod tests {
     fn native_chat_request_mistral_serializes_matching_valid_tool_call_ids() {
         let provider = make_model_provider("Mistral", "https://api.mistral.ai/v1", None);
         let invalid_id = "chatcmpl-tool-abc";
-        let history_json = serde_json::json!({
-            "content": "",
-            "tool_calls": [{
-                "id": invalid_id,
-                "name": "shell",
-                "arguments": "{\"cmd\":\"pwd\"}"
-            }]
-        });
+
         let messages = vec![
-            ChatMessage::assistant(history_json.to_string()),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "tool_call_id": invalid_id,
-                    "content": "done"
-                })
-                .to_string(),
+            ChatMessage::assistant_tool_calls(
+                ("").to_string(),
+                serde_json::from_value(serde_json::json!([{
+                    "id": invalid_id,
+                    "name": "shell",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                }]))
+                .unwrap(),
+                None,
             ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: (invalid_id).to_string(),
+                tool_name: String::new(),
+                content: ("done").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            }),
         ];
 
         let req = NativeChatRequest {
@@ -12311,10 +12198,15 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_for_native_keeps_user_image_markers_as_text_when_disabled() {
-        let input = vec![ChatMessage::user(
-            "System primer [IMAGE:data:image/png;base64,abcd] user turn",
-        )];
+    fn convert_messages_for_native_keeps_user_text_when_images_are_disabled() {
+        let input = vec![
+            ChatMessage::user("System primer  user turn").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/png;base64,abcd".to_string(),
+                },
+            ]),
+        ];
 
         let provider = make_model_provider("test", "https://example.com", None);
         let converted = provider.convert_messages_for_native(&input, false);
@@ -12322,8 +12214,7 @@ mod tests {
         assert_eq!(converted[0].role, "user");
         assert!(matches!(
             converted[0].content.as_ref(),
-            Some(MessageContent::Text(value))
-                if value == "System primer [IMAGE:data:image/png;base64,abcd] user turn"
+            Some(MessageContent::Text(value)) if value == "System primer  user turn"
         ));
     }
 
@@ -12750,12 +12641,23 @@ mod tests {
         let messages = vec![
             ChatMessage::system("sys"),
             ChatMessage::user("search for cats"),
-            ChatMessage::assistant(
-                r#"{"content":"I'll search","tool_calls":[{"id":"chatcmpl-tool-abc","name":"web_search","arguments":"{}"}]}"#,
+            ChatMessage::assistant_tool_calls(
+                "I'll search",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "chatcmpl-tool-abc".into(),
+                    name: "web_search".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
-            ChatMessage::tool(
-                r#"{"tool_call_id":"chatcmpl-tool-abc","content":"Found 10 results"}"#,
-            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "chatcmpl-tool-abc".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "Found 10 results".into(),
+                attachments: Vec::new(),
+            }),
             ChatMessage::assistant("Here are the results about cats"),
             ChatMessage::user("thanks"),
         ];
@@ -12799,10 +12701,23 @@ mod tests {
         let messages = vec![
             ChatMessage::system("sys"),
             ChatMessage::user("do it"),
-            ChatMessage::assistant(
-                r#"{"content":"","tool_calls":[{"id":"tc1","name":"shell","arguments":"{}"}]}"#,
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "tc1".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
-            ChatMessage::tool(r#"{"tool_call_id":"tc1","content":"ok"}"#),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "tc1".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "ok".into(),
+                attachments: Vec::new(),
+            }),
             ChatMessage::assistant("Done"),
         ];
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -12849,12 +12764,23 @@ mod tests {
         let messages = vec![
             ChatMessage::system("sys"),
             ChatMessage::user("search for cats"),
-            ChatMessage::assistant(
-                r#"{"content":"I'll search","tool_calls":[{"id":"chatcmpl-tool-abc","name":"web_search","arguments":"{}"}]}"#,
+            ChatMessage::assistant_tool_calls(
+                "I'll search",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "chatcmpl-tool-abc".into(),
+                    name: "web_search".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
-            ChatMessage::tool(
-                r#"{"tool_call_id":"chatcmpl-tool-abc","content":"Found 10 results"}"#,
-            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "chatcmpl-tool-abc".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "Found 10 results".into(),
+                attachments: Vec::new(),
+            }),
             ChatMessage::assistant("Here are the results about cats"),
         ];
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -12907,10 +12833,14 @@ mod tests {
     }
 
     #[test]
-    fn to_message_content_converts_image_markers_to_openai_parts() {
-        let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
-        let value = serde_json::to_value(OpenAiCompatibleModelProvider::to_message_content(
-            "user", content, true,
+    fn message_content_converts_image_references_to_openai_parts() {
+        let message =
+            ChatMessage::user("Describe this").with_attachments(vec![AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/png;base64,abcd".into(),
+            }]);
+        let value = serde_json::to_value(OpenAiCompatibleModelProvider::content_with_image_parts(
+            &message,
         ))
         .unwrap();
         let parts = value
@@ -12926,27 +12856,29 @@ mod tests {
     #[test]
     fn to_message_content_keeps_markers_as_text_when_user_image_parts_disabled() {
         let content = "Policy [IMAGE:data:image/png;base64,abcd]";
-        let value = serde_json::to_value(OpenAiCompatibleModelProvider::to_message_content(
-            "user", content, false,
-        ))
+        let provider = make_model_provider("test", "https://example.com", None);
+        let value = serde_json::to_value(
+            provider.message_content_for_role(&ChatMessage::user(content), false),
+        )
         .unwrap();
         assert_eq!(value, serde_json::json!(content));
     }
 
     #[test]
     fn to_message_content_keeps_plain_text_for_non_user_roles() {
-        let value = serde_json::to_value(OpenAiCompatibleModelProvider::to_message_content(
-            "system",
-            "You are a helpful assistant.",
-            true,
-        ))
-        .unwrap();
+        let provider = make_model_provider("test", "https://example.com", None);
+        let value =
+            serde_json::to_value(provider.message_content_for_role(
+                &ChatMessage::system("You are a helpful assistant."),
+                true,
+            ))
+            .unwrap();
         assert_eq!(value, serde_json::json!("You are a helpful assistant."));
     }
 
     #[tokio::test]
     async fn normalize_messages_for_upstream_rewrites_local_image_path_to_data_uri() {
-        // bare local paths inside `[IMAGE:...]` markers
+        // Local paths in attachment references
         // must be base64-encoded at the provider boundary so strict upstreams
         // (vLLM 0.20+) never see `image_url.url = "/home/.../photo.png"`.
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -12963,8 +12895,15 @@ mod tests {
         let path_str = path.to_string_lossy().into_owned();
 
         let msg = ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
             role: "user".into(),
-            content: format!("Caption please [IMAGE:{}]", path_str),
+            content: "Caption please".into(),
+            attachments: vec![AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: path_str.clone(),
+            }],
         };
 
         // Omit-policy tool-result stripping must not touch user-message
@@ -12979,9 +12918,9 @@ mod tests {
             .expect("normalize ok");
 
         assert_eq!(normalized.len(), 1);
-        let content = &normalized[0].content;
+        let content = &normalized[0].attachments[0].target;
         assert!(
-            content.contains("[IMAGE:data:image/png;base64,"),
+            content.starts_with("data:image/png;base64,"),
             "expected base64 data URI in normalized content, got: {content}"
         );
         assert!(
@@ -13013,15 +12952,22 @@ mod tests {
         // configured `max_images = 8`. The configured policy must reach the
         // provider.
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let mut markers = String::from("compare these");
+        let mut attachments = Vec::new();
         for index in 0..5 {
             let path = tmp.path().join(format!("shot{index}.png"));
             std::fs::write(&path, boundary_test_png()).expect("write fixture");
-            markers.push_str(&format!(" [IMAGE:{}]", path.display()));
+            attachments.push(AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: path.to_string_lossy().into_owned(),
+            });
         }
         let msg = ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
             role: "user".into(),
-            content: markers,
+            content: "compare these".into(),
+            attachments,
         };
 
         let configured = zeroclaw_config::schema::MultimodalConfig {
@@ -13043,12 +12989,11 @@ mod tests {
             .await
             .expect("normalization succeeds");
 
-        let content = &normalized[0].content;
-        let surviving = content.matches("[IMAGE:data:image/png;base64,").count();
+        let surviving = normalized[0].attachments.len();
         assert_eq!(
             surviving, 5,
             "all five images must survive the configured max_images = 8; \
-             a default-config boundary pass would have evicted down to 2: {content}"
+             a default-config boundary pass would have evicted down to 2"
         );
 
         // The default policy is what the boundary used before this fix. The
@@ -13068,10 +13013,7 @@ mod tests {
             .normalize_messages_for_upstream(std::slice::from_ref(&msg))
             .await
             .expect("normalization succeeds");
-        let default_surviving = default_normalized[0]
-            .content
-            .matches("[IMAGE:data:image/png;base64,")
-            .count();
+        let default_surviving = default_normalized[0].attachments.len();
         assert_eq!(
             default_surviving, 2,
             "under the default max_images = 4 the boundary pass evicts down to two images; \
@@ -13087,14 +13029,18 @@ mod tests {
             .auth_style(AuthStyle::Bearer)
             .tool_result_image_policy(ToolResultImagePolicy::Omit)
             .build();
-        let message = ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "call_image",
-                "name": "inspect",
-                "content": "before after",
-                "attachments": [{"kind": "image", "target": "/tmp/secret.png"}],
-            })
-            .to_string(),
+        let message = ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+            tool_call_id: ("call_image").to_string(),
+            tool_name: ("inspect").to_string(),
+            content: ("before after").to_string(),
+            success: None,
+            attachments: Vec::new(),
+        })
+        .with_attachments(
+            serde_json::from_value(
+                serde_json::json!([{"kind": "image", "target": "/tmp/secret.png"}]),
+            )
+            .expect("typed fixture attachments"),
         );
 
         let normalized = provider
@@ -13102,7 +13048,7 @@ mod tests {
             .await
             .expect("normalize ok");
         let envelope: serde_json::Value =
-            serde_json::from_str(&normalized[0].content).expect("tool envelope remains valid JSON");
+            crate::tool_protocol::tool_message_value(&normalized[0]).unwrap();
 
         assert_eq!(envelope["tool_call_id"], "call_image");
         assert_eq!(envelope["name"], "inspect");
@@ -13110,11 +13056,8 @@ mod tests {
             envelope["content"],
             "before after\n\n[tool-result image omitted by provider policy]"
         );
-        assert_eq!(
-            envelope["attachments"],
-            serde_json::json!([]),
-            "the omit pass empties the attachments array in place"
-        );
+        assert!(envelope.get("attachments").is_none());
+        assert!(normalized[0].attachments.is_empty());
         assert!(!normalized[0].content.contains("/tmp/secret.png"));
     }
 
@@ -13328,6 +13271,10 @@ mod tests {
     async fn chat_with_tools_without_key_attempts_request() {
         let p = make_model_provider("TestProvider", "http://127.0.0.1:1", None);
         let messages = vec![ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
+            attachments: Vec::new(),
             role: "user".to_string(),
             content: "hello".to_string(),
         }];
@@ -13354,18 +13301,25 @@ mod tests {
     #[test]
     fn chat_with_tools_request_preserves_reasoning_content_in_history() {
         let p = make_model_provider("DeepSeek", "https://api.deepseek.example/v1", None);
-        let history_json = serde_json::json!({
-            "content": "I will inspect the workspace.",
-            "tool_calls": [{
-                "id": "call_1",
-                "name": "shell",
-                "arguments": "{\"cmd\":\"ls\"}"
-            }],
-            "reasoning_content": "Need to inspect the current files before answering."
-        });
+
         let messages = vec![
-            ChatMessage::assistant(history_json.to_string()),
-            ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"src\nCargo.toml"}"#),
+            ChatMessage::assistant_tool_calls(
+                ("I will inspect the workspace.").to_string(),
+                serde_json::from_value(serde_json::json!([{
+                    "id": "call_1",
+                    "name": "shell",
+                    "arguments": "{\"cmd\":\"ls\"}"
+                }]))
+                .unwrap(),
+                Some(("Need to inspect the current files before answering.").to_string()),
+            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call_1".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "src\nCargo.toml".into(),
+                attachments: Vec::new(),
+            }),
             ChatMessage::user("continue"),
         ];
         let tools = vec![NativeToolSpec {
@@ -13420,7 +13374,13 @@ mod tests {
             ChatMessage::assistant("Earlier assistant turn"),
             ChatMessage::system("System B"),
             ChatMessage::user("User turn"),
-            ChatMessage::tool(r#"{"ok":true}"#),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call_flatten".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                content: r#"{"ok":true}"#.into(),
+                attachments: Vec::new(),
+            }),
         ];
 
         let (flattened, system_merged) =
@@ -14819,8 +14779,7 @@ mod tests {
             .auth_style(AuthStyle::Bearer)
             .with_thinking_passthrough()
             .build();
-        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"thought one\",\"signature\":\"sig1\"}\n{\"thinking\":\"thought two\",\"signature\":\"sig2\"}", "tool_calls": []}"#;
-        let messages = vec![ChatMessage::assistant(signed.to_string())];
+        let messages = vec![ChatMessage::assistant_tool_calls("answer", vec![], Some("{\"thinking\":\"thought one\",\"signature\":\"sig1\"}\n{\"thinking\":\"thought two\",\"signature\":\"sig2\"}".into()))];
 
         let native = provider.convert_messages_for_native(&messages, false);
         assert_eq!(native.len(), 1);
@@ -14855,8 +14814,7 @@ mod tests {
             .auth_style(AuthStyle::Bearer)
             .with_thinking_passthrough()
             .build();
-        let signature_only = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"\",\"signature\":\"CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ==\"}", "tool_calls": []}"#;
-        let messages = vec![ChatMessage::assistant(signature_only.to_string())];
+        let messages = vec![ChatMessage::assistant_tool_calls("answer", vec![], Some("{\"thinking\":\"\",\"signature\":\"CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ==\"}".into()))];
 
         let native = provider.convert_messages_for_native(&messages, false);
         let blocks = native[0]
@@ -14887,13 +14845,12 @@ mod tests {
             .with_thinking_passthrough()
             .build();
         let messages = vec![
-            ChatMessage::assistant(
-                r#"{"content": "a", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"\"}"}"#
-                    .to_string(),
+            ChatMessage::assistant_tool_calls(
+                "a",
+                vec![],
+                Some("{\"thinking\":\"t\",\"signature\":\"\"}".into()),
             ),
-            ChatMessage::assistant(
-                r#"{"content": "b", "reasoning_content": "plain streamed reasoning"}"#.to_string(),
-            ),
+            ChatMessage::assistant_tool_calls("b", vec![], Some("plain streamed reasoning".into())),
         ];
 
         let native = provider.convert_messages_for_native(&messages, false);
@@ -14919,8 +14876,7 @@ mod tests {
             .auth_style(AuthStyle::Bearer)
             .with_thinking_passthrough()
             .build();
-        let mixed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"signed\",\"signature\":\"sig\"}\n{\"thinking\":\"unsigned\",\"signature\":\"\"}", "tool_calls": []}"#;
-        let messages = vec![ChatMessage::assistant(mixed.to_string())];
+        let messages = vec![ChatMessage::assistant_tool_calls("answer", vec![], Some("{\"thinking\":\"signed\",\"signature\":\"sig\"}\n{\"thinking\":\"unsigned\",\"signature\":\"\"}".into()))];
 
         let native = provider.convert_messages_for_native(&messages, false);
         assert!(native[0].thinking_blocks.is_none());
@@ -14931,8 +14887,11 @@ mod tests {
     fn thinking_passthrough_replay_flag_off_replays_strings_verbatim() {
         // Flag off = today's behavior: strings replay, no blocks field.
         let provider = make_model_provider("gateway", "https://example.com", None);
-        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"sig\"}", "tool_calls": []}"#;
-        let messages = vec![ChatMessage::assistant(signed.to_string())];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "answer",
+            vec![],
+            Some("{\"thinking\":\"t\",\"signature\":\"sig\"}".into()),
+        )];
 
         let native = provider.convert_messages_for_native(&messages, false);
         assert_eq!(
@@ -14955,8 +14914,11 @@ mod tests {
             .with_thinking_passthrough()
             .without_assistant_reasoning_replay()
             .build();
-        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"sig\"}", "tool_calls": []}"#;
-        let messages = vec![ChatMessage::assistant(signed.to_string())];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "answer",
+            vec![],
+            Some("{\"thinking\":\"t\",\"signature\":\"sig\"}".into()),
+        )];
 
         let native = provider.convert_messages_for_native(&messages, false);
         assert_eq!(native[0].reasoning_content, None);
@@ -14975,8 +14937,11 @@ mod tests {
             .auth_style(AuthStyle::Bearer)
             .with_thinking_passthrough()
             .build();
-        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"sig\"}", "tool_calls": []}"#;
-        let messages = vec![ChatMessage::assistant(signed.to_string())];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "answer",
+            vec![],
+            Some("{\"thinking\":\"t\",\"signature\":\"sig\"}".into()),
+        )];
 
         let native = provider.convert_messages_for_native(&messages, false);
         let value = serde_json::to_value(&native[0]).unwrap();
@@ -15237,23 +15202,28 @@ mod tests {
             .with_thinking_passthrough()
             .build();
         let envelope = r#"{"thinking":"checked the weather","signature":"sig1"}"#;
-        let assistant_content = serde_json::json!({
-            "content": null,
-            "reasoning_content": envelope,
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "name": "get_weather",
-                    "arguments": "{\"city\": \"SF\"}",
-                }
-            ],
-        });
+
         let history = vec![
             ChatMessage::user("What is the weather in SF?"),
-            ChatMessage::assistant(assistant_content.to_string()),
-            ChatMessage::tool(
-                r#"{"tool_call_id": "call_1", "content": "72F and sunny"}"#.to_string(),
+            ChatMessage::assistant_tool_calls(
+                String::new(),
+                serde_json::from_value(serde_json::json!([
+                    {
+                        "id": "call_1",
+                        "name": "get_weather",
+                        "arguments": "{\"city\": \"SF\"}",
+                    }
+                ]))
+                .unwrap(),
+                Some((envelope).to_string()),
             ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call_1".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "72F and sunny".into(),
+                attachments: Vec::new(),
+            }),
         ];
 
         let native = provider.convert_messages_for_native(&history, false);
@@ -15365,17 +15335,17 @@ mod tests {
     #[test]
     fn convert_messages_for_native_round_trips_reasoning_content() {
         // Simulate stored assistant history JSON that includes reasoning_content
-        let history_json = serde_json::json!({
-            "content": "I will check",
-            "tool_calls": [{
+
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            ("I will check").to_string(),
+            serde_json::from_value(serde_json::json!([{
                 "id": "tc_1",
                 "name": "shell",
                 "arguments": "{\"cmd\":\"ls\"}"
-            }],
-            "reasoning_content": "Let me think about this..."
-        });
-
-        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+            }]))
+            .unwrap(),
+            Some(("Let me think about this...").to_string()),
+        )];
         let provider = make_model_provider("test", "https://example.com", None);
         let native = provider.convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
@@ -15394,17 +15364,18 @@ mod tests {
                 "thought_signature": "sig_1"
             }
         });
-        let history_json = serde_json::json!({
-            "content": "",
-            "tool_calls": [{
+
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            ("").to_string(),
+            serde_json::from_value(serde_json::json!([{
                 "id": "tc_1",
                 "name": "shell",
                 "arguments": "{\"cmd\":\"ls\"}",
                 "extra_content": extra_content.clone()
-            }]
-        });
-
-        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+            }]))
+            .unwrap(),
+            None,
+        )];
         let provider = make_model_provider("test", "https://example.com", None);
         let native = provider.convert_messages_for_native(&messages, true);
         let tool_calls = native[0].tool_calls.as_ref().unwrap();
@@ -15414,18 +15385,16 @@ mod tests {
 
     #[test]
     fn groq_outbound_omits_reasoning_replay_but_default_preserves_it() {
-        let history_json = serde_json::json!({
-            "content": "I will check",
-            "tool_calls": [{
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            ("I will check").to_string(),
+            serde_json::from_value(serde_json::json!([{
                 "id": "tc_1",
                 "name": "shell",
                 "arguments": "{\"cmd\":\"ls\"}"
-            }],
-            "reasoning_content": "canonical thought",
-            "reasoning": "alias thought"
-        });
-
-        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+            }]))
+            .unwrap(),
+            Some(("canonical thought").to_string()),
+        )];
         let default_provider =
             make_model_provider("OpenRouter", "https://openrouter.ai/api/v1", None);
         let default_request = default_provider.build_native_tool_chat_request(
@@ -15443,19 +15412,13 @@ mod tests {
             default_message.reasoning_content.as_deref(),
             Some("canonical thought")
         );
-        // Default provider preserves BOTH field names faithfully so the value
-        // round-trips on multi-turn requests `reasoning_content` and
-        // `reasoning` are carried independently, not collapsed into one.
-        assert_eq!(default_message.reasoning.as_deref(), Some("alias thought"));
+        // Runtime history carries canonical reasoning; provider-specific
+        // aliases belong to the final wire adapter.
         assert!(default_message.tool_calls.is_some());
         let default_json = serde_json::to_value(default_message).unwrap();
         assert_eq!(
             default_json.get("reasoning_content"),
             Some(&serde_json::json!("canonical thought"))
-        );
-        assert_eq!(
-            default_json.get("reasoning"),
-            Some(&serde_json::json!("alias thought"))
         );
 
         let groq_provider = OpenAiCompatibleModelProvider::builder("test")
@@ -15494,16 +15457,17 @@ mod tests {
     #[test]
     fn convert_messages_for_native_no_reasoning_content_when_absent() {
         // Normal model history without reasoning_content key
-        let history_json = serde_json::json!({
-            "content": "I will check",
-            "tool_calls": [{
+
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            ("I will check").to_string(),
+            serde_json::from_value(serde_json::json!([{
                 "id": "tc_1",
                 "name": "shell",
                 "arguments": "{\"cmd\":\"ls\"}"
-            }]
-        });
-
-        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+            }]))
+            .unwrap(),
+            None,
+        )];
         let provider = make_model_provider("test", "https://example.com", None);
         let native = provider.convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
@@ -15512,12 +15476,11 @@ mod tests {
 
     #[test]
     fn convert_messages_for_native_round_trips_reasoning_content_without_tool_calls() {
-        let history_json = serde_json::json!({
-            "content": "Direct answer.",
-            "reasoning_content": "Let me think step by step..."
-        });
-
-        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            ("Direct answer.").to_string(),
+            Vec::new(),
+            Some(("Let me think step by step...").to_string()),
+        )];
         let provider = make_model_provider("test", "https://example.com", None);
         let native = provider.convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
@@ -15593,26 +15556,27 @@ mod tests {
 
     #[test]
     fn convert_messages_for_native_omits_empty_tool_call_content() {
-        let empty_history_json = serde_json::json!({
-            "content": "",
-            "tool_calls": [{
-                "id": "tc_1",
-                "name": "shell",
-                "arguments": "{\"cmd\":\"ls\"}"
-            }]
-        });
-        let non_empty_history_json = serde_json::json!({
-            "content": "I will check",
-            "tool_calls": [{
-                "id": "tc_2",
-                "name": "shell",
-                "arguments": "{\"cmd\":\"pwd\"}"
-            }]
-        });
-
         let messages = vec![
-            ChatMessage::assistant(empty_history_json.to_string()),
-            ChatMessage::assistant(non_empty_history_json.to_string()),
+            ChatMessage::assistant_tool_calls(
+                ("").to_string(),
+                serde_json::from_value(serde_json::json!([{
+                    "id": "tc_1",
+                    "name": "shell",
+                    "arguments": "{\"cmd\":\"ls\"}"
+                }]))
+                .unwrap(),
+                None,
+            ),
+            ChatMessage::assistant_tool_calls(
+                ("I will check").to_string(),
+                serde_json::from_value(serde_json::json!([{
+                    "id": "tc_2",
+                    "name": "shell",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                }]))
+                .unwrap(),
+                None,
+            ),
         ];
         let provider = make_model_provider("test", "https://example.com", None);
         let native = provider.convert_messages_for_native(&messages, true);
@@ -15637,15 +15601,17 @@ mod tests {
         // content=null -> 400, content omitted -> 400, content="" -> 200.
         // Every other backend keeps the omitting behaviour pinned by
         // convert_messages_for_native_omits_empty_tool_call_content.
-        let history_json = serde_json::json!({
-            "content": "",
-            "tool_calls": [{
+
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            ("").to_string(),
+            serde_json::from_value(serde_json::json!([{
                 "id": "tc_1",
                 "name": "realms_proposal_firewall",
                 "arguments": "{}"
-            }]
-        });
-        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+            }]))
+            .unwrap(),
+            None,
+        )];
 
         let cloudflare = make_model_provider(
             "workers_ai",
@@ -16090,10 +16056,23 @@ mod tests {
     fn strip_native_tool_messages_coalesces_adjacent_assistants() {
         let messages = vec![
             ChatMessage::user("search for cats"),
-            ChatMessage::assistant(
-                r#"{"content":"I'll search","tool_calls":[{"id":"t1","name":"web_search","arguments":"{}"}]}"#,
+            ChatMessage::assistant_tool_calls(
+                "I'll search",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "t1".into(),
+                    name: "web_search".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
-            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"Found 10 results"}"#),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "t1".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "Found 10 results".into(),
+                attachments: Vec::new(),
+            }),
             ChatMessage::assistant("Here are the results about cats"),
         ];
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -16127,10 +16106,23 @@ mod tests {
     fn strip_native_tool_messages_coalesces_adjacent_users() {
         let messages = vec![
             ChatMessage::user("summarize this build output"),
-            ChatMessage::assistant(
-                r#"{"content":"","tool_calls":[{"id":"t1","name":"shell","arguments":"{}"}]}"#,
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "t1".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
-            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"cargo output"}"#),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "t1".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "cargo output".into(),
+                attachments: Vec::new(),
+            }),
             ChatMessage::user("go on"),
         ];
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -16155,14 +16147,31 @@ mod tests {
     fn strip_native_tool_messages_drops_internal_pruning_markers_before_coalescing() {
         let messages = vec![
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "assistant".to_string(),
                 content: ChatMessage::pruned_tool_exchange_summary(1),
             },
             ChatMessage::pruned_context_separator(),
-            ChatMessage::assistant(
-                r#"{"content":"","tool_calls":[{"id":"t1","name":"shell","arguments":"{}"}]}"#,
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "t1".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
-            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"cargo output"}"#),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "t1".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "cargo output".into(),
+                attachments: Vec::new(),
+            }),
             ChatMessage::user("go on"),
         ];
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -16182,10 +16191,23 @@ mod tests {
     fn strip_native_tool_messages_drops_empty_narration_cleanly() {
         let messages = vec![
             ChatMessage::user("search for cats"),
-            ChatMessage::assistant(
-                r#"{"content":"","tool_calls":[{"id":"t1","name":"web_search","arguments":"{}"}]}"#,
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "t1".into(),
+                    name: "web_search".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
-            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"Found"}"#),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "t1".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "Found".into(),
+                attachments: Vec::new(),
+            }),
             ChatMessage::assistant("Here are the results"),
         ];
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -17020,8 +17042,10 @@ mod tests {
             .auth_style(AuthStyle::Bearer)
             .without_assistant_reasoning_replay()
             .build();
-        let messages = vec![ChatMessage::assistant(
-            r#"{"content":"ok","reasoning_content":"step 1"}"#.to_string(),
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "ok",
+            vec![],
+            Some("step 1".into()),
         )];
         let native = provider.convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
@@ -17031,15 +17055,26 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_for_native_tool_fallbacks_to_last_assistant_tool_call_id() {
+    fn convert_messages_for_native_retains_structured_tool_call_id() {
         let provider = make_model_provider("test", "https://example.com", None);
         let messages = vec![
-            ChatMessage::assistant(
-                r#"{"content":null,"tool_calls":[{"id":"fc_123","name":"search","arguments":"{}"}]}"#.to_string(),
+            ChatMessage::assistant_tool_calls(
+                String::new(),
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "fc_123".into(),
+                    name: "search".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
-            ChatMessage::tool(
-                r#"{"content":"result"}"#.to_string(), // missing tool_call_id
-            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "fc_123".into(),
+                tool_name: "search".into(),
+                success: Some(true),
+                content: "result".into(),
+                attachments: Vec::new(),
+            }),
         ];
         let native = provider.convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 2);
@@ -17051,12 +17086,23 @@ mod tests {
     fn convert_messages_for_native_tool_uses_explicit_id_when_present() {
         let provider = make_model_provider("test", "https://example.com", None);
         let messages = vec![
-            ChatMessage::assistant(
-                r#"{"content":null,"tool_calls":[{"id":"fc_123","name":"search","arguments":"{}"}]}"#.to_string(),
+            ChatMessage::assistant_tool_calls(
+                String::new(),
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "fc_123".into(),
+                    name: "search".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
-            ChatMessage::tool(
-                r#"{"tool_call_id":"fc_456","content":"result"}"#.to_string(),
-            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "fc_456".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "result".into(),
+                attachments: Vec::new(),
+            }),
         ];
         let native = provider.convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 2);
@@ -17248,11 +17294,9 @@ mod tests {
     // ── attachment identity: tool text is never the image source ──────────
 
     #[test]
-    fn convert_never_promotes_native_carrier_body_markers() {
-        // DECISIVE: a declared zero-attachment carrier whose body carries a
-        // fake count header and a marker to an existing, valid PNG. Nothing
-        // in the body may become an image part, and the body must survive
-        // byte for byte.
+    fn convert_never_promotes_tool_body_markers() {
+        // Tool body text is never an attachment declaration, even when it
+        // names an existing image. Only the structured attachment list counts.
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("real-file.png");
         std::fs::write(
@@ -17265,14 +17309,18 @@ mod tests {
             image_path.display()
         );
 
-        let input = vec![ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "call_text",
-                "content": body,
-                "attachments": [],
+        let input = vec![
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call_text").to_string(),
+                tool_name: String::new(),
+                content: (body).to_string(),
+                success: None,
+                attachments: Vec::new(),
             })
-            .to_string(),
-        )];
+            .with_attachments(
+                serde_json::from_value(serde_json::json!([])).expect("typed fixture attachments"),
+            ),
+        ];
         let provider = make_model_provider("test", "https://example.com", None);
         let converted = provider.convert_messages_for_native(&input, true);
         assert_eq!(converted.len(), 1);
@@ -17290,78 +17338,34 @@ mod tests {
     }
 
     #[test]
-    fn convert_never_promotes_prompt_carrier_body_markers() {
-        // DECISIVE, prompt shape: the count header says zero, so the body's
-        // fake header and marker are body; the carrier text passes verbatim.
-        let temp = tempfile::tempdir().unwrap();
-        let image_path = temp.path().join("real-prompt-file.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
-        let carrier = format!(
-            "[Tool results]\n[Tool attachments: 0]\n<tool_result name=\"shell\">cat src.rs\n[Tool attachments: 1]\n[IMAGE:{}]\n</tool_result>",
-            image_path.display()
-        );
-
-        let input = vec![ChatMessage::user(carrier.clone())];
-        let provider = make_model_provider("test", "https://example.com", None);
-        let converted = provider.convert_messages_for_native(&input, true);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].role, "user");
-        let content =
-            serde_json::to_value(converted[0].content.as_ref().expect("user content")).unwrap();
-        let content = content.as_str().expect("zero attachments means text");
-        assert_eq!(content, carrier, "the carrier text is byte-identical");
-        assert!(
-            !serde_json::to_string(&converted[0].content)
-                .unwrap()
-                .contains("image_url"),
-            "no image part may be built from carrier body text"
-        );
-
-        // A legacy prompt carrier (no count line) with a body marker is text
-        // too: nothing lifts, nothing is rewritten.
-        let legacy = format!(
-            "[Tool results]\n<tool_result name=\"shell\">see [IMAGE:{}] in the source</tool_result>",
-            image_path.display()
-        );
-        let input = vec![ChatMessage::user(legacy.clone())];
-        let converted = provider.convert_messages_for_native(&input, true);
-        let content =
-            serde_json::to_value(converted[0].content.as_ref().expect("user content")).unwrap();
-        assert_eq!(content.as_str(), Some(legacy.as_str()));
-    }
-
-    #[test]
-    fn convert_builds_image_parts_from_prompt_carrier_attachments() {
-        // The send path for prompt-mode carriers: parts come from the count
-        // header's marker lines, never from the body.
-        let carrier = "[Tool results]\n[Tool attachments: 1]\n[IMAGE:data:image/png;base64,QUJD]\n<tool_result name=\"image_info\">File: /tmp/a.png</tool_result>";
-        let input = vec![ChatMessage::user(carrier.to_string())];
+    fn convert_builds_image_parts_from_structured_tool_attachments() {
+        let body = "File: /tmp/a.png";
+        let input = vec![
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("image-call").to_string(),
+                tool_name: ("image_info").to_string(),
+                content: (body).to_string(),
+                success: None,
+                attachments: Vec::new(),
+            })
+            .with_attachments(vec![AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/png;base64,QUJD".into(),
+            }]),
+        ];
         let provider = make_model_provider("test", "https://example.com", None);
         let converted = provider.convert_messages_for_native(&input, true);
         let value =
-            serde_json::to_value(converted[0].content.as_ref().expect("user content")).unwrap();
-        let parts = value.as_array().expect("carrier images become parts");
+            serde_json::to_value(converted[0].content.as_ref().expect("tool content")).unwrap();
+        assert_eq!(converted[0].role, "tool");
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("image-call"));
+        let parts = value.as_array().expect("structured images become parts");
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[1]["type"], "image_url");
         assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,QUJD");
         let text = parts[0]["text"].as_str().expect("text part");
-        assert!(text.contains("<tool_result name=\"image_info\">"));
         assert!(!text.contains("data:image"));
-        // The fixture's only marker is the declared header marker, so the
-        // neighboring assertions alone would also pass under a reversion to
-        // raw whole-string marker scanning (the scan lifts the same marker
-        // and keeps the envelope). The declared count header must NOT ride
-        // the delivered text: the carrier-aware path re-renders the
-        // envelope without the lifted image line, so the count it leaves
-        // behind says zero, not the one the raw scan would leave.
-        assert!(
-            !text.contains("[Tool attachments: 1]"),
-            "the declared count header must not ride the delivered text: {text}"
-        );
+        assert_eq!(text, body);
     }
 }

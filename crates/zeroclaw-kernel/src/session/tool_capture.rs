@@ -130,10 +130,16 @@ impl ToolScope {
                 let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(&text);
                 if calls.iter().any(|call| {
                     call.name == intent.proposed_name
-                        && intent
-                            .provider_call_id
-                            .as_ref()
-                            .is_none_or(|id| call.tool_call_id.as_deref() == Some(id.as_str()))
+                        // Text protocols may omit an ID; runtime creates one
+                        // for typed history. Only compare IDs when both the
+                        // provider response and preparation carry one. An
+                        // explicit provider ID must still match exactly.
+                        && call.tool_call_id.as_ref().is_none_or(|provider_id| {
+                            intent
+                                .provider_call_id
+                                .as_ref()
+                                .is_none_or(|id| id == provider_id)
+                        })
                 }) {
                     return Ok((event.event_id.clone(), index));
                 }

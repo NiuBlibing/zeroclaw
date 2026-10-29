@@ -9468,14 +9468,8 @@ mod tests {
         assert!(result.output.contains("tool count matched: 1"));
     }
 
-    /// The bounded agentic child turn gates image markers with the PARENT's
-    /// policy (`self.security`): a marker under the parent policy's
-    /// workspace on a non-vision provider refuses the child turn with the
-    /// capability error, before any provider dispatch. If the child
-    /// `ResolvedIo` regressed to `security: None`, the gate would fail
-    /// closed to the degrade and the child turn would succeed instead.
     #[tokio::test]
-    async fn bounded_agentic_child_refuses_policy_readable_marker_on_non_vision_provider() {
+    async fn bounded_agentic_child_keeps_literal_media_text_as_text() {
         let workspace = tempfile::tempdir().expect("workspace tempdir should create");
         let image_path = workspace.path().join("shot.png");
         std::fs::write(&image_path, b"policy-readable marker fixture")
@@ -9506,15 +9500,9 @@ mod tests {
             .unwrap();
 
         assert!(
-            !result.success,
-            "a policy-readable marker under the parent policy workspace must refuse \
-             the bounded child turn, got error: {:?}",
+            result.success,
+            "literal marker text cannot grant image semantics: {:?}",
             result.error
-        );
-        let error = result.error.as_deref().unwrap_or_default();
-        assert!(
-            error.contains("image marker") && error.contains("vision"),
-            "the refusal must surface the capability error text, got: {error}"
         );
     }
 

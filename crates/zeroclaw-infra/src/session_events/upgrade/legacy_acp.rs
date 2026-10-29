@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 #[cfg(any(test, feature = "test-util"))]
 use rusqlite::{Transaction, TransactionBehavior};
 use std::path::Path;
+use zeroclaw_api::media::AttachmentReference;
 #[cfg(any(test, feature = "test-util"))]
 use zeroclaw_api::model_provider::projected_entry_count;
 use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
@@ -267,6 +268,7 @@ impl LegacyAcpStore {
                  role              TEXT NOT NULL,
                  content           TEXT NOT NULL,
                  reasoning_content TEXT,
+                 attachments_json TEXT,
                  created_at        TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_acp_messages_session ON acp_messages(session_id, id);
@@ -279,6 +281,7 @@ impl LegacyAcpStore {
                  event_kind   TEXT NOT NULL,
                  payload      TEXT NOT NULL,
                  outcome      TEXT,
+                 attachments_json TEXT,
                  created_at   TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_acp_tool_calls_message ON acp_tool_calls(message_id, id);
@@ -328,11 +331,58 @@ impl LegacyAcpStore {
         Self::ensure_retained_context_columns(&conn)
             .context("Failed to migrate ACP retained context columns")?;
 
+        Self::ensure_message_attachments_column(&conn)
+            .context("Failed to migrate ACP message attachments")?;
+        Self::ensure_tool_attachments_column(&conn)
+            .context("Failed to migrate ACP tool attachments")?;
+
         Ok(Self {
             conn: Mutex::new(conn),
             sessions_dir: sessions_dir.into(),
             importing,
         })
+    }
+
+    fn ensure_message_attachments_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(acp_messages)")?;
+        let mut rows = stmt.query([])?;
+        let mut present = false;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1)? == "attachments_json" {
+                present = true;
+                break;
+            }
+        }
+        drop(rows);
+        drop(stmt);
+        if !present {
+            conn.execute(
+                "ALTER TABLE acp_messages ADD COLUMN attachments_json TEXT",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_tool_attachments_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(acp_tool_calls)")?;
+        let mut rows = stmt.query([])?;
+        let mut present = false;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1)? == "attachments_json" {
+                present = true;
+                break;
+            }
+        }
+        drop(rows);
+        drop(stmt);
+        if !present {
+            conn.execute(
+                "ALTER TABLE acp_tool_calls ADD COLUMN attachments_json TEXT",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     /// Add the `principal_id` owner column on upgrade (RFC 7141 session
@@ -987,7 +1037,7 @@ impl LegacyAcpStore {
         while remaining > 0 && current_id > 0 {
             let row = conn
                 .query_row(
-                    "SELECT id, role, content, reasoning_content
+                    "SELECT id, role, content, reasoning_content, attachments_json
                      FROM acp_messages
                      WHERE session_id = ?1 AND role != 'system' AND id <= ?2 AND id <= ?3
                      ORDER BY id DESC LIMIT 1",
@@ -998,14 +1048,22 @@ impl LegacyAcpStore {
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((message_id, role, content, reasoning_content)) = row else {
+            let Some((message_id, role, content, reasoning_content, attachments_json)) = row else {
                 break;
             };
-            let group = load_projected_group(&conn, message_id, role, content, reasoning_content)?;
+            let group = load_projected_group(
+                &conn,
+                message_id,
+                role,
+                content,
+                reasoning_content,
+                parse_attachments(attachments_json)?,
+            )?;
             let end = end_offset.unwrap_or(group.len());
             if end > group.len() {
                 return Err(anyhow::Error::msg("invalid ACP session cursor offset"));
@@ -1434,18 +1492,19 @@ impl LegacyAcpStore {
         // regresses or an old row survives a partial migration.
         let mut msg_stmt = conn
             .prepare(
-                "SELECT id, role, content, reasoning_content
+                "SELECT id, role, content, reasoning_content, attachments_json
                  FROM acp_messages WHERE session_id = ?1 AND role != 'system' ORDER BY id ASC",
             )
             .context("Failed to prepare message query")?;
 
-        let msg_rows: Vec<(i64, String, String, Option<String>)> = msg_stmt
+        let msg_rows = msg_stmt
             .query_map(params![session_id], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -1455,13 +1514,14 @@ impl LegacyAcpStore {
         // tool_results (event_kind='out') in id order.
         let mut tc_stmt = conn
             .prepare(
-                "SELECT tool_call_id, tool_name, event_kind, payload
+                "SELECT tool_call_id, tool_name, event_kind, payload, attachments_json
                  FROM acp_tool_calls WHERE message_id = ?1 ORDER BY id ASC",
             )
             .context("Failed to prepare tool_call query")?;
 
         let mut out = Vec::with_capacity(msg_rows.len());
-        for (msg_id, role, content, reasoning_content) in msg_rows {
+        for (msg_id, role, content, reasoning_content, attachments_json) in msg_rows {
+            let attachments = parse_attachments(attachments_json)?;
             // Split this message's tool_calls into ins and outs preserving order.
             let mut ins: Vec<ToolCall> = Vec::new();
             let mut outs: Vec<ToolResultMessage> = Vec::new();
@@ -1472,11 +1532,12 @@ impl LegacyAcpStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()
                 .context("Failed to read tool_call rows")?;
-            for (tool_call_id, tool_name, event_kind, payload) in rows {
+            for (tool_call_id, tool_name, event_kind, payload, attachments_json) in rows {
                 match event_kind.as_str() {
                     "in" => ins.push(ToolCall {
                         id: tool_call_id,
@@ -1485,13 +1546,14 @@ impl LegacyAcpStore {
                         extra_content: None,
                     }),
                     "out" => outs.push(ToolResultMessage {
+                        success: None,
                         tool_call_id,
                         content: payload,
                         // Carry the producing tool name (looked up from the
                         // matching 'in' row on write) so a resumed session
-                        // stays provenance-aware for media-marker
-                        // canonicalization
+                        // retains the producing tool's identity.
                         tool_name,
+                        attachments: parse_attachments(attachments_json)?,
                     }),
                     other => {
                         ::zeroclaw_log::record!(
@@ -1525,7 +1587,14 @@ impl LegacyAcpStore {
             // scores the parent row once for its text and each unmatched
             // result once, so the reload must present the same entries.
             if ins.is_empty() {
-                out.push(ConversationMessage::Chat(ChatMessage { role, content }));
+                out.push(ConversationMessage::Chat(ChatMessage {
+                    role,
+                    content,
+                    attachments,
+                    tool_calls: Vec::new(),
+                    tool_result: None,
+                    reasoning_content: None,
+                }));
                 if !outs.is_empty() {
                     out.push(ConversationMessage::ToolResults(outs));
                 }
@@ -1689,9 +1758,15 @@ impl LegacyAcpStore {
                 ConversationMessage::Chat(chat) => {
                     tx.execute(
                         "INSERT INTO acp_messages
-                           (session_id, role, content, reasoning_content, created_at)
-                         VALUES (?1, ?2, ?3, NULL, ?4)",
-                        params![session_id, chat.role, chat.content, now],
+                           (session_id, role, content, reasoning_content, attachments_json, created_at)
+                         VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
+                        params![
+                            session_id,
+                            chat.role,
+                            chat.content,
+                            serde_json::to_string(&chat.attachments)?,
+                            now,
+                        ],
                     )
                     .context("Failed to insert chat message")?;
                     projected_increment += 1;
@@ -1811,8 +1886,8 @@ impl LegacyAcpStore {
                         }
                         tx.execute(
                             "INSERT INTO acp_tool_calls
-                               (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                               (message_id, tool_call_id, tool_name, event_kind, payload, outcome, attachments_json, created_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                             params![
                                 msg_id,
                                 result.tool_call_id,
@@ -1820,6 +1895,7 @@ impl LegacyAcpStore {
                                 ToolEventKind::Out.as_str(),
                                 result.content,
                                 EventOutcome::Unknown.as_str(),
+                                serde_json::to_string(&result.attachments)?,
                                 now,
                             ],
                         )
@@ -1942,8 +2018,13 @@ impl LegacyAcpStore {
             .map(|message| match message {
                 ConversationMessage::Chat(chat) if chat.role == "system" => {
                     ConversationMessage::Chat(ChatMessage {
+                        tool_calls: Vec::new(),
+                        tool_result: None,
+                        reasoning_content: None,
                         role: SYNTHETIC_INTERRUPTION_ROLE.to_string(),
                         content: chat.content.clone(),
+
+                        attachments: Vec::new(),
                     })
                 }
                 other => other.clone(),
@@ -3130,9 +3211,17 @@ struct ProjectedGroup {
     role: String,
     content: String,
     reasoning_content: Option<String>,
+    attachments: Vec<AttachmentReference>,
     has_tool_events: bool,
     input_count: usize,
     unmatched_output_count: usize,
+}
+
+fn parse_attachments(raw: Option<String>) -> Result<Vec<AttachmentReference>> {
+    raw.filter(|value| !value.is_empty())
+        .map(|value| serde_json::from_str(&value).context("invalid persisted attachment list"))
+        .transpose()
+        .map(|attachments| attachments.unwrap_or_default())
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -3178,12 +3267,16 @@ impl ProjectedGroup {
         if !self.has_tool_events {
             if range.start == 0 && range.end > 0 {
                 messages.push(ConversationMessage::Chat(ChatMessage {
+                    tool_calls: Vec::new(),
+                    tool_result: None,
+                    reasoning_content: None,
                     role: if self.role == SYNTHETIC_INTERRUPTION_ROLE {
                         "system".to_string()
                     } else {
                         self.role.clone()
                     },
                     content: self.content.clone(),
+                    attachments: self.attachments.clone(),
                 }));
             }
             return Ok(messages);
@@ -3195,8 +3288,12 @@ impl ProjectedGroup {
         let narration = usize::from(!self.content.is_empty());
         if range.start < narration && !self.content.is_empty() {
             messages.push(ConversationMessage::Chat(ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
                 role: "assistant".to_string(),
                 content: self.content.clone(),
+                attachments: self.attachments.clone(),
             }));
         }
 
@@ -3231,7 +3328,7 @@ impl ProjectedGroup {
                  )
                  SELECT input_rows.tool_call_id, input_rows.tool_name,
                         input_rows.payload, output_rows.payload,
-                        output_rows.tool_name
+                        output_rows.tool_name, output_rows.attachments_json
                  FROM selected_inputs
                  JOIN ranked_inputs ON ranked_inputs.id = selected_inputs.id
                  JOIN acp_tool_calls input_rows ON input_rows.id = selected_inputs.id
@@ -3250,11 +3347,13 @@ impl ProjectedGroup {
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 },
             )?;
             for row in rows {
-                let (tool_call_id, tool_name, arguments, output, output_name) = row?;
+                let (tool_call_id, tool_name, arguments, output, output_name, output_attachments) =
+                    row?;
                 selected_ids.insert(tool_call_id.clone());
                 messages.push(ConversationMessage::AssistantToolCalls {
                     text: None,
@@ -3268,9 +3367,11 @@ impl ProjectedGroup {
                 });
                 if let Some(content) = output {
                     messages.push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        success: None,
                         tool_call_id,
                         content,
                         tool_name: output_name.unwrap_or_default(),
+                        attachments: parse_attachments(output_attachments)?,
                     }]));
                 }
             }
@@ -3303,7 +3404,7 @@ impl ProjectedGroup {
                      ORDER BY outputs.id LIMIT ?2 OFFSET ?3
                  )
                  SELECT output_rows.tool_call_id, output_rows.tool_name,
-                        output_rows.payload
+                        output_rows.payload, output_rows.attachments_json
                  FROM selected_outputs
                  JOIN acp_tool_calls output_rows ON output_rows.id = selected_outputs.id
                  ORDER BY output_rows.id",
@@ -3315,16 +3416,19 @@ impl ProjectedGroup {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )?;
             for row in rows {
-                let (tool_call_id, tool_name, content) = row?;
+                let (tool_call_id, tool_name, content, attachments_json) = row?;
                 selected_ids.insert(tool_call_id.clone());
                 messages.push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                    success: None,
                     tool_call_id,
                     content,
                     tool_name,
+                    attachments: parse_attachments(attachments_json)?,
                 }]));
             }
         }
@@ -3369,6 +3473,7 @@ fn load_projected_group(
     role: String,
     content: String,
     reasoning_content: Option<String>,
+    attachments: Vec<AttachmentReference>,
 ) -> Result<ProjectedGroup> {
     let has_tool_events: bool = conn.query_row(
         "SELECT EXISTS(
@@ -3383,6 +3488,7 @@ fn load_projected_group(
             role,
             content,
             reasoning_content,
+            attachments,
             has_tool_events,
             input_count: 0,
             unmatched_output_count: 0,
@@ -3420,6 +3526,7 @@ fn load_projected_group(
         role,
         content,
         reasoning_content,
+        attachments,
         has_tool_events,
         input_count: input_count.max(0) as usize,
         unmatched_output_count: unmatched_output_count.max(0) as usize,
@@ -3614,6 +3721,8 @@ mod tests {
                 "turn",
                 &[
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        success: None,
+                        attachments: Vec::new(),
                         tool_call_id: "retained-call".into(),
                         tool_name: "read".into(),
                         content: "result".into(),
@@ -4122,6 +4231,8 @@ mod tests {
             reasoning_content: None,
         };
         let result = ConversationMessage::ToolResults(vec![ToolResultMessage {
+            success: None,
+            attachments: Vec::new(),
             tool_call_id: "call-1".to_string(),
             tool_name: "shell".to_string(),
             content: "/tmp/workspace".to_string(),
@@ -4321,6 +4432,8 @@ mod tests {
             .unwrap();
 
         let invalid_terminal = vec![ConversationMessage::ToolResults(vec![ToolResultMessage {
+            success: None,
+            attachments: Vec::new(),
             tool_call_id: "missing".to_string(),
             tool_name: "shell".to_string(),
             content: "orphan".to_string(),
@@ -4404,11 +4517,15 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                attachments: Vec::new(),
                 tool_call_id: "paired".to_string(),
                 tool_name: "shell".to_string(),
                 content: "first".to_string(),
             }]),
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                attachments: Vec::new(),
                 tool_call_id: "orphan".to_string(),
                 tool_name: "shell".to_string(),
                 content: "misplaced".to_string(),
@@ -4442,9 +4559,11 @@ mod tests {
             extra_content: None,
         };
         let result = |id: &str| ToolResultMessage {
+            success: None,
             tool_call_id: id.into(),
             tool_name: "shell".into(),
             content: format!("output for {id}"),
+            attachments: Vec::new(),
         };
         for (call_count, result_count) in [(2, 1), (2, 2), (1, 2)] {
             for keep_unique_peer in [false, true] {
@@ -4513,6 +4632,8 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                attachments: Vec::new(),
                 tool_call_id: "call-1".to_string(),
                 tool_name: "shell".to_string(),
                 content: "x".repeat(MAX_PERSISTED_TOOL_OUTPUT_BYTES + 10),
@@ -4563,6 +4684,8 @@ mod tests {
             },
             ConversationMessage::ToolResults(vec![
                 zeroclaw_api::model_provider::ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "call-1".into(),
                     content: "old result".into(),
                     tool_name: "old_tool".into(),
@@ -4619,6 +4742,8 @@ mod tests {
                     },
                     ConversationMessage::ToolResults(vec![
                         zeroclaw_api::model_provider::ToolResultMessage {
+                            success: None,
+                            attachments: Vec::new(),
                             tool_call_id: "call-2".into(),
                             content: "new result".into(),
                             tool_name: "new_tool".into(),
@@ -4663,11 +4788,15 @@ mod tests {
             },
             ConversationMessage::ToolResults(vec![
                 ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "c1".into(),
                     content: "ok".into(),
                     tool_name: "shell".into(),
                 },
                 ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "c2".into(),
                     content: "ok".into(),
                     tool_name: "read".into(),
@@ -4863,6 +4992,8 @@ mod tests {
                 reasoning_content: Some("think think".into()),
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                attachments: Vec::new(),
                 tool_call_id: "tc-1".into(),
                 content: "file.txt\n".into(),
                 tool_name: String::new(),
@@ -5099,6 +5230,51 @@ mod tests {
     }
 
     #[test]
+    fn structured_attachments_round_trip_in_compatibility_history_and_pages() {
+        let (_tmp, store) = open_store();
+        let sid = "typed-attachments";
+        store.create_session(sid, "alpha", "/tmp", None).unwrap();
+        let reference = AttachmentReference {
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+            target: "/tmp/image.png".into(),
+        };
+        let messages = vec![
+            ConversationMessage::Chat(
+                ChatMessage::user("literal [IMAGE:/example]")
+                    .with_attachments(vec![reference.clone()]),
+            ),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call".into(),
+                    name: "image_info".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                tool_call_id: "call".into(),
+                tool_name: "image_info".into(),
+                content: "image ready".into(),
+                attachments: vec![reference],
+            }]),
+        ];
+        store.append_turn(sid, &messages).unwrap();
+        let restored = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.messages).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+        let page = store.load_message_page(sid, 10, None).unwrap();
+        assert_eq!(
+            serde_json::to_value(&page.messages).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+    }
+
+    #[test]
     fn cursor_pages_newest_rows_and_walks_back_without_repeating() {
         let (_tmp, store) = open_store();
         store
@@ -5146,8 +5322,13 @@ mod tests {
                     ConversationMessage::Chat(ChatMessage::user("question")),
                     ConversationMessage::Chat(ChatMessage::assistant("answer")),
                     ConversationMessage::Chat(ChatMessage {
+                        tool_calls: Vec::new(),
+                        tool_result: None,
+                        reasoning_content: None,
                         role: "user".into(),
                         content: String::new(),
+
+                        attachments: Vec::new(),
                     }),
                 ],
             )
@@ -5198,16 +5379,22 @@ mod tests {
                     },
                     ConversationMessage::ToolResults(vec![
                         ToolResultMessage {
+                            success: None,
+                            attachments: Vec::new(),
                             tool_call_id: "two".into(),
                             content: "two-result".into(),
                             tool_name: "shell".into(),
                         },
                         ToolResultMessage {
+                            success: None,
+                            attachments: Vec::new(),
                             tool_call_id: "orphan".into(),
                             content: "orphan-result".into(),
                             tool_name: "shell".into(),
                         },
                         ToolResultMessage {
+                            success: None,
+                            attachments: Vec::new(),
                             tool_call_id: "one".into(),
                             content: "one-result".into(),
                             tool_name: "shell".into(),
@@ -5333,6 +5520,8 @@ mod tests {
         };
         let result = |id: &str| {
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                attachments: Vec::new(),
                 tool_call_id: id.into(),
                 content: "ok".into(),
                 tool_name: "shell".into(),
@@ -5541,6 +5730,8 @@ mod tests {
                         reasoning_content: None,
                     },
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        success: None,
+                        attachments: Vec::new(),
                         tool_call_id: "tc-1".into(),
                         content: "ok".into(),
                         tool_name: String::new(),
@@ -5951,9 +6142,11 @@ mod tests {
 
     fn tool_result(id: &str) -> ToolResultMessage {
         ToolResultMessage {
+            success: None,
             tool_call_id: id.to_string(),
             content: "out".into(),
             tool_name: "shell".into(),
+            attachments: Vec::new(),
         }
     }
 
@@ -6934,6 +7127,8 @@ mod tests {
                         reasoning_content: Some("thinking".into()),
                     },
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        success: None,
+                        attachments: Vec::new(),
                         tool_call_id: "tc-1".into(),
                         content: "done".into(),
                         tool_name: String::new(),

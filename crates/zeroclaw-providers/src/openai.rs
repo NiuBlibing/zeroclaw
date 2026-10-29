@@ -467,11 +467,13 @@ impl OpenAiModelProvider {
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
+        let projected = crate::multimodal::project_attachment_metadata(messages);
+        let messages = projected.as_ref();
         messages
             .iter()
             .map(|m| {
                 if m.role == "assistant"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(m)
                     && let Some(tool_calls_value) = value.get("tool_calls")
                     && let Ok(parsed_calls) =
                         serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
@@ -510,7 +512,7 @@ impl OpenAiModelProvider {
                 }
 
                 if m.role == "tool"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(m)
                 {
                     let tool_call_id = value
                         .get("tool_call_id")
@@ -2029,12 +2031,23 @@ mod tool_round_policy_tests {
         let dispatch = ProviderDispatch::new(Arc::clone(&provider));
         let messages = [
             ChatMessage::user("continue"),
-            ChatMessage::assistant(
-                r#"{"content":"working","tool_calls":[{"id":"call-one","name":"echo","arguments":"{}"}]}"#,
+            ChatMessage::assistant_tool_calls(
+                "working",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "call-one".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
-            ChatMessage::tool(
-                r#"{"tool_call_id":"call-one","tool_name":"echo","content":"result-one"}"#,
-            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call-one".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "result-one".into(),
+                attachments: Vec::new(),
+            }),
         ];
         let tools = if tool_shape == 2 {
             vec![ToolSpec::new(
@@ -3405,17 +3418,16 @@ mod tests {
     fn convert_messages_round_trips_reasoning_content() {
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let history_json = serde_json::json!({
-            "content": "I will check",
-            "tool_calls": [{
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            ("I will check").to_string(),
+            serde_json::from_value(serde_json::json!([{
                 "id": "tc_1",
                 "name": "shell",
                 "arguments": "{}"
-            }],
-            "reasoning_content": "Let me think..."
-        });
-
-        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+            }]))
+            .unwrap(),
+            Some(("Let me think...").to_string()),
+        )];
         let native = OpenAiModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
         assert_eq!(
@@ -3428,16 +3440,16 @@ mod tests {
     fn convert_messages_no_reasoning_content_when_absent() {
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let history_json = serde_json::json!({
-            "content": "I will check",
-            "tool_calls": [{
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            ("I will check").to_string(),
+            serde_json::from_value(serde_json::json!([{
                 "id": "tc_1",
                 "name": "shell",
                 "arguments": "{}"
-            }]
-        });
-
-        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+            }]))
+            .unwrap(),
+            None,
+        )];
         let native = OpenAiModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
@@ -3450,8 +3462,15 @@ mod tests {
         // covered in `compatible::tests::sanitize_tool_arguments_*`.
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let messages = vec![ChatMessage::assistant(
-            r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#.to_string(),
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "trying",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_bad".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"rm -rf".into(),
+                extra_content: None,
+            }],
+            None,
         )];
 
         let native = OpenAiModelProvider::convert_messages(&messages);
@@ -3467,8 +3486,15 @@ mod tests {
         // Companion regression: valid JSON must round-trip byte-for-byte.
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let messages = vec![ChatMessage::assistant(
-            r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#.to_string(),
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "using",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_ok".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"pwd\"}".into(),
+                extra_content: None,
+            }],
+            None,
         )];
 
         let native = OpenAiModelProvider::convert_messages(&messages);

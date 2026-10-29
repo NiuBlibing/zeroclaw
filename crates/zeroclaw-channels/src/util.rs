@@ -602,62 +602,6 @@ pub fn strip_tool_call_tags(message: &str) -> String {
     result.trim().to_string()
 }
 
-/// Recognized attachment marker kinds (e.g. `[IMAGE:/path]`, `[DOCUMENT:url]`).
-const ATTACHMENT_KINDS: &[&str] = &[
-    "IMAGE", "PHOTO", "DOCUMENT", "FILE", "VIDEO", "AUDIO", "VOICE", "LOCATION",
-];
-
-/// Parse `[KIND:target]` attachment markers out of a message.
-/// Returns cleaned text (markers removed) and a vec of `(kind, target)` pairs.
-pub fn parse_attachment_markers(message: &str) -> (String, Vec<(String, String)>) {
-    parse_attachment_markers_of_kinds(message, ATTACHMENT_KINDS)
-}
-
-pub(crate) fn parse_attachment_markers_of_kinds(
-    message: &str,
-    kinds: &[&str],
-) -> (String, Vec<(String, String)>) {
-    let mut cleaned = String::with_capacity(message.len());
-    let mut attachments = Vec::new();
-    let mut cursor = 0usize;
-
-    while let Some(rel_start) = message[cursor..].find('[') {
-        let start = cursor + rel_start;
-        cleaned.push_str(&message[cursor..start]);
-
-        let Some(rel_end) = message[start..].find(']') else {
-            cleaned.push_str(&message[start..]);
-            cursor = message.len();
-            break;
-        };
-        let end = start + rel_end;
-        let marker_text = &message[start + 1..end];
-
-        let parsed = marker_text.split_once(':').and_then(|(kind, target)| {
-            let kind_upper = kind.trim().to_ascii_uppercase();
-            let target = target.trim();
-            if target.is_empty() || !kinds.contains(&kind_upper.as_str()) {
-                return None;
-            }
-            Some((kind_upper, target.to_string()))
-        });
-
-        if let Some(attachment) = parsed {
-            attachments.push(attachment);
-        } else {
-            cleaned.push_str(&message[start..=end]);
-        }
-
-        cursor = end + 1;
-    }
-
-    if cursor < message.len() {
-        cleaned.push_str(&message[cursor..]);
-    }
-
-    (cleaned.trim().to_string(), attachments)
-}
-
 /// Minimum reply size, in bytes, that earns a voice note. Byte-measured, so a
 /// non-ASCII reply clears the floor with fewer characters than an ASCII one.
 #[cfg(any(feature = "channel-telegram", feature = "whatsapp-web", test))]
@@ -691,12 +635,6 @@ fn leading_bracket_skip_reason(content: &str) -> Option<&'static str> {
     let inner = &after_open[..close];
     let tail = &after_open[close + 1..];
 
-    // Attachment markers always carry `:` (`[IMAGE:/path]`), because both
-    // parsers key on `split_once(':')`. Audio tags never do, so the colon is
-    // what keeps a filesystem path from being read aloud.
-    if inner.contains(':') {
-        return Some("attachment_marker");
-    }
     // Markdown link: `[text](url)`. Without this the URL would be spoken.
     if tail.starts_with('(') {
         return Some("markdown_link");
@@ -742,77 +680,17 @@ pub(crate) fn voice_reply_skip_reason(content: &str) -> Option<&'static str> {
     None
 }
 
-/// A native location pin parsed from a `[LOCATION:...]` marker. Shared by
-/// both WhatsApp backends (web protobuf send and Cloud API JSON send).
-#[cfg(any(feature = "whatsapp-web", feature = "channel-whatsapp-cloud", test))]
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct WhatsAppLocation {
-    pub(crate) lat: f64,
-    pub(crate) lng: f64,
-    pub(crate) name: Option<String>,
-    pub(crate) address: Option<String>,
-}
-
-#[cfg(any(feature = "whatsapp-web", feature = "channel-whatsapp-cloud", test))]
-impl WhatsAppLocation {
-    pub(crate) fn parse(target: &str) -> Option<Self> {
-        // Extract the next field.  If the trimmed input starts with `"` the
-        // field runs to the closing `"` and may contain commas; otherwise the
-        // field ends at the first `,`.  Returns `(field, rest)` — `rest` has
-        // already been trimmed and stripped of the separating comma.
-        fn next_field(s: &str) -> (&str, &str) {
-            let s = s.trim();
-            if let Some(inner) = s.strip_prefix('"') {
-                if let Some(end) = inner.find('"') {
-                    // Quoted field: grab everything up to the closing quote.
-                    let field = &inner[..end];
-                    let rest = inner[end + 1..].trim();
-                    let rest = match rest.strip_prefix(',') {
-                        Some(s) => s.trim(),
-                        None => "",
-                    };
-                    return (field, rest);
-                }
-                // Unclosed quote — treat the rest as one field.
-                return (inner, "");
-            }
-            // Plain field: split on the first comma.
-            match s.find(',') {
-                Some(pos) => (s[..pos].trim(), s[pos + 1..].trim()),
-                None => (s, ""),
-            }
-        }
-
-        let (lat_str, rest) = next_field(target);
-        let lat: f64 = lat_str.parse().ok()?;
-        let (lng_str, rest) = next_field(rest);
-        let lng: f64 = lng_str.parse().ok()?;
-        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
-            return None;
-        }
-
-        let (name_raw, rest) = next_field(rest);
-        let name = (!name_raw.is_empty()).then(|| name_raw.to_string());
-
-        let address = (!rest.is_empty()).then(|| rest.to_string());
-
-        Some(Self {
-            lat,
-            lng,
-            name,
-            address,
-        })
-    }
-}
+#[cfg(any(feature = "whatsapp-web", feature = "channel-whatsapp-cloud"))]
+pub(crate) use zeroclaw_api::media::LocationAttachment as WhatsAppLocation;
 
 /// Render an inbound static location as chat text, e.g.
-/// `[Location: 40.712800, -74.006000 — NYC]`. Shared by both WhatsApp
+/// `Location: 40.712800, -74.006000 — NYC`. Shared by both WhatsApp
 /// backends so inbound pins read identically regardless of transport.
 #[cfg(any(feature = "whatsapp-web", feature = "channel-whatsapp-cloud", test))]
 pub(crate) fn format_location_content(lat: f64, lng: f64, name: Option<&str>) -> String {
     match name.filter(|n| !n.is_empty()) {
-        Some(name) => format!("[Location: {lat:.6}, {lng:.6} — {name}]"),
-        None => format!("[Location: {lat:.6}, {lng:.6}]"),
+        Some(name) => format!("Location: {lat:.6}, {lng:.6} — {name}"),
+        None => format!("Location: {lat:.6}, {lng:.6}"),
     }
 }
 
@@ -1685,79 +1563,6 @@ mod tests {
         assert_eq!(strip_tool_call_tags(mid_tag), "Working on it");
     }
 
-    #[test]
-    fn parse_attachment_markers_extracts_known_kinds() {
-        let (cleaned, attachments) =
-            parse_attachment_markers("Here [IMAGE:/tmp/a.png] and [DOCUMENT:/tmp/b.pdf] done");
-        assert_eq!(cleaned, "Here  and  done");
-        assert_eq!(attachments.len(), 2);
-        assert_eq!(attachments[0], ("IMAGE".into(), "/tmp/a.png".into()));
-        assert_eq!(attachments[1], ("DOCUMENT".into(), "/tmp/b.pdf".into()));
-    }
-
-    #[test]
-    fn parse_attachment_markers_preserves_unknown_kinds() {
-        let (cleaned, attachments) = parse_attachment_markers("Check [UNKNOWN:foo] out");
-        assert_eq!(cleaned, "Check [UNKNOWN:foo] out");
-        assert!(attachments.is_empty());
-    }
-
-    #[test]
-    fn parse_attachment_markers_delivers_echoed_media_placeholder_as_prose() {
-        // A text-only model sees the degradation placeholder in its history
-        // and may repeat it; the reply must reach the user as readable text,
-        // not as a marker or a stray bracket span.
-        let reply = format!(
-            "I can't view that, it shows as {}.",
-            zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER
-        );
-        let (cleaned, attachments) = parse_attachment_markers(&reply);
-        assert_eq!(cleaned, reply);
-        assert!(attachments.is_empty());
-        assert!(!cleaned.contains('['));
-    }
-
-    #[test]
-    fn parse_attachment_markers_preserves_empty_target() {
-        let (cleaned, attachments) = parse_attachment_markers("See [IMAGE:] here");
-        assert_eq!(cleaned, "See [IMAGE:] here");
-        assert!(attachments.is_empty());
-    }
-
-    #[test]
-    fn parse_attachment_markers_no_markers() {
-        let (cleaned, attachments) = parse_attachment_markers("Hello world");
-        assert_eq!(cleaned, "Hello world");
-        assert!(attachments.is_empty());
-    }
-
-    #[test]
-    fn parse_attachment_markers_all_kinds() {
-        let input = "[IMAGE:a] [PHOTO:b] [DOCUMENT:c] [FILE:d] [VIDEO:e] [AUDIO:f] [VOICE:g]";
-        let (_, attachments) = parse_attachment_markers(input);
-        assert_eq!(attachments.len(), 7);
-    }
-
-    #[test]
-    fn parse_attachment_markers_case_insensitive_kind() {
-        let (_, attachments) = parse_attachment_markers("[image:/tmp/a.png]");
-        assert_eq!(attachments.len(), 1);
-        assert_eq!(attachments[0].0, "IMAGE");
-    }
-
-    #[test]
-    fn parse_attachment_markers_of_kinds_leaves_other_kinds_in_text() {
-        let (cleaned, attachments) = parse_attachment_markers_of_kinds(
-            "Pin [LOCATION:40.7,-74.0] pic [IMAGE:/tmp/a.png]",
-            &["LOCATION"],
-        );
-        assert_eq!(cleaned, "Pin  pic [IMAGE:/tmp/a.png]");
-        assert_eq!(
-            attachments,
-            vec![("LOCATION".to_string(), "40.7,-74.0".to_string())]
-        );
-    }
-
     /// A reply opening with an ElevenLabs v3 expressive audio tag is prose
     /// written for speech, so it must reach TTS rather than be filtered out
     /// as machine output.
@@ -1785,55 +1590,51 @@ mod tests {
         );
     }
 
-    /// The bracket clause still has to reject genuine machine output. An
-    /// attachment marker reaching TTS would read a filesystem path aloud.
+    /// The bracket clause still has to reject genuine machine output.
     #[test]
     fn voice_reply_rejects_bracketed_machine_output() {
         for (content, expected) in [
             (
                 "[{\"a\":1},{\"b\":2}] ecco il meteo di oggi per Roma.",
-                "json_array",
+                Some("json_array"),
             ),
             (
                 "[\"alpha\",\"beta\",\"gamma\",\"delta\",\"epsilon\"]",
-                "json_array",
+                Some("json_array"),
             ),
             (
                 "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]",
-                "json_array",
+                Some("json_array"),
             ),
             (
                 "[] plus filler text to clear the length floor here",
-                "json_array",
+                Some("json_array"),
             ),
             (
                 "[IMAGE:/home/pi/chart.png] Ecco il grafico richiesto.",
-                "attachment_marker",
+                None,
             ),
             (
                 "[VOICE:/tmp/zeroclaw/out.ogg] Nota vocale registrata.",
-                "attachment_marker",
+                None,
             ),
-            (
-                "[DOCUMENT:https://example.com/report.pdf] Ecco il file.",
-                "attachment_marker",
-            ),
+            ("[DOCUMENT:/a.pdf] Ecco il file del report richiesto.", None),
             (
                 "[Guida](https://example.com/docs) ecco il link utile.",
-                "markdown_link",
+                Some("markdown_link"),
             ),
             (
                 "[unclosed tag and a sentence that never closes it",
-                "unclosed_bracket",
+                Some("unclosed_bracket"),
             ),
             (
                 "[didascalia molto lunga che sfora il limite dei tag] ok",
-                "bracketed_prefix",
+                Some("bracketed_prefix"),
             ),
         ] {
             assert_eq!(
                 voice_reply_skip_reason(content),
-                Some(expected),
+                expected,
                 "input: {content}"
             );
         }
@@ -1893,100 +1694,28 @@ mod tests {
         );
     }
 
-    /// Pins the classifier so a refactor that breaks tag recognition or the
-    /// marker guard fails loudly rather than silently.
+    /// Pins the classifier so expressive tags remain distinct from ordinary
+    /// bracketed text.
     #[test]
-    fn leading_bracket_classifier_distinguishes_tags_from_markers() {
+    fn leading_bracket_classifier_distinguishes_tags_from_text() {
         assert_eq!(leading_bracket_skip_reason("[whispers] rest"), None);
-        assert_eq!(
-            leading_bracket_skip_reason("[IMAGE:/x] rest"),
-            Some("attachment_marker")
-        );
+        assert_eq!(leading_bracket_skip_reason("[IMAGE:/x] rest"), None);
         assert_eq!(leading_bracket_skip_reason("no bracket here"), None);
-    }
-
-    #[test]
-    fn location_marker_parses_coordinates_name_and_address() {
-        // Bare coordinates.
-        assert_eq!(
-            WhatsAppLocation::parse("40.7128,-74.0060"),
-            Some(WhatsAppLocation {
-                lat: 40.7128,
-                lng: -74.0060,
-                name: None,
-                address: None,
-            })
-        );
-        // Coordinates + name, with surrounding whitespace trimmed.
-        assert_eq!(
-            WhatsAppLocation::parse(" 40.7128 , -74.0060 , Statue of Liberty "),
-            Some(WhatsAppLocation {
-                lat: 40.7128,
-                lng: -74.0060,
-                name: Some("Statue of Liberty".to_string()),
-                address: None,
-            })
-        );
-        // The address is the trailing field and may contain commas.
-        assert_eq!(
-            WhatsAppLocation::parse("40.7128,-74.0060,Liberty Island,New York, NY 10004"),
-            Some(WhatsAppLocation {
-                lat: 40.7128,
-                lng: -74.0060,
-                name: Some("Liberty Island".to_string()),
-                address: Some("New York, NY 10004".to_string()),
-            })
-        );
-        // Double-quoted name may contain commas.
-        assert_eq!(
-            WhatsAppLocation::parse("40.7128,-74.0060,\"ACME, Inc.\",New York, NY 10004"),
-            Some(WhatsAppLocation {
-                lat: 40.7128,
-                lng: -74.0060,
-                name: Some("ACME, Inc.".to_string()),
-                address: Some("New York, NY 10004".to_string()),
-            })
-        );
-        // Quoted name without trailing address.
-        assert_eq!(
-            WhatsAppLocation::parse("40.7128,-74.0060,\"ACME, Inc.\""),
-            Some(WhatsAppLocation {
-                lat: 40.7128,
-                lng: -74.0060,
-                name: Some("ACME, Inc.".to_string()),
-                address: None,
-            })
-        );
-    }
-
-    #[test]
-    fn location_marker_rejects_out_of_range_coordinates() {
-        assert_eq!(WhatsAppLocation::parse("91.0,0.0"), None);
-        assert_eq!(WhatsAppLocation::parse("-91.0,0.0"), None);
-        assert_eq!(WhatsAppLocation::parse("0.0,181.0"), None);
-        assert_eq!(WhatsAppLocation::parse("0.0,-181.0"), None);
-    }
-
-    #[test]
-    fn location_marker_rejects_malformed_input() {
-        assert_eq!(WhatsAppLocation::parse("not-a-number,0.0"), None);
-        assert_eq!(WhatsAppLocation::parse("40.7128"), None);
-        assert_eq!(WhatsAppLocation::parse(""), None);
     }
 
     #[test]
     fn format_location_content_omits_empty_name() {
         assert_eq!(
             format_location_content(40.7128, -74.0060, Some("NYC")),
-            "[Location: 40.712800, -74.006000 — NYC]"
+            "Location: 40.712800, -74.006000 — NYC"
         );
         assert_eq!(
             format_location_content(40.7128, -74.0060, Some("")),
-            "[Location: 40.712800, -74.006000]"
+            "Location: 40.712800, -74.006000"
         );
         assert_eq!(
             format_location_content(40.7128, -74.0060, None),
-            "[Location: 40.712800, -74.006000]"
+            "Location: 40.712800, -74.006000"
         );
     }
 

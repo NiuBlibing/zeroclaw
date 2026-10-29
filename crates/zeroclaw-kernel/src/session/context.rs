@@ -574,12 +574,8 @@ impl EngineSession {
             .get("legacy_messages")
             .and_then(serde_json::Value::as_array)
         {
-            let mut messages = Vec::new();
+            let mut messages = Vec::with_capacity(entries.len());
             for (index, entry) in entries.iter().enumerate() {
-                let role = entry
-                    .get("role")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| anyhow::Error::msg("legacy context role missing"))?;
                 let PayloadRead::Present(content) = read(vec![0, index]).await? else {
                     anyhow::bail!("legacy engine content has been erased");
                 };
@@ -595,12 +591,11 @@ impl EngineSession {
                         anyhow::bail!("legacy engine context representation unsupported");
                     }
                 }
-                messages.push(zeroclaw_api::model_provider::ConversationMessage::Chat(
-                    zeroclaw_api::model_provider::ChatMessage {
-                        role: role.into(),
-                        content: text,
-                    },
-                ));
+                // Decode through the canonical message schema: imported
+                // metadata and future typed fields must not be discarded.
+                let mut message = entry.clone();
+                message["content"] = text.into();
+                messages.push(serde_json::from_value::<ChatMessage>(message)?.into_conversation());
             }
             messages
         } else {

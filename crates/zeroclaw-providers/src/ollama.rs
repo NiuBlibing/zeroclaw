@@ -378,8 +378,15 @@ impl OllamaModelProvider {
         }
     }
 
-    fn convert_user_message_content(&self, content: &str) -> (Option<String>, Option<Vec<String>>) {
-        let (cleaned, image_refs) = multimodal::parse_user_message_image_refs(content);
+    fn convert_user_message_content(
+        &self,
+        message: &ChatMessage,
+    ) -> (Option<String>, Option<Vec<String>>) {
+        let content = message.content.as_str();
+        let (cleaned, image_refs) = (
+            message.content.clone(),
+            multimodal::message_image_refs(message),
+        );
         if image_refs.is_empty() {
             return (Some(content.to_string()), None);
         }
@@ -404,13 +411,15 @@ impl OllamaModelProvider {
     }
 
     fn convert_messages(&self, messages: &[ChatMessage]) -> Vec<Message> {
+        let projected = crate::multimodal::project_attachment_metadata(messages);
+        let messages = projected.as_ref();
         let mut tool_name_by_id: HashMap<String, String> = HashMap::new();
 
         messages
             .iter()
             .map(|message| {
                 if message.role == "assistant"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(message)
                     && let Some(tool_calls_value) = value.get("tool_calls")
                     && let Ok(parsed_calls) =
                         serde_json::from_value::<Vec<ToolCall>>(tool_calls_value.clone())
@@ -442,7 +451,7 @@ impl OllamaModelProvider {
                 }
 
                 if message.role == "tool"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(message)
                 {
                     let tool_name = value
                         .get("tool_name")
@@ -473,7 +482,7 @@ impl OllamaModelProvider {
                 }
 
                 if message.role == "user" {
-                    let (content, images) = self.convert_user_message_content(&message.content);
+                    let (content, images) = self.convert_user_message_content(message);
                     return Message {
                         role: "user".to_string(),
                         content,
@@ -837,7 +846,8 @@ impl ModelProvider for OllamaModelProvider {
             });
         }
 
-        let (user_content, user_images) = self.convert_user_message_content(message);
+        let (user_content, user_images) =
+            self.convert_user_message_content(&ChatMessage::user(message));
         messages.push(Message {
             role: "user".to_string(),
             content: user_content,
@@ -885,7 +895,9 @@ impl ModelProvider for OllamaModelProvider {
     ) -> anyhow::Result<String> {
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
-        let api_messages = self.convert_messages(messages);
+        let mut messages = messages.to_vec();
+        crate::tool_protocol::render_text_tool_protocol(&mut messages)?;
+        let api_messages = self.convert_messages(&messages);
 
         let response = self
             .send_request(
@@ -933,7 +945,9 @@ impl ModelProvider for OllamaModelProvider {
     ) -> anyhow::Result<ChatResponse> {
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
-        let api_messages = self.convert_messages(messages);
+        let mut messages = messages.to_vec();
+        crate::tool_protocol::render_text_tool_protocol(&mut messages)?;
+        let api_messages = self.convert_messages(&messages);
 
         // Tools arrive pre-formatted in OpenAI/Ollama-compatible JSON from
         // tools_to_openai_format() in loop_.rs — pass them through directly.
@@ -964,8 +978,9 @@ impl ModelProvider for OllamaModelProvider {
     ) -> anyhow::Result<ChatResponse> {
         let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
-        let messages =
+        let mut messages =
             self.with_prompt_guided_tool_instructions(request.messages, request.tools)?;
+        crate::tool_protocol::render_text_tool_protocol(&mut messages)?;
         let api_messages = self.convert_messages(&messages);
         let response = self
             .send_request(
@@ -1683,10 +1698,16 @@ mod tests {
     #[test]
     fn convert_messages_parses_native_assistant_tool_calls() {
         let model_provider = OllamaModelProvider::builder("test").build();
-        let messages = vec![ChatMessage {
-            role: "assistant".into(),
-            content: r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"ls\"}"}]}"#.into(),
-        }];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            String::new(),
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_1".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"ls\"}".into(),
+                extra_content: None,
+            }],
+            None,
+        )];
 
         let converted = model_provider.convert_messages(&messages);
 
@@ -1707,14 +1728,23 @@ mod tests {
     fn convert_messages_maps_tool_result_call_id_to_tool_name() {
         let model_provider = OllamaModelProvider::builder("test").build();
         let messages = vec![
-            ChatMessage {
-                role: "assistant".into(),
-                content: r#"{"content":null,"tool_calls":[{"id":"call_7","name":"file_read","arguments":"{\"path\":\"README.md\"}"}]}"#.into(),
-            },
-            ChatMessage {
-                role: "tool".into(),
-                content: r#"{"tool_call_id":"call_7","content":"ok"}"#.into(),
-            },
+            ChatMessage::assistant_tool_calls(
+                String::new(),
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "call_7".into(),
+                    name: "file_read".into(),
+                    arguments: "{\"path\":\"README.md\"}".into(),
+                    extra_content: None,
+                }],
+                None,
+            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call_7".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "ok".into(),
+                attachments: Vec::new(),
+            }),
         ];
 
         let converted = model_provider.convert_messages(&messages);
@@ -1727,12 +1757,16 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_extracts_images_from_user_marker() {
+    fn convert_messages_extracts_images_from_user_attachment() {
         let model_provider = OllamaModelProvider::builder("test").build();
-        let messages = vec![ChatMessage {
-            role: "user".into(),
-            content: "Inspect this screenshot [IMAGE:data:image/png;base64,abcd==]".into(),
-        }];
+        let messages = vec![
+            ChatMessage::user("Inspect this screenshot").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/png;base64,abcd==".into(),
+                },
+            ]),
+        ];
 
         let converted = model_provider.convert_messages(&messages);
         assert_eq!(converted.len(), 1);

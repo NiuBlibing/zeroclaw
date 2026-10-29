@@ -728,26 +728,12 @@ enum TelegramAttachmentKind {
     Document,
     Video,
     Audio,
-    Voice,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TelegramAttachment {
     kind: TelegramAttachmentKind,
     target: String,
-}
-
-impl TelegramAttachmentKind {
-    fn from_marker(marker: &str) -> Option<Self> {
-        match marker.trim().to_ascii_uppercase().as_str() {
-            "IMAGE" | "PHOTO" => Some(Self::Image),
-            "DOCUMENT" | "FILE" => Some(Self::Document),
-            "VIDEO" => Some(Self::Video),
-            "AUDIO" => Some(Self::Audio),
-            "VOICE" => Some(Self::Voice),
-            _ => None,
-        }
-    }
 }
 
 fn telegram_audio_send_spec(
@@ -778,47 +764,21 @@ fn telegram_audio_send_spec(
 
 /// Build the user-facing content string for an incoming attachment.
 ///
-/// An attachment earns the `[IMAGE:/path]` marker when the multimodal loader
-/// will actually accept it (`provider_loadable_image_mime()`), regardless of
-/// whether Telegram delivered it as a photo or a document — so an image sent
-/// "as file", even extensionless, is still marked as an image rather than
-/// falling back to the `[Document: name] /path` form.
-///
-/// The check is deliberately the *loadable* one rather than the conservative
-/// `looks_like_image()`. A marker the loader rejects is worse than no marker:
-/// preparation drops it in favour of a "could not be loaded" note, and the
-/// `[Document: ...]` line that would have kept the saved path reachable was
-/// never emitted. Formats outside the provider's set therefore stay documents,
-/// which leaves both the bytes and a usable path in the model's hands.
-/// The disposition Telegram commits to for an inbound attachment, resolved once
-/// against the provider's loadability contract.
+/// Resolve the typed disposition Telegram commits to for an inbound attachment,
+/// using the provider's loadability contract once at ingestion.
 ///
 /// `parse_attachment_metadata` only yields documents and photos, so an
 /// attachment is either a loadable image the provider will accept or a
 /// document. The rendered text and the typed envelope both read this one
 /// verdict, so a document the loader would reject cannot be re-decided as an
 /// image by a later payload-only classifier.
-fn attachment_marker_kind(
+fn attachment_kind(
     attachment: &zeroclaw_api::media::MediaAttachment,
-) -> zeroclaw_api::media::MarkerKind {
+) -> zeroclaw_api::media::AttachmentKind {
     if attachment.provider_loadable_image_mime().is_some() {
-        zeroclaw_api::media::MarkerKind::Image
+        zeroclaw_api::media::AttachmentKind::Image
     } else {
-        zeroclaw_api::media::MarkerKind::Document
-    }
-}
-
-fn format_attachment_content(
-    attachment: &zeroclaw_api::media::MediaAttachment,
-    local_path: &Path,
-) -> String {
-    match attachment_marker_kind(attachment) {
-        zeroclaw_api::media::MarkerKind::Image => format!("[IMAGE:{}]", local_path.display()),
-        _ => format!(
-            "[Document: {}] {}",
-            attachment.file_name,
-            local_path.display()
-        ),
+        zeroclaw_api::media::AttachmentKind::Document
     }
 }
 
@@ -843,121 +803,9 @@ fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
 
-fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
-    let normalized = target
-        .split('?')
-        .next()
-        .unwrap_or(target)
-        .split('#')
-        .next()
-        .unwrap_or(target);
-
-    let extension = Path::new(normalized)
-        .extension()
-        .and_then(|ext| ext.to_str())?
-        .to_ascii_lowercase();
-
-    match extension.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Some(TelegramAttachmentKind::Image),
-        "mp4" | "mov" | "mkv" | "avi" | "webm" => Some(TelegramAttachmentKind::Video),
-        "mp3" | "m4a" | "wav" | "flac" => Some(TelegramAttachmentKind::Audio),
-        "ogg" | "oga" | "opus" => Some(TelegramAttachmentKind::Voice),
-        "pdf" | "txt" | "md" | "csv" | "json" | "zip" | "tar" | "gz" | "doc" | "docx" | "xls"
-        | "xlsx" | "ppt" | "pptx" => Some(TelegramAttachmentKind::Document),
-        _ => None,
-    }
-}
-
-fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
-    let trimmed = message.trim();
-    if trimmed.is_empty() || trimmed.contains('\n') {
-        return None;
-    }
-
-    let candidate = trimmed.trim_matches(|c| matches!(c, '`' | '"' | '\''));
-    if candidate.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
-    let kind = infer_attachment_kind_from_target(candidate)?;
-
-    if !is_http_url(candidate) && !Path::new(candidate).exists() {
-        return None;
-    }
-
-    Some(TelegramAttachment {
-        kind,
-        target: candidate.to_string(),
-    })
-}
-
 /// Delegate to the shared `strip_tool_call_tags` in the orchestrator module.
 fn strip_tool_call_tags(message: &str) -> String {
     crate::orchestrator::strip_tool_call_tags(message)
-}
-
-fn find_matching_close(s: &str) -> Option<usize> {
-    let mut depth = 1usize;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) {
-    let mut cleaned = String::with_capacity(message.len());
-    let mut attachments = Vec::new();
-    let mut cursor = 0;
-
-    while cursor < message.len() {
-        let Some(open_rel) = message[cursor..].find('[') else {
-            cleaned.push_str(&message[cursor..]);
-            break;
-        };
-
-        let open = cursor + open_rel;
-        cleaned.push_str(&message[cursor..open]);
-
-        let Some(close_rel) = find_matching_close(&message[open + 1..]) else {
-            cleaned.push_str(&message[open..]);
-            break;
-        };
-
-        let close = open + 1 + close_rel;
-        let marker = &message[open + 1..close];
-
-        let parsed = marker.split_once(':').and_then(|(kind, target)| {
-            let kind = TelegramAttachmentKind::from_marker(kind)?;
-            let target = target.trim();
-            if target.is_empty() {
-                return None;
-            }
-            Some(TelegramAttachment {
-                kind,
-                target: target.to_string(),
-            })
-        });
-
-        if let Some(attachment) = parsed {
-            attachments.push(attachment);
-        } else {
-            cleaned.push_str(&message[open..=close]);
-        }
-
-        cursor = close + 1;
-    }
-
-    (cleaned.trim().to_string(), attachments)
 }
 
 /// Telegram Bot API maximum file download size (20 MB).
@@ -1071,10 +919,7 @@ pub(crate) enum UpdateDisposition {
 }
 
 enum AttachmentMaterialization {
-    Ready {
-        content: String,
-        attachment: zeroclaw_api::media::MediaAttachment,
-    },
+    Ready(zeroclaw_api::media::MediaAttachment),
     SkipPermanent,
     RetryTransient,
 }
@@ -3155,11 +3000,10 @@ impl TelegramChannel {
             }
         }
 
-        let (text_without_markers, attachments) = parse_attachment_markers(&text);
         // `finalize_draft` receives the final agent-turn text (`delivered_response`),
         // not the draft updater's accumulated multi-turn buffer. Intermediate turns
         // are emitted via `flush_draft_turn`; send the final turn in full.
-        let remainder = sanitize_multi_message_visible_text(&text_without_markers);
+        let remainder = sanitize_multi_message_visible_text(&text);
 
         if !remainder.is_empty() && !voice_only {
             self.pace_multi_message_send(last_sent_at).await;
@@ -3170,17 +3014,6 @@ impl TelegramChannel {
             // the whole answer from chunk zero and duplicate the accepted prefix.
             self.finalize_send_chunks(&remainder, &chat_id, thread_id.as_deref())
                 .await?;
-        }
-
-        // Attachments are permanent Bot API sends, so they fall under the same
-        // voice-only guard as narration and final text: an unsuppressed voice
-        // peer receives only the voice note. A `suppress_voice = true` (text
-        // routed) peer still gets its media, matching ordinary text delivery.
-        if !voice_only {
-            for attachment in &attachments {
-                self.send_attachment(&chat_id, thread_id.as_deref(), attachment)
-                    .await?;
-            }
         }
 
         // Queue the voice reply only after the pending narration and the final
@@ -4871,7 +4704,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .then_some(sender_identity)
     }
 
-    /// Download and persist one attachment, returning only its prompt marker.
+    /// Download and persist one attachment, returning its typed metadata.
     /// Authorization, mention gating, captions, replies, and forwarding are
     /// intentionally handled by the caller so an album applies them once.
     async fn materialize_attachment_content(
@@ -4990,26 +4823,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return AttachmentMaterialization::RetryTransient;
         }
 
-        // Preserve the typed envelope as the source of truth for both the
-        // rendered marker and downstream attachment classification. Albums
-        // collect these envelopes alongside their ordered content markers.
+        // Preserve the typed envelope as the source of truth for downstream
+        // attachment classification. Albums collect these envelopes in order.
         let mut media_attachment = zeroclaw_api::media::MediaAttachment {
             file_name: display_filename,
             data: file_data,
             mime_type: attachment.mime_type.clone(),
-            marker: None,
+            reference: None,
         };
-        let marker_kind = attachment_marker_kind(&media_attachment);
-        media_attachment.marker = Some(zeroclaw_api::media::RenderedMarker {
+        let kind = attachment_kind(&media_attachment);
+        media_attachment.reference = Some(zeroclaw_api::media::AttachmentReference {
             target: local_path.display().to_string(),
-            kind: marker_kind,
+            kind,
         });
-        let content = format_attachment_content(&media_attachment, &local_path);
-
-        AttachmentMaterialization::Ready {
-            content,
-            attachment: media_attachment,
-        }
+        AttachmentMaterialization::Ready(media_attachment)
     }
 
     fn finalize_attachment_message(
@@ -5112,10 +4939,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .materialize_attachment_content(&attachment, &chat_id, message_id, false)
             .await
         {
-            AttachmentMaterialization::Ready {
-                content,
-                attachment,
-            } => (content, attachment),
+            AttachmentMaterialization::Ready(attachment) => (String::new(), attachment),
             AttachmentMaterialization::SkipPermanent => {
                 return UpdateDisposition::SkipPermanent;
             }
@@ -5218,7 +5042,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateDisposition::SkipPermanent;
         };
 
-        let mut contents = Vec::with_capacity(ordered.len());
         let mut attachments = Vec::with_capacity(ordered.len());
         for update in ordered {
             let Some(message) = update.get("message") else {
@@ -5234,13 +5057,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .materialize_attachment_content(&attachment, &chat_id, message_id, true)
                 .await
             {
-                AttachmentMaterialization::Ready {
-                    content,
-                    attachment,
-                } => {
-                    contents.push(content);
-                    attachments.push(attachment);
-                }
+                AttachmentMaterialization::Ready(attachment) => attachments.push(attachment),
                 AttachmentMaterialization::SkipPermanent => {}
                 AttachmentMaterialization::RetryTransient => {
                     return UpdateDisposition::RetryTransient;
@@ -5248,14 +5065,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         }
 
-        if contents.is_empty() {
+        if attachments.is_empty() {
             return UpdateDisposition::SkipPermanent;
         }
 
         self.finalize_attachment_message(
             anchor_message,
             sender_identity,
-            contents.join("\n\n"),
+            String::new(),
             gated_caption.as_deref(),
             attachments,
         )
@@ -5495,9 +5312,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let content = if let Some(quote) = self.extract_reply_context(message) {
-            format!("{quote}\n\n[Voice] {text}")
+            format!("{quote}\n\n{text}")
         } else {
-            format!("[Voice] {text}")
+            text
         };
 
         // Prepend forwarding attribution when the message was forwarded
@@ -5692,19 +5509,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 self.voice_transcriptions
                     .lock()
                     .get(&format!("{cid}:{mid}"))
-                    .map(|t| format!("[Voice] {t}"))
-                    .unwrap_or_else(|| "[Voice message]".to_string())
+                    .cloned()
+                    .unwrap_or_else(|| "Voice message".to_string())
             } else {
-                "[Voice message]".to_string()
+                "Voice message".to_string()
             }
         } else if reply.get("photo").is_some() {
-            "[Photo]".to_string()
+            "Photo attachment".to_string()
         } else if reply.get("document").is_some() {
-            "[Document]".to_string()
+            "Document attachment".to_string()
         } else if reply.get("video").is_some() {
-            "[Video]".to_string()
+            "Video attachment".to_string()
         } else if reply.get("sticker").is_some() {
-            "[Sticker]".to_string()
+            "Sticker attachment".to_string()
         } else {
             "[Message]".to_string()
         };
@@ -6325,10 +6142,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     self.send_audio_by_url(chat_id, thread_id, target, None)
                         .await
                 }
-                TelegramAttachmentKind::Voice => {
-                    self.send_voice_by_url(chat_id, thread_id, target, None)
-                        .await
-                }
             };
 
             // If sending media by URL failed (e.g. Telegram can't fetch the URL,
@@ -6349,7 +6162,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     TelegramAttachmentKind::Document => "Document",
                     TelegramAttachmentKind::Video => "Video",
                     TelegramAttachmentKind::Audio => "Audio",
-                    TelegramAttachmentKind::Voice => "Voice",
                 };
                 let fallback_text = format!("{kind_label}: {target}");
                 self.send_text_chunks(&fallback_text, chat_id, thread_id, 0)
@@ -6387,7 +6199,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
             TelegramAttachmentKind::Video => self.send_video(chat_id, thread_id, path, None).await,
             TelegramAttachmentKind::Audio => self.send_audio(chat_id, thread_id, path, None).await,
-            TelegramAttachmentKind::Voice => self.send_voice(chat_id, thread_id, path, None).await,
         }
     }
 
@@ -7985,9 +7796,6 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        // Parse attachments before processing
-        let (text_without_markers, attachments) = parse_attachment_markers(text);
-
         // Parse message ID once for reuse
         let msg_id = match message_id.parse::<i64>() {
             Ok(id) => Some(id),
@@ -8004,37 +7812,6 @@ impl Channel for TelegramChannel {
                 None
             }
         };
-
-        // If we have attachments, delete the draft and send fresh messages
-        // (Telegram editMessageText can't add attachments)
-        if !attachments.is_empty() {
-            // Delete the draft message
-            if let Some(id) = msg_id {
-                let _ = self
-                    .http_client()
-                    .post(self.api_url("deleteMessage"))
-                    .json(&serde_json::json!({
-                        "chat_id": chat_id,
-                        "message_id": id,
-                    }))
-                    .send()
-                    .await;
-            }
-
-            // Send text without markers
-            if !text_without_markers.is_empty() {
-                self.finalize_send_chunks(&text_without_markers, &chat_id, thread_id.as_deref())
-                    .await?;
-            }
-
-            // Send attachments
-            for attachment in &attachments {
-                self.send_attachment(&chat_id, thread_id.as_deref(), attachment)
-                    .await?;
-            }
-
-            return Ok(());
-        }
 
         // If text exceeds limit, delete draft and send as chunked messages
         if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
@@ -8231,7 +8008,26 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        let (text_without_markers, attachments) = parse_attachment_markers(&content);
+        let text_without_markers = content.clone();
+        let attachments: Vec<TelegramAttachment> = message
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                let reference = attachment.reference.as_ref()?;
+                let kind = match reference.kind {
+                    zeroclaw_api::media::AttachmentKind::Image => TelegramAttachmentKind::Image,
+                    zeroclaw_api::media::AttachmentKind::Audio => TelegramAttachmentKind::Audio,
+                    zeroclaw_api::media::AttachmentKind::Video => TelegramAttachmentKind::Video,
+                    zeroclaw_api::media::AttachmentKind::Document => {
+                        TelegramAttachmentKind::Document
+                    }
+                };
+                Some(TelegramAttachment {
+                    kind,
+                    target: reference.target.clone(),
+                })
+            })
+            .collect();
 
         if !attachments.is_empty() {
             if !text_without_markers.is_empty() {
@@ -8244,12 +8040,6 @@ impl Channel for TelegramChannel {
                 self.send_attachment(chat_id, thread_id, attachment).await?;
             }
 
-            return Ok(());
-        }
-
-        if let Some(attachment) = parse_path_only_attachment(&content) {
-            self.send_attachment(chat_id, thread_id, &attachment)
-                .await?;
             return Ok(());
         }
 
@@ -8900,6 +8690,7 @@ impl UpdateDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::media::{AttachmentKind, AttachmentReference};
     use zeroclaw_config::schema::{Config, TelegramConfig};
     use zeroclaw_runtime::LiveConfigAuthority;
 
@@ -11515,14 +11306,9 @@ mod tests {
             sent_bodies.iter().any(|b| b.contains("FINAL_TOKEN")),
             "text-routed voice peer must receive the final answer; bodies: {sent_bodies:?}"
         );
-        // The attachment is delivered too — text-mode routing includes media.
-        assert!(
-            reqs.iter().any(|r| r.url.path().ends_with("/sendPhoto")),
-            "text-routed voice peer must receive the attachment; paths: {:?}",
-            reqs.iter()
-                .map(|r| r.url.path().to_string())
-                .collect::<Vec<_>>()
-        );
+        // Marker-looking text is ordinary text now; without a typed attachment,
+        // text-mode routing sends only the accumulated text.
+        assert!(!reqs.iter().any(|r| r.url.path().ends_with("/sendPhoto")));
         // No voice note: suppress_voice=true is text-only.
         assert!(
             !reqs
@@ -15247,54 +15033,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_attachment_markers_extracts_multiple_types() {
-        let message = "Here are files [IMAGE:/tmp/a.png] and [DOCUMENT:https://example.com/a.pdf]";
-        let (cleaned, attachments) = parse_attachment_markers(message);
-
-        assert_eq!(cleaned, "Here are files  and");
-        assert_eq!(attachments.len(), 2);
-        assert_eq!(attachments[0].kind, TelegramAttachmentKind::Image);
-        assert_eq!(attachments[0].target, "/tmp/a.png");
-        assert_eq!(attachments[1].kind, TelegramAttachmentKind::Document);
-        assert_eq!(attachments[1].target, "https://example.com/a.pdf");
-    }
-
-    #[test]
-    fn parse_attachment_markers_keeps_invalid_markers_in_text() {
-        let message = "Report [UNKNOWN:/tmp/a.bin]";
-        let (cleaned, attachments) = parse_attachment_markers(message);
-
-        assert_eq!(cleaned, "Report [UNKNOWN:/tmp/a.bin]");
-        assert!(attachments.is_empty());
-    }
-
-    #[test]
-    fn parse_path_only_attachment_detects_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let image_path = dir.path().join("snap.png");
-        std::fs::write(&image_path, b"fake-png").unwrap();
-
-        let parsed = parse_path_only_attachment(image_path.to_string_lossy().as_ref())
-            .expect("expected attachment");
-
-        assert_eq!(parsed.kind, TelegramAttachmentKind::Image);
-        assert_eq!(parsed.target, image_path.to_string_lossy());
-    }
-
-    #[test]
-    fn parse_path_only_attachment_rejects_sentence_text() {
-        assert!(parse_path_only_attachment("Screenshot saved to /tmp/snap.png").is_none());
-    }
-
-    #[test]
-    fn infer_attachment_kind_from_target_detects_document_extension() {
-        assert_eq!(
-            infer_attachment_kind_from_target("https://example.com/files/specs.pdf?download=1"),
-            Some(TelegramAttachmentKind::Document)
-        );
-    }
-
-    #[test]
     fn parse_update_message_uses_chat_id_as_reply_target() {
         let mention_only = false;
         let ch = TelegramChannel::new(
@@ -17427,7 +17165,7 @@ mod tests {
             }
         });
         let ctx = ch.extract_reply_context(&msg).unwrap();
-        assert_eq!(ctx, "> @bob:\n> [Voice message]");
+        assert_eq!(ctx, "> @bob:\n> Voice message");
     }
 
     #[test]
@@ -17535,7 +17273,7 @@ mod tests {
             }
         });
         let ctx = ch.extract_reply_context(&msg).unwrap();
-        assert_eq!(ctx, "> @bob:\n> [Voice] Hello from voice");
+        assert_eq!(ctx, "> @bob:\n> Hello from voice");
     }
 
     #[test]
@@ -17922,7 +17660,7 @@ mod tests {
             panic!("expected Parsed voice message");
         };
         assert_eq!(message.platform_sender_id.as_deref(), Some("123"));
-        assert_eq!(message.content, "[Voice] hello from voice");
+        assert_eq!(message.content, "hello from voice");
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -18227,9 +17965,15 @@ mod tests {
             .expect("timed out waiting for the attachment message")
             .expect("channel closed before delivering the attachment message");
         assert!(
-            msg.content.contains("report.pdf"),
-            "unexpected content: {}",
-            msg.content
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment.file_name == "report.pdf"
+                    || attachment
+                        .reference
+                        .as_ref()
+                        .is_some_and(|reference| reference.target.contains("report.pdf"))),
+            "unexpected attachments: {:?}",
+            msg.attachments
         );
 
         let main_loop_bodies = telegram_main_loop_getupdates_bodies(&mock_server).await;
@@ -18464,9 +18208,16 @@ mod tests {
             .expect("timed out waiting for the recovered attachment")
             .expect("channel closed before delivering the recovered attachment");
         assert!(
-            recovered.content.contains("report.pdf"),
-            "the failed update must recover before the later update, got: {}",
-            recovered.content
+            recovered
+                .attachments
+                .iter()
+                .any(|attachment| attachment.file_name == "report.pdf"
+                    || attachment
+                        .reference
+                        .as_ref()
+                        .is_some_and(|reference| reference.target.contains("report.pdf"))),
+            "the failed update must recover before the later update, got: {:?}",
+            recovered.attachments
         );
         let third_message = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
@@ -18667,9 +18418,15 @@ mod tests {
             .expect("timed out waiting for the queued attachment message")
             .expect("channel closed before delivering the queued attachment message");
         assert!(
-            msg.content.contains("queued.pdf"),
-            "unexpected content: {}",
-            msg.content
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment.file_name == "queued.pdf"
+                    || attachment
+                        .reference
+                        .as_ref()
+                        .is_some_and(|reference| reference.target.contains("queued.pdf"))),
+            "unexpected attachments: {:?}",
+            msg.attachments
         );
 
         // Exactly one main-loop poll (timeout: 30) must have happened at the
@@ -19321,9 +19078,15 @@ mod tests {
             .expect("timed out: a transient failure was wrongly skipped instead of retried")
             .expect("channel closed before delivering the retried attachment");
         assert!(
-            msg.content.contains("later.pdf"),
-            "unexpected content: {}",
-            msg.content
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment.file_name == "later.pdf"
+                    || attachment
+                        .reference
+                        .as_ref()
+                        .is_some_and(|reference| reference.target.contains("later.pdf"))),
+            "unexpected attachments: {:?}",
+            msg.attachments
         );
 
         // More than one poll at the un-advanced offset proves it was held.
@@ -19407,9 +19170,15 @@ mod tests {
             .expect("timed out: a body-less 408 was acknowledged instead of retried")
             .expect("channel closed: the update behind a 408 was silently consumed");
         assert!(
-            msg.content.contains("held.pdf"),
-            "unexpected content: {}",
-            msg.content
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment.file_name == "held.pdf"
+                    || attachment
+                        .reference
+                        .as_ref()
+                        .is_some_and(|reference| reference.target.contains("held.pdf"))),
+            "unexpected attachments: {:?}",
+            msg.attachments
         );
 
         // More than one poll at offset 0 proves the update was held, not
@@ -19881,13 +19650,13 @@ mod tests {
             .expect("extract_reply_context should return Some for voice reply");
 
         assert!(
-            ctx.contains(&format!("[Voice] {transcript}")),
+            ctx.contains(&format!("{transcript}")),
             "expected cached transcription in reply context, got: {ctx}"
         );
 
         // Must NOT contain the fallback placeholder
         assert!(
-            !ctx.contains("[Voice message]"),
+            !ctx.contains("Voice message"),
             "context should use cached transcription, not fallback placeholder, got: {ctx}"
         );
     }
@@ -20142,7 +19911,7 @@ mod tests {
             .expect("follow-up should dispatch")
             .expect("listener should remain connected");
         assert_eq!(album.id, "telegram_100_101");
-        assert_eq!(album.content.matches("[IMAGE:").count(), 2);
+        assert_eq!(album.attachments.len(), 2);
         assert!(album.content.contains("compare these"));
         assert_eq!(follow_up.content, "after album");
         assert!(rx.try_recv().is_err(), "album must dispatch exactly once");
@@ -20361,7 +20130,7 @@ mod tests {
             .expect("album a should dispatch")
             .expect("listener should remain connected");
         assert_eq!(album_a.id, "telegram_100_101");
-        assert_eq!(album_a.content.matches("[IMAGE:").count(), 2);
+        assert_eq!(album_a.attachments.len(), 2);
 
         // 3. Album B arrives as one single turn containing all 3 photos,
         // because its settlement was held until the saturated page boundary
@@ -20372,7 +20141,7 @@ mod tests {
             .expect("listener should remain connected");
         assert_eq!(album_b.id, "telegram_100_199");
         assert_eq!(
-            album_b.content.matches("[IMAGE:").count(),
+            album_b.attachments.len(),
             3,
             "album b must include all 3 photos across the page boundary in a single turn"
         );
@@ -20631,7 +20400,7 @@ mod tests {
             .expect("album a should dispatch")
             .expect("listener should remain connected");
         assert_eq!(album_a.id, "telegram_100_101");
-        assert_eq!(album_a.content.matches("[IMAGE:").count(), 2);
+        assert_eq!(album_a.attachments.len(), 2);
 
         // 3. Album B arrives once, with the photo from update 99 and the photo
         // from update 101 in the same turn. Settling it from the replayed page
@@ -20642,7 +20411,7 @@ mod tests {
             .expect("listener should remain connected");
         assert_eq!(album_b.id, "telegram_100_199");
         assert_eq!(
-            album_b.content.matches("[IMAGE:").count(),
+            album_b.attachments.len(),
             2,
             "album b must include both photos spanning the page boundary in a single turn"
         );
@@ -20806,7 +20575,7 @@ mod tests {
             .expect("listener should remain connected");
         assert_eq!(album.id, "telegram_100_100");
         assert_eq!(
-            album.content.matches("[IMAGE:").count(),
+            album.attachments.len(),
             2,
             "both supported photos must arrive in one turn: {}",
             album.content
@@ -20972,21 +20741,21 @@ mod tests {
         );
 
         assert_eq!(
-            msg.content.matches("[IMAGE:").count(),
+            msg.attachments.len(),
             2,
             "both supported image markers must be present"
         );
-        let first_marker = msg
-            .content
-            .find("photo_-100_10")
-            .expect("first photo marker");
-        let second_marker = msg
-            .content
-            .find("photo_-100_12")
-            .expect("second photo marker");
         assert!(
-            first_marker < second_marker,
-            "image markers must stay in message_id order"
+            msg.attachments[0]
+                .reference_target()
+                .unwrap()
+                .contains("photo_-100_10")
+        );
+        assert!(
+            msg.attachments[1]
+                .reference_target()
+                .unwrap()
+                .contains("photo_-100_12")
         );
         assert_eq!(
             msg.content.matches("@mybot compare these").count(),
@@ -21083,7 +20852,14 @@ mod tests {
             "mention_only album whose only mention is on an unsupported member must still be admitted",
         );
         assert!(
-            msg.content.contains("[IMAGE:"),
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment
+                    .reference
+                    .as_ref()
+                    .is_some_and(
+                        |reference| reference.kind == zeroclaw_api::media::AttachmentKind::Image
+                    )),
             "the supported sibling must still be dispatched"
         );
     }
@@ -21263,7 +21039,7 @@ mod tests {
         );
         assert_eq!(msg.reply_target, "-100:77");
         assert_eq!(msg.thread_ts.as_deref(), Some("77"));
-        assert_eq!(msg.content.matches("[IMAGE:").count(), 2);
+        assert_eq!(msg.attachments.len(), 2);
         assert_eq!(
             msg.attachments.len(),
             2,
@@ -21271,13 +21047,29 @@ mod tests {
         );
         assert!(msg.attachments.iter().all(|attachment| {
             attachment
-                .marker
+                .reference
                 .as_ref()
-                .is_some_and(|marker| marker.kind == zeroclaw_api::media::MarkerKind::Image)
+                .is_some_and(|marker| marker.kind == zeroclaw_api::media::AttachmentKind::Image)
                 && !attachment.data.is_empty()
         }));
-        let first_pos = msg.content.find("photo_-100_10.jpg").unwrap();
-        let second_pos = msg.content.find("photo_-100_11.jpg").unwrap();
+        let targets: Vec<&str> = msg
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                attachment
+                    .reference
+                    .as_ref()
+                    .map(|reference| reference.target.as_str())
+            })
+            .collect();
+        let first_pos = targets
+            .iter()
+            .position(|target| target.contains("photo_-100_10.jpg"))
+            .unwrap();
+        let second_pos = targets
+            .iter()
+            .position(|target| target.contains("photo_-100_11.jpg"))
+            .unwrap();
         assert!(
             first_pos < second_pos,
             "attachments follow message_id order"
@@ -21376,7 +21168,6 @@ mod tests {
             "both documents should materialize",
         );
 
-        assert_eq!(msg.content.matches("[Document: report.pdf]").count(), 2);
         assert_eq!(msg.attachments.len(), 2);
         assert!(
             msg.attachments
@@ -21389,8 +21180,18 @@ mod tests {
         let second_path = save_dir.join("document_100_11_report.pdf");
         assert_eq!(tokio::fs::read(&first_path).await.unwrap(), b"first");
         assert_eq!(tokio::fs::read(&second_path).await.unwrap(), b"second");
-        assert!(msg.content.contains(&first_path.display().to_string()));
-        assert!(msg.content.contains(&second_path.display().to_string()));
+        assert!(msg.attachments.iter().any(|attachment| {
+            attachment
+                .reference
+                .as_ref()
+                .is_some_and(|reference| reference.target == first_path.display().to_string())
+        }));
+        assert!(msg.attachments.iter().any(|attachment| {
+            attachment
+                .reference
+                .as_ref()
+                .is_some_and(|reference| reference.target == second_path.display().to_string())
+        }));
     }
 
     #[tokio::test]
@@ -21501,22 +21302,6 @@ mod tests {
 
     // ── Attachment content format tests ──────────────────────────────
 
-    /// Build a typed envelope for content-format tests.
-    fn envelope(
-        file_name: &str,
-        mime_type: Option<&str>,
-        data: &[u8],
-    ) -> zeroclaw_api::media::MediaAttachment {
-        zeroclaw_api::media::MediaAttachment {
-            file_name: file_name.to_string(),
-            data: data.to_vec(),
-            mime_type: mime_type.map(str::to_string),
-            marker: None,
-        }
-    }
-
-    /// Photo attachments with image extension must use `[IMAGE:/path]` marker
-    /// so the multimodal pipeline validates vision capability on the model_provider.
     #[test]
     fn media_group_document_storage_names_are_safe_and_unique() {
         let display = safe_attachment_filename("../reports/report.pdf");
@@ -21527,310 +21312,36 @@ mod tests {
         );
     }
 
-    /// Photo attachments with image extension must use `[IMAGE:/path]` marker
-    /// so the multimodal pipeline validates vision capability on the model_provider.
     #[test]
-    fn attachment_photo_content_uses_image_marker() {
-        let local_path = std::path::Path::new("/tmp/workspace/photo_123_45.jpg");
-
-        let content =
-            format_attachment_content(&envelope("photo_123_45.jpg", None, &[]), local_path);
-
-        assert_eq!(content, "[IMAGE:/tmp/workspace/photo_123_45.jpg]");
-        assert!(content.starts_with("[IMAGE:"));
-        assert!(content.ends_with(']'));
-    }
-
-    #[test]
-    fn attachment_document_content_uses_document_label() {
-        let local_path = std::path::Path::new("/tmp/workspace/report.pdf");
-
-        let content = format_attachment_content(
-            &envelope("report.pdf", Some("application/pdf"), &[]),
-            local_path,
-        );
-
-        assert_eq!(content, "[Document: report.pdf] /tmp/workspace/report.pdf");
-        assert!(!content.contains("[IMAGE:"));
-    }
-
-    /// An image sent "as file" must get the `[IMAGE:]` marker even without an
-    /// image extension, as long as the loader can resolve the payload to a
-    /// format it accepts. The marker keeps the media pipeline from re-inlining
-    /// the same image as base64.
-    #[test]
-    fn image_document_content_uses_image_marker() {
-        let local_path = std::path::Path::new("/tmp/workspace/telegram_files/upload");
-
-        // Magic bytes only: no MIME, no extension. The loader sniffs the same
-        // bytes and reaches the same verdict.
-        let content = format_attachment_content(
-            &envelope("upload", None, &[0xFF, 0xD8, 0xFF, 0xE0]),
-            local_path,
-        );
-        assert_eq!(content, "[IMAGE:/tmp/workspace/telegram_files/upload]");
-
-        // The sender's declared MIME travels with the envelope but the loader
-        // never sees it for a path marker: it resolves extension then magic.
-        // A declared type alone therefore cannot earn a marker the loader
-        // would reject.
-        let content = format_attachment_content(
-            &envelope("upload", Some("image/jpeg"), b"not actually an image"),
-            local_path,
-        );
-        assert!(
-            content.starts_with("[Document:"),
-            "a declared MIME must not outvote the loader's own resolution: {content}"
-        );
-    }
-
-    /// Formats the multimodal loader cannot normalize must stay documents.
-    /// Marking them would be strictly worse than not marking them: preparation
-    /// drops the rejected marker for a "could not be loaded" note, and the
-    /// `[Document:]` line that would have kept the saved path reachable was
-    /// never emitted, so both the bytes and the path are lost.
-    #[test]
-    fn unloadable_image_formats_stay_documents() {
-        for (filename, data) in [
-            ("photo.heic", &b"\x00\x00\x00\x18ftypheic"[..]),
-            ("scan.tiff", &b"\x49\x49\x2a\x00rest"[..]),
-            (
-                "logo.svg",
-                &b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"[..],
-            ),
-            ("old.bmp", &b"BMxxxx"[..]),
-        ] {
-            let path_str = format!("/tmp/ws/{filename}");
-            let path = std::path::Path::new(&path_str);
-            let content = format_attachment_content(&envelope(filename, None, data), path);
-            assert!(
-                content.starts_with("[Document:"),
-                "{filename}: unloadable image must stay a document, got: {content}"
-            );
-            assert!(
-                content.contains(&path_str),
-                "{filename}: the saved path must remain reachable, got: {content}"
-            );
-        }
-    }
-
-    /// An extensionless upload whose magic bytes are an unloadable format is
-    /// rejected the same way, so sniffing cannot smuggle one past the gate.
-    #[test]
-    fn unloadable_magic_bytes_stay_documents() {
-        let path = std::path::Path::new("/tmp/ws/upload");
-        let content =
-            format_attachment_content(&envelope("upload", None, b"\x49\x49\x2a\x00rest"), path);
-        assert!(
-            content.starts_with("[Document:"),
-            "TIFF magic must not earn an image marker: {content}"
-        );
-    }
-
-    /// A `.md` upload is text, so no envelope signal ever classifies it as an
-    /// image and it must never produce an `[IMAGE:]` marker.
-    #[test]
-    fn markdown_file_never_produces_image_marker() {
-        let local_path = std::path::Path::new("/tmp/workspace/telegram_files/notes.md");
-
-        // No envelope signal says image, so even a Telegram misclassification
-        // (photo vs document) cannot produce an [IMAGE:] marker: the verdict
-        // comes from the envelope, not from Telegram's kind.
-        let content = format_attachment_content(
-            &envelope("notes.md", None, b"# heading\nbody text"),
-            local_path,
-        );
-        assert!(
-            !content.contains("[IMAGE:"),
-            "markdown must not get [IMAGE:] marker: {content}"
-        );
-        assert!(content.starts_with("[Document:"));
-    }
-
-    /// Non-image files fall back to `[Document:]` format regardless of how
-    /// Telegram classified them (the envelope decides, not the kind).
-    #[test]
-    fn non_image_attachment_falls_back_to_document_format() {
-        for (filename, ext_path) in [
-            ("file.md", "/tmp/ws/file.md"),
-            ("file.txt", "/tmp/ws/file.txt"),
-            ("file.pdf", "/tmp/ws/file.pdf"),
-            ("file.csv", "/tmp/ws/file.csv"),
-            ("file.json", "/tmp/ws/file.json"),
-            ("file.zip", "/tmp/ws/file.zip"),
-            ("file", "/tmp/ws/file"),
-        ] {
-            let path = std::path::Path::new(ext_path);
-            let content =
-                format_attachment_content(&envelope(filename, None, b"not image bytes"), path);
-            assert!(
-                !content.contains("[IMAGE:"),
-                "{filename}: non-image file should not get [IMAGE:] marker, got: {content}"
-            );
-            assert!(
-                content.starts_with("[Document:"),
-                "{filename}: should use [Document:] format, got: {content}"
-            );
-        }
-    }
-
-    /// Every extension the multimodal loader accepts produces an `[IMAGE:]`
-    /// marker. The list is exactly the loader's, not a wider "looks like an
-    /// image" set — see `unloadable_image_formats_stay_documents`.
-    #[test]
-    fn image_extensions_produce_image_marker() {
-        for ext in ["png", "jpg", "jpeg", "gif", "webp"] {
-            let filename = format!("photo_1_2.{ext}");
-            let path_str = format!("/tmp/ws/{filename}");
-            let path = std::path::Path::new(&path_str);
-            let content = format_attachment_content(&envelope(&filename, None, &[]), path);
-            assert!(
-                content.starts_with("[IMAGE:"),
-                "{ext}: image should get [IMAGE:] marker, got: {content}"
-            );
-        }
-    }
-
-    #[test]
-    fn markdown_attachment_not_detected_by_multimodal_image_markers() {
-        let content = format_attachment_content(
-            &envelope("notes.md", None, b"# heading"),
-            std::path::Path::new("/tmp/ws/notes.md"),
-        );
-        let messages = vec![zeroclaw_providers::ChatMessage::user(content)];
-        assert_eq!(
-            zeroclaw_providers::multimodal::count_image_markers(&messages),
-            0,
-            "markdown file must not trigger image marker detection"
-        );
-    }
-
-    /// `count_image_markers` from the multimodal module must detect the
-    /// `[IMAGE:]` marker produced by photo attachment formatting.
-    #[test]
-    fn photo_image_marker_detected_by_multimodal() {
-        let photo_content = "[IMAGE:/tmp/workspace/photo_1_2.jpg]";
-        let messages = vec![zeroclaw_providers::ChatMessage::user(
-            photo_content.to_string(),
-        )];
-        let count = zeroclaw_providers::multimodal::count_image_markers(&messages);
+    fn photo_attachment_detected_by_multimodal() {
+        let messages = vec![
+            zeroclaw_providers::ChatMessage::user("").with_attachments(vec![AttachmentReference {
+                kind: AttachmentKind::Image,
+                target: "/tmp/workspace/photo_1_2.jpg".into(),
+            }]),
+        ];
+        let count = zeroclaw_providers::multimodal::count_image_attachments(&messages);
         assert_eq!(
             count, 1,
-            "multimodal should detect exactly one image marker"
+            "multimodal should detect exactly one image attachment"
         );
     }
 
     #[test]
-    fn photo_image_marker_with_caption() {
-        let local_path = std::path::Path::new("/tmp/workspace/photo_1_2.jpg");
-        let mut content = format!("[IMAGE:{}]", local_path.display());
+    fn photo_attachment_with_caption() {
         let caption = "Look at this screenshot";
-        use std::fmt::Write;
-        let _ = write!(content, "\n\n{caption}");
-
+        let messages = vec![
+            zeroclaw_providers::ChatMessage::user(caption).with_attachments(vec![
+                AttachmentReference {
+                    kind: AttachmentKind::Image,
+                    target: "/tmp/workspace/photo_1_2.jpg".into(),
+                },
+            ]),
+        ];
+        assert_eq!(messages[0].content, caption);
         assert_eq!(
-            content,
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nLook at this screenshot"
-        );
-
-        // Multimodal pipeline still detects the marker.
-        let messages = vec![zeroclaw_providers::ChatMessage::user(content)];
-        assert_eq!(
-            zeroclaw_providers::multimodal::count_image_markers(&messages),
+            zeroclaw_providers::multimodal::count_image_attachments(&messages),
             1
-        );
-    }
-
-    // ── E2E: attachment saves file and formats content ───────────────
-
-    #[test]
-    fn e2e_attachment_saves_file_and_formats_content() {
-        let workspace = tempfile::tempdir().expect("create temp workspace");
-
-        // ── Document attachment ──────────────────────────────────────
-        let doc_filename = "report.pdf";
-        let doc_path = workspace.path().join(doc_filename);
-        // Simulate downloaded file.
-        std::fs::write(&doc_path, b"%PDF-1.4 fake").expect("write doc fixture");
-        assert!(doc_path.exists(), "document file must exist on disk");
-
-        let doc_content = format_attachment_content(
-            &envelope(doc_filename, Some("application/pdf"), b"%PDF-1.4 fake"),
-            &doc_path,
-        );
-        assert!(
-            doc_content.starts_with("[Document: report.pdf]"),
-            "document label format mismatch: {doc_content}"
-        );
-        // Multimodal must NOT detect image markers in document content.
-        let doc_msgs = vec![zeroclaw_providers::ChatMessage::user(doc_content)];
-        assert_eq!(
-            zeroclaw_providers::multimodal::count_image_markers(&doc_msgs),
-            0,
-            "document content must not contain image markers"
-        );
-
-        // ── Photo attachment ─────────────────────────────────────────
-        let photo_filename = "photo_99_1.jpg";
-        let photo_path = workspace.path().join(photo_filename);
-        // Copy the JPEG fixture.
-        let fixture =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_photo.jpg");
-        std::fs::copy(&fixture, &photo_path).expect("copy photo fixture");
-        assert!(photo_path.exists(), "photo file must exist on disk");
-
-        let photo_bytes = std::fs::read(&photo_path).expect("read photo fixture");
-        let photo_content =
-            format_attachment_content(&envelope(photo_filename, None, &photo_bytes), &photo_path);
-        assert!(
-            photo_content.starts_with("[IMAGE:"),
-            "photo must use [IMAGE:] marker: {photo_content}"
-        );
-        assert!(
-            photo_content.ends_with(']'),
-            "photo marker must close with ]: {photo_content}"
-        );
-
-        // Multimodal detects the marker.
-        let photo_msgs = vec![zeroclaw_providers::ChatMessage::user(photo_content.clone())];
-        assert_eq!(
-            zeroclaw_providers::multimodal::count_image_markers(&photo_msgs),
-            1,
-            "multimodal must detect exactly one image marker in photo content"
-        );
-
-        // ── Photo with caption ───────────────────────────────────────
-        let mut captioned = photo_content;
-        use std::fmt::Write;
-        let _ = write!(captioned, "\n\nCheck this out");
-        let cap_msgs = vec![zeroclaw_providers::ChatMessage::user(captioned.clone())];
-        assert_eq!(
-            zeroclaw_providers::multimodal::count_image_markers(&cap_msgs),
-            1,
-            "caption must not break image marker detection"
-        );
-        assert!(
-            captioned.contains("Check this out"),
-            "caption text must be present in content"
-        );
-
-        // ── Markdown file sent as Photo────────────────
-        let md_filename = "notes.md";
-        let md_path = workspace.path().join(md_filename);
-        std::fs::write(&md_path, b"# Hello\nSome markdown").expect("write md fixture");
-        let md_content = format_attachment_content(
-            &envelope(md_filename, None, b"# Hello\nSome markdown"),
-            &md_path,
-        );
-        assert!(
-            !md_content.contains("[IMAGE:"),
-            "markdown must not get [IMAGE:] marker: {md_content}"
-        );
-        let md_msgs = vec![zeroclaw_providers::ChatMessage::user(md_content)];
-        assert_eq!(
-            zeroclaw_providers::multimodal::count_image_markers(&md_msgs),
-            0,
-            "markdown file must not trigger image marker detection"
         );
     }
 
@@ -21854,14 +21365,18 @@ mod tests {
             "Groq model_provider must not support vision"
         );
 
-        // Build a message with an [IMAGE:] marker (as photo attachment would).
-        let messages = vec![zeroclaw_providers::ChatMessage::user(
-            "[IMAGE:/tmp/photo.jpg]\n\nDescribe this image".to_string(),
-        )];
-        let marker_count = zeroclaw_providers::multimodal::count_image_markers(&messages);
-        assert_eq!(marker_count, 1, "must detect image marker in photo content");
+        let messages = vec![
+            zeroclaw_providers::ChatMessage::user("Describe this image").with_attachments(vec![
+                AttachmentReference {
+                    kind: AttachmentKind::Image,
+                    target: "/tmp/photo.jpg".into(),
+                },
+            ]),
+        ];
+        let attachment_count = zeroclaw_providers::multimodal::count_image_attachments(&messages);
+        assert_eq!(attachment_count, 1);
 
-        // The combination of marker_count > 0 && !supports_vision() means
+        // The combination of attachment_count > 0 && !supports_vision() means
         // the agent loop will return ProviderCapabilityError before calling
         // the model_provider, and the channel will send "⚠️ Error: ..." to the user.
     }
@@ -22618,7 +22133,14 @@ mod tests {
         assert_eq!(msg.attachments[0].kind(), MediaKind::Image);
         assert_eq!(msg.attachments[0].data, photo_bytes);
         assert!(
-            msg.content.contains("[IMAGE:"),
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment
+                    .reference
+                    .as_ref()
+                    .is_some_and(
+                        |reference| reference.kind == zeroclaw_api::media::AttachmentKind::Image
+                    )),
             "content marker must still be emitted for the multimodal pipeline: {}",
             msg.content
         );
@@ -22686,7 +22208,14 @@ mod tests {
         // [Document:], so the media pipeline recognizes the file as already
         // marked instead of re-inlining it as base64.
         assert!(
-            msg.content.contains("[IMAGE:"),
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment
+                    .reference
+                    .as_ref()
+                    .is_some_and(
+                        |reference| reference.kind == zeroclaw_api::media::AttachmentKind::Image
+                    )),
             "image document must get an [IMAGE:] marker: {}",
             msg.content
         );
@@ -22756,12 +22285,22 @@ mod tests {
         // the content marker so downstream marker-based consumers (media
         // pipeline dedup) agree with the typed envelope.
         assert!(
-            msg.content.contains("[IMAGE:"),
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment
+                    .reference
+                    .as_ref()
+                    .is_some_and(
+                        |reference| reference.kind == zeroclaw_api::media::AttachmentKind::Image
+                    )),
             "extensionless image document must get an [IMAGE:] marker: {}",
             msg.content
         );
         assert!(
-            msg.content.contains("upload"),
+            msg.attachments[0]
+                .reference_target()
+                .unwrap()
+                .contains("upload"),
             "marker must carry the saved file path: {}",
             msg.content
         );

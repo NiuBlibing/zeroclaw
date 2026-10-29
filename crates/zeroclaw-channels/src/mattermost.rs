@@ -998,7 +998,7 @@ impl MattermostChannel {
                     );
                     None
                 } else {
-                    Some(format!("[Voice] {trimmed}"))
+                    Some(trimmed.to_string())
                 }
             }
             Err(e) => {
@@ -3664,7 +3664,7 @@ mod tests {
             });
 
             let result = ch.try_transcribe_audio_attachment(&post).await;
-            assert_eq!(result.as_deref(), Some("[Voice] test transcript"));
+            assert_eq!(result.as_deref(), Some("test transcript"));
         }
 
         #[tokio::test]

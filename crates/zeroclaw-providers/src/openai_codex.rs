@@ -37,7 +37,7 @@ pub struct OpenAiCodexModelProvider {
     reasoning_effort: Option<String>,
     /// The configured `[multimodal]` policy.
     ///
-    /// This provider normalizes image markers on its own boundary, and that
+    /// This provider normalizes image references on its own boundary, and that
     /// normalization decodes pixels and applies `max_images` /
     /// `max_image_size_mb`. Holding the configured policy keeps the boundary
     /// pass on the same rules the runtime already applied instead of silently
@@ -297,16 +297,6 @@ fn response_message_item(role: &str, content: Vec<Value>) -> Value {
     })
 }
 
-fn legacy_tool_output_message(content: &str) -> Value {
-    response_message_item(
-        "user",
-        vec![serde_json::json!({
-            "type": "input_text",
-            "text": format!("Legacy tool output without call_id:\n{content}"),
-        })],
-    )
-}
-
 fn response_item_type(item: &Value) -> Option<&str> {
     item.get("type").and_then(Value::as_str)
 }
@@ -380,6 +370,8 @@ pub(crate) fn build_function_call_item(call: ProviderToolCall) -> Value {
 }
 
 pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
+    let projected = crate::multimodal::project_attachment_metadata(messages);
+    let messages = projected.as_ref();
     let mut system_parts: Vec<&str> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
 
@@ -388,7 +380,7 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
             "system" => system_parts.push(&msg.content),
             "user" => {
                 let (cleaned_text, image_refs) =
-                    multimodal::parse_user_message_image_refs(&msg.content);
+                    (msg.content.clone(), multimodal::message_image_refs(msg));
 
                 let mut content_items = Vec::new();
 
@@ -416,7 +408,7 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                 input.push(response_message_item("user", content_items));
             }
             "assistant" => {
-                if let Ok(value) = serde_json::from_str::<Value>(&msg.content)
+                if let Some(value) = crate::tool_protocol::tool_message_value(msg)
                     && let Some(tool_calls_value) = value.get("tool_calls")
                     && let Ok(parsed_calls) =
                         serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
@@ -477,26 +469,21 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                 }
             }
             "tool" => {
-                if let Ok(value) = serde_json::from_str::<Value>(&msg.content) {
-                    if let Some(call_id) = value
+                if let Some(value) = crate::tool_protocol::tool_message_value(msg)
+                    && let Some(call_id) = value
                         .get("tool_call_id")
                         .and_then(Value::as_str)
                         .and_then(|id| first_nonempty(Some(id)))
-                    {
-                        let output = value
-                            .get("content")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        input.push(serde_json::json!({
-                            "type": "function_call_output",
-                            "call_id": call_id,
-                            "output": output,
-                        }));
-                    } else if !msg.content.trim().is_empty() {
-                        input.push(legacy_tool_output_message(&msg.content));
-                    }
-                } else if !msg.content.trim().is_empty() {
-                    input.push(legacy_tool_output_message(&msg.content));
+                {
+                    let output = value
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    input.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": output,
+                    }));
                 }
             }
             _ => {}
@@ -2013,7 +2000,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
         model: &str,
         _temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        // Normalize image markers: convert file paths to data URIs, under the
+        // Normalize image references: convert file paths to data URIs, under the
         // configured policy rather than defaults.
         let prepared =
             crate::multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
@@ -3066,18 +3053,34 @@ data: [DONE]
     fn build_responses_input_maps_content_types_by_role() {
         let messages = vec![
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "system".into(),
                 content: "You are helpful.".into(),
             },
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "user".into(),
                 content: "Hi".into(),
             },
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "assistant".into(),
                 content: "Hello!".into(),
             },
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "user".into(),
                 content: "Thanks".into(),
             },
@@ -3101,6 +3104,10 @@ data: [DONE]
     #[test]
     fn build_responses_input_uses_default_instructions_without_system() {
         let messages = vec![ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
+            attachments: Vec::new(),
             role: "user".into(),
             content: "Hello".into(),
         }];
@@ -3112,11 +3119,18 @@ data: [DONE]
     #[test]
     fn build_responses_input_maps_tool_outputs() {
         let messages = vec![
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call_123".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "result".into(),
+                attachments: Vec::new(),
+            }),
             ChatMessage {
-                role: "tool".into(),
-                content: r#"{"tool_call_id":"call_123","content":"result"}"#.into(),
-            },
-            ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "user".into(),
                 content: "Go".into(),
             },
@@ -3131,78 +3145,16 @@ data: [DONE]
     }
 
     #[test]
-    fn build_responses_input_replays_plain_tool_text_without_synthetic_call_id() {
-        let messages = vec![ChatMessage {
-            role: "tool".into(),
-            content: "legacy plain text result".into(),
-        }];
-
-        let (_, input) = build_responses_input(&messages);
-
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "message");
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"][0]["type"], "input_text");
-        assert_eq!(
-            input[0]["content"][0]["text"],
-            "Legacy tool output without call_id:\nlegacy plain text result"
-        );
-        assert!(input[0].get("call_id").is_none());
-    }
-
-    #[test]
-    fn build_responses_input_replays_tool_json_without_call_id_as_text() {
-        let messages = vec![ChatMessage {
-            role: "tool".into(),
-            content: r#"{"content":"legacy result","status":"ok"}"#.into(),
-        }];
-
-        let (_, input) = build_responses_input(&messages);
-
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "message");
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"][0]["type"], "input_text");
-        assert_eq!(
-            input[0]["content"][0]["text"],
-            r#"Legacy tool output without call_id:
-{"content":"legacy result","status":"ok"}"#
-        );
-        assert!(input[0].get("call_id").is_none());
-    }
-
-    #[test]
-    fn build_responses_input_replays_blank_tool_call_id_as_legacy_text() {
-        for raw_id in ["", "   "] {
-            let messages = vec![ChatMessage {
-                role: "tool".into(),
-                content: serde_json::json!({
-                    "tool_call_id": raw_id,
-                    "content": "legacy result"
-                })
-                .to_string(),
-            }];
-
-            let (_, input) = build_responses_input(&messages);
-
-            assert_eq!(input.len(), 1);
-            assert_eq!(input[0]["type"], "message");
-            assert_eq!(input[0]["role"], "user");
-            assert_eq!(input[0]["content"][0]["type"], "input_text");
-            assert!(input[0].get("call_id").is_none());
-            assert!(
-                input[0]["content"][0]["text"]
-                    .as_str()
-                    .unwrap()
-                    .contains("\"legacy result\"")
-            );
-        }
-    }
-
-    #[test]
     fn build_responses_input_maps_native_assistant_tool_calls() {
-        let messages = vec![ChatMessage::assistant(
-            r#"{"content":"Using shell","tool_calls":[{"id":"call_abc","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#,
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "Using shell",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_abc".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"pwd\"}".into(),
+                extra_content: None,
+            }],
+            None,
         )];
         let (_, input) = build_responses_input(&messages);
 
@@ -3235,27 +3187,25 @@ data: [DONE]
             encode_responses_history_items(&[reasoning_item, function_call_item], true)
                 .expect("history envelope should encode");
         let messages = vec![
-            ChatMessage::assistant(
-                serde_json::json!({
-                    "content": null,
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "name": "shell",
-                            "arguments": "{\"command\":\"pwd\"}"
-                        }
-                    ],
-                    "reasoning_content": reasoning_content
-                })
-                .to_string(),
+            ChatMessage::assistant_tool_calls(
+                String::new(),
+                serde_json::from_value(serde_json::json!([
+                    {
+                        "id": "call_1",
+                        "name": "shell",
+                        "arguments": "{\"command\":\"pwd\"}"
+                    }
+                ]))
+                .unwrap(),
+                Some((reasoning_content).to_string()),
             ),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "tool_call_id": "call_1",
-                    "content": "ok"
-                })
-                .to_string(),
-            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call_1").to_string(),
+                tool_name: String::new(),
+                content: ("ok").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            }),
         ];
 
         let (_, input) = build_responses_input(&messages);
@@ -3311,9 +3261,12 @@ data: [DONE]
 
     #[test]
     fn build_responses_input_handles_image_markers() {
-        let messages = vec![ChatMessage::user(
-            "Describe this\n\n[IMAGE:data:image/png;base64,abc]",
-        )];
+        let messages = vec![ChatMessage::user("Describe this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/png;base64,abc".to_string(),
+            },
+        ])];
         let (_, input) = build_responses_input(&messages);
 
         assert_eq!(input.len(), 1);
@@ -3346,9 +3299,18 @@ data: [DONE]
 
     #[test]
     fn build_responses_input_handles_multiple_images() {
-        let messages = vec![ChatMessage::user(
-            "Compare these: [IMAGE:data:image/png;base64,img1] and [IMAGE:data:image/jpeg;base64,img2]",
-        )];
+        let messages = vec![
+            ChatMessage::user("Compare these:  and").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/png;base64,img1".to_string(),
+                },
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/jpeg;base64,img2".to_string(),
+                },
+            ]),
+        ];
         let (_, input) = build_responses_input(&messages);
 
         assert_eq!(input.len(), 1);

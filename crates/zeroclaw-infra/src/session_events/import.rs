@@ -180,7 +180,9 @@ pub(super) fn import_snapshot(
     let mut bytes = 0usize;
     let mut chunk = 0usize;
     for (index, source) in messages.into_iter().enumerate() {
-        let message = source.message;
+        let mut message = source.message;
+        super::upgrade::legacy_media::upgrade_chat(&mut message);
+        super::upgrade::legacy_media::upgrade_legacy_tool_carrier(&mut message, index);
         let mut parts = Vec::new();
         let mut start = 0;
         while start < message.content.len() || (start == 0 && message.content.is_empty()) {
@@ -219,6 +221,18 @@ pub(super) fn import_snapshot(
         bytes += content.body.len();
         let mut entry =
             serde_json::json!({"role":message.role,"content_ref":StoredPayloadRef::from(&content)});
+        if !message.attachments.is_empty() {
+            entry["attachments"] = serde_json::json!(message.attachments);
+        }
+        if !message.tool_calls.is_empty() {
+            entry["tool_calls"] = serde_json::json!(message.tool_calls);
+        }
+        if let Some(result) = message.tool_result {
+            entry["tool_result"] = serde_json::json!(result);
+        }
+        if let Some(reasoning) = message.reasoning_content {
+            entry["reasoning_content"] = serde_json::json!(reasoning);
+        }
         if let Some(time) = source.created_at {
             entry["created_at"] = serde_json::json!(time.timestamp_millis());
         }

@@ -8,9 +8,9 @@ pub struct ToolExecutionOutcome {
     /// URL) into this text and credential-scrub it before storing it here.
     pub output: String,
     /// Attachments the tool declared for this result (`ToolOutput::attachments`).
-    /// They reach history through the carrier grammar and are never recovered
+    /// They reach history as structured fields and are never recovered
     /// by scanning `output`.
-    pub attachments: Vec<zeroclaw_api::media::RenderedMarker>,
+    pub attachments: Vec<zeroclaw_api::media::AttachmentReference>,
     /// Structured output when the tool declared one (`ToolOutput::data`).
     /// Feeds SOP step capture and data-flow surfaces; the LLM sees only
     /// `output`. Stored raw — consumers scrub at their own rendering boundary.

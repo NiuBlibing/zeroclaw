@@ -355,18 +355,7 @@ fn configured_provider_allowed_for_turn(
 }
 
 fn effort_routing_classification_content(message: &str) -> String {
-    static ATTACHMENT_MARKER_RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| {
-            regex::Regex::new(
-                r"(?i)\[\s*(?:IMAGE|PHOTO|DOCUMENT|FILE|VIDEO|AUDIO|VOICE|LOCATION)\s*:[^\]]+\]",
-            )
-            .expect("attachment marker regex must compile")
-        });
-
-    ATTACHMENT_MARKER_RE
-        .replace_all(message, "")
-        .trim()
-        .to_string()
+    message.trim().to_string()
 }
 
 fn resolve_channel_context_limits(
@@ -2097,11 +2086,11 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on Matrix:\n\
              - Use Markdown formatting (bold, italic, code blocks)\n\
              - Be concise and direct\n\
-             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
-             - Local marker paths may be workspace-relative or absolute, but they must resolve inside the configured workspace directory.\n\
-             - Copy paths from inbound messages or file tools exactly into markers. Do not add, remove, or rewrite path components.\n\
-             - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - For media attachments, use the structured attachment fields provided by the delivery tool; keep paths and URLs out of message text.\n\
+             - Local attachment paths may be workspace-relative or absolute, but they must resolve inside the configured workspace directory.\n\
+             - Copy paths from inbound messages or file tools exactly into attachment fields. Do not add, remove, or rewrite path components.\n\
+             - Remote media is also accepted via http:// or https:// URLs in attachment fields.\n\
+             - Keep ordinary text in body and attachments in their own fields.\n\
              - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
              - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
         ),
@@ -2109,12 +2098,12 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on Discord:\n\
              - Use Markdown formatting (bold, italic, code blocks)\n\
              - Be concise and direct\n\
-             - For media attachments use markers: [IMAGE:<absolute-path>], [DOCUMENT:<absolute-path>], [VIDEO:<absolute-path>], [AUDIO:<absolute-path>], or [VOICE:<absolute-path>]\n\
-             - Paths inside markers MUST be absolute (starting with /) and live inside the configured workspace directory. Never use relative paths.\n\
-             - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
+             - For media attachments, use the structured attachment fields provided by the delivery tool; keep paths and URLs out of message text.\n\
+             - Local attachment paths MUST be absolute (starting with /) and live inside the configured workspace directory. Never use relative paths.\n\
+             - Remote media is also accepted via http:// or https:// URLs in attachment fields.\n\
              - For a rich embed, emit [EMBED:{...}] where {...} is a Discord embed JSON object (keys: title, description, url, color, timestamp, footer{text,icon_url}, image, thumbnail, author{name,url,icon_url}, fields[{name,value,inline}]). Any image/thumbnail/icon/url MUST be an http(s) URL; local paths are not embeddable. Keep the JSON on one line.\n\
              - To offer interactive buttons or a menu, emit one marker [COMPONENTS:{\"rows\":[[<component>, ...], ...]}] on a single line (up to 5 rows; a row holds up to 5 buttons OR exactly one select). Action button: {\"label\":\"Approve\",\"style\":\"primary|secondary|success|danger\",\"prompt\":\"<text run as a new turn when clicked>\"}; link button: {\"label\":\"Docs\",\"url\":\"https://...\"}; select: {\"select\":\"placeholder\",\"options\":[{\"label\":\"A\",\"value\":\"a\",\"prompt\":\"<run when chosen>\"}, ...]}. A button may instead carry a modal (a popup form) in place of prompt/url: {\"label\":\"Report\",\"style\":\"danger\",\"prompt\":\"<run on submit>\",\"modal\":{\"title\":\"Report\",\"fields\":[{\"id\":\"reason\",\"label\":\"Reason\",\"style\":\"short|paragraph\",\"required\":true,\"placeholder\":\"...\",\"min\":1,\"max\":500}]}} — clicking opens the form and the typed field values are appended to that button's prompt when submitted. Every action button and select option needs a prompt describing what should happen when it is clicked.\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n",
+             - Keep ordinary text in body and attachments in their own fields.\n",
         ),
         "whatsapp" | "whatsapp-web" => Some(
             "When responding on WhatsApp Web:\n\
@@ -2122,11 +2111,11 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - WhatsApp has its own formatting syntax and does not render Markdown. Use *single asterisks* for bold, _underscores_ for italic, and ~tildes~ for strikethrough.\n\
              - Do not use **double asterisks**, # headers, or [label](url) Markdown links: WhatsApp renders none of them, so the raw characters reach the reader as literal punctuation.\n\
              - Start each list item with a dash and a space. Leave bare URLs unwrapped; WhatsApp links them automatically.\n\
-             - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
-             - To send a native location pin, use marker: [LOCATION:<latitude>,<longitude>,<name>,<address>] where name and address are optional. Double-quote the name if it contains commas; the trailing address may contain commas without quoting.\n\
-             - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
-             - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n",
+             - For media attachments, use the structured attachment fields provided by the delivery tool; keep paths and URLs out of message text.\n\
+             - To send a native location pin, supply lat, lng, name and address in the delivery tool locations field.\n\
+             - Attachment paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
+             - Do not use http://, https://, data:, file:, or any other URL scheme in attachments.\n\
+             - Keep ordinary text in body and attachments in their own fields.\n",
         ),
         "lark" | "feishu" => Some(
             "When responding on Lark/Feishu:\n\
@@ -2134,14 +2123,14 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Use Markdown formatting for readable answers\n\
              - If a tool can answer the task, use your tools instead of stopping at a plain chat reply\n\
              - Use tool results silently: answer with the outcome and do not narrate internal tool execution bookkeeping\n\
-             - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
-             - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
-             - Do not use http://, https://, data:, file:, or any other URL scheme in Lark/Feishu media markers.\n\
-             - Keep normal text outside markers and never wrap markers, tool output, or protocol markup in code fences.\n",
+             - For media attachments, use the structured attachment fields provided by the delivery tool; keep paths and URLs out of message text.\n\
+             - Attachment paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
+             - Do not use http://, https://, data:, file:, or any other URL scheme in Lark/Feishu structured media fields.\n\
+             - Keep normal text in body and attachments in their own fields; never wrap tool output or protocol markup in code fences.\n",
         ),
         "telegram" => Some(
             "When responding on Telegram:\n\
-             - Include media markers for files or URLs that should be sent as attachments\n\
+             - Use the structured attachment fields for files or URLs that should be sent as attachments\n\
              - Use **bold** for key terms, section titles, and important info (renders as <b>)\n\
              - Use *italic* for emphasis (renders as <i>)\n\
              - Use `backticks` for inline code, commands, or technical terms\n\
@@ -2149,8 +2138,8 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Use emoji naturally to add personality — but don't overdo it\n\
              - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
              - Structure longer answers with bold headers, not raw markdown ## headers\n\
-             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - For media attachments, use the structured attachment fields provided by the delivery tool; keep paths and URLs out of message text.\n\
+             - Keep ordinary text in body and attachments in their own fields.\n\
              - When a question needs current, real-time, or external information \
                (prices, news, weather, web pages, lookups, etc.), use your tools — \
                e.g. web_search_tool and web_fetch — to obtain it before answering; \
@@ -2162,24 +2151,22 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on QQ:\n\
              - Use Markdown formatting\n\
              - Be concise and direct\n\
-             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
-               [VIDEO:<path-or-url>], [VOICE:<path-or-url>]\n\
-             - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n",
+             - Use the structured attachment fields provided by the delivery tool; keep paths and URLs out of message text.\n\
+             - Voice supports .wav, .mp3, .silk formats only. Send other audio formats as document attachments\n\
+             - Keep ordinary text in body and attachments in their own fields.\n",
         ),
         "wechat" => Some(
             "When responding on WeChat:\n\
              - Be concise and direct\n\
-             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
-               [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Use the structured attachment fields provided by the delivery tool; keep paths and URLs out of message text.\n\
+             - Keep ordinary text in body and attachments in their own fields.\n\
              - Use absolute local paths when sending generated files whenever possible.\n",
         ),
         "wecom_ws" => Some(
             "When responding on WeCom AI Bot WebSocket:\n\
              - Be concise and direct\n\
              - Use Markdown text; the channel sends progressive draft updates when enabled\n\
-             - Do not use local attachment markers; outbound image payloads are not supported yet.\n",
+             - Outbound image attachments are not supported yet.\n",
         ),
         _ => None,
     }
@@ -2227,17 +2214,17 @@ fn build_channel_system_prompt(
             prompt = format!("{prompt}\n\n{instructions}");
         }
         // Both WhatsApp backends share a name, but only Web delivers documents.
-        if instructions.contains("[DOCUMENT:")
+        if instructions.contains("structured attachment")
             && !matches!(channel_name, "whatsapp" | "whatsapp-web")
         {
             prompt.push_str(
                 "\n\nWhen generating large HTML, scripts, spreadsheets or exports, use available \
                  file-writing tools to save the complete artifact at an absolute path inside the \
                  configured workspace instead of pasting it into chat. After saving successfully, \
-                 send a short summary plus the document marker described above, using that same absolute path \
+                 send a short summary plus the structured attachment field described above, using that same absolute path \
                  and following this channel's path and URL restrictions. If file-writing tools \
                  are unavailable or saving fails, explain the limitation and provide the content \
-                 in chat. Do not emit a document marker for an \
+                 in chat. Do not put document paths in message text for an \
                  unsaved file.",
             );
         }
@@ -2535,57 +2522,6 @@ fn timestamped_channel_user_history_content(
     attributed_channel_user_turn(msg, label, &timestamped_content)
 }
 
-/// Collapse only heavy inline `data:` image payloads in historical turns while
-/// preserving re-loadable `[IMAGE:<path>]` file references, so a later turn can
-/// re-inflate from disk without re-sending megabytes of base64 every request.
-/// File-path and placeholder markers pass through untouched.
-fn collapse_inline_image_payloads(turns: &mut [ChatMessage]) {
-    if turns.len() <= 1 {
-        return;
-    }
-    let last_idx = turns.len() - 1;
-    collapse_inline_image_payloads_in(&mut turns[..last_idx]);
-}
-
-/// Collapse inline `data:` image payloads in every one of `turns`. Callers
-/// whose slice ends with the turn being sent use
-/// [`collapse_inline_image_payloads`], which leaves that last turn intact.
-fn collapse_inline_image_payloads_in(turns: &mut [ChatMessage]) {
-    for turn in turns {
-        if turn.role != "user" || !turn.content.contains("[IMAGE:data:") {
-            continue;
-        }
-        let (_, refs) = zeroclaw_providers::multimodal::parse_image_markers(&turn.content);
-        if refs.iter().any(|r| r.starts_with("data:")) {
-            turn.content = strip_inline_data_image_markers(&turn.content);
-        }
-    }
-}
-
-fn strip_inline_data_image_markers(content: &str) -> String {
-    let mut out = String::with_capacity(content.len());
-    let mut cursor = 0usize;
-    while let Some(rel) = content[cursor..].find("[IMAGE:data:") {
-        let start = cursor + rel;
-        out.push_str(&content[cursor..start]);
-        match content[start..].find(']') {
-            Some(rel_end) => {
-                out.push_str("[Image attachment omitted from history]");
-                cursor = start + rel_end + 1;
-            }
-            None => {
-                out.push_str(&content[start..]);
-                cursor = content.len();
-                break;
-            }
-        }
-    }
-    if cursor < content.len() {
-        out.push_str(&content[cursor..]);
-    }
-    out.trim().to_string()
-}
-
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut normalized = Vec::with_capacity(turns.len());
     let mut expecting_user = true;
@@ -2607,13 +2543,12 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
             // Interrupted channel turns can produce consecutive user messages
             // (no assistant persisted yet). Merge instead of dropping.
             (false, "user") | (true, "assistant") => {
-                if let Some(last_turn) = normalized.last_mut()
-                    && !turn.content.is_empty()
-                {
-                    if !last_turn.content.is_empty() {
+                if let Some(last_turn) = normalized.last_mut() {
+                    if !last_turn.content.is_empty() && !turn.content.is_empty() {
                         last_turn.content.push_str("\n\n");
                     }
                     last_turn.content.push_str(&turn.content);
+                    last_turn.attachments.extend(turn.attachments);
                 }
             }
             _ => {}
@@ -2652,8 +2587,7 @@ fn provider_ready_cached_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     turns
 }
 
-/// Remove `<tool_result …>…</tool_result>` blocks (and a leading `[Tool results]`
-/// header, if present) from a conversation-history entry so that stale tool
+/// Remove `<tool_result …>…</tool_result>` blocks from visible output so stale tool
 /// output is never presented to the LLM without the corresponding `<tool_call>`.
 fn strip_tool_result_content(text: &str) -> String {
     static TOOL_RESULT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -2661,25 +2595,8 @@ fn strip_tool_result_content(text: &str) -> String {
             .expect("TOOL_RESULT_RE regex must compile")
     });
 
-    // A new-shape carrier opens with a results prefix, an attachments count
-    // line, and that many marker lines before the body. Parse the carrier so
-    // the fixed-position header and marker lines drop out exactly, and only
-    // the body's tool_result blocks are stripped below.
-    let body = if let Some(parts) = zeroclaw_api::tool_carrier::classify("user", text)
-        && parts.declared
-    {
-        parts.text
-    } else {
-        text.to_string()
-    };
-
-    let cleaned = TOOL_RESULT_RE.replace_all(&body, "");
+    let cleaned = TOOL_RESULT_RE.replace_all(text, "");
     let cleaned = cleaned.trim();
-
-    // If the only remaining content is the header, drop it entirely.
-    if cleaned == "[Tool results]" || cleaned.is_empty() {
-        return String::new();
-    }
 
     cleaned.to_string()
 }
@@ -4103,8 +4020,7 @@ impl zeroclaw_api::conversation_binding::ConversationBindingOwner for ChannelCon
         }
         // None of these turns is the one being sent, so every inline image
         // payload is collapsed, where a channel turn spares its newest.
-        let mut turns = provider_ready_cached_turns(turns);
-        collapse_inline_image_payloads_in(&mut turns);
+        let turns = provider_ready_cached_turns(turns);
         Ok(turns)
     }
 
@@ -5509,93 +5425,25 @@ fn sender_memory_session_ids(
 
 #[cfg(test)]
 fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> String {
-    fn push_unique_tool_name(tool_names: &mut Vec<String>, name: &str) {
-        let candidate = name.trim();
-        if candidate.is_empty() {
-            return;
-        }
-        if !tool_names.iter().any(|existing| existing == candidate) {
-            tool_names.push(candidate.to_string());
-        }
-    }
-
-    fn collect_tool_names_from_tool_call_tags(content: &str, tool_names: &mut Vec<String>) {
-        const TAG_PAIRS: [(&str, &str); 4] = [
-            ("<tool_call>", "</tool_call>"),
-            ("<toolcall>", "</toolcall>"),
-            ("<tool-call>", "</tool-call>"),
-            ("<invoke>", "</invoke>"),
-        ];
-
-        for (open_tag, close_tag) in TAG_PAIRS {
-            for segment in content.split(open_tag) {
-                if let Some(json_end) = segment.find(close_tag) {
-                    let json_str = segment[..json_end].trim();
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str)
-                        && let Some(name) = val.get("name").and_then(|n| n.as_str())
-                    {
-                        push_unique_tool_name(tool_names, name);
-                    }
-                }
+    let mut names = Vec::new();
+    for message in history.iter().skip(start_index) {
+        for call in &message.tool_calls {
+            if !names.contains(&call.name) {
+                names.push(call.name.clone());
             }
         }
-    }
-
-    fn collect_tool_names_from_native_json(content: &str, tool_names: &mut Vec<String>) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(content)
-            && let Some(calls) = val.get("tool_calls").and_then(|c| c.as_array())
+        if let Some(result) = &message.tool_result
+            && !result.tool_name.is_empty()
+            && !names.contains(&result.tool_name)
         {
-            for call in calls {
-                let name = call
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .or_else(|| call.get("name").and_then(|n| n.as_str()));
-                if let Some(name) = name {
-                    push_unique_tool_name(tool_names, name);
-                }
-            }
+            names.push(result.tool_name.clone());
         }
     }
-
-    fn collect_tool_names_from_tool_results(content: &str, tool_names: &mut Vec<String>) {
-        let marker = "<tool_result name=\"";
-        let mut remaining = content;
-        while let Some(start) = remaining.find(marker) {
-            let name_start = start + marker.len();
-            let after_name_start = &remaining[name_start..];
-            if let Some(name_end) = after_name_start.find('"') {
-                let name = &after_name_start[..name_end];
-                push_unique_tool_name(tool_names, name);
-                remaining = &after_name_start[name_end + 1..];
-            } else {
-                break;
-            }
-        }
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!("[Used tools: {}]", names.join(", "))
     }
-
-    let mut tool_names: Vec<String> = Vec::new();
-
-    for msg in history.iter().skip(start_index) {
-        match msg.role.as_str() {
-            "assistant" => {
-                collect_tool_names_from_tool_call_tags(&msg.content, &mut tool_names);
-                collect_tool_names_from_native_json(&msg.content, &mut tool_names);
-            }
-            "user" => {
-                // Prompt-mode tool calls are always followed by [Tool results] entries
-                // containing `<tool_result name="...">` tags with canonical tool names.
-                collect_tool_names_from_tool_results(&msg.content, &mut tool_names);
-            }
-            _ => {}
-        }
-    }
-
-    if tool_names.is_empty() {
-        return String::new();
-    }
-
-    format!("[Used tools: {}]", tool_names.join(", "))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5702,10 +5550,10 @@ async fn classify_channel_reply_intent(
             "assistant" => "assistant",
             _ => "user",
         };
-        // Strip media markers — auxiliary classifier does not need image
-        // content, and forwarding `[IMAGE:/local/path]` would reach the
+        // Strip structured media fields — auxiliary classifier does not need image
+        // content, and forwarding `a local path` would reach the
         // provider as a malformed `image_url.url` and trigger 400 errors.
-        let safe_content = zeroclaw_providers::multimodal::strip_media_markers(&msg.content);
+        let safe_content = &msg.content;
         let _ = writeln!(convo, "[{role}] {safe_content}");
     }
 
@@ -9021,7 +8869,12 @@ async fn reconcile_early_ack(
 fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, history_key: &str) {
     let timestamped_content =
         timestamped_channel_user_history_content(msg, WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL);
-    append_sender_turn(ctx, history_key, ChatMessage::user(&timestamped_content));
+    append_sender_turn(
+        ctx,
+        history_key,
+        ChatMessage::user(&timestamped_content)
+            .with_attachments(media_pipeline::attachment_references(&msg.attachments)),
+    );
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
@@ -9481,7 +9334,8 @@ async fn process_channel_message_body_inner(
             transcription_manager.as_ref(),
             vision,
         );
-        msg.content = Box::pin(pipeline.process(&msg.content, &msg.attachments)).await;
+        let enriched = Box::pin(pipeline.process_message(&msg.content, &msg.attachments)).await;
+        msg.content = enriched.content;
     }
 
     // ── Link enricher: prepend URL summaries before agent sees the message ──
@@ -9670,7 +9524,7 @@ async fn process_channel_message_body_inner(
     // durable memory. Strip them here (path/markers are preserved) before the
     // store; the channel-history cache still keeps the re-loadable markers via
     // collapse_inline_image_payloads downstream.
-    let autosave_content = strip_inline_data_image_markers(&history_user_content);
+    let autosave_content = history_user_content.clone();
     if ctx.auto_save_memory
         && autosave_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !zeroclaw_memory::should_skip_autosave_content(&autosave_content)
@@ -9749,17 +9603,17 @@ async fn process_channel_message_body_inner(
     let known_prefix = append_sender_turn(
         ctx.as_ref(),
         &history_key,
-        ChatMessage::user(&timestamped_content),
+        ChatMessage::user(&timestamped_content)
+            .with_attachments(media_pipeline::attachment_references(&msg.attachments)),
     );
 
     // Build history from per-sender conversation cache.
-    let mut prior_turns = provider_ready_cached_turns(known_prefix.clone());
+    let prior_turns = provider_ready_cached_turns(known_prefix.clone());
 
     // Collapse only heavy inline `data:` image payloads in older cached turns.
-    // Re-loadable `[IMAGE:<path>]` references survive so a later turn can
+    // Re-loadable structured image attachments references survive so a later turn can
     // re-inflate from disk inline base64 is dropped to keep history
     // within the context budget
-    collapse_inline_image_payloads(&mut prior_turns);
 
     let is_group_chat = is_group_reply_target(&msg.reply_target);
     let mut memory_sessions: Vec<Option<String>> = sender_memory_session_ids(&msg, &history_key)
@@ -11259,6 +11113,14 @@ async fn process_channel_message_body_inner(
                     let suppress = suppress_voice_override.unwrap_or(false);
                     let mut send_msg = SendMessage::new(&delivered_response, &delivery_recipient)
                         .in_thread(msg.thread_ts.clone());
+                    send_msg.attachments = turn_route
+                        .as_ref()
+                        .map(|route| route.attachments.clone())
+                        .unwrap_or_default();
+                    send_msg.locations = turn_route
+                        .as_ref()
+                        .map(|route| route.locations.clone())
+                        .unwrap_or_default();
                     if suppress {
                         send_msg = send_msg.suppress_voice();
                     } else if force_voice_override {
@@ -11289,6 +11151,40 @@ async fn process_channel_message_body_inner(
                         let message = SendMessage::new(&delivered_response, &delivery_recipient)
                             .force_voice()
                             .in_thread(msg.thread_ts.clone());
+                        let mut message = message.with_attachments(
+                            turn_route
+                                .as_ref()
+                                .map(|route| route.attachments.clone())
+                                .unwrap_or_default(),
+                        );
+                        message.locations = turn_route
+                            .as_ref()
+                            .map(|route| route.locations.clone())
+                            .unwrap_or_default();
+                        session_history::deliver(
+                            native_history.as_ref(),
+                            &native_turn_id,
+                            channel.name(),
+                            &delivery_recipient,
+                            &delivered_response,
+                            channel.send_final(&message),
+                        )
+                        .await
+                        .is_ok()
+                    } else if let Some(route) = turn_route.as_ref().filter(|route| {
+                        !route.attachments.is_empty() || !route.locations.is_empty()
+                    }) {
+                        let _ = session_history::cancel_draft(
+                            channel.as_ref(),
+                            &delivery_recipient,
+                            draft_id,
+                        )
+                        .await;
+                        let mut message =
+                            SendMessage::new(&delivered_response, &delivery_recipient)
+                                .with_attachments(route.attachments.clone())
+                                .in_thread(msg.thread_ts.clone());
+                        message.locations = route.locations.clone();
                         session_history::deliver(
                             native_history.as_ref(),
                             &native_turn_id,
@@ -11413,6 +11309,14 @@ async fn process_channel_message_body_inner(
                     let suppress = suppress_voice_override.unwrap_or(false);
                     let mut send_msg = SendMessage::reply_to(&msg, &delivered_response)
                         .with_cancellation(cancellation_token.clone());
+                    send_msg.attachments = turn_route
+                        .as_ref()
+                        .map(|route| route.attachments.clone())
+                        .unwrap_or_default();
+                    send_msg.locations = turn_route
+                        .as_ref()
+                        .map(|route| route.locations.clone())
+                        .unwrap_or_default();
                     if suppress {
                         send_msg = send_msg.suppress_voice();
                     } else if force_voice_override {
@@ -18729,7 +18633,12 @@ fn bound_load_returns_the_history_a_channel_turn_would_send() {
 
     let cached = vec![
         zeroclaw_runtime::agent::history_trim::breadcrumb(),
-        ChatMessage::user("what is in this picture? [IMAGE:data:image/png;base64,QUJDRA==]"),
+        ChatMessage::user("what is in this picture?").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                target: "data:image/png;base64,QUJDRA==".into(),
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+            },
+        ]),
         ChatMessage::assistant("[Used tools: shell]\nA cat."),
         ChatMessage::user("thanks"),
         ChatMessage::assistant("You're welcome."),
@@ -18994,6 +18903,16 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn structured_tool_result(content: impl Into<String>) -> ChatMessage {
+        ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+            tool_call_id: "call-test".into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            content: content.into(),
+            attachments: Vec::new(),
+        })
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn ingress_task_tracker_reaps_completed_tasks_before_spawning() {
@@ -22766,8 +22685,7 @@ api_key = "anthropic-key"
 
     #[test]
     fn strip_tool_result_content_removes_blocks_and_header() {
-        let input = r#"[Tool results]
-<tool_result name="shell">Mon Feb 20</tool_result>
+        let input = r#"<tool_result name="shell">Mon Feb 20</tool_result>
 <tool_result name="http_request">{"status":200}</tool_result>"#;
         assert_eq!(strip_tool_result_content(input), "");
 
@@ -25646,9 +25564,7 @@ api_key = "anthropic-key"
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            let has_tool_results = messages
-                .iter()
-                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
+            let has_tool_results = messages.iter().any(|msg| msg.tool_result.is_some());
             if has_tool_results {
                 Ok("BTC is currently around $65,000 based on latest tool output.".to_string())
             } else {
@@ -25952,10 +25868,7 @@ api_key = "anthropic-key"
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            if let Some(tool_results) = messages
-                .iter()
-                .find(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
-            {
+            if let Some(tool_results) = messages.iter().find(|msg| msg.tool_result.is_some()) {
                 if tool_results.content.contains("test-channel_chat-42_alice")
                     && tool_results.content.contains("channel=test-channel")
                     && tool_results.content.contains("messages=1")
@@ -26004,9 +25917,7 @@ api_key = "anthropic-key"
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            let has_tool_results = messages
-                .iter()
-                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
+            let has_tool_results = messages.iter().any(|msg| msg.tool_result.is_some());
             if has_tool_results {
                 Ok("BTC alias-tag flow resolved to final text output.".to_string())
             } else {
@@ -26074,7 +25985,7 @@ BTC is currently around $65,000 based on latest tool output."#
         fn completed_tool_iterations(messages: &[ChatMessage]) -> usize {
             messages
                 .iter()
-                .filter(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
+                .filter(|msg| msg.tool_result.is_some())
                 .count()
         }
     }
@@ -26299,6 +26210,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[derive(Default)]
     struct HistoryCaptureModelProvider {
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        attachments: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
         vision: bool,
     }
 
@@ -26324,6 +26236,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 .iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
                 .collect::<Vec<_>>();
+            self.attachments
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(messages.to_vec());
             let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
             calls.push(snapshot);
             Ok(format!("response-{}", calls.len()))
@@ -35553,10 +35469,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 model: &str,
                 temperature: Option<f64>,
             ) -> anyhow::Result<String> {
-                if messages
-                    .iter()
-                    .any(|message| message.content.contains("[Tool results]"))
-                {
+                if messages.iter().any(|message| message.tool_result.is_some()) {
                     Ok("done".into())
                 } else {
                     self.chat_with_system(None, "", model, temperature).await
@@ -35800,7 +35713,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn native_channel_recovery_preserves_route_identity_and_attachment_parts() {
         use zeroclaw_api::channel::ChannelConversationScope;
-        use zeroclaw_api::media::{MarkerKind, MediaAttachment, RenderedMarker};
+        use zeroclaw_api::media::{AttachmentKind, AttachmentReference, MediaAttachment};
 
         let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             Arc::new(SendMessageRecordingChannel::matrix()),
@@ -35833,9 +35746,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     file_name: "original.png".into(),
                     data: vec![1, 2, 3],
                     mime_type: Some("image/png".into()),
-                    marker: Some(RenderedMarker {
+                    reference: Some(AttachmentReference {
                         target: "original-target".into(),
-                        kind: MarkerKind::Image,
+                        kind: AttachmentKind::Image,
                     }),
                 });
                 let family = runtime_conversation_history_key(&ctx, &message);
@@ -35851,6 +35764,12 @@ BTC is currently around $65,000 based on latest tool output."#
                 assert!(route.get("content").is_none());
                 assert!(route.get("attachments").is_none());
                 assert!(route.get("platform_sender_id").is_none());
+                for part in &input.parts {
+                    if let zeroclaw_api::session_events::capture::EngineInputPart::File(file) = part
+                    {
+                        assert!(file.registration.get("byte_len").is_none());
+                    }
+                }
                 let restored = session_history::recover_message(&ctx, &input, &family).unwrap();
                 assert_eq!(restored.id, message.id);
                 assert_eq!(restored.sender, message.sender);
@@ -35879,8 +35798,8 @@ BTC is currently around $65,000 based on latest tool output."#
                     Some("image/png")
                 );
                 assert_eq!(
-                    restored.attachments[0].marker,
-                    message.attachments[0].marker
+                    restored.attachments[0].reference,
+                    message.attachments[0].reference
                 );
                 assert!(session_history::recover_message(&ctx, &input, "another-family").is_err());
                 let mut changed = input;
@@ -41979,15 +41898,19 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn effort_routing_channel_classification_ignores_media_marker_bytes() {
+    async fn effort_routing_channel_classification_ignores_attachment_bytes() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, provider, _channel) = effort_routing_channel_context(tmp.path(), true);
         let mut turn = scope_test_msg("alice", "chan-1", None);
         turn.id = "media-marker-turn".into();
-        turn.content = format!(
-            "what [ is this?\n[IMAGE:data:image/png;base64,{}]\n\nhi",
-            "a".repeat(256)
-        );
+        turn.content = "what [ is this?\n\nhi".into();
+        turn.attachments = vec![zeroclaw_api::media::MediaAttachment {
+            reference: Some(zeroclaw_api::media::AttachmentReference {
+                target: format!("data:image/png;base64,{}", "a".repeat(256)),
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+            }),
+            ..Default::default()
+        }];
 
         process_channel_message(ctx, turn, CancellationToken::new()).await;
 
@@ -42512,10 +42435,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            if messages
-                .iter()
-                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
-            {
+            if messages.iter().any(|msg| msg.tool_result.is_some()) {
                 Ok("the reply".to_string())
             } else {
                 Ok(send_via_text_tool_call())
@@ -46781,7 +46701,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
                     ],
                     mime_type: Some("image/png".to_string()),
-                    marker: None,
+                    reference: None,
                 }],
                 subject: None,
                 internal_sop_event: None,
@@ -46802,7 +46722,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .rev()
             .find(|(role, _)| role == "user")
             .expect("provider call should include current user message");
-        assert!(current_user.1.contains("[IMAGE:data:image/png;base64,"));
+        assert!(!current_user.1.contains("[IMAGE:"));
         assert!(current_user.1.contains("please inspect this"));
         drop(calls);
 
@@ -46814,11 +46734,14 @@ BTC is currently around $65,000 based on latest tool output."#
             .peek("test-channel_chat-image_alice")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
-        assert!(turns[0].content.starts_with('['));
-        assert!(turns[0].content.contains("[Image: sticker.png attached"));
+        assert!(!turns[0].content.contains("[Image:"));
         assert!(turns[0].content.contains("please inspect this"));
-        assert!(turns[0].content.contains("[IMAGE:data:"));
-        assert!(turns[0].content.contains("iVBORw0KGgoAAAANSUhEUg"));
+        assert_eq!(turns[0].attachments.len(), 1);
+        assert!(
+            turns[0].attachments[0]
+                .target
+                .starts_with("data:image/png;base64,")
+        );
     }
 
     #[tokio::test]
@@ -46965,7 +46888,9 @@ BTC is currently around $65,000 based on latest tool output."#
             "telegram channel instructions should be embedded into the system prompt"
         );
         assert!(
-            calls[0][0].1.contains("For media attachments use markers:"),
+            calls[0][0]
+                .1
+                .contains("use the structured attachment fields"),
             "telegram media marker guidance should live in the system prompt"
         );
         assert!(
@@ -46987,7 +46912,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     .contains("explain the limitation and provide the content in chat")
                 && calls[0][0]
                     .1
-                    .contains("Do not emit a document marker for an unsaved file"),
+                    .contains("Do not put document paths in message text for an unsaved file"),
             "the no-tools provider request must include an honest inline fallback"
         );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
@@ -47008,13 +46933,16 @@ BTC is currently around $65,000 based on latest tool output."#
                 prompt.contains(
                     "save the complete artifact at an absolute path inside the configured workspace"
                 ) && prompt.contains("instead of pasting it into chat")
-                    && prompt.contains("short summary plus the document marker")
+                    && prompt.contains(
+                        "short summary plus the structured attachment field described above"
+                    )
                     && prompt.contains("using that same absolute path")
                     && prompt.contains("following this channel's path and URL restrictions")
                     && prompt.contains("After saving successfully")
                     && prompt.contains("If file-writing tools are unavailable or saving fails")
                     && prompt.contains("explain the limitation and provide the content in chat")
-                    && prompt.contains("Do not emit a document marker for an unsaved file"),
+                    && prompt
+                        .contains("Do not put document paths in message text for an unsaved file"),
                 "{channel_name} must guide large artifacts through its existing document route"
             );
             assert_eq!(
@@ -47032,7 +46960,8 @@ BTC is currently around $65,000 based on latest tool output."#
         ] {
             let prompt = build_channel_system_prompt(base, channel_name, None);
             assert!(
-                !prompt.contains("short summary plus the document marker"),
+                !prompt
+                    .contains("short summary plus the structured attachment field described above"),
                 "{channel_name} must not advertise document delivery from base-prompt marker text"
             );
         }
@@ -47047,7 +46976,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "matrix block must identify itself"
         );
         assert!(
-            block.contains("[IMAGE:<path-or-url>]"),
+            block.contains("structured attachment fields"),
             "matrix block must describe local path or URL marker syntax"
         );
         assert!(
@@ -47077,7 +47006,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "discord block must identify itself"
         );
         assert!(
-            block.contains("For media attachments use markers:"),
+            block.contains("use the structured attachment fields"),
             "discord block must describe marker syntax"
         );
         assert!(
@@ -47089,7 +47018,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "discord block must reference workspace bounds"
         );
         assert!(
-            block.contains("[IMAGE:<absolute-path>]"),
+            block.contains("structured attachment fields"),
             "discord block must show the absolute-path marker form"
         );
     }
@@ -47103,11 +47032,11 @@ BTC is currently around $65,000 based on latest tool output."#
             "whatsapp block must identify itself"
         );
         assert!(
-            block.contains("[LOCATION:"),
+            block.contains("locations"),
             "whatsapp block must include location pin instructions"
         );
         assert!(
-            block.contains("[IMAGE:<path>]"),
+            block.contains("structured attachment fields"),
             "whatsapp block must describe marker syntax"
         );
         assert!(
@@ -47218,13 +47147,25 @@ BTC is currently around $65,000 based on latest tool output."#
     fn extract_tool_context_summary_collects_alias_and_native_tool_calls() {
         let history = vec![
             ChatMessage::system("sys"),
-            ChatMessage::assistant(
-                r#"<toolcall>
-{"name":"shell","arguments":{"command":"date"}}
-</toolcall>"#,
+            ChatMessage::assistant_tool_calls(
+                String::new(),
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "shell-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"date"}"#.into(),
+                    extra_content: None,
+                }],
+                None,
             ),
-            ChatMessage::assistant(
-                r#"{"content":null,"tool_calls":[{"id":"1","name":"web_search","arguments":"{}"}]}"#,
+            ChatMessage::assistant_tool_calls(
+                String::new(),
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "1".into(),
+                    name: "web_search".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
         ];
 
@@ -47233,19 +47174,24 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn extract_tool_context_summary_collects_prompt_mode_tool_result_names() {
+    fn extract_tool_context_summary_collects_structured_tool_result_names() {
         let history = vec![
             ChatMessage::system("sys"),
             ChatMessage::assistant("Using markdown tool call fence"),
-            ChatMessage::user(
-                r#"[Tool results]
-<tool_result name="http_request">
-{"status":200}
-</tool_result>
-<tool_result name="shell">
-Mon Feb 20
-</tool_result>"#,
-            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("http-1").to_string(),
+                tool_name: ("http_request").to_string(),
+                content: ("{\"status\":200}").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            }),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("shell-1").to_string(),
+                tool_name: ("shell").to_string(),
+                content: ("Mon Feb 20").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            }),
         ];
 
         let summary = extract_tool_context_summary(&history, 1);
@@ -47255,15 +47201,25 @@ Mon Feb 20
     #[test]
     fn extract_tool_context_summary_respects_start_index() {
         let history = vec![
-            ChatMessage::assistant(
-                r#"<tool_call>
-{"name":"stale_tool","arguments":{}}
-</tool_call>"#,
+            ChatMessage::assistant_tool_calls(
+                String::new(),
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "stale-1".into(),
+                    name: "stale_tool".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
-            ChatMessage::assistant(
-                r#"<tool_call>
-{"name":"fresh_tool","arguments":{}}
-</tool_call>"#,
+            ChatMessage::assistant_tool_calls(
+                String::new(),
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "fresh-1".into(),
+                    name: "fresh_tool".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             ),
         ];
 
@@ -48493,7 +48449,7 @@ This is an example JSON object for profile settings."#;
             .process_attachments_for_test(&attachments, &reqwest::Client::new())
             .await;
 
-        assert_eq!(text, "[Voice] routed transcript");
+        assert_eq!(text, "routed transcript");
         assert!(
             media.is_empty(),
             "successful direct-channel transcription must not fall back to media"
@@ -50294,7 +50250,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn channel_history_preserves_document_voice_and_text_verbatim() {
         let doc = "[Document: report.pdf] /tmp/media/report.pdf summarize this";
-        let voice = "[Voice] what did i just send";
+        let voice = "what did i just send";
         let text = "plain text with no markers";
         let mut turns = vec![
             ChatMessage::user(doc),
@@ -50312,55 +50268,11 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
-    fn collapse_inline_image_payloads_drops_data_uri_keeps_path() {
-        let path_turn = "[IMAGE:/tmp/media/screenshot.png] can you see this?";
-        let data_turn = format!(
-            "[IMAGE:data:image/png;base64,{}] old screenshot",
-            "AQIDBAUGBwg".repeat(64)
-        );
-        let mut turns = vec![
-            ChatMessage::user(path_turn),
-            ChatMessage::assistant("ok"),
-            ChatMessage::user(&data_turn),
-            ChatMessage::assistant("ok"),
-            ChatMessage::user("[IMAGE:/tmp/media/current.png] and this?"),
-        ];
-
-        collapse_inline_image_payloads(&mut turns);
-
-        assert_eq!(turns[0].content, path_turn, "file-path marker must survive");
-        assert!(
-            !turns[2].content.contains("base64"),
-            "inline data payload must be collapsed"
-        );
-        assert!(turns[2].content.contains("old screenshot"));
-        assert_eq!(
-            turns[4].content, "[IMAGE:/tmp/media/current.png] and this?",
-            "current turn is never collapsed"
-        );
-    }
-
-    #[test]
-    fn strip_inline_data_image_markers_drops_bytes_keeps_path_marker_for_autosave() {
-        // The autosave path calls strip_inline_data_image_markers before
-        // storing to durable memory, so inline data: bytes never persist while
-        // re-loadable path markers and surrounding text survive.
-        let img_open = format!("[{}", "IMAGE:/tmp/shot.png]");
-        let payload = "AQIDBAUGBwg".repeat(64);
-        let data_marker = format!("[{}{payload}]", "IMAGE:data:image/png;base64,");
-        let content = format!("look at {img_open} and {data_marker} please");
-
-        let cleaned = strip_inline_data_image_markers(&content);
-
-        assert!(
-            !cleaned.contains("base64"),
-            "inline data bytes must be stripped before autosave: {cleaned}"
-        );
-        assert!(
-            cleaned.contains("/tmp/shot.png"),
-            "re-loadable path marker must survive: {cleaned}"
-        );
-        assert!(cleaned.contains("look at") && cleaned.contains("please"));
+    fn channel_history_keeps_literal_media_syntax_verbatim() {
+        let text = "look [IMAGE:/tmp/shot.png] and [IMAGE:data:image/png;base64,AQID]";
+        let kept = normalize_cached_channel_turns(vec![ChatMessage::user(text)]);
+        assert_eq!(kept[0].content, text);
+        assert!(kept[0].attachments.is_empty());
     }
 
     #[tokio::test]
@@ -50449,7 +50361,7 @@ This is an example JSON object for profile settings."#;
                         0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
                     ],
                     mime_type: Some("image/png".to_string()),
-                    marker: None,
+                    reference: None,
                 }],
                 subject: None,
                 internal_sop_event: None,
@@ -50503,10 +50415,9 @@ This is an example JSON object for profile settings."#;
 
     /// An image uploaded "as file" through Telegram, with the media pipeline
     /// ENABLED and a vision-capable provider, must not pick up a second,
-    /// base64-inlined `[IMAGE:data:` copy in the outgoing prompt or in stored
-    /// history. The channel emits the same re-loadable `[IMAGE:<path>]` marker
-    /// for image documents as for photos, and the pipeline recognizes it as
-    /// already marked instead of describing it again.
+    /// base64-inlined copy in the outgoing prompt or stored history. The
+    /// channel emits the same reloadable image attachment reference for image
+    /// documents as for photos, and the pipeline keeps that reference.
     #[cfg(feature = "channel-telegram")]
     #[tokio::test]
     async fn telegram_image_document_with_enabled_pipeline_never_inlines_base64() {
@@ -50560,7 +50471,14 @@ This is an example JSON object for profile settings."#;
             .await
             .expect_parsed("image document update should parse");
         assert!(
-            msg.content.contains("[IMAGE:"),
+            msg.attachments
+                .iter()
+                .any(|attachment| attachment
+                    .reference
+                    .as_ref()
+                    .is_some_and(
+                        |reference| reference.kind == zeroclaw_api::media::AttachmentKind::Image
+                    )),
             "channel must emit the path marker for image documents: {}",
             msg.content
         );
@@ -50571,8 +50489,8 @@ This is an example JSON object for profile settings."#;
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let provider_impl = Arc::new(HistoryCaptureModelProvider {
-            calls: std::sync::Mutex::new(Vec::new()),
             vision: true,
+            ..Default::default()
         });
         let base_ctx = peer_prompt_test_context(
             channels_by_name,
@@ -50596,7 +50514,7 @@ This is an example JSON object for profile settings."#;
         process_channel_message(Arc::clone(&ctx), msg, CancellationToken::new()).await;
 
         // Marker resolution legitimately inlines ONE base64 copy of the
-        // `[IMAGE:<path>]` marker at provider-call time; the double-describe
+        // structured image attachments marker at provider-call time; the double-describe
         // bug added a SECOND copy via the pipeline's own annotation. Assert
         // the annotation is absent and no message carries more than one copy.
         let calls = provider_impl
@@ -50642,7 +50560,7 @@ This is an example JSON object for profile settings."#;
     /// An UNSUPPORTED image document (HEIC and the extensionless
     /// declared-`image/*` variant) the multimodal loader rejects. `kind()`
     /// still reads the `image/*` MIME as `Image`, so before the disposition was
-    /// recorded the pipeline re-described it and added an `[IMAGE:data:...]`
+    /// recorded the pipeline re-described it and added an `inline image data`
     /// copy the provider then dropped. Driven through the REAL parser and
     /// orchestrator with the pipeline enabled and a vision provider, it must
     /// stay a document end to end: the saved path reaches the provider and
@@ -50713,13 +50631,23 @@ This is an example JSON object for profile settings."#;
                 .await
                 .expect_parsed("unsupported image document update should parse");
             assert!(
-                msg.content.contains("[Document:"),
-                "an unsupported image document must render as a document \
-                 ({file_name}/{mime}): {}",
-                msg.content
+                msg.attachments
+                    .iter()
+                    .any(|attachment| attachment
+                        .reference
+                        .as_ref()
+                        .is_some_and(|reference| reference.kind
+                            == zeroclaw_api::media::AttachmentKind::Document)),
+                "an unsupported image document must remain a document ({file_name}/{mime}): {:?}",
+                msg.attachments
             );
             assert!(
-                !msg.content.contains("[IMAGE:"),
+                !msg.attachments.iter().any(|attachment| attachment
+                    .reference
+                    .as_ref()
+                    .is_some_and(
+                        |reference| reference.kind == zeroclaw_api::media::AttachmentKind::Image
+                    )),
                 "an unsupported image document must not earn an image marker \
                  ({file_name}/{mime}): {}",
                 msg.content
@@ -50727,7 +50655,7 @@ This is an example JSON object for profile settings."#;
             let document_path = msg
                 .attachments
                 .first()
-                .and_then(|a| a.marker_target())
+                .and_then(|a| a.reference_target())
                 .expect("the channel must record the document target")
                 .to_string();
 
@@ -50737,8 +50665,8 @@ This is an example JSON object for profile settings."#;
             channels_by_name.insert(channel.name().to_string(), channel);
 
             let provider_impl = Arc::new(HistoryCaptureModelProvider {
-                calls: std::sync::Mutex::new(Vec::new()),
                 vision: true,
+                ..Default::default()
             });
             let base_ctx = peer_prompt_test_context(
                 channels_by_name,
@@ -50769,7 +50697,6 @@ This is an example JSON object for profile settings."#;
                 !calls.is_empty(),
                 "provider must have been called ({file_name}/{mime})"
             );
-            let mut document_path_reached_user_turn = false;
             for call in calls.iter() {
                 for (role, content) in call {
                     assert!(
@@ -50787,17 +50714,24 @@ This is an example JSON object for profile settings."#;
                         "an unsupported image document must not become a load-failure note \
                          ({role}): {content}"
                     );
-                    if role == "user" && content.contains(&document_path) {
-                        document_path_reached_user_turn = true;
-                    }
                 }
             }
-            assert!(
-                document_path_reached_user_turn,
-                "the document path must reach the provider on the user turn \
-                 ({file_name}/{mime})"
-            );
             drop(calls);
+            let attachment_calls = provider_impl
+                .attachments
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                attachment_calls.iter().flatten().any(|message| {
+                    message.role == "user"
+                        && message.attachments.iter().any(|attachment| {
+                            attachment.kind == zeroclaw_api::media::AttachmentKind::Document
+                                && attachment.target == document_path
+                        })
+                }),
+                "the document reference must reach the provider on the user turn ({file_name}/{mime})"
+            );
+            drop(attachment_calls);
 
             let histories = ctx
                 .conversation_histories
@@ -50819,7 +50753,10 @@ This is an example JSON object for profile settings."#;
                          ({file_name}/{mime}): {}",
                         msg.content
                     );
-                    if msg.content.contains(&document_path) {
+                    if msg.attachments.iter().any(|attachment| {
+                        attachment.kind == zeroclaw_api::media::AttachmentKind::Document
+                            && attachment.target == document_path
+                    }) {
                         document_path_persisted = true;
                     }
                 }
@@ -50947,20 +50884,23 @@ This is an example JSON object for profile settings."#;
             sop_driver_sink: None,
         });
 
-        // Simulate a photo attachment message with [IMAGE:] marker.
+        // Simulate a photo message with an explicit attachment.
         process_channel_message(
             runtime_ctx,
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
+                content: "What is this?".to_string(),
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
-                attachments: vec![],
+                attachments: vec![
+                    zeroclaw_api::media::MediaAttachment::from_file(photo_path.to_str().unwrap())
+                        .unwrap(),
+                ],
                 subject: None,
 
                 ..Default::default()
@@ -51090,13 +51030,16 @@ This is an example JSON object for profile settings."#;
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
+                content: "What is this?".to_string(),
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
-                attachments: vec![],
+                attachments: vec![
+                    zeroclaw_api::media::MediaAttachment::from_file(photo_path.to_str().unwrap())
+                        .unwrap(),
+                ],
                 subject: None,
 
                 ..Default::default()
@@ -55628,7 +55571,7 @@ Done."#;
             ChatMessage::assistant("older reply"),
             ChatMessage::user("block the iPad"),
             ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
-            ChatMessage::tool("ok"),
+            structured_tool_result("ok"),
             ChatMessage::assistant("Done, iPad is blocked."),
         ];
 
@@ -55655,9 +55598,9 @@ Done."#;
         let history = vec![
             ChatMessage::user("do two things"),
             ChatMessage::assistant("{\"tool_call\": \"read_skill\"}"),
-            ChatMessage::tool("skill content"),
+            structured_tool_result("skill content"),
             ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
-            ChatMessage::tool("shell output"),
+            structured_tool_result("shell output"),
             ChatMessage::assistant("All done."),
         ];
 
@@ -55670,7 +55613,7 @@ Done."#;
         let turns = vec![
             ChatMessage::user("block the iPad"),
             ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
-            ChatMessage::tool("ok"),
+            structured_tool_result("ok"),
             ChatMessage::assistant("iPad blocked."),
             ChatMessage::user("next question"),
         ];

@@ -18,6 +18,7 @@ const REGISTRY: &[(&str, Codec)] = &[
     ("session.conversation/v1", Codec::ContentLeaf),
     ("session.reasoning/v1", Codec::ContentLeaf),
     ("session.bytes/v1", Codec::ContentLeaf),
+    ("session.attachment-reference/v1", Codec::ContentLeaf),
     ("session.error-detail/v1", Codec::ContentLeaf),
     ("session.locator/v1", Codec::ContentLeaf),
     ("session.tool-arguments/v1", Codec::ContentLeaf),
@@ -127,7 +128,7 @@ mod tests {
             assert!(names.insert(name), "duplicate codec {name}");
             assert!(lookup(name).is_some());
         }
-        assert_eq!(content_leaf_names().count(), 8);
+        assert_eq!(content_leaf_names().count(), 9);
         for name in ["session.future/v1", "session.text/v2", ""] {
             assert!(lookup(name).is_none());
             assert!(!content_leaf(name));

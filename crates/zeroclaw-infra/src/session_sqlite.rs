@@ -73,8 +73,13 @@ impl SqliteSessionBackend {
             let raw: Option<String> = row.get(2)?;
             Ok(crate::session_backend::TimestampedMessage {
                 message: ChatMessage {
+                    tool_calls: Vec::new(),
+                    tool_result: None,
+                    reasoning_content: None,
                     role: row.get(0)?,
                     content: row.get(1)?,
+
+                    attachments: Vec::new(),
                 },
                 created_at: raw
                     .as_deref()
@@ -981,8 +986,13 @@ impl SessionBackend for SqliteSessionBackend {
         let rows = statement
             .query_map(params![session_key], |row| {
                 Ok(ChatMessage {
+                    tool_calls: Vec::new(),
+                    tool_result: None,
+                    reasoning_content: None,
                     role: row.get(0)?,
                     content: row.get(1)?,
+
+                    attachments: Vec::new(),
                 })
             })
             .map_err(std::io::Error::other)?;
@@ -1000,8 +1010,13 @@ impl SessionBackend for SqliteSessionBackend {
 
         let rows = match stmt.query_map(params![session_key], |row| {
             Ok(ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
                 role: row.get(0)?,
                 content: row.get(1)?,
+
+                attachments: Vec::new(),
             })
         }) {
             Ok(r) => r,
@@ -1033,7 +1048,14 @@ impl SessionBackend for SqliteSessionBackend {
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&Utc));
             Ok(TimestampedMessage {
-                message: ChatMessage { role, content },
+                message: ChatMessage {
+                    tool_calls: Vec::new(),
+                    tool_result: None,
+                    reasoning_content: None,
+                    role,
+                    content,
+                    attachments: Vec::new(),
+                },
                 created_at,
             })
         }) {

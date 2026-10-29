@@ -489,11 +489,13 @@ impl AzureOpenAiModelProvider {
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
+        let projected = crate::multimodal::project_attachment_metadata(messages);
+        let messages = projected.as_ref();
         messages
             .iter()
             .map(|m| {
                 if m.role == "assistant"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(m)
                     && let Some(tool_calls_value) = value.get("tool_calls")
                     && let Ok(parsed_calls) =
                         serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
@@ -532,7 +534,7 @@ impl AzureOpenAiModelProvider {
                 }
 
                 if m.role == "tool"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(m)
                 {
                     let tool_call_id = value
                         .get("tool_call_id")
@@ -1634,11 +1636,16 @@ mod tests {
         // covered in `compatible::tests::sanitize_tool_arguments_*`.
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let messages = vec![ChatMessage {
-            role: "assistant".into(),
-            content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
-                .into(),
-        }];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "trying",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_bad".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"rm -rf".into(),
+                extra_content: None,
+            }],
+            None,
+        )];
 
         let native = AzureOpenAiModelProvider::convert_messages(&messages);
         let tool_calls = native[0].tool_calls.as_ref().unwrap();
@@ -1653,11 +1660,16 @@ mod tests {
         // Companion regression: valid JSON must round-trip byte-for-byte.
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let messages = vec![ChatMessage {
-            role: "assistant".into(),
-            content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
-                .into(),
-        }];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "using",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_ok".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"pwd\"}".into(),
+                extra_content: None,
+            }],
+            None,
+        )];
 
         let native = AzureOpenAiModelProvider::convert_messages(&messages);
         let tool_calls = native[0].tool_calls.as_ref().unwrap();

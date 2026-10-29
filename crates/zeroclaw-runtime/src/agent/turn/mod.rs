@@ -355,9 +355,7 @@ fn suppress_quarantined_provider_images(
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, message)| {
-            message.role == "user" && !message.content.trim_start().starts_with("[Tool results]")
-        })
+        .find(|(_, message)| message.role == "user")
         .map(|(index, message)| (index, message.clone()));
     let mut filtered =
         zeroclaw_providers::multimodal::omit_provider_image_ids(messages, quarantined);
@@ -395,9 +393,11 @@ mod provider_image_state_tests {
     use super::*;
 
     fn image_id(payload: &str) -> zeroclaw_providers::multimodal::ProviderImageId {
-        zeroclaw_providers::multimodal::provider_image_ids(&[ChatMessage::user(format!(
-            "[IMAGE:data:image/png;base64,{payload}]"
-        ))])[0]
+        zeroclaw_providers::multimodal::provider_image_ids(&[ChatMessage::user("")
+            .with_attachments(vec![zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: format!("data:image/png;base64,{payload}").to_string(),
+            }])])[0]
     }
 
     fn image_ids(prefix: &str, count: usize) -> Vec<ProviderImageId> {
@@ -495,7 +495,12 @@ mod provider_image_state_tests {
     #[test]
     fn provider_image_recovery_view_includes_newest_unaccepted_image() {
         let image = "data:image/png;base64,AAAA";
-        let messages = vec![ChatMessage::user(format!("new [IMAGE:{image}]"))];
+        let messages = vec![ChatMessage::user("new").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: image.to_string(),
+            },
+        ])];
         let submitted = zeroclaw_providers::multimodal::provider_image_ids(&messages);
 
         let (recovery_messages, replaced) =
@@ -510,22 +515,32 @@ mod provider_image_state_tests {
     fn newest_user_resubmission_bypasses_only_its_own_suppression() {
         let image = "data:image/png;base64,AAAA";
         let messages = vec![
-            ChatMessage::user(format!("old [IMAGE:{image}]")),
+            ChatMessage::user("old").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: image.to_string(),
+                },
+            ]),
             ChatMessage::assistant("retry it"),
-            ChatMessage::user(format!("new [IMAGE:{image}]")),
+            ChatMessage::user("new").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: image.to_string(),
+                },
+            ]),
         ];
         let id = image_id("AAAA");
 
         let filtered = suppress_quarantined_provider_images(&messages, &[id], true);
 
-        assert!(!filtered[0].content.contains("[IMAGE:"));
-        assert!(filtered[2].content.contains("[IMAGE:"));
+        assert!(filtered[0].attachments.is_empty());
+        assert_eq!(filtered[2].attachments, messages[2].attachments);
 
         let continued = suppress_quarantined_provider_images(&messages, &[id], false);
         assert!(
             continued
                 .iter()
-                .all(|message| !message.content.contains("[IMAGE:"))
+                .all(|message| message.attachments.is_empty())
         );
     }
 }
@@ -1234,7 +1249,7 @@ async fn enforce_reported_budget(
     agent_alias: Option<&str>,
     turn_id: &str,
     // The multimodal boundary the NEXT request will re-normalize retained
-    // history through. A short `[IMAGE:...]` marker in raw history can become a
+    // history through. A short structured image attachments marker in raw history can become a
     // large base64 provider payload, so selection and the recount must describe
     // the same provider-facing population actually sent next — not the raw
     // transcript the marker-only estimate sees.
@@ -1324,7 +1339,7 @@ async fn enforce_reported_budget(
     refresh_prompt_anchor(&mut trimmed, next_use_native_tools);
     // Re-trim against the provider-facing population. The initial raw-based
     // selection can no-op (or under-trim) when image markers make the raw
-    // estimate look small: a short `[IMAGE:...]` marker in raw history becomes a
+    // estimate look small: a short structured image attachments marker in raw history becomes a
     // large base64 provider payload on the next request. Re-normalize the
     // retained set through the multimodal boundary; while the calibrated
     // prepared count still exceeds the budget, drop the oldest whole turn and
@@ -1581,11 +1596,9 @@ impl<'a> TurnState<'a> {
     /// the cursor.  Wraps `append_tool_round_to_history` + canonical sync.
     fn append_tool_round(
         &mut self,
-        assistant_history_content: String,
+        assistant_history_content: ChatMessage,
         native_tool_calls: &[zeroclaw_providers::ToolCall],
         individual_results: &[results_collect::ToolRoundResult],
-        tool_results: &str,
-        use_native_tools: bool,
     ) {
         let from = self.history.len();
         crate::agent::turn::history_append::append_tool_round_to_history(
@@ -1593,8 +1606,6 @@ impl<'a> TurnState<'a> {
             assistant_history_content,
             native_tool_calls,
             individual_results,
-            tool_results,
-            use_native_tools,
         );
         if let Some(ref mut canonical) = self.canonical {
             canonical.extend_from_slice(&self.history[from..]);
@@ -2090,8 +2101,8 @@ async fn run_tool_call_loop_inner<'a>(
                     // (do not append it) when it is.
                     IngressDecision::Drop { .. } => continue,
                 }
-                let msg = ChatMessage::user(steering_input.into_text());
-                has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
+                let msg = steering_input.into_message();
+                has_new_user_input |= msg.role != "tool";
                 turn_state.push_dual(msg);
             }
         }
@@ -2548,9 +2559,9 @@ async fn run_tool_call_loop_inner<'a>(
             let mut tokens_after_dispatch = tokens_before_dispatch;
             let max_iterations = crate::agent::history_trim::count_turns(turn_state.history) + 1;
             for _ in 0..max_iterations {
-                // Wire roles cannot identify turns: prompt-mode results are
-                // plain user messages. Remove precisely the durable source
-                // span, preserving prepared media and the hook suffix.
+                // The wire projection may change roles for text-only
+                // providers, so remove the durable source span from the
+                // structured history and preserve prepared media and hooks.
                 let removed_rows =
                     original_body_start..original_body_start + total_dropped_messages;
                 let mut trimmed_post_hook: Vec<_> = post_hook_snapshot
@@ -3604,7 +3615,6 @@ async fn run_tool_call_loop_inner<'a>(
 
         let CollectedResults {
             individual_results,
-            tool_results,
             detection_relevant_output,
         } = collect_tool_results(
             ordered_results,
@@ -3636,8 +3646,6 @@ async fn run_tool_call_loop_inner<'a>(
             assistant_history_content,
             &native_tool_calls,
             &individual_results,
-            &tool_results,
-            use_native_tools,
         );
 
         if cancelled_mid_batch {
@@ -5585,7 +5593,7 @@ mod reported_budget_tests {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
 
         // `estimate_history_tokens` now charges the same fixed per-image cost
-        // whether a `[IMAGE:...]` marker holds a path or the base64 payload
+        // whether a structured image attachments marker holds a path or the base64 payload
         // preparation resolves it to, so the raw and prepared populations for
         // this history are equal by design (see `IMAGE_TOKEN_ESTIMATE`).
         // Selection and the emitted recount must still describe the
@@ -5603,11 +5611,14 @@ mod reported_budget_tests {
             STANDARD.decode(PNG_B64).expect("valid PNG fixture"),
         )
         .unwrap();
-        let marker = format!("[IMAGE:{}]", image_path.display());
+        let attachment = zeroclaw_api::media::AttachmentReference {
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+            target: image_path.display().to_string(),
+        };
         let big = "x".repeat(2000);
         let mut history = vec![
             ChatMessage::system("system"),
-            ChatMessage::user(format!("turn1 {marker}")),
+            ChatMessage::user("turn1").with_attachments(vec![attachment]),
             ChatMessage::assistant("a1".to_string()),
             ChatMessage::user(format!("turn2 {big}")),
             ChatMessage::assistant("a2".to_string()),
@@ -6474,7 +6485,12 @@ mod active_route_context_tests {
             ChatMessage::system("system"),
             ChatMessage::user(format!("old question {large}")),
             ChatMessage::assistant(format!("old answer {large}")),
-            ChatMessage::user("inspect [IMAGE:/tmp/image.png]"),
+            ChatMessage::user("inspect").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "/tmp/image.png".to_string(),
+                },
+            ]),
         ];
         let tokens_before = crate::agent::history::estimate_history_tokens(&history);
         assert!(tokens_before < text_limits.context_token_budget);
@@ -6809,9 +6825,9 @@ vision_model_provider = "custom.vision"
                 // The producer declares its image; under the attachment
                 // contract nothing in the result text is promoted.
                 Ok(ToolResult::ok("here it is").with_attachment(
-                    zeroclaw_api::media::RenderedMarker {
+                    zeroclaw_api::media::AttachmentReference {
                         target: self.path.clone(),
-                        kind: zeroclaw_api::media::MarkerKind::Image,
+                        kind: zeroclaw_api::media::AttachmentKind::Image,
                     },
                 ))
             }
@@ -8102,7 +8118,9 @@ mod sop_step_reassembly_tests {
                     request
                         .messages
                         .iter()
-                        .any(|m| m.content.contains("data:image/png;base64,")),
+                        .any(|m| m.attachments.iter().any(|attachment| attachment
+                            .target
+                            .starts_with("data:image/png;base64,"))),
                     self.2,
                     "summary must apply quarantine for the hook-selected model"
                 );
@@ -8133,7 +8151,9 @@ mod sop_step_reassembly_tests {
                 assert!(
                     messages
                         .iter()
-                        .any(|m| m.content.contains("data:image/png;base64,")),
+                        .any(|m| m.attachments.iter().any(|attachment| attachment
+                            .target
+                            .starts_with("data:image/png;base64,"))),
                     "hooks must see prepared images"
                 );
                 if self.cancel {
@@ -8160,11 +8180,16 @@ mod sop_step_reassembly_tests {
             ],
         )
         .unwrap();
-        let prompt = format!("describe [IMAGE:{}]", image.display());
+        let prompt = ChatMessage::user("describe").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image.display()).to_string(),
+            },
+        ]);
         let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
         let mut id_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
         let prepared = prepare_messages_for_iteration(
-            &[ChatMessage::user(prompt.clone())],
+            std::slice::from_ref(&prompt),
             &multimodal,
             false,
             Some(&mut id_cache),
@@ -8197,7 +8222,7 @@ mod sop_step_reassembly_tests {
                 change_model,
             }));
             let budget = ExecutionTreeBudget::root(1);
-            let mut history = vec![ChatMessage::user(prompt.clone())];
+            let mut history = vec![prompt.clone()];
             let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
             let mut provider_image_state = ProviderImageState::default();
             provider_image_state.record_recovery(
@@ -8235,7 +8260,7 @@ mod sop_step_reassembly_tests {
                 assert!(!response.contains("maximum tool iterations"));
             }
             assert_eq!(
-                history[0].content, prompt,
+                history[0].content, prompt.content,
                 "preparation must not rewrite durable user history"
             );
             assert_eq!(
@@ -8244,7 +8269,7 @@ mod sop_step_reassembly_tests {
                 "hook cancellation must prevent dispatch"
             );
         }
-        let mut history = vec![ChatMessage::user(prompt)];
+        let mut history = vec![prompt.clone()];
         let result = run_budgeted_test_loop_with_hooks(
             &TextProvider,
             &mut history,
@@ -9972,12 +9997,12 @@ mod tool_lifecycle_abandonment_tests {
             requests: Mutex::new(Vec::new()),
             error_message: "rejected request",
         };
-        let retained_user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+        let retained_user = ChatMessage::user("inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]);
         let mut history = vec![
             ChatMessage::system("You are helpful."),
             ChatMessage::user(format!("discarded-old-turn {}", "old ".repeat(10_000))),
             ChatMessage::assistant("old answer"),
-            ChatMessage::user(retained_user),
+            retained_user.clone(),
         ];
         let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
         let mut provider_state = ProviderImageState::default();
@@ -10025,11 +10050,9 @@ mod tool_lifecycle_abandonment_tests {
                 .iter()
                 .all(|m| !m.content.contains("discarded-old-turn"))
         );
-        assert!(
-            history
-                .iter()
-                .any(|m| m.role == "user" && m.content == retained_user)
-        );
+        assert!(history.iter().any(|m| m.role == "user"
+            && m.content == retained_user.content
+            && m.attachments == retained_user.attachments));
     }
 
     #[tokio::test]
@@ -10039,11 +10062,8 @@ mod tool_lifecycle_abandonment_tests {
                 requests: Mutex::new(Vec::new()),
                 error_message: "rejected request",
             };
-            let user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
-            let mut history = vec![
-                ChatMessage::system("You are helpful."),
-                ChatMessage::user(user),
-            ];
+            let user = ChatMessage::user("inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]);
+            let mut history = vec![ChatMessage::system("You are helpful."), user.clone()];
             let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
             let mut provider_state = ProviderImageState::default();
             let registry = registry_with(Vec::new());
@@ -10086,11 +10106,9 @@ mod tool_lifecycle_abandonment_tests {
                 let error = result.expect_err("stateless callers keep the original error");
                 assert!(error.to_string().contains("rejected request"));
             }
-            assert!(
-                history
-                    .iter()
-                    .any(|message| message.role == "user" && message.content == user)
-            );
+            assert!(history.iter().any(|message| message.role == "user"
+                && message.content == user.content
+                && message.attachments == user.attachments));
             assert!(
                 history
                     .iter()
@@ -10106,12 +10124,12 @@ mod tool_lifecycle_abandonment_tests {
             requests: Mutex::new(Vec::new()),
             error_message: "prompt is too long",
         };
-        let user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+        let user = ChatMessage::user("inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]);
         let mut history = vec![
             ChatMessage::system("You are helpful."),
             ChatMessage::user(format!("old-context {}", "old ".repeat(10_000))),
             ChatMessage::assistant("old answer"),
-            ChatMessage::user(user),
+            user.clone(),
         ];
         let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
         let mut provider_state = ProviderImageState::default();
@@ -10155,11 +10173,9 @@ mod tool_lifecycle_abandonment_tests {
         );
         let route = ProviderImageState::route("scripted", "scripted-model");
         assert!(provider_state.quarantined(&route).is_empty());
-        assert!(
-            history
-                .iter()
-                .any(|message| message.role == "user" && message.content == user)
-        );
+        assert!(history.iter().any(|message| message.role == "user"
+            && message.content == user.content
+            && message.attachments == user.attachments));
     }
 
     #[tokio::test]

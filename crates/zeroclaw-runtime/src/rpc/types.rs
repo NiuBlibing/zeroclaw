@@ -1473,7 +1473,7 @@ rpc_type! {
     /// Result for a single file in a `file/attach` response.
     pub struct FileEntryResult {
         pub ref_id: String,
-        pub marker: String,
+        pub kind: zeroclaw_api::media::AttachmentKind,
         pub workspace_path: String,
         pub size_bytes: u64,
         pub deduplicated: bool,

@@ -1553,9 +1553,7 @@ fn provider_exhausted_attrs(
 }
 
 fn is_context_turn_boundary(message: &ChatMessage) -> bool {
-    message.role == "user"
-        && !zeroclaw_api::tool_carrier::is_tool_result_carrier(&message.role, &message.content)
-        && !message.is_pruned_context_separator()
+    message.role == "user" && !message.is_pruned_context_separator()
 }
 
 fn context_truncation_limit(messages: &[ChatMessage]) -> &'static str {
@@ -10228,33 +10226,28 @@ mod tests {
     }
 
     fn native_tool_call(ids: &[&str]) -> ChatMessage {
-        let tool_calls = ids
-            .iter()
-            .map(|id| {
-                serde_json::json!({
-                    "id": id,
-                    "name": "shell",
-                    "arguments": "{}",
+        ChatMessage::assistant_tool_calls(
+            "",
+            ids.iter()
+                .map(|id| crate::ToolCall {
+                    id: (*id).into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
                 })
-            })
-            .collect::<Vec<_>>();
-        ChatMessage::assistant(
-            serde_json::json!({
-                "content": "",
-                "tool_calls": tool_calls,
-            })
-            .to_string(),
+                .collect(),
+            None,
         )
     }
 
     fn native_tool_result(id: &str) -> ChatMessage {
-        ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": id,
-                "content": format!("result for {id}"),
-            })
-            .to_string(),
-        )
+        ChatMessage::tool_result(crate::ToolResultMessage {
+            tool_call_id: id.into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            content: format!("result for {id}"),
+            attachments: Vec::new(),
+        })
     }
 
     fn context_overflow_native_tool_history() -> Vec<ChatMessage> {
@@ -10338,7 +10331,13 @@ mod tests {
             ChatMessage::assistant("old response"),
             ChatMessage::user("run a prompt tool"),
             ChatMessage::assistant("<tool_call>...</tool_call>"),
-            ChatMessage::user("[Tool results]\n<tool_result>ok</tool_result>"),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call-a").to_string(),
+                tool_name: ("shell").to_string(),
+                content: ("ok").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            }),
             ChatMessage::assistant("tool summary"),
             ChatMessage::user("current question"),
         ];

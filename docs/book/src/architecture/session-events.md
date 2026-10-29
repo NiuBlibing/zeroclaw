@@ -51,6 +51,26 @@ effect has one initial outcome: completed, failed, verified cancelled or unknown
 Progress checkpoints preserve durable partial text, reasoning, media and tool
 output. Content still in an uncommitted memory buffer cannot survive a crash.
 
+Live conversation messages and tool results carry media references in their
+`attachments` fields, with an explicit kind and target. Channel ingress,
+uploads, steering, context transforms, recovery and provider preparation keep
+those fields separate from text. Text such as `[IMAGE:/path]` has no attachment
+meaning during normal execution. Only the legacy import path translates the
+previous text syntax and tool attachment declarations into structured fields.
+Runtime messages keep tool calls, result identity/outcome and opaque reasoning
+in typed fields; `content` is always literal text. Context replay, budgeting,
+trimming and media preparation operate on those fields. Only provider/channel
+adapters render their required wire protocol. File registration does not store
+or validate a duplicate byte length; payload bytes are the content owner.
+
+Canonical tool exchanges use `AssistantToolCalls` and `ToolResults` for both
+native and text-only model protocols. Tool results retain call IDs, tool names,
+observed success, body text and attachments. Text-only provider requests render
+temporary text tool blocks in the provider adapter; history never uses a `[Tool results]`
+header to distinguish tool output from user input. Slack code snippets without
+a file source remain ordinary text. Discord embed/component markup remains a
+Discord-specific outbound presentation protocol in the message body.
+
 Gemini CLI and Kilo CLI drain stdout and stderr while writing stdin. Received
 UTF-8 stdout is checkpointed before process exit, including output received
 before a nonzero exit, signal, decode error or timeout. Text is checkpointed
@@ -595,6 +615,13 @@ Reference traversal and erasure use that registry; SQLite derives its content
 body projection from the same registrations as JSONL. Adding a codec requires
 one registration, with its decoder when it has a typed schema. Persisted codec
 names and bytes remain unchanged.
+
+`session.attachment-reference/v1` is an erasable content leaf for a typed
+attachment reference already admitted by the Gateway. This change does not
+add raw-file registration or history recovery for Email, Matrix, WhatsApp, ACP,
+or RPC; those paths remain the #9488 scope. Queries never infer references from
+arbitrary file bytes or body markers, nor reuse a later input's metadata for an
+earlier message. Erased references or metadata remain unavailable.
 
 Native session deletion appends `SessionClosed`, removes the active session,
 and hides it from ordinary lists. RPC and Gateway responses report

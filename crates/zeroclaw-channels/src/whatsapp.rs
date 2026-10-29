@@ -950,9 +950,6 @@ impl WhatsAppChannel {
     }
 }
 
-/// The marker kinds the Cloud API backend extracts from outgoing text.
-const LOCATION_MARKER_KIND: &[&str] = &["LOCATION"];
-
 fn text_message_body(to: &str, content: &str) -> serde_json::Value {
     serde_json::json!({
         "messaging_product": "whatsapp",
@@ -1013,42 +1010,14 @@ impl Channel for WhatsAppChannel {
             None => &message.recipient,
         };
 
-        // Native location pins ([LOCATION:...]) are the only marker kind this
-        // backend can deliver; markers of any other kind stay in the text.
-        let (text, location_markers) =
-            crate::util::parse_attachment_markers_of_kinds(&message.content, LOCATION_MARKER_KIND);
-
-        if location_markers.is_empty() {
-            // No pins: send the content untouched (extraction trims the text).
-            return self
-                .post_message(text_message_body(to, &message.content))
-                .await;
+        if !message.content.is_empty() || message.locations.is_empty() {
+            self.post_message(text_message_body(to, &message.content))
+                .await?;
         }
-
-        if !text.is_empty() {
-            self.post_message(text_message_body(to, &text)).await?;
-        }
-
-        let mut failed_markers = 0usize;
-        for (_, target) in &location_markers {
-            match crate::util::WhatsAppLocation::parse(target) {
-                Some(loc) => self.post_message(location_message_body(to, &loc)).await?,
-                None => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"reason": "invalid_location"})),
-                        "whatsapp: location marker target is malformed or outside WGS84 range"
-                    );
-                    failed_markers += 1;
-                }
-            }
-        }
-        if failed_markers == location_markers.len() && text.is_empty() {
-            anyhow::bail!(
-                "WhatsApp location marker must be `lat,lng[,name[,address]]` with in-range WGS84 coordinates"
-            );
+        for location in &message.locations {
+            anyhow::ensure!(location.is_valid(), "invalid_location");
+            self.post_message(location_message_body(to, location))
+                .await?;
         }
 
         Ok(())
@@ -1508,7 +1477,7 @@ mod tests {
 
         let msgs = ch.parse_webhook_payload(&payload);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "[Location: 40.712800, -74.006000 — NYC]");
+        assert_eq!(msgs[0].content, "Location: 40.712800, -74.006000 — NYC");
     }
 
     #[test]
@@ -2243,7 +2212,7 @@ mod tests {
         });
         let msgs = ch.parse_webhook_payload(&payload);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "[Location: 40.712800, -74.006000]");
+        assert_eq!(msgs[0].content, "Location: 40.712800, -74.006000");
     }
 
     #[test]

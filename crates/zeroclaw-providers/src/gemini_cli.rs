@@ -1,5 +1,5 @@
 //! Gemini CLI subprocess model_provider.
-use crate::traits::{ChatRequest, ChatResponse, ModelProvider};
+use crate::traits::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use tokio::process::Command;
@@ -158,6 +158,28 @@ impl ModelProvider for GeminiCliModelProvider {
         };
 
         self.invoke_cli(&full_message, model).await
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        let mut messages = messages.to_vec();
+        crate::tool_protocol::render_text_tool_protocol(&mut messages)?;
+        let projected = crate::multimodal::project_attachment_metadata(&messages);
+        let system = projected
+            .iter()
+            .find(|message| message.role == "system")
+            .map(|message| message.content.as_str());
+        let last_user = projected
+            .iter()
+            .rfind(|message| message.role == "user")
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        self.chat_with_system(system, last_user, model, temperature)
+            .await
     }
 
     async fn chat(

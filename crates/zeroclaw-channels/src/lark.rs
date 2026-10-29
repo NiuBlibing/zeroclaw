@@ -531,28 +531,16 @@ enum LarkOutgoingMediaKind {
     File { file_type: &'static str },
 }
 
-impl LarkOutgoingMediaKind {
-    fn from_marker_kind(kind: &str) -> Option<Self> {
-        match kind.trim().to_ascii_uppercase().as_str() {
-            "IMAGE" | "PHOTO" => Some(Self::Image),
-            "DOCUMENT" | "FILE" => Some(Self::File {
-                file_type: "stream",
-            }),
-            "VIDEO" => Some(Self::File { file_type: "mp4" }),
-            "AUDIO" | "VOICE" => Some(Self::File { file_type: "opus" }),
-            _ => None,
-        }
-    }
-}
+impl LarkOutgoingMediaKind {}
 
 #[derive(Debug, Clone)]
-struct LarkOutgoingMediaMarker {
+struct LarkOutgoingAttachment {
     kind: LarkOutgoingMediaKind,
     target: String,
 }
 
 #[derive(Debug, Clone)]
-struct LarkResolvedMediaMarker {
+struct LarkResolvedAttachment {
     kind: LarkOutgoingMediaKind,
     path: PathBuf,
     file_name: String,
@@ -564,17 +552,7 @@ struct LarkPreparedMediaMessage {
     content: serde_json::Value,
 }
 
-fn lark_outgoing_media_from_marker(
-    kind: String,
-    target: String,
-) -> Option<LarkOutgoingMediaMarker> {
-    Some(LarkOutgoingMediaMarker {
-        kind: LarkOutgoingMediaKind::from_marker_kind(&kind)?,
-        target,
-    })
-}
-
-fn validate_lark_marker_target(
+fn validate_lark_attachment_target(
     target: &str,
     workspace_dir: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
@@ -650,11 +628,11 @@ fn validate_lark_marker_target(
     Ok(candidate)
 }
 
-fn resolve_lark_media_marker(
-    marker: &LarkOutgoingMediaMarker,
+fn resolve_lark_attachment(
+    marker: &LarkOutgoingAttachment,
     workspace_dir: Option<&Path>,
-) -> anyhow::Result<LarkResolvedMediaMarker> {
-    let path = validate_lark_marker_target(&marker.target, workspace_dir)?;
+) -> anyhow::Result<LarkResolvedAttachment> {
+    let path = validate_lark_attachment_target(&marker.target, workspace_dir)?;
     let metadata = std::fs::metadata(&path).map_err(|err| {
         anyhow::Error::msg(format!(
             "read Lark/Feishu marker target metadata failed: {err}"
@@ -672,14 +650,14 @@ fn resolve_lark_media_marker(
         .unwrap_or("attachment")
         .to_string();
 
-    Ok(LarkResolvedMediaMarker {
+    Ok(LarkResolvedAttachment {
         kind: marker.kind,
         path,
         file_name,
     })
 }
 
-async fn build_lark_image_upload_form(marker: &LarkResolvedMediaMarker) -> anyhow::Result<Form> {
+async fn build_lark_image_upload_form(marker: &LarkResolvedAttachment) -> anyhow::Result<Form> {
     let bytes = fs::read(&marker.path).await.map_err(|err| {
         anyhow::Error::msg(format!(
             "read Lark/Feishu image marker target failed: {err}"
@@ -692,7 +670,7 @@ async fn build_lark_image_upload_form(marker: &LarkResolvedMediaMarker) -> anyho
 }
 
 async fn build_lark_file_upload_form(
-    marker: &LarkResolvedMediaMarker,
+    marker: &LarkResolvedAttachment,
     file_type: &'static str,
 ) -> anyhow::Result<Form> {
     let bytes = fs::read(&marker.path).await.map_err(|err| {
@@ -767,7 +745,7 @@ pub struct LarkChannel {
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
-    /// Workspace root that bounds outbound media marker reads. Resolved by
+    /// Workspace root that bounds outbound attachment reads. Resolved by
     /// the orchestrator from `Config::channel_workspace_dir("lark.<alias>")`.
     workspace_dir: Option<PathBuf>,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
@@ -1658,6 +1636,7 @@ impl LarkChannel {
                     }
 
                     // Decode content by type (mirrors clawdbot-feishu parsing)
+                    let mut attachments = Vec::new();
                     let (text, post_mentioned_open_ids) = match lark_msg.message_type.as_str() {
                         "text" => {
                             let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
@@ -1682,11 +1661,11 @@ impl LarkChannel {
                                 Some(k) => k.to_string(),
                                 None => { ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WS: image message missing image_key"); continue; }
                             };
-                            match self.download_image_as_marker(&lark_msg.message_id, &image_key).await {
+                            match self.download_image_attachment(&lark_msg.message_id, &image_key, &mut attachments).await {
                                 Some(marker) => (marker, Vec::new()),
                                 None => {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"image_key": image_key})), "WS: failed to download image");
-                                    (format!("[IMAGE:{image_key} | download failed]"), Vec::new())
+                                    (format!("Image download failed: {image_key}"), Vec::new())
                                 }
                             }
                         }
@@ -1703,11 +1682,11 @@ impl LarkChannel {
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("unknown_file")
                                 .to_string();
-                            match self.download_file_as_content(&lark_msg.message_id, &file_key, &file_name).await {
+                            match self.download_file_as_content(&lark_msg.message_id, &file_key, &file_name, &mut attachments).await {
                                 Some(content) => (content, Vec::new()),
                                 None => {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"file_key": file_key})), "WS: failed to download file");
-                                    (format!("[ATTACHMENT:{file_name} | download failed]"), Vec::new())
+                                    (format!("Attachment download failed: {file_name}"), Vec::new())
                                 }
                             }
                         }
@@ -1732,7 +1711,7 @@ impl LarkChannel {
                     };
 
                     let text = text.trim().to_string();
-                    if text.is_empty() { continue; }
+                    if text.is_empty() && attachments.is_empty() { continue; }
 
                     // Group-chat: only respond when explicitly @-mentioned
                     let bot_open_id = self.resolved_bot_open_id();
@@ -1792,7 +1771,7 @@ impl LarkChannel {
                             .as_secs(),
                         thread_ts: None,
                         interruption_scope_id: None,
-                    attachments: vec![],
+                    attachments,
                         subject: None,
 
                         ..Default::default()};
@@ -1881,8 +1860,13 @@ impl LarkChannel {
         *cached = None;
     }
 
-    /// Download an image from the Lark API and return an `[IMAGE:data:...]` marker string.
-    async fn download_image_as_marker(&self, message_id: &str, image_key: &str) -> Option<String> {
+    /// Download an image from the Lark API and return a structured attachment.
+    async fn download_image_attachment(
+        &self,
+        message_id: &str,
+        image_key: &str,
+        attachments: &mut Vec<zeroclaw_api::media::MediaAttachment>,
+    ) -> Option<String> {
         let url = self.image_resource_url(message_id, image_key);
         let mut retried_token = false;
 
@@ -2011,7 +1995,14 @@ impl LarkChannel {
             }
 
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            return Some(format!("[IMAGE:data:{mime};base64,{encoded}]"));
+            attachments.push(zeroclaw_api::media::MediaAttachment {
+                reference: Some(zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: format!("data:{mime};base64,{encoded}"),
+                }),
+                ..Default::default()
+            });
+            return Some(String::new());
         }
     }
 
@@ -2022,6 +2013,7 @@ impl LarkChannel {
         message_id: &str,
         file_key: &str,
         file_name: &str,
+        attachments: &mut Vec<zeroclaw_api::media::MediaAttachment>,
     ) -> Option<String> {
         let token = match self.get_tenant_access_token().await {
             Ok(t) => t,
@@ -2084,7 +2076,7 @@ impl LarkChannel {
                 "file too large for : bytes exceeds limit"
             );
             return Some(format!(
-                "[ATTACHMENT:{file_name} | size={cl} bytes | too large to inline]"
+                "File unavailable: {file_name} ({cl} bytes, exceeds download limit)"
             ));
         }
 
@@ -2129,8 +2121,27 @@ impl LarkChannel {
             && LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str())
         {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            return Some(format!("[IMAGE:data:{mime};base64,{encoded}]"));
+            attachments.push(zeroclaw_api::media::MediaAttachment {
+                reference: Some(zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: format!("data:{mime};base64,{encoded}"),
+                }),
+                ..Default::default()
+            });
+            return Some(String::new());
         }
+
+        attachments.push(zeroclaw_api::media::MediaAttachment {
+            file_name: file_name.to_string(),
+            reference: Some(zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Document,
+                target: format!(
+                    "data:{content_type};base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(&bytes)
+                ),
+            }),
+            ..Default::default()
+        });
 
         // If the file looks like text, inline it
         if bytes.len() <= LARK_FILE_MAX_BYTES
@@ -2146,11 +2157,11 @@ impl LarkChannel {
             let text = String::from_utf8_lossy(&bytes);
             let truncated = lark_inline_text_file_preview(text);
             let ext = file_name.rsplit('.').next().unwrap_or("text");
-            return Some(format!("[FILE:{file_name}]\n```{ext}\n{truncated}\n```"));
+            return Some(format!("{file_name}\n```{ext}\n{truncated}\n```"));
         }
 
         Some(format!(
-            "[ATTACHMENT:{file_name} | mime={content_type} | size={} bytes]",
+            "File attached: {file_name} ({content_type}, {} bytes)",
             bytes.len()
         ))
     }
@@ -2547,7 +2558,7 @@ impl LarkChannel {
     async fn upload_lark_image(
         &self,
         token: &mut String,
-        marker: &LarkResolvedMediaMarker,
+        marker: &LarkResolvedAttachment,
     ) -> anyhow::Result<String> {
         let url = format!("{}/im/v1/images", self.api_base());
         let form = build_lark_image_upload_form(marker).await?;
@@ -2581,7 +2592,7 @@ impl LarkChannel {
     async fn upload_lark_file(
         &self,
         token: &mut String,
-        marker: &LarkResolvedMediaMarker,
+        marker: &LarkResolvedAttachment,
         file_type: &'static str,
     ) -> anyhow::Result<String> {
         let url = format!("{}/im/v1/files", self.api_base());
@@ -2613,10 +2624,10 @@ impl LarkChannel {
             .ok_or_else(|| anyhow::Error::msg("Lark/Feishu file upload returned no file_key"))
     }
 
-    async fn prepare_lark_media_marker(
+    async fn prepare_lark_attachment(
         &self,
         token: &mut String,
-        marker: &LarkResolvedMediaMarker,
+        marker: &LarkResolvedAttachment,
     ) -> anyhow::Result<LarkPreparedMediaMessage> {
         let (msg_type, content) = match marker.kind {
             LarkOutgoingMediaKind::Image => {
@@ -2718,6 +2729,7 @@ impl LarkChannel {
             .and_then(|m| m.as_str())
             .unwrap_or("");
 
+        let mut attachments = Vec::new();
         let (text, post_mentioned_open_ids): (String, Vec<String>) = match msg_type {
             "text" => {
                 let extracted = serde_json::from_str::<serde_json::Value>(content_str)
@@ -2747,7 +2759,9 @@ impl LarkChannel {
                     });
                 match image_key {
                     Some(key) => {
-                        let marker = match self.download_image_as_marker(evt_message_id, &key).await
+                        let marker = match self
+                            .download_image_attachment(evt_message_id, &key, &mut attachments)
+                            .await
                         {
                             Some(m) => m,
                             None => {
@@ -2761,7 +2775,7 @@ impl LarkChannel {
                                     .with_attrs(::serde_json::json!({"key": key})),
                                     "failed to download image"
                                 );
-                                format!("[IMAGE:{key} | download failed]")
+                                format!("Image download failed: {key}")
                             }
                         };
                         (marker, Vec::new())
@@ -2793,7 +2807,12 @@ impl LarkChannel {
                 match file_key {
                     Some(key) => {
                         let content = match self
-                            .download_file_as_content(evt_message_id, &key, &file_name)
+                            .download_file_as_content(
+                                evt_message_id,
+                                &key,
+                                &file_name,
+                                &mut attachments,
+                            )
                             .await
                         {
                             Some(c) => c,
@@ -2808,7 +2827,7 @@ impl LarkChannel {
                                     .with_attrs(::serde_json::json!({"key": key})),
                                     "failed to download file"
                                 );
-                                format!("[ATTACHMENT:{file_name} | download failed]")
+                                format!("Attachment download failed: {file_name}")
                             }
                         };
                         (content, Vec::new())
@@ -2888,7 +2907,7 @@ impl LarkChannel {
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
-            attachments: vec![],
+            attachments,
             subject: None,
 
             ..Default::default()
@@ -2916,18 +2935,37 @@ impl Channel for LarkChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mut token = self.get_tenant_access_token().await?;
         let url = self.send_message_url(&message.recipient);
-        let (text_content, raw_markers) = super::util::parse_attachment_markers(&message.content);
-        let markers = raw_markers
-            .into_iter()
-            .filter_map(|(kind, target)| lark_outgoing_media_from_marker(kind, target))
+        let text_content = message.content.clone();
+        let markers = message
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                let reference = attachment.reference.as_ref()?;
+                let kind = match reference.kind {
+                    zeroclaw_api::media::AttachmentKind::Image => LarkOutgoingMediaKind::Image,
+                    zeroclaw_api::media::AttachmentKind::Audio => {
+                        LarkOutgoingMediaKind::File { file_type: "opus" }
+                    }
+                    zeroclaw_api::media::AttachmentKind::Video => {
+                        LarkOutgoingMediaKind::File { file_type: "mp4" }
+                    }
+                    zeroclaw_api::media::AttachmentKind::Document => LarkOutgoingMediaKind::File {
+                        file_type: "stream",
+                    },
+                };
+                Some(LarkOutgoingAttachment {
+                    kind,
+                    target: reference.target.clone(),
+                })
+            })
             .collect::<Vec<_>>();
         let resolved_markers = markers
             .iter()
-            .map(|marker| resolve_lark_media_marker(marker, self.workspace_dir.as_deref()))
+            .map(|marker| resolve_lark_attachment(marker, self.workspace_dir.as_deref()))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let mut prepared_media = Vec::with_capacity(resolved_markers.len());
         for marker in &resolved_markers {
-            prepared_media.push(self.prepare_lark_media_marker(&mut token, marker).await?);
+            prepared_media.push(self.prepare_lark_attachment(&mut token, marker).await?);
         }
 
         if !text_content.is_empty() || markers.is_empty() {
@@ -3412,20 +3450,7 @@ impl Channel for LarkChannel {
         self.last_draft_edit.lock().await.remove(message_id);
 
         let mut token = self.get_tenant_access_token().await?;
-        let (text_content, raw_markers) = super::util::parse_attachment_markers(text);
-        let markers = raw_markers
-            .into_iter()
-            .filter_map(|(kind, target)| lark_outgoing_media_from_marker(kind, target))
-            .collect::<Vec<_>>();
-        let resolved_markers = markers
-            .iter()
-            .map(|marker| resolve_lark_media_marker(marker, self.workspace_dir.as_deref()))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let mut prepared_media = Vec::with_capacity(resolved_markers.len());
-        for marker in &resolved_markers {
-            prepared_media.push(self.prepare_lark_media_marker(&mut token, marker).await?);
-        }
-
+        let text_content = text.to_string();
         let chunks = split_markdown_chunks(&text_content, LARK_CARD_MARKDOWN_MAX_BYTES);
         let first = chunks.first().copied().unwrap_or("");
         self.patch_card_content(message_id, first).await?;
@@ -3437,11 +3462,6 @@ impl Channel for LarkChannel {
                 self.send_json_with_token_refresh(&url, &mut token, &body, "finalize_draft chunk")
                     .await?;
             }
-        }
-
-        for media in &prepared_media {
-            self.send_lark_media_message(&mut token, recipient, media)
-                .await?;
         }
 
         Ok(())
@@ -4773,36 +4793,13 @@ mod tests {
     }
 
     #[test]
-    fn lark_outgoing_media_kind_maps_shared_marker_kinds() {
-        assert_eq!(
-            LarkOutgoingMediaKind::from_marker_kind("image"),
-            Some(LarkOutgoingMediaKind::Image)
-        );
-        assert_eq!(
-            LarkOutgoingMediaKind::from_marker_kind("document"),
-            Some(LarkOutgoingMediaKind::File {
-                file_type: "stream"
-            })
-        );
-        assert_eq!(
-            LarkOutgoingMediaKind::from_marker_kind("video"),
-            Some(LarkOutgoingMediaKind::File { file_type: "mp4" })
-        );
-        assert_eq!(
-            LarkOutgoingMediaKind::from_marker_kind("voice"),
-            Some(LarkOutgoingMediaKind::File { file_type: "opus" })
-        );
-        assert_eq!(LarkOutgoingMediaKind::from_marker_kind("embed"), None);
-    }
-
-    #[test]
     fn lark_marker_target_accepts_workspace_relative_file() {
         let workspace = tempfile::tempdir().expect("tempdir");
         let file = workspace.path().join("image.png");
         std::fs::write(&file, b"png").expect("write file");
 
-        let resolved =
-            validate_lark_marker_target("image.png", Some(workspace.path())).expect("valid target");
+        let resolved = validate_lark_attachment_target("image.png", Some(workspace.path()))
+            .expect("valid target");
 
         assert_eq!(resolved, file.canonicalize().expect("canonical file"));
     }
@@ -4814,7 +4811,7 @@ mod tests {
         let file = outside.path().join("secret.txt");
         std::fs::write(&file, b"secret").expect("write outside file");
 
-        let err = validate_lark_marker_target(&file.to_string_lossy(), Some(workspace.path()))
+        let err = validate_lark_attachment_target(&file.to_string_lossy(), Some(workspace.path()))
             .expect_err("outside workspace must be refused");
 
         assert!(
@@ -4827,9 +4824,11 @@ mod tests {
     fn lark_marker_target_rejects_url_schemes() {
         let workspace = tempfile::tempdir().expect("workspace");
 
-        let err =
-            validate_lark_marker_target("https://example.com/image.png", Some(workspace.path()))
-                .expect_err("url target must be refused");
+        let err = validate_lark_attachment_target(
+            "https://example.com/image.png",
+            Some(workspace.path()),
+        )
+        .expect_err("url target must be refused");
 
         assert!(
             err.to_string().contains("disallowed scheme"),
@@ -7652,7 +7651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lark_send_uploads_workspace_image_marker_after_text() {
+    async fn lark_send_uploads_workspace_image_attachment_after_text() {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, ResponseTemplate};
 
@@ -7701,7 +7700,15 @@ mod tests {
             .with_workspace_dir(workspace.path().to_path_buf());
         ch.api_base_override = Some(mock_server.uri());
 
-        let message = SendMessage::new("caption [IMAGE:photo.png]", "oc_test_chat_id");
+        let message = SendMessage::new("caption", "oc_test_chat_id").with_attachments(vec![
+            zeroclaw_api::media::MediaAttachment {
+                reference: Some(zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "photo.png".into(),
+                }),
+                ..Default::default()
+            },
+        ]);
         Channel::send(&ch, &message)
             .await
             .expect("Channel::send should upload and send image marker");
@@ -7790,7 +7797,15 @@ mod tests {
             .with_workspace_dir(workspace.path().to_path_buf());
         ch.api_base_override = Some(mock_server.uri());
 
-        let message = SendMessage::new("see attached [DOCUMENT:brief.txt]", "oc_test_chat_id");
+        let message = SendMessage::new("see attached", "oc_test_chat_id").with_attachments(vec![
+            zeroclaw_api::media::MediaAttachment {
+                reference: Some(zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Document,
+                    target: "brief.txt".into(),
+                }),
+                ..Default::default()
+            },
+        ]);
         Channel::send(&ch, &message)
             .await
             .expect("Channel::send should upload and send document marker");
@@ -7822,94 +7837,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lark_finalize_draft_cleans_marker_text_and_sends_media() {
-        use wiremock::matchers::{method, path, path_regex, query_param};
+    async fn lark_finalize_draft_treats_media_markers_as_literal_text() {
+        use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
-
-        let mock_server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/auth/v3/tenant_access_token/internal"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "code": 0,
-                "tenant_access_token": "test-tenant-token",
-                "expire": 7200
+                "code": 0, "tenant_access_token": "test-token", "expire": 7200
             })))
-            .mount(&mock_server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/im/v1/images"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "code": 0,
-                "data": { "image_key": "draft_img_key" }
-            })))
-            .expect(1)
-            .mount(&mock_server)
+            .mount(&server)
             .await;
         Mock::given(method("PATCH"))
-            .and(path_regex("/im/v1/messages/om_draft_media"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
+            .and(path("/im/v1/messages/om_draft_media"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":0})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut channel = make_channel().with_streaming(StreamMode::Partial, 500);
+        channel.api_base_override = Some(server.uri());
+        channel
+            .finalize_draft(
+                "oc_test_chat_id",
+                "om_draft_media",
+                "literal [IMAGE:draft.png]",
+                false,
             )
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/im/v1/messages"))
-            .and(query_param("receive_id_type", "chat_id"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "code": 0,
-                "data": { "message_id": "om_test_message_id" }
-            })))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let workspace = tempfile::tempdir().expect("workspace");
-        std::fs::write(workspace.path().join("draft.png"), b"\x89PNG\r\n\x1a\n")
-            .expect("write image");
-        let mut ch = make_channel()
-            .with_streaming(StreamMode::Partial, 500)
-            .with_workspace_dir(workspace.path().to_path_buf());
-        ch.api_base_override = Some(mock_server.uri());
-
-        ch.finalize_draft(
-            "oc_test_chat_id",
-            "om_draft_media",
-            "final caption [IMAGE:draft.png]",
-            false,
-        )
-        .await
-        .expect("finalize_draft should clean text and send image");
-
-        let requests = mock_server
-            .received_requests()
             .await
-            .expect("mock server should record requests");
+            .expect("finalize literal draft");
+        let requests = server.received_requests().await.unwrap();
         let patch = requests
             .iter()
             .find(|request| request.method.as_str() == "PATCH")
-            .expect("expected draft PATCH");
-        let patch_body = String::from_utf8_lossy(&patch.body);
-        assert!(patch_body.contains("final caption"));
+            .unwrap();
+        assert!(String::from_utf8_lossy(&patch.body).contains("literal [IMAGE:draft.png]"));
         assert!(
-            !patch_body.contains("[IMAGE:"),
-            "final draft body must not leak marker text: {patch_body}"
+            !requests
+                .iter()
+                .any(|request| request.url.path() == "/im/v1/images")
         );
-        let image_send = requests
-            .iter()
-            .filter(|request| request.url.path() == "/im/v1/messages")
-            .map(|request| {
-                serde_json::from_slice::<serde_json::Value>(&request.body)
-                    .expect("send body should be valid JSON")
-            })
-            .find(|body| body["msg_type"].as_str() == Some("image"))
-            .expect("expected image send after draft finalization");
-        let content = image_send["content"]
-            .as_str()
-            .expect("image content should be a JSON string");
-        let content_json: serde_json::Value =
-            serde_json::from_str(content).expect("image content should parse as JSON");
-        assert_eq!(content_json["image_key"].as_str(), Some("draft_img_key"));
     }
 
     #[test]

@@ -65,8 +65,15 @@ mod tests {
         let asst = ChatMessage::assistant("Hi there");
         assert_eq!(asst.role, "assistant");
 
-        let tool = ChatMessage::tool("{}");
+        let tool = ChatMessage::tool_result(ToolResultMessage {
+            tool_call_id: "call_1".into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            content: "{}".into(),
+            attachments: Vec::new(),
+        });
         assert_eq!(tool.role, "tool");
+        assert_eq!(tool.tool_result.as_ref().unwrap().tool_call_id, "call_1");
     }
 
     #[test]
@@ -142,6 +149,8 @@ mod tests {
         assert!(json.contains("\"type\":\"Chat\""));
 
         let tool_result = ConversationMessage::ToolResults(vec![ToolResultMessage {
+            success: None,
+            attachments: Vec::new(),
             tool_call_id: "1".into(),
             content: "done".into(),
             tool_name: String::new(),

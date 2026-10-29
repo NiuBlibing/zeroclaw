@@ -16,6 +16,9 @@ pub struct HistoricalMessage {
     pub role: String,
     pub text: String,
     pub files: Vec<String>,
+    /// Explicit attachment references carried by the message. This is a
+    /// projection field; the event payload remains the source of truth.
+    pub attachments: Vec<crate::media::AttachmentReference>,
     pub unresolved_parts: Vec<usize>,
     pub unavailable_parts: Vec<UnavailableContentPart>,
     pub content_source: Option<PayloadSelector>,

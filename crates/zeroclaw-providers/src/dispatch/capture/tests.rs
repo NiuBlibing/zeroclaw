@@ -501,11 +501,10 @@ async fn native_anthropic_signed_reasoning_preserves_partial_final_and_request_r
                 assert_eq!(continuation, format!("{signed}\n{opaque}"));
                 let replay = [
                     messages[0].clone(),
-                    ChatMessage::assistant(
-                        serde_json::json!({
-                            "content":"answer", "tool_calls":[], "reasoning_content":continuation,
-                        })
-                        .to_string(),
+                    ChatMessage::assistant_tool_calls(
+                        ("answer").to_string(),
+                        serde_json::from_value(serde_json::json!([])).unwrap(),
+                        Some((continuation).to_string()),
                     ),
                     ChatMessage::user("continue"),
                 ];

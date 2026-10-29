@@ -94,7 +94,7 @@ pub struct SessionOverrides {
 #[derive(Clone, Debug)]
 pub struct UploadEntry {
     pub ref_id: String,
-    pub marker: String,
+    pub kind: zeroclaw_api::media::AttachmentKind,
     pub workspace_path: String,
     pub size_bytes: u64,
 }

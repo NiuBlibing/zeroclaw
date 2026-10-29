@@ -23,9 +23,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 #[cfg(test)]
 use zeroclaw_providers::ChatRequest;
-use zeroclaw_providers::{
-    self, ChatMessage, ConversationMessage, ModelProvider, ToolResultMessage,
-};
+use zeroclaw_providers::{self, ChatMessage, ConversationMessage, ModelProvider};
 
 #[path = "session_adapter.rs"]
 mod session_adapter;
@@ -1501,8 +1499,8 @@ impl Agent {
     ///
     /// A turn that just ended in a non-retryable failure is the newest whole
     /// turn: its opening user prompt is the last turn-opening user message and
-    /// nothing was appended after the failure. Prompt-mode `[Tool results]`
-    /// carriers inside the turn are not turn openings, so the span reaches
+    /// nothing was appended after the failure. Tool-result rows are not turn
+    /// openings, so the span reaches
     /// back past them to the prompt that actually opened the turn. Any
     /// attachment in that span was already rejected (or already defeated the
     /// request), so leaving it in place resends it on the next prompt of the
@@ -1554,7 +1552,9 @@ impl Agent {
     ) -> bool {
         match (left, right) {
             (ConversationMessage::Chat(left), ConversationMessage::Chat(right)) => {
-                left.role == right.role && left.content == right.content
+                left.role == right.role
+                    && left.content == right.content
+                    && left.attachments == right.attachments
             }
             (
                 ConversationMessage::AssistantToolCalls {
@@ -1587,6 +1587,8 @@ impl Agent {
                         left.tool_call_id == right.tool_call_id
                             && left.content == right.content
                             && left.tool_name == right.tool_name
+                            && left.success == right.success
+                            && left.attachments == right.attachments
                     })
             }
             _ => false,
@@ -1768,7 +1770,7 @@ impl Agent {
         if messages
             .iter()
             .filter(|message| message.role != "system")
-            .any(|message| message.content.contains("[IMAGE:"))
+            .any(|message| !message.attachments.is_empty())
         {
             return None;
         }
@@ -1793,10 +1795,12 @@ impl Agent {
 
     async fn append_streamed_user_message_to_history(
         &mut self,
-        user_message: &str,
+        input: impl Into<ChatMessage>,
         new_msgs: &mut Vec<ConversationMessage>,
         turn_id: &str,
     ) {
+        let input = input.into();
+        let user_message = input.content.as_str();
         // Memory context is injected once in the engine, keyed on the
         // ingress origin (agent::memory_inject).
         if self.auto_save {
@@ -1823,7 +1827,9 @@ impl Agent {
 
         let enriched = self.enrich_user_message(user_message);
 
-        let user_msg = ConversationMessage::Chat(ChatMessage::user(enriched));
+        let user_msg = ConversationMessage::Chat(
+            ChatMessage::user(enriched).with_attachments(input.attachments.clone()),
+        );
         new_msgs.push(user_msg.clone());
         self.history.push(user_msg);
     }
@@ -2111,7 +2117,9 @@ impl Agent {
                     });
                 }
                 let enriched = self.enrich_user_message(input.text());
-                prepared.push((input, ChatMessage::user(enriched)));
+                let message = ChatMessage::user(enriched)
+                    .with_attachments(input.message().attachments.clone());
+                prepared.push((input, message));
             }
         }
     }
@@ -3508,110 +3516,19 @@ impl Agent {
                 .map(|_| target.index)
         });
         let mut replayed: Vec<ConversationMessage> = Vec::with_capacity(loop_messages.len());
-        let mut tool_names = std::collections::HashMap::<String, String>::new();
-        let push_tool_results = |replayed: &mut Vec<ConversationMessage>,
-                                 results: Vec<ToolResultMessage>| {
-            if let Some(ConversationMessage::ToolResults(previous)) = replayed.last_mut() {
-                previous.extend(results);
-            } else {
-                replayed.push(ConversationMessage::ToolResults(results));
-            }
-        };
-        for (index, msg) in loop_messages.iter().enumerate() {
-            if msg.role == "assistant"
-                && let Ok(serde_json::Value::Object(obj)) =
-                    serde_json::from_str::<serde_json::Value>(&msg.content)
-                && let Some(calls) = obj.get("tool_calls").and_then(|c| c.as_array())
-                && !calls.is_empty()
-                && calls.iter().all(|c| {
-                    c.get("id").is_some_and(serde_json::Value::is_string)
-                        && c.get("name").is_some_and(serde_json::Value::is_string)
-                })
-            {
-                let tool_calls: Vec<_> = calls
-                    .iter()
-                    .map(|c| zeroclaw_providers::ToolCall {
-                        id: c
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        name: c
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        arguments: c
-                            .get("arguments")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        extra_content: c.get("extra_content").filter(|v| !v.is_null()).cloned(),
-                    })
-                    .collect();
-                for call in &tool_calls {
-                    tool_names.insert(call.id.clone(), call.name.clone());
-                }
-                replayed.push(ConversationMessage::AssistantToolCalls {
-                    text: obj
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    tool_calls,
-                    reasoning_content: obj
-                        .get("reasoning_content")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                });
-                continue;
-            }
-            if msg.role == "tool" {
-                if let Ok(vals) = serde_json::from_str::<Vec<serde_json::Value>>(&msg.content) {
-                    let results: Vec<ToolResultMessage> = vals
-                        .into_iter()
-                        .filter_map(|v| {
-                            Some(ToolResultMessage {
-                                tool_call_id: v.get("tool_call_id")?.as_str()?.to_string(),
-                                content: v
-                                    .get("content")
-                                    .and_then(|c| c.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                tool_name: tool_names
-                                    .get(v.get("tool_call_id")?.as_str()?)
-                                    .cloned()
-                                    .unwrap_or_default(),
-                            })
-                        })
-                        .collect();
-                    if !results.is_empty() {
-                        push_tool_results(&mut replayed, results);
-                        continue;
+        fn push_replayed(replayed: &mut Vec<ConversationMessage>, message: ChatMessage) {
+            match message.into_conversation() {
+                ConversationMessage::ToolResults(results) => {
+                    if let Some(ConversationMessage::ToolResults(previous)) = replayed.last_mut() {
+                        previous.extend(results);
+                    } else {
+                        replayed.push(ConversationMessage::ToolResults(results));
                     }
                 }
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg.content) {
-                    let result = ToolResultMessage {
-                        tool_call_id: v
-                            .get("tool_call_id")
-                            .and_then(|id| id.as_str())
-                            .unwrap_or("unknown")
-                            .to_string(),
-                        content: v
-                            .get("content")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        tool_name: v
-                            .get("tool_call_id")
-                            .and_then(|id| id.as_str())
-                            .and_then(|id| tool_names.get(id))
-                            .cloned()
-                            .unwrap_or_default(),
-                    };
-                    push_tool_results(&mut replayed, vec![result]);
-                    continue;
-                }
+                message => replayed.push(message),
             }
+        }
+        for (index, msg) in loop_messages.iter().enumerate() {
             let stripped = if strip_at == Some(index) {
                 crate::agent::memory_inject::strip_memory_context_preamble(
                     &msg.content,
@@ -3621,11 +3538,11 @@ impl Agent {
                 msg.content.as_str()
             };
             if stripped.len() == msg.content.len() {
-                replayed.push(ConversationMessage::Chat(msg.clone()));
+                push_replayed(&mut replayed, msg.clone());
             } else {
                 let mut msg = msg.clone();
                 msg.content = stripped.to_string();
-                replayed.push(ConversationMessage::Chat(msg));
+                push_replayed(&mut replayed, msg);
             }
         }
         replayed
@@ -3653,12 +3570,14 @@ impl Agent {
         format!("{error:#}")
     }
 
-    pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+    pub async fn turn(&mut self, input: impl Into<ChatMessage>) -> Result<String> {
+        let mut input = input.into();
+        let user_message = input.content.as_str();
         self.sync_config_generation();
         let thinking = self.native_thinking_for_turn(user_message).await?;
-        let user_message = crate::agent::thinking::strip_thinking_directive(user_message);
+        input.content = crate::agent::thinking::strip_thinking_directive(user_message).into_owned();
         let result = zeroclaw_api::NATIVE_THINKING_OVERRIDE
-            .scope(thinking, Box::pin(self.turn_body(user_message.as_ref())))
+            .scope(thinking, Box::pin(self.turn_body(&input)))
             .await;
         self.capture_context_projection("agent_turn_projection")
             .await?;
@@ -3712,8 +3631,9 @@ impl Agent {
         Ok(())
     }
 
-    async fn turn_body(&mut self, user_message: &str) -> Result<String> {
-        if user_message.trim().is_empty() {
+    async fn turn_body(&mut self, input: &ChatMessage) -> Result<String> {
+        let user_message = input.content.as_str();
+        if user_message.trim().is_empty() && input.attachments.is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -3783,8 +3703,9 @@ impl Agent {
 
         let enriched = self.enrich_user_message(user_message);
 
-        self.history
-            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
+        self.history.push(ConversationMessage::Chat(
+            ChatMessage::user(enriched).with_attachments(input.attachments.clone()),
+        ));
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -4147,14 +4068,16 @@ impl Agent {
 
     pub async fn turn_streamed(
         &mut self,
-        user_message: &str,
+        input: impl Into<ChatMessage>,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(String, Vec<ConversationMessage>)> {
+        let input = input.into();
+        let user_message = input.content.as_str();
         // See `Agent::turn` for the rationale. Same guard: blank input would
         // push a timestamp-only user message into history and the model would
         // narrate the trailing prompt-template sentinel instead of replying.
-        if user_message.trim().is_empty() {
+        if user_message.trim().is_empty() && input.attachments.is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -4179,7 +4102,7 @@ impl Agent {
             safeguard_fallback,
             ..
         } = self
-            .turn_streamed_with_steering_state(user_message, event_tx, cancel_token, None)
+            .turn_streamed_with_steering_state(input, event_tx, cancel_token, None)
             .await
             .map_err(|err| err.error)?;
         let response = crate::agent::append_safeguard_fallback_notice(
@@ -4208,11 +4131,13 @@ impl Agent {
     /// `Closed` and can send the text as an ordinary prompt instead.
     pub async fn turn_streamed_with_steering_state(
         &mut self,
-        user_message: &str,
+        input: impl Into<ChatMessage>,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
+        let mut input = input.into();
+        let user_message = input.content.as_str();
         let mut steering = CloseSteeringOnExit(steering_rx);
         #[cfg(test)]
         if let Some(pause) = self.turn_entry_pause.clone() {
@@ -4228,7 +4153,7 @@ impl Agent {
                 committed_response: String::new(),
                 new_messages: Vec::new(),
             })?;
-        let user_message = crate::agent::thinking::strip_thinking_directive(user_message);
+        input.content = crate::agent::thinking::strip_thinking_directive(user_message).into_owned();
         let mut turn_model = RestoreTurnModel {
             agent: self,
             base: None,
@@ -4237,7 +4162,7 @@ impl Agent {
             .scope(
                 thinking,
                 Box::pin(turn_model.agent.turn_streamed_with_steering_body(
-                    user_message.as_ref(),
+                    &input,
                     event_tx,
                     cancel_token,
                     steering.0.as_deref_mut(),
@@ -4264,16 +4189,17 @@ impl Agent {
     /// exit relies on the wrapper's guard.
     async fn turn_streamed_with_steering_body(
         &mut self,
-        user_message: &str,
+        input: &ChatMessage,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
         turn_base: &mut Option<SessionModelProvider>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
+        let user_message = input.content.as_str();
         // See `Agent::turn` for the rationale. Same guard: blank input would
         // push a timestamp-only user message into history and the model would
         // narrate the trailing prompt-template sentinel instead of replying.
-        if user_message.trim().is_empty() {
+        if user_message.trim().is_empty() && input.attachments.is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -4340,7 +4266,7 @@ impl Agent {
             self.observer_agent_alias(),
             Some(turn_id.clone()),
         );
-        self.append_streamed_user_message_to_history(user_message, &mut new_msgs, &turn_id)
+        self.append_streamed_user_message_to_history(input, &mut new_msgs, &turn_id)
             .await;
 
         let active_dispatcher = {
@@ -5198,12 +5124,31 @@ mod tests {
         }
     }
 
-    /// Regression: trim write-back must never persist the provider-only
-    /// recalled-memory preamble the turn engine injects onto the last user
-    /// message. `replay_loop_messages` feeds every durable-history write-back
-    /// call site, so stripping it there covers both the buffered and
-    /// streamed trim paths. The strip target carries the injected message's
-    /// index within the replayed (mutated history) buffer.
+    #[test]
+    fn replay_loop_messages_keeps_typed_tool_attachments_through_retention() {
+        let attachment = zeroclaw_api::media::AttachmentReference {
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+            target: "/workspace/result.png".into(),
+        };
+        let message = ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+            tool_call_id: ("tool-1").to_string(),
+            tool_name: String::new(),
+            content: ("literal [IMAGE:/example]").to_string(),
+            success: None,
+            attachments: Vec::new(),
+        })
+        .with_attachments(vec![attachment.clone()]);
+        let replayed = Agent::replay_loop_messages(&[message], None);
+        let ConversationMessage::ToolResults(results) = &replayed[0] else {
+            panic!("typed tool results expected");
+        };
+        assert_eq!(results[0].tool_call_id, "tool-1");
+        assert_eq!(results[0].content, "literal [IMAGE:/example]");
+        assert_eq!(results[0].attachments, vec![attachment.clone()]);
+        let projected = NativeToolDispatcher.to_provider_messages(&replayed);
+        assert_eq!(projected[0].attachments, vec![attachment]);
+    }
+
     #[test]
     fn replay_loop_messages_strips_the_memory_context_preamble() {
         let preamble = format!(
@@ -7800,7 +7745,7 @@ mod tests {
     }
 
     struct MultimodalCaptureProvider {
-        seen_user_messages: Arc<Mutex<Vec<String>>>,
+        seen_user_messages: Arc<Mutex<Vec<ChatMessage>>>,
         streamed: bool,
     }
 
@@ -7823,7 +7768,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             if let Some(message) = request.messages.iter().rfind(|msg| msg.role == "user") {
-                self.seen_user_messages.lock().push(message.content.clone());
+                self.seen_user_messages.lock().push(message.clone());
             }
             Ok(zeroclaw_providers::ChatResponse {
                 output_blocks: Vec::new(),
@@ -7847,7 +7792,7 @@ mod tests {
             use futures_util::stream::{self, StreamExt};
 
             if let Some(message) = request.messages.iter().rfind(|msg| msg.role == "user") {
-                self.seen_user_messages.lock().push(message.content.clone());
+                self.seen_user_messages.lock().push(message.clone());
             }
 
             if self.streamed {
@@ -8189,14 +8134,14 @@ mod tests {
             for (index, id, output) in [(1, "call-one", "result-1"), (2, "call-two", "result-2")] {
                 let messages = &captured[index].1;
                 let result = messages.iter().rfind(|m| m.role == "tool").unwrap();
-                let result: serde_json::Value = serde_json::from_str(&result.content).unwrap();
-                assert_eq!(result["tool_call_id"], id);
-                assert_eq!(result["content"], output);
+                assert_eq!(
+                    result.tool_result.as_ref().map(|r| r.tool_call_id.as_str()),
+                    Some(id)
+                );
+                assert_eq!(result.content, output);
                 let assistant = messages.iter().rfind(|m| m.role == "assistant").unwrap();
-                let assistant: serde_json::Value =
-                    serde_json::from_str(&assistant.content).unwrap();
-                assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 1);
-                assert_eq!(assistant["tool_calls"][0]["id"], id);
+                assert_eq!(assistant.tool_calls.len(), 1);
+                assert_eq!(assistant.tool_calls[0].id, id);
             }
             let mut ordered = Vec::new();
             while let Ok(event) = rx.try_recv() {
@@ -10247,7 +10192,7 @@ mod tests {
                 Some(mm_config),
             );
 
-            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+            let msg = ChatMessage::user("describe this image").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]);
 
             // The vision provider will fail to connect to localhost:9, but the
             // prompt rebuild and provider-visible transcript happen before the
@@ -10295,7 +10240,7 @@ mod tests {
                 Some(mm_config),
             );
 
-            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+            let msg = ChatMessage::user("describe this image").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]);
             let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
 
             let result = agent.turn_streamed(msg, event_tx, None).await;
@@ -10637,19 +10582,25 @@ mod tests {
         let requests = requests.lock();
         assert_eq!(requests.len(), 3, "two turns must include one tool round");
         let second_turn = &requests[2].1;
-        let call = second_turn
+        second_turn
             .iter()
             .filter(|message| message.role == "assistant")
-            .filter_map(|message| serde_json::from_str::<serde_json::Value>(&message.content).ok())
-            .find(|message| message["tool_calls"][0]["id"] == "local-call")
+            .find(|message| {
+                message
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.id == "local-call")
+            })
             .expect("the next turn must retain the structured assistant tool call");
         let result = second_turn
             .iter()
             .find(|message| message.role == "tool")
             .expect("the next turn must retain the structured tool result");
-        let result: serde_json::Value = serde_json::from_str(&result.content).unwrap();
-        assert_eq!(result["tool_call_id"], call["tool_calls"][0]["id"]);
-        assert_eq!(result["content"], "tool-out");
+        assert_eq!(
+            result.tool_result.as_ref().map(|r| r.tool_call_id.as_str()),
+            Some("local-call")
+        );
+        assert_eq!(result.content, "tool-out");
     }
 
     #[tokio::test]
@@ -11400,6 +11351,8 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                attachments: Vec::new(),
                 tool_call_id: "tc-1".into(),
                 content: "ok".into(),
                 tool_name: String::new(),
@@ -11485,6 +11438,8 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                attachments: Vec::new(),
                 tool_call_id: "seed-call".into(),
                 content: "result".into(),
                 tool_name: "echo".into(),
@@ -12413,18 +12368,22 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         agent
-            .turn(&format!(
-                "inspect [IMAGE:{}]",
-                image_path.display().to_string()
-            ))
+            .turn(ChatMessage::user("inspect").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: image_path.display().to_string(),
+                },
+            ]))
             .await
             .expect("turn should succeed");
 
         let seen = seen_user_messages.lock();
         let last = seen.last().expect("provider should receive a user message");
         assert!(
-            last.contains("data:image/png;base64,"),
-            "expected normalized data URI in provider request, got: {last}"
+            last.attachments
+                .iter()
+                .any(|attachment| attachment.target.starts_with("data:image/png;base64,")),
+            "expected normalized data URI in provider request, got: {last:?}"
         );
     }
 
@@ -12478,7 +12437,12 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
         agent
             .turn_streamed(
-                &format!("inspect [IMAGE:{}]", image_path.display().to_string()),
+                ChatMessage::user("inspect").with_attachments(vec![
+                    zeroclaw_api::media::AttachmentReference {
+                        kind: zeroclaw_api::media::AttachmentKind::Image,
+                        target: image_path.display().to_string(),
+                    },
+                ]),
                 event_tx,
                 None,
             )
@@ -12488,8 +12452,10 @@ mod tests {
         let seen = seen_user_messages.lock();
         let last = seen.last().expect("provider should receive a user message");
         assert!(
-            last.contains("data:image/png;base64,"),
-            "expected normalized data URI in provider request, got: {last}"
+            last.attachments
+                .iter()
+                .any(|attachment| attachment.target.starts_with("data:image/png;base64,")),
+            "expected normalized data URI in provider request, got: {last:?}"
         );
     }
 
@@ -12597,6 +12563,8 @@ mod tests {
         agent
             .history
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                attachments: Vec::new(),
                 tool_call_id,
                 content: format!("result {index}"),
                 tool_name: "mock".into(),
@@ -12814,7 +12782,7 @@ mod tests {
         seed_old_trim_test_turn(&mut agent);
 
         let error = agent
-            .turn("inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]")
+            .turn(ChatMessage::user("inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]))
             .await
             .expect_err("missing vision support should fail before provider dispatch");
 
@@ -12844,7 +12812,7 @@ mod tests {
 
         let error = agent
             .turn_streamed(
-                "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
+                ChatMessage::user("inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }]),
                 event_tx,
                 None,
             )
@@ -15098,15 +15066,20 @@ mod tests {
         );
         agent.hook_runner = None;
 
-        // Messages containing `[IMAGE:]` must return None (skip cache).
+        // Messages containing image attachments must skip the cache.
         let multimodal_messages = vec![
             ChatMessage::system("system prompt"),
-            ChatMessage::user("describe this image [IMAGE:/tmp/photo.png]"),
+            ChatMessage::user("describe this image").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "/tmp/photo.png".to_string(),
+                },
+            ]),
         ];
         let key = agent.response_cache_key_for_messages(&multimodal_messages, "test-model");
         assert!(
             key.is_none(),
-            "multimodal prompt with [IMAGE:] marker must skip response cache"
+            "multimodal prompt with attachments must skip response cache"
         );
     }
 
@@ -18102,9 +18075,9 @@ vision_model_provider = "custom.vision"
                 // The producer declares its image; under the attachment
                 // contract nothing in the result text is promoted.
                 Ok(crate::tools::ToolResult::ok("here it is").with_attachment(
-                    zeroclaw_api::media::RenderedMarker {
+                    zeroclaw_api::media::AttachmentReference {
                         target: self.path.clone(),
-                        kind: zeroclaw_api::media::MarkerKind::Image,
+                        kind: zeroclaw_api::media::AttachmentKind::Image,
                     },
                 ))
             }

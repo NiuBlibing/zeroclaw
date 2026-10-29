@@ -7258,7 +7258,7 @@ impl Default for PipelineConfig {
 pub struct MultimodalConfig {
     /// Maximum number of image attachments accepted per request.
     ///
-    /// Caps the total number of `[IMAGE:...]` markers that survive into the
+    /// Caps the total number of image attachments that survive into the
     /// provider request after multimodal preprocessing. Older images are
     /// dropped first. When a new image takes the count past the limit, the
     /// oldest images are removed in one batch, down to half the limit
@@ -7305,7 +7305,7 @@ pub struct MultimodalConfig {
     #[serde(default)]
     pub allow_remote_fetch: bool,
     /// ModelProvider name to use for vision/image messages (e.g. `"ollama"`).
-    /// When set, messages containing `[IMAGE:]` markers are routed to this
+    /// When set, messages containing image attachments are routed to this
     /// model_provider instead of the default text model_provider.
     #[serde(default)]
     pub vision_model_provider: Option<String>,

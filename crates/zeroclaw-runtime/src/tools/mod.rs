@@ -1255,8 +1255,6 @@ const TOOL_REGISTRY_BUILD_STACK_BYTES: usize = 4 * 1024 * 1024;
 fn warm_lazy_regexes() {
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KV_REGEX);
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KEY_REGEX);
-    std::sync::LazyLock::force(&crate::agent::loop_::IMAGE_DATA_URI_REGEX);
-    zeroclaw_providers::multimodal::warm_lazy_regexes();
 }
 
 /// Create the full tool registry on a dedicated builder thread.

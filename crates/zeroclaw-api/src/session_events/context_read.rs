@@ -48,15 +48,23 @@ pub fn resolve_message(
                     "context reference outside stream".into(),
                 ));
             }
-            let role = match &event.body.data {
+            let (role, attachments, metadata): (
+                String,
+                Vec<crate::media::AttachmentReference>,
+                serde_json::Value,
+            ) = match &event.body.data {
                 EventData::UserContentRecorded {
                     content_ref: actual,
                     ..
-                } if actual == content_ref => "user".to_owned(),
+                } if actual == content_ref => {
+                    ("user".to_owned(), Vec::new(), serde_json::Value::Null)
+                }
                 EventData::AssistantContentRecorded {
                     content_ref: actual,
                     ..
-                } if actual == content_ref => "assistant".to_owned(),
+                } if actual == content_ref => {
+                    ("assistant".to_owned(), Vec::new(), serde_json::Value::Null)
+                }
                 EventData::ContextProjectionCreated {
                     reason_key,
                     result_ref,
@@ -65,7 +73,7 @@ pub fn resolve_message(
                     let context: serde_json::Value =
                         serde_json::from_slice(&present(store, result_ref)?.body)
                             .map_err(|error| ReadError::Corrupt(error.to_string()))?;
-                    context
+                    let source = context
                         .get("legacy_messages")
                         .and_then(serde_json::Value::as_array)
                         .and_then(|messages| {
@@ -73,12 +81,23 @@ pub fn resolve_message(
                                 message.get("content_ref") == Some(&serde_json::json!(content_ref))
                             })
                         })
-                        .and_then(|message| message.get("role"))
+                        .ok_or_else(|| {
+                            ReadError::Corrupt("imported context source missing".into())
+                        })?;
+                    let role = source
+                        .get("role")
                         .and_then(serde_json::Value::as_str)
                         .ok_or_else(|| {
                             ReadError::Corrupt("imported context origin missing".into())
                         })?
-                        .to_owned()
+                        .to_owned();
+                    let attachments = source
+                        .get("attachments")
+                        .map(|value| serde_json::from_value(value.clone()))
+                        .transpose()
+                        .map_err(|error| ReadError::Corrupt(error.to_string()))?
+                        .unwrap_or_default();
+                    (role, attachments, source.clone())
                 }
                 _ => {
                     return Err(ReadError::Corrupt("context content source mismatch".into()));
@@ -106,10 +125,13 @@ pub fn resolve_message(
                     }
                 }
             }
-            Ok(Some(ConversationMessage::Chat(ChatMessage {
-                role,
-                content: text,
-            })))
+            let mut fields = metadata.as_object().cloned().unwrap_or_default();
+            fields.insert("role".into(), role.into());
+            fields.insert("content".into(), text.into());
+            fields.insert("attachments".into(), serde_json::json!(attachments));
+            let message: ChatMessage = serde_json::from_value(serde_json::Value::Object(fields))
+                .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+            Ok(Some(message.into_conversation()))
         }
     }
 }

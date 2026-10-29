@@ -1513,6 +1513,8 @@ fn conversation_message_serialization_roundtrip() {
             reasoning_content: None,
         },
         ConversationMessage::ToolResults(vec![ToolResultMessage {
+            success: None,
+            attachments: Vec::new(),
             tool_call_id: "tc1".into(),
             content: "ok".into(),
             tool_name: String::new(),
@@ -1566,26 +1568,27 @@ fn xml_format_results_includes_status_and_output() {
             output: "file1.txt\nfile2.txt".into(),
             success: true,
             tool_call_id: None,
+            attachments: Vec::new(),
         },
         ToolExecutionResult {
             name: "file_read".into(),
             output: "Error: file not found".into(),
             success: false,
             tool_call_id: None,
+            attachments: Vec::new(),
         },
     ];
 
     let msg = dispatcher.format_results(&results);
-    let content = match msg {
-        ConversationMessage::Chat(c) => c.content,
-        _ => panic!("Expected Chat variant"),
+    let results = match msg {
+        ConversationMessage::ToolResults(results) => results,
+        _ => panic!("Expected ToolResults variant"),
     };
-
-    assert!(content.contains("shell"));
-    assert!(content.contains("file1.txt"));
-    assert!(content.contains("ok"));
-    assert!(content.contains("file_read"));
-    assert!(content.contains("error"));
+    assert_eq!(results[0].tool_name, "shell");
+    assert!(results[0].content.contains("file1.txt"));
+    assert_eq!(results[0].success, Some(true));
+    assert_eq!(results[1].tool_name, "file_read");
+    assert_eq!(results[1].success, Some(false));
 }
 
 #[test]
@@ -1605,12 +1608,14 @@ fn native_format_results_maps_tool_call_ids() {
             output: format!("File: {}", image_path.display().to_string()),
             success: true,
             tool_call_id: Some("tc-001".into()),
+            attachments: Vec::new(),
         },
         ToolExecutionResult {
             name: "b".into(),
             output: "out2".into(),
             success: true,
             tool_call_id: Some("tc-002".into()),
+            attachments: Vec::new(),
         },
     ];
 
@@ -1633,13 +1638,13 @@ fn native_format_results_maps_tool_call_ids() {
     // stored text, and the carrier still declares the (empty) array.
     let messages = dispatcher.to_provider_messages(&[msg]);
     assert_eq!(messages.len(), 2);
-    let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+    let payload: serde_json::Value = serde_json::to_value(&messages[0]).unwrap();
     assert_eq!(
         payload["content"].as_str(),
         Some(format!("File: {}", image_path.display().to_string()).as_str())
     );
     assert_eq!(
-        payload["attachments"],
+        serde_json::to_value(&messages[0].attachments).unwrap(),
         serde_json::json!([]),
         "a bare image path in stored tool text must yield zero attachments"
     );
@@ -1665,17 +1670,18 @@ fn xml_format_results_keeps_local_image_paths_as_text() {
         output: format!("Saved image to {}", image_path.display().to_string()),
         success: true,
         tool_call_id: None,
+        attachments: Vec::new(),
     }];
 
     let msg = dispatcher.format_results(&results);
     let content = match msg {
-        ConversationMessage::Chat(c) => c.content,
-        _ => panic!("Expected Chat variant"),
+        ConversationMessage::ToolResults(results) => results[0].content.clone(),
+        _ => panic!("Expected ToolResults variant"),
     };
 
     assert!(!content.contains("[IMAGE:"));
     assert!(content.contains(&image_path.display().to_string()));
-    assert!(content.contains("[Tool attachments: 0]"));
+    assert!(!content.contains("[Tool attachments:"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1699,6 +1705,8 @@ fn xml_dispatcher_converts_history_to_provider_messages() {
             reasoning_content: None,
         },
         ConversationMessage::ToolResults(vec![ToolResultMessage {
+            success: None,
+            attachments: Vec::new(),
             tool_call_id: "tc1".into(),
             content: "ok".into(),
             tool_name: String::new(),
@@ -1727,11 +1735,15 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
     let dispatcher = NativeToolDispatcher;
     let history = vec![ConversationMessage::ToolResults(vec![
         ToolResultMessage {
+            success: None,
+            attachments: Vec::new(),
             tool_call_id: "tc1".into(),
             content: format!("Saved image to {}", image_path.display().to_string()),
             tool_name: String::new(),
         },
         ToolResultMessage {
+            success: None,
+            attachments: Vec::new(),
             tool_call_id: "tc2".into(),
             content: "output2".into(),
             tool_name: String::new(),
@@ -1742,21 +1754,21 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "tool");
     assert_eq!(messages[1].role, "tool");
-    let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+    let payload: serde_json::Value = serde_json::to_value(&messages[0]).unwrap();
     let content = payload["content"].as_str().unwrap();
     // A bare image path in stored tool text is text: typed replay declares no
     // attachments — the attachment-identity boundary — and the body keeps
     // the path.
     assert_eq!(
-        payload["attachments"],
+        serde_json::to_value(&messages[0].attachments).unwrap(),
         serde_json::json!([]),
         "no attachment may be inferred from a bare path in replayed text"
     );
     assert!(!content.contains("[IMAGE:"));
     assert!(content.contains(&image_path.display().to_string()));
     // The second result declared nothing.
-    let second: serde_json::Value = serde_json::from_str(&messages[1].content).unwrap();
-    assert_eq!(second["attachments"], serde_json::json!([]));
+    let second: serde_json::Value = serde_json::to_value(&messages[1]).unwrap();
+    assert!(messages[1].attachments.is_empty());
     assert_eq!(second["content"].as_str(), Some("output2"));
 }
 

@@ -534,8 +534,14 @@ impl HailoOllamaModelProvider {
         serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
     }
 
-    fn convert_user_message_content(content: &str) -> (Option<String>, Option<Vec<String>>) {
-        let (cleaned, image_refs) = multimodal::parse_user_message_image_refs(content);
+    fn convert_user_message_content(
+        message: &ChatMessage,
+    ) -> (Option<String>, Option<Vec<String>>) {
+        let content = message.content.as_str();
+        let (cleaned, image_refs) = (
+            message.content.clone(),
+            multimodal::message_image_refs(message),
+        );
         if image_refs.is_empty() {
             return (Some(content.to_string()), None);
         }
@@ -554,13 +560,15 @@ impl HailoOllamaModelProvider {
     }
 
     fn convert_messages(&self, messages: &[ChatMessage]) -> Vec<Message> {
+        let projected = crate::multimodal::project_attachment_metadata(messages);
+        let messages = projected.as_ref();
         let mut tool_name_by_id: HashMap<String, String> = HashMap::new();
 
         messages
             .iter()
             .map(|message| {
                 if message.role == "assistant"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(message)
                     && let Some(tool_calls_value) = value.get("tool_calls")
                     && let Ok(parsed_calls) =
                         serde_json::from_value::<Vec<ToolCall>>(tool_calls_value.clone())
@@ -592,7 +600,7 @@ impl HailoOllamaModelProvider {
                 }
 
                 if message.role == "tool"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(message)
                 {
                     let tool_name = value
                         .get("tool_name")
@@ -622,7 +630,7 @@ impl HailoOllamaModelProvider {
                 }
 
                 if message.role == "user" {
-                    let (content, images) = Self::convert_user_message_content(&message.content);
+                    let (content, images) = Self::convert_user_message_content(message);
                     return Message {
                         role: "user".to_string(),
                         content,
@@ -704,11 +712,6 @@ impl HailoOllamaModelProvider {
                 .images
                 .as_ref()
                 .is_some_and(|images| !images.is_empty())
-                || (message.role != "system"
-                    && message
-                        .content
-                        .as_deref()
-                        .is_some_and(multimodal::carries_image_marker))
             {
                 return Err(anyhow::Error::new(NonRetryableProviderError::new(
                     "Hailo-Ollama does not support image inputs",
@@ -750,9 +753,6 @@ impl HailoOllamaModelProvider {
             }
 
             let (kind, content) = match message.role.as_str() {
-                "user" if zeroclaw_api::tool_carrier::is_tool_result_carrier("user", &content) => {
-                    (MessageKind::ToolResult, content)
-                }
                 "user" => (MessageKind::User, content),
                 "assistant" => (MessageKind::Assistant, content),
                 "tool" => {
@@ -1300,6 +1300,14 @@ impl HailoOllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ApiChatResponse> {
+        if messages
+            .iter()
+            .any(|message| !multimodal::message_image_refs(message).is_empty())
+        {
+            return Err(anyhow::Error::new(NonRetryableProviderError::new(
+                "Hailo-Ollama does not support image inputs",
+            )));
+        }
         let messages = self.convert_messages(messages);
         self.send_request(messages, model, temperature).await
     }

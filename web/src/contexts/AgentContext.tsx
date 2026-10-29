@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react';
 import type {
   ApprovalDecision,
+  AttachmentReference,
   PendingApproval,
   SessionMessagesResponse,
   WsMessage,
@@ -50,6 +51,8 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'agent';
   content: string;
+  attachments?: AttachmentReference[];
+  fileIds?: string[];
   thinking?: string;
   markdown?: boolean;
   toolCall?: ToolCallInfo;
@@ -73,7 +76,7 @@ export interface ChatMessage {
 
 export interface AgentContextValue {
   messages: ChatMessage[];
-  sendMessage: (content: string) => void;
+  sendMessage: (content: string, attachments?: AttachmentReference[]) => void;
   connected: boolean;
   error: string | null;
   typing: boolean;
@@ -190,7 +193,7 @@ export interface SessionSocket {
   connect(): void;
   disconnect(): void;
   readonly connected: boolean;
-  sendMessage(content: string): void;
+  sendMessage(content: string, attachments?: AttachmentReference[]): void;
   sendApprovalResponse(requestId: string, decision: ApprovalDecision): void;
 }
 
@@ -865,10 +868,10 @@ export function AgentProvider({
     };
   }, [modelInfoVersion, agentAlias]);
 
-  const sendMessage = useCallback((content: string) => {
+  const sendMessage = useCallback((content: string, attachments: AttachmentReference[] = []) => {
     if (!wsRef.current?.connected) return;
     try {
-      wsRef.current.sendMessage(content);
+      wsRef.current.sendMessage(content, attachments);
 
       setTyping(true);
       foldTurnStream({ type: 'turn_start' });
@@ -879,6 +882,7 @@ export function AgentProvider({
           id: generateUUID(),
           role: 'user',
           content,
+          attachments,
           timestamp: new Date(),
           local: true,
         },

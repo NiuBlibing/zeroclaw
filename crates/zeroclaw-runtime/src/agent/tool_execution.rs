@@ -2280,7 +2280,7 @@ mod tests {
 
     /// End-to-end: a failed tool whose detailed body carries a credential must
     /// reach the model's tool-result message scrubbed, in both the native
-    /// (`role=tool`) and the prompt-mode (`[Tool results]`) history shapes —
+    /// (`role=tool`) and the text-protocol provider history shape —
     /// the actual "text sent to the model / provider history".
     #[tokio::test]
     async fn failed_tool_credential_is_scrubbed_in_provider_history() {
@@ -2349,12 +2349,6 @@ mod tests {
         )
         .expect("collect_tool_results must succeed");
 
-        assert!(
-            !collected.tool_results.contains(secret)
-                && collected.tool_results.contains("[REDACTED]"),
-            "prompt-mode <tool_result> block must be scrubbed: {}",
-            collected.tool_results
-        );
         for result in &collected.individual_results {
             assert!(
                 !result.output.contains(secret) && result.output.contains("[REDACTED]"),
@@ -2367,11 +2361,9 @@ mod tests {
         let mut native_history: Vec<ChatMessage> = Vec::new();
         append_tool_round_to_history(
             &mut native_history,
-            "assistant text".to_string(),
+            ChatMessage::assistant("assistant text"),
             &native_calls,
             &collected.individual_results,
-            &collected.tool_results,
-            true,
         );
         assert!(
             native_history.iter().all(|m| !m.content.contains(secret)),
@@ -2386,27 +2378,27 @@ mod tests {
 
         let prompt_results = vec![ToolRoundResult {
             tool_call_id: None,
+            tool_name: "test_tool".into(),
+            success: true,
             output: collected.individual_results[0].output.clone(),
             attachments: Vec::new(),
         }];
         let mut prompt_history: Vec<ChatMessage> = Vec::new();
         append_tool_round_to_history(
             &mut prompt_history,
-            "assistant text".to_string(),
+            ChatMessage::assistant("assistant text"),
             &native_calls,
             &prompt_results,
-            &collected.tool_results,
-            false,
         );
         assert!(
             prompt_history.iter().all(|m| !m.content.contains(secret)),
-            "no prompt-mode history message may carry the raw credential"
+            "no structured tool history message may carry the raw credential"
         );
         assert!(
             prompt_history
                 .iter()
                 .any(|m| m.content.contains("[REDACTED]")),
-            "the prompt-mode [Tool results] message must carry the scrubbed body"
+            "the tool-result message must carry the scrubbed body"
         );
     }
 

@@ -330,8 +330,18 @@ mod tests {
             ChatMessage::assistant("old reply"),
             ChatMessage::user(format!("{preamble}current request")),
             ChatMessage::assistant("current progress"),
-            ChatMessage::assistant(crate::agent::loop_::build_native_assistant_history("", &[call], Some("private reasoning"))),
-            ChatMessage { role: "tool".into(), content: serde_json::json!({"tool_call_id": "listing-call", "content": "/tmp/listed-image.png"}).to_string() },
+            crate::agent::loop_::build_native_assistant_history(
+                "",
+                &[call],
+                Some("private reasoning"),
+            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "listing-call".into(),
+                tool_name: "glob_search".into(),
+                success: Some(true),
+                content: "/tmp/listed-image.png".into(),
+                attachments: Vec::new(),
+            }),
             ChatMessage::user(genuine.clone()),
         ];
         let mut injected = Some(super::super::MemoryPreamble {
@@ -392,9 +402,24 @@ mod tests {
             .unwrap()
             .retained_context
             .unwrap();
-        assert!(retained.iter().any(|message| matches!(message,
-            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls { tool_calls, reasoning_content: None, .. }
-                if tool_calls[0].extra_content.as_ref() == Some(&signature))));
+        assert!(retained.iter().any(|message| {
+            match message {
+                zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
+                    tool_calls,
+                    reasoning_content: None,
+                    ..
+                }
+                | zeroclaw_api::model_provider::ConversationMessage::Chat(
+                    zeroclaw_api::model_provider::ChatMessage { tool_calls, .. },
+                ) => {
+                    tool_calls
+                        .first()
+                        .and_then(|call| call.extra_content.as_ref())
+                        == Some(&signature)
+                }
+                _ => false,
+            }
+        }));
         assert!(retained.iter().any(|message| matches!(message,
             zeroclaw_api::model_provider::ConversationMessage::ToolResults(results)
                 if results[0].tool_name == "glob_search" && results[0].content == "/tmp/listed-image.png")));

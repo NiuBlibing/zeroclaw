@@ -2140,7 +2140,7 @@ impl AcpServer {
         };
         let (prompt, native_parts) = if native.is_some() {
             match Self::prepare_prompt_history(params, &session_id) {
-                Ok(prepared) => prepared,
+                Ok((text, parts)) => (ChatMessage::user(text), parts),
                 Err(error) => {
                     self.remove_cancel_token(&session_id);
                     return Err(error);
@@ -2182,7 +2182,7 @@ impl AcpServer {
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start).with_category(::zeroclaw_log::EventCategory::Channel)
                 .with_attrs(::serde_json::json!({
-                    "prompt_len": prompt.len(),
+                    "prompt_len": prompt.content.len(),
                 })),
             "ACP session/prompt turn starting"
         );
@@ -2332,7 +2332,7 @@ impl AcpServer {
                     // agent's own authoritative post-turn history, so the trim
                     // is reflected durably too; otherwise append the delta, so
                     // any earlier content only durable storage still
-                    // remembers (e.g. a degraded-away attachment marker) is
+                    // remembers (e.g. a degraded-away attachment reference) is
                     // preserved.
                     let _ =
                         if session.agent.history_trim_generation() != history_trim_generation_before_turn {
@@ -2441,7 +2441,7 @@ impl AcpServer {
                             // Not the full authoritative history: the
                             // pre-degrade delta this turn produced, so
                             // existing durable content (which may itself hold
-                            // an earlier degraded-away attachment marker)
+                            // an earlier degraded-away attachment reference)
                             // stays untouched.
                             Self::append_transcript(
                                 persist_store,
@@ -2922,7 +2922,7 @@ impl AcpServer {
     /// A failed turn is the run of messages ending at the durable failure
     /// sentinel and beginning at the turn-opening user prompt that started it.
     /// The opening prompt is found with the shared turn-opening predicate, so
-    /// a prompt-mode `[Tool results]` carrier between the prompt and the
+    /// a text-protocol tool-result carrier between the prompt and the
     /// failure does not cut the span short and leave the prompt's attachment
     /// in the seed. Recognition is structural (`is_failure_sentinel`), so a
     /// transcript persisted under one locale degrades correctly after a
@@ -3297,7 +3297,7 @@ impl AcpServer {
     fn materialize_history_parts(
         parts: &[zeroclaw_api::session_events::capture::EngineInputPart],
         workspace: Option<&Path>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatMessage> {
         use base64::Engine as _;
         use zeroclaw_api::session_events::capture::EngineInputPart;
         let mut total = 0usize;
@@ -3320,6 +3320,7 @@ impl AcpServer {
             }
         }
         let mut text = Vec::new();
+        let mut attachments = Vec::new();
         for part in parts {
             match part {
                 EngineInputPart::Text(value) => text.push(value.clone()),
@@ -3356,13 +3357,16 @@ impl AcpServer {
                         );
                         anyhow::Error::msg(diagnostic)
                     })?;
-                    text.push(materialized.marker);
+                    attachments.push(materialized.reference);
                 }
                 EngineInputPart::Opaque { .. } => {}
             }
         }
-        anyhow::ensure!(!text.is_empty(), "ACP prompt contains no supported content");
-        Ok(text.join("\n\n"))
+        anyhow::ensure!(
+            !text.is_empty() || !attachments.is_empty(),
+            "ACP prompt contains no supported content"
+        );
+        Ok(ChatMessage::user(text.join("\n\n")).with_attachments(attachments))
     }
 
     /// Freeze the incoming parts without filesystem effects. Registration
@@ -3480,109 +3484,13 @@ impl AcpServer {
     fn materialize_prompt(
         params: &Value,
         workspace_dir: Option<&Path>,
-    ) -> std::result::Result<String, RpcError> {
-        match params.get("prompt") {
-            Some(Value::String(s)) => Ok(s.clone()),
-            Some(Value::Array(arr)) => {
-                // Stage: validate every embedded blob (decode + size cap) before
-                // writing any, so an invalid later part cannot leave earlier parts
-                // already materialized in uploads/.
-                let mut total = 0usize;
-                for part in arr {
-                    let resource = Self::prompt_resource(part);
-                    if let Some(blob) = resource
-                        .as_deref()
-                        .and_then(|res| res.get("blob"))
-                        .and_then(|v| v.as_str())
-                    {
-                        if workspace_dir.is_none() {
-                            return Err(RpcError {
-                                code: INVALID_PARAMS,
-                                message: "resource.blob requires an active session workspace"
-                                    .to_string(),
-                                data: None,
-                            });
-                        }
-                        let bytes =
-                            acp_embedded::decode_embedded_blob(blob).map_err(|e| RpcError {
-                                code: INVALID_PARAMS,
-                                message: e.0,
-                                data: None,
-                            })?;
-                        total = total.saturating_add(bytes.len());
-                        if total > 20 * 1024 * 1024 {
-                            return Err(RpcError {
-                                code: INVALID_PARAMS,
-                                message: "ACP attachments exceed request byte limit".into(),
-                                data: None,
-                            });
-                        }
-                    }
-                }
-
-                let mut joined = String::new();
-                for part in arr {
-                    let mut added = false;
-                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                        if !joined.is_empty() {
-                            joined.push_str("\n\n");
-                        }
-                        joined.push_str(text);
-                        added = true;
-                    }
-                    // Support ACP resource blocks for @-notation file attachments
-                    // (clients send {"type":"resource","resource":{"uri":"...","text":"..."}})
-                    // and embedded binary context via `resource.blob` (base64).
-                    if let Some(res) = Self::prompt_resource(part) {
-                        if let Some(text) = res.get("text").and_then(|v| v.as_str()) {
-                            if added || !joined.is_empty() {
-                                joined.push_str("\n\n");
-                            }
-                            joined.push_str(text);
-                            added = true;
-                        }
-                        if let Some(blob) = res.get("blob").and_then(|v| v.as_str()) {
-                            let Some(ws) = workspace_dir else {
-                                return Err(RpcError {
-                                    code: INVALID_PARAMS,
-                                    message: "resource.blob requires an active session workspace"
-                                        .to_string(),
-                                    data: None,
-                                });
-                            };
-                            let uri = res.get("uri").and_then(|v| v.as_str());
-                            let mime = res.get("mimeType").and_then(|v| v.as_str());
-                            let materialized =
-                                acp_embedded::materialize_resource_blob(ws, uri, mime, blob)
-                                    .map_err(|e| RpcError {
-                                        code: INVALID_PARAMS,
-                                        message: e.0,
-                                        data: None,
-                                    })?;
-                            if added || !joined.is_empty() {
-                                joined.push_str("\n\n");
-                            }
-                            joined.push_str(&materialized.marker);
-                        }
-                    }
-                }
-                if joined.is_empty() {
-                    return Err(RpcError {
-                        code: INVALID_PARAMS,
-                        message: "Parameter 'prompt' array must contain at least one text part"
-                            .to_string(),
-                        data: None,
-                    });
-                }
-                Ok(joined)
-            }
-            _ => Err(RpcError {
-                code: INVALID_PARAMS,
-                message: "Missing required parameter: prompt (must be string or array of parts)"
-                    .to_string(),
-                data: None,
-            }),
-        }
+    ) -> std::result::Result<ChatMessage, RpcError> {
+        let (_, parts) = Self::prepare_prompt_history(params, "materialize")?;
+        Self::materialize_history_parts(&parts, workspace_dir).map_err(|error| RpcError {
+            code: INVALID_PARAMS,
+            message: error.to_string(),
+            data: None,
+        })
     }
 
     async fn handle_session_stop(&self, params: &Value) -> RpcResult {
@@ -4243,6 +4151,20 @@ fn history_notifications_for_message(
     session_id: &str,
     msg: &ConversationMessage,
 ) -> Vec<JsonRpcNotification> {
+    fn attachment_content(reference: &zeroclaw_api::media::AttachmentReference) -> Value {
+        let name = match reference.kind {
+            zeroclaw_api::media::AttachmentKind::Image => "image",
+            zeroclaw_api::media::AttachmentKind::Audio => "audio",
+            zeroclaw_api::media::AttachmentKind::Video => "video",
+            zeroclaw_api::media::AttachmentKind::Document => "document",
+        };
+        serde_json::json!({
+            "type": "resource_link",
+            "uri": reference.target,
+            "name": name,
+        })
+    }
+
     match msg {
         ConversationMessage::Chat(chat) => {
             // The durable failed-turn boundary projects to its localized
@@ -4269,17 +4191,34 @@ fn history_notifications_for_message(
                 "assistant" => "agent_message_chunk",
                 _ => return vec![],
             };
-            vec![JsonRpcNotification {
-                jsonrpc: "2.0",
-                method: "session/update",
-                params: serde_json::json!({
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": update_type,
-                        "content": { "type": "text", "text": &chat.content }
-                    }
-                }),
-            }]
+            let mut notifications = Vec::new();
+            if !chat.content.is_empty() {
+                notifications.push(JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": update_type,
+                            "content": { "type": "text", "text": &chat.content }
+                        }
+                    }),
+                });
+            }
+            for attachment in &chat.attachments {
+                notifications.push(JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": update_type,
+                            "content": attachment_content(attachment)
+                        }
+                    }),
+                });
+            }
+            notifications
         }
         ConversationMessage::AssistantToolCalls {
             text, tool_calls, ..
@@ -4332,23 +4271,32 @@ fn history_notifications_for_message(
         }
         ConversationMessage::ToolResults(results) => results
             .iter()
-            .map(|r| JsonRpcNotification {
-                jsonrpc: "2.0",
-                method: "session/update",
-                params: serde_json::json!({
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": &r.tool_call_id,
-                        "status": "completed",
-                        "rawOutput": &r.content,
-                        "body": &r.content,
-                        "content": [{
-                            "type": "content",
-                            "content": { "type": "text", "text": &r.content }
-                        }]
-                    }
-                }),
+            .map(|r| {
+                let mut content = vec![serde_json::json!({
+                    "type": "content",
+                    "content": { "type": "text", "text": &r.content }
+                })];
+                content.extend(r.attachments.iter().map(|attachment| {
+                    serde_json::json!({
+                        "type": "content",
+                        "content": attachment_content(attachment)
+                    })
+                }));
+                JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": &r.tool_call_id,
+                            "status": "completed",
+                            "rawOutput": &r.content,
+                            "body": &r.content,
+                            "content": content
+                        }
+                    }),
+                }
             })
             .collect(),
     }
@@ -4498,7 +4446,7 @@ mod tests {
     /// stripped by the text-only degrade path. A request recorded here
     /// genuinely carries whatever media the seed still contains, which makes
     /// the failed-media regressions discriminate: a resent rejected image
-    /// shows up as a `[IMAGE:data:...]` part, a degraded one as the omission
+    /// shows up as a typed image attachment, a degraded one as the omission
     /// note only.
     struct RecordingVisionProvider {
         requests: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
@@ -6230,14 +6178,12 @@ mod tests {
                             if message.role != "tool" {
                                 return false;
                             }
-                            let Ok(value) = serde_json::from_str::<Value>(&message.content) else {
-                                return false;
-                            };
-                            value["tool_call_id"] == "tc-deliver"
-                                && value["content"].as_str().is_some_and(|content| {
-                                    content.contains("Delivered out.pdf")
-                                        && content.contains("attachment://deliver/")
-                                })
+                            message
+                                .tool_result
+                                .as_ref()
+                                .is_some_and(|result| result.tool_call_id == "tc-deliver")
+                                && message.content.contains("Delivered out.pdf")
+                                && message.content.contains("attachment://deliver/")
                         });
                         anyhow::ensure!(
                             correlated_result.is_some(),
@@ -6480,11 +6426,12 @@ mod tests {
 
         let requests = requests.lock();
         assert_eq!(requests.len(), 2, "one tool round plus one terminal round");
-        assert!(
-            requests[0]
+        assert!(requests[0].iter().any(|message| {
+            message
+                .attachments
                 .iter()
-                .any(|message| message.content.contains("[Document: in.pdf]"))
-        );
+                .any(|attachment| attachment.kind == zeroclaw_api::media::AttachmentKind::Document)
+        }));
         for request in requests.iter() {
             for message in request {
                 assert!(!message.content.contains(&inbound_b64));
@@ -6523,8 +6470,13 @@ mod tests {
             !dir.path().join("uploads").exists(),
             "capture has no filesystem effect"
         );
-        let text = AcpServer::materialize_prompt(&params, Some(dir.path())).unwrap();
-        assert!(text.contains(".jpg"));
+        let message = AcpServer::materialize_prompt(&params, Some(dir.path())).unwrap();
+        assert!(
+            message
+                .attachments
+                .iter()
+                .any(|attachment| attachment.target.ends_with(".jpg"))
+        );
         let files: Vec<_> = std::fs::read_dir(dir.path().join("uploads"))
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -6558,7 +6510,8 @@ mod tests {
         std::fs::remove_file(&uploads[0]).unwrap();
         let restored =
             AcpServer::materialize_history_parts(&parts, Some(directory.path())).unwrap();
-        assert_eq!(restored, expected);
+        assert_eq!(restored.content, expected.content);
+        assert_eq!(restored.attachments, expected.attachments);
         assert_eq!(std::fs::read(&uploads[0]).unwrap(), b"original bytes");
         std::fs::remove_file(&uploads[0]).unwrap();
         let mut unsupported = parts.clone();
@@ -6574,7 +6527,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_prompt_writes_blob_and_returns_marker() {
+    fn materialize_prompt_writes_blob_and_returns_attachment() {
         let dir = tempfile::tempdir().unwrap();
         let bytes = b"pdf-bytes";
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
@@ -6589,8 +6542,12 @@ mod tests {
             }]
         });
         let result = AcpServer::materialize_prompt(&params, Some(dir.path())).unwrap();
-        assert!(result.contains("[Document: a.pdf]"));
-        assert!(result.contains("uploads"));
+        assert_eq!(result.attachments.len(), 1);
+        assert_eq!(
+            result.attachments[0].kind,
+            zeroclaw_api::media::AttachmentKind::Document
+        );
+        assert!(result.attachments[0].target.contains("uploads"));
         let uploads = dir.path().join("uploads");
         assert!(uploads.exists());
         let written: Vec<_> = std::fs::read_dir(&uploads).unwrap().collect();
@@ -8033,6 +7990,37 @@ mod tests {
         assert_eq!(remaining, 0, "cancel token must be removed after turn ends");
     }
 
+    #[test]
+    fn history_replays_structured_attachments_without_reinterpreting_text() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolResultMessage};
+
+        let reference = zeroclaw_api::media::AttachmentReference {
+            target: "/tmp/photo.png".into(),
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+        };
+        for message in [
+            ConversationMessage::Chat(
+                ChatMessage::user("literal [IMAGE:/example]")
+                    .with_attachments(vec![reference.clone()]),
+            ),
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                tool_call_id: "call".into(),
+                tool_name: "image_info".into(),
+                content: "literal [IMAGE:/example]".into(),
+                attachments: vec![reference.clone()],
+            }]),
+        ] {
+            let notifications = history_notifications_for_message("session", &message);
+            let serialized = serde_json::to_value(&notifications).unwrap();
+            let encoded = serialized.to_string();
+            assert!(encoded.contains("literal [IMAGE:/example]"));
+            assert!(encoded.contains("resource_link"));
+            assert!(encoded.contains("/tmp/photo.png"));
+            assert!(!encoded.contains("[IMAGE:/tmp/photo.png]"));
+        }
+    }
+
     #[tokio::test]
     async fn session_load_restores_history_and_streams_notifications() {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
@@ -8334,6 +8322,8 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                attachments: Vec::new(),
                 tool_call_id: "toolu_read_1".to_string(),
                 content: "port = 8080".to_string(),
                 tool_name: "read_file".to_string(),
@@ -8422,6 +8412,8 @@ mod tests {
                 reasoning_content: None,
             }),
             seed_row(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                attachments: Vec::new(),
                 tool_call_id: "toolu_ok".to_string(),
                 content: "done".to_string(),
                 tool_name: "shell".to_string(),
@@ -8439,6 +8431,8 @@ mod tests {
         })];
         partial.push(seed_row(ConversationMessage::ToolResults(vec![
             ToolResultMessage {
+                success: None,
+                attachments: Vec::new(),
                 tool_call_id: "toolu_ok".to_string(),
                 content: "done".to_string(),
                 tool_name: "shell".to_string(),
@@ -9413,7 +9407,6 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let image_path = cwd.path().join("rejected.png");
         std::fs::write(&image_path, b"not really a png").unwrap();
-        let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
         let store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
@@ -9432,7 +9425,12 @@ mod tests {
             .append_turn(
                 session_id,
                 &AcpServer::failed_turn_transcript(vec![ConversationMessage::Chat(
-                    ChatMessage::user(marker.clone()),
+                    ChatMessage::user("look at this").with_attachments(vec![
+                        zeroclaw_api::media::AttachmentReference {
+                            target: image_path.display().to_string(),
+                            kind: zeroclaw_api::media::AttachmentKind::Image,
+                        },
+                    ]),
                 )]),
             )
             .unwrap();
@@ -9516,7 +9514,6 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let image_path = cwd.path().join("cross-locale.png");
         std::fs::write(&image_path, valid_1x1_png()).unwrap();
-        let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
         let store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
@@ -9535,7 +9532,12 @@ mod tests {
             .append_turn(
                 session_id,
                 &AcpServer::failed_turn_transcript(vec![ConversationMessage::Chat(
-                    ChatMessage::user(marker.clone()),
+                    ChatMessage::user("look at this").with_attachments(vec![
+                        zeroclaw_api::media::AttachmentReference {
+                            target: image_path.display().to_string(),
+                            kind: zeroclaw_api::media::AttachmentKind::Image,
+                        },
+                    ]),
                 )]),
             )
             .unwrap();
@@ -9628,7 +9630,10 @@ mod tests {
         assert_eq!(requests.len(), 1, "expected exactly one provider request");
         for message in &requests[0] {
             assert!(
-                !message.content.contains("data:image"),
+                message
+                    .attachments
+                    .iter()
+                    .all(|attachment| !attachment.target.starts_with("data:image")),
                 "the rejected attachment must not be re-attached to the provider request: {message:?}"
             );
         }
@@ -9723,7 +9728,6 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let image_path = cwd.path().join("rejected-live.png");
         std::fs::write(&image_path, valid_1x1_png()).unwrap();
-        let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
         let store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
@@ -9767,7 +9771,7 @@ mod tests {
         // Prompt 1: the image goes out and the provider rejects it.
         server
             .handle_session_prompt(
-                &serde_json::json!({ "sessionId": session_id, "prompt": marker }),
+                &serde_json::json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "look at this" }, { "type": "resource", "resource": { "uri": image_path.display().to_string(), "mimeType": "image/png", "blob": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, valid_1x1_png()) } }] }),
                 &serde_json::json!(1),
             )
             .await
@@ -9786,13 +9790,19 @@ mod tests {
         let requests = requests.lock();
         assert_eq!(requests.len(), 2, "both prompts reached the provider");
         assert!(
-            requests[0].iter().any(|m| m.content.contains("data:image")),
+            requests[0].iter().any(|m| m
+                .attachments
+                .iter()
+                .any(|attachment| attachment.target.starts_with("data:image"))),
             "precondition: the first request carried the image: {:?}",
             requests[0]
         );
         for message in &requests[1] {
             assert!(
-                !message.content.contains("data:image"),
+                message
+                    .attachments
+                    .iter()
+                    .all(|attachment| !attachment.target.starts_with("data:image")),
                 "the rejected attachment must not be re-attached to the next active request: {message:?}"
             );
             assert!(
@@ -9817,7 +9827,7 @@ mod tests {
             .expect("session record exists");
         assert!(
             stored.messages.iter().any(
-                |m| matches!(m, ConversationMessage::Chat(chat) if chat.content.contains("rejected-live.png"))
+                |m| matches!(m, ConversationMessage::Chat(chat) if !chat.attachments.is_empty())
             ),
             "the failed turn's transcript must keep the attachment for client replay: {:?}",
             stored.messages
@@ -9828,24 +9838,15 @@ mod tests {
     async fn failed_image_with_tool_result_carrier_degrades_media_on_both_paths() {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 
-        // A prompt-mode tool round appends its results as a user-role
-        // `[Tool results]` carrier, and typed replay preserves it as an
-        // ordinary user chat. A turn shaped `user(image) -> assistant(tool
-        // request) -> user([Tool results] ...) -> failure` therefore hides its
-        // opening prompt behind that carrier: a span selector that walks back
-        // to "the last user message" starts at the carrier, misses the image
-        // prompt, and leaves the rejected attachment in both the live history
-        // and the restored seed. This regression drives that exact shape
-        // through both repair paths with a vision-capable provider, which
-        // retains historical image markers, so a clean next request is only
-        // possible if the span reached the opening prompt.
+        // Tool results do not open a user turn. Both the live and restored
+        // paths must reach the original image-bearing user message when
+        // degrading a failed turn's media.
 
         // ── Phase A: restore path ────────────────────────────────────
         let cwd = tempfile::tempdir().unwrap();
         let image_path = cwd.path().join("carrier-rejected.png");
         let file_bytes = valid_1x1_png();
         std::fs::write(&image_path, &file_bytes).unwrap();
-        let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
         let store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
@@ -9864,12 +9865,22 @@ mod tests {
             .append_turn(
                 session_id,
                 &AcpServer::failed_turn_transcript(vec![
-                    ConversationMessage::Chat(ChatMessage::user(marker.clone())),
+                    ConversationMessage::Chat(ChatMessage::user("look at this").with_attachments(
+                        vec![zeroclaw_api::media::AttachmentReference {
+                            target: image_path.display().to_string(),
+                            kind: zeroclaw_api::media::AttachmentKind::Image,
+                        }],
+                    )),
                     ConversationMessage::Chat(ChatMessage::assistant("let me read that file")),
-                    ConversationMessage::Chat(ChatMessage::user(format!(
-                        "[Tool results]\n{}",
-                        String::from_utf8_lossy(&file_bytes)
-                    ))),
+                    ConversationMessage::ToolResults(vec![
+                        zeroclaw_api::model_provider::ToolResultMessage {
+                            tool_call_id: "read-file".into(),
+                            tool_name: "file_read".into(),
+                            content: String::from_utf8_lossy(&file_bytes).into_owned(),
+                            success: Some(true),
+                            attachments: vec![],
+                        },
+                    ]),
                 ]),
             )
             .unwrap();
@@ -9932,7 +9943,10 @@ mod tests {
             assert_eq!(restore_requests.len(), 1, "expected one provider request");
             for message in &restore_requests[0] {
                 assert!(
-                    !message.content.contains("data:image"),
+                    message
+                        .attachments
+                        .iter()
+                        .all(|attachment| !attachment.target.starts_with("data:image")),
                     "the restored seed must not re-attach the rejected image past the tool carrier: {message:?}"
                 );
             }
@@ -10021,7 +10035,6 @@ mod tests {
         let live_cwd = tempfile::tempdir().unwrap();
         let live_image = live_cwd.path().join("carrier-live.png");
         std::fs::write(&live_image, &file_bytes).unwrap();
-        let live_marker = format!("look at this [IMAGE:{}]", live_image.display());
         let tool_call_response = format!(
             "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": {}}}}}\n</tool_call>",
             serde_json::to_string(&live_image.display().to_string())
@@ -10071,7 +10084,7 @@ mod tests {
         // The image-bearing turn runs one prompt-mode tool round, then fails.
         live_server
             .handle_session_prompt(
-                &serde_json::json!({ "sessionId": live_session, "prompt": live_marker }),
+                &serde_json::json!({ "sessionId": live_session, "prompt": [{ "type": "text", "text": "look at this" }, { "type": "resource", "resource": { "uri": live_image.display().to_string(), "mimeType": "image/png", "blob": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &file_bytes) } }] }),
                 &serde_json::json!(1),
             )
             .await
@@ -10087,14 +10100,13 @@ mod tests {
             stored
                 .messages
                 .iter()
-                .any(|m| matches!(m, ConversationMessage::Chat(chat)
-                    if chat.role == "user" && chat.content.starts_with("[Tool results]"))),
-            "precondition: the failed turn must contain a prompt-mode tool-result carrier: {:?}",
+                .any(|m| matches!(m, ConversationMessage::ToolResults(_))),
+            "precondition: the failed turn must contain structured tool results: {:?}",
             stored.messages
         );
         assert!(
             stored.messages.iter().any(
-                |m| matches!(m, ConversationMessage::Chat(chat) if chat.content.contains("carrier-live.png"))
+                |m| matches!(m, ConversationMessage::Chat(chat) if !chat.attachments.is_empty())
             ),
             "the failed turn's transcript must keep the attachment for client replay: {:?}",
             stored.messages
@@ -10117,14 +10129,18 @@ mod tests {
             live_requests.len()
         );
         assert!(
-            live_requests[0]
+            live_requests[0].iter().any(|m| m
+                .attachments
                 .iter()
-                .any(|m| m.content.contains("data:image")),
+                .any(|attachment| attachment.target.starts_with("data:image"))),
             "precondition: the first request carried the image"
         );
         for message in &live_requests[2] {
             assert!(
-                !message.content.contains("data:image"),
+                message
+                    .attachments
+                    .iter()
+                    .all(|attachment| !attachment.target.starts_with("data:image")),
                 "the rejected image must not be re-attached past the tool carrier: {message:?}"
             );
         }

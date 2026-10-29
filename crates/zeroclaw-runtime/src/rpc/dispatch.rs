@@ -1632,7 +1632,7 @@ impl PromptAdmission {
         &self,
         session_id: &str,
         input: zeroclaw_api::session_events::capture::EngineTurnInput,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatMessage> {
         use zeroclaw_api::session_events::capture::EngineInputPart;
         anyhow::ensure!(
             input.agent_alias.as_deref() == Some(self.agent_alias.as_str())
@@ -1693,6 +1693,7 @@ impl PromptAdmission {
                     .to_string_lossy()
                     .into_owned();
                 let mut parts = Vec::new();
+                let mut attachments = Vec::new();
                 for part in input.parts {
                     match part {
                         EngineInputPart::Text(text) => parts.push(text),
@@ -1717,12 +1718,15 @@ impl PromptAdmission {
                                 filename,
                                 &upload_root,
                             )?;
-                            parts.push(stored.marker);
+                            attachments.push(zeroclaw_api::media::AttachmentReference {
+                                kind: stored.kind,
+                                target: stored.workspace_path,
+                            });
                         }
                         EngineInputPart::Opaque { .. } => {}
                     }
                 }
-                Ok(parts.join("\n"))
+                Ok(ChatMessage::user(parts.join("\n")).with_attachments(attachments))
             })
             .await
             .ok_or_else(|| {
@@ -7348,8 +7352,10 @@ impl RpcDispatcher {
                 .await);
         }
 
-        // Process inline attachments: upload each, append markers to prompt.
-        let mut prompt = req.prompt.clone();
+        // Process inline attachments: upload each and attach typed references
+        // to the prompt message.
+        let prompt = req.prompt.clone();
+        let mut prompt_attachments = Vec::new();
         let mut native_files = Vec::new();
         if !req.attachments.is_empty() {
             use super::attachments::process_file_entry_with_history;
@@ -7383,9 +7389,6 @@ impl RpcDispatcher {
                     }
                 }
             };
-            if !prompt.is_empty() {
-                prompt.push('\n');
-            }
             for (idx, entry) in req.attachments.iter().enumerate() {
                 let source = attachment_sources.get(idx).and_then(|s| s.as_ref());
                 let result = tokio::select! {
@@ -7407,10 +7410,10 @@ impl RpcDispatcher {
                 };
                 let (result, history) = result;
                 native_files.push(history);
-                if idx > 0 {
-                    prompt.push('\n');
-                }
-                prompt.push_str(&result.marker);
+                prompt_attachments.push(zeroclaw_api::media::AttachmentReference {
+                    kind: result.kind,
+                    target: result.workspace_path,
+                });
             }
         }
 
@@ -7693,7 +7696,9 @@ impl RpcDispatcher {
                 let turn_id = uuid::Uuid::new_v4().to_string();
                 let session_id = sid.to_string();
                 let turn_id_for_store = turn_id.clone();
-                let initial = vec![ConversationMessage::Chat(ChatMessage::user(&prompt))];
+                let initial = vec![ConversationMessage::Chat(
+                    ChatMessage::user(&prompt).with_attachments(prompt_attachments.clone()),
+                )];
                 let checkpoint_admission = admission.duplicate();
                 let persisted = if let Some(store) = self.ctx.session_repository.clone() {
                     match tokio::task::spawn_blocking(move || {
@@ -7793,7 +7798,7 @@ impl RpcDispatcher {
         let recovery_session_id = sid.to_owned();
         let turn = execute_turn(
             agent,
-            prompt.clone(),
+            ChatMessage::user(prompt.clone()).with_attachments(prompt_attachments),
             cancel.clone(),
             TurnAttribution {
                 session_key: Some(sid.to_string()),
@@ -8112,11 +8117,37 @@ impl RpcDispatcher {
             }
         }
 
-        // The live Agent holds the context installed by this turn, including
-        // compaction and cancellation. Count that projection without reading
-        // an archived transcript backend.
-        let message_count = if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
-            Some(agent.lock().await.history().len())
+        // Report the same durable transcript count as the session picker and
+        // pager. The live model context can omit or compact historical rows.
+        let history_reader = native_session
+            .as_ref()
+            .and_then(|port| port.history_reader());
+        let message_count = if let Some(reader) = history_reader {
+            Some(
+                reader
+                    .current()
+                    .await
+                    .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
+                    .message_count,
+            )
+        } else if chat_mode == ChatMode::Acp
+            && let Some(store) = self.ctx.session_repository.clone()
+        {
+            let session_id = sid.to_owned();
+            tokio::task::spawn_blocking(move || store.projected_message_count(&session_id))
+                .await
+                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
+                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
+        } else if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
+            let agent = agent.lock().await;
+            let history = agent.history();
+            let system_rows = history
+                .iter()
+                .filter(|message| {
+                    matches!(message, ConversationMessage::Chat(chat) if chat.role == "system")
+                })
+                .count();
+            Some(zeroclaw_api::model_provider::projected_entry_count(history) - system_rows)
         } else {
             None
         };
@@ -14043,7 +14074,7 @@ impl RpcDispatcher {
                         .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
                 port.record_file(EngineFileInput {
                     file_id:stored.ref_id.clone(),representation,
-                    registration:serde_json::json!({"source":"rpc_upload_owner","filename":filename,"workspace_path":stored.workspace_path,"byte_len":stored.size_bytes}),
+                    registration:super::attachments::file_registration(filename, &stored.workspace_path),
                     policy_evidence:serde_json::json!({"source":"authorized_rpc_upload_commit","method":method.wire_name()}),
                 },"upload_rendition_observed").await.map_err(|error|rpc_err(INTERNAL_ERROR,error.to_string()))?;
             }
@@ -15595,9 +15626,11 @@ fn checkpoint_fragment_for_event(event: &TurnEvent) -> Option<ConversationMessag
         } => {
             let content = zeroclaw_api::session_events::transcript::bounded_tool_output(output);
             Some(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
                 tool_call_id: id.clone(),
                 content,
                 tool_name: name.clone(),
+                attachments: Vec::new(),
             }]))
         }
         _ => None,
@@ -32207,9 +32240,13 @@ mod tests {
             .recover_prompt(sid, input.clone())
             .await
             .expect("recover");
+        assert_eq!(prompt.content, "original before\noriginal after");
         assert_eq!(
-            prompt,
-            format!("original before\n{}\noriginal after", stored.marker)
+            prompt.attachments,
+            vec![zeroclaw_api::media::AttachmentReference {
+                kind: stored.kind,
+                target: stored.workspace_path.clone(),
+            }]
         );
         assert_eq!(
             std::fs::read(&stored.workspace_path).expect("restored bytes"),
@@ -33699,11 +33736,15 @@ mod tests {
             },
             ConversationMessage::ToolResults(vec![
                 ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "shared".into(),
                     content: "/tmp".into(),
                     tool_name: "shell".into(),
                 },
                 ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "shared".into(),
                     content: "duplicate result".into(),
                     tool_name: "shell".into(),
@@ -33726,16 +33767,22 @@ mod tests {
             },
             ConversationMessage::ToolResults(vec![
                 ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "solo".into(),
                     content: "contents".into(),
                     tool_name: "read".into(),
                 },
                 ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "shared".into(),
                     content: "second fold".into(),
                     tool_name: "shell".into(),
                 },
                 ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "orphan".into(),
                     content: "late result".into(),
                     tool_name: "shell".into(),
@@ -35038,6 +35085,8 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                attachments: Vec::new(),
                 tool_call_id: "call-1".into(),
                 tool_name: "shell".into(),
                 content: "/tmp".into(),
@@ -35977,16 +36026,22 @@ mod tests {
             },
             ConversationMessage::ToolResults(vec![
                 ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "call-2".into(),
                     content: "contents".into(),
                     tool_name: "read".into(),
                 },
                 ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "call-1".into(),
                     content: "/tmp".into(),
                     tool_name: "shell".into(),
                 },
                 ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "orphan".into(),
                     content: "late result".into(),
                     tool_name: "shell".into(),
@@ -36048,11 +36103,15 @@ mod tests {
             },
             ConversationMessage::ToolResults(vec![
                 ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "duplicate".into(),
                     content: "first result".into(),
                     tool_name: "first".into(),
                 },
                 ToolResultMessage {
+                    success: None,
+                    attachments: Vec::new(),
                     tool_call_id: "duplicate".into(),
                     content: "second result".into(),
                     tool_name: "second".into(),
@@ -36084,6 +36143,8 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                success: None,
+                attachments: Vec::new(),
                 tool_call_id: "old-call".into(),
                 content: "/tmp".into(),
                 tool_name: "shell".into(),
@@ -36156,8 +36217,13 @@ mod tests {
                 sid,
                 &[
                     ConversationMessage::Chat(ChatMessage {
+                        tool_calls: Vec::new(),
+                        tool_result: None,
+                        reasoning_content: None,
                         role: "user".into(),
                         content: "hello from prior turn".into(),
+
+                        attachments: Vec::new(),
                     }),
                     ConversationMessage::AssistantToolCalls {
                         text: Some("let me check the logs".into()),
@@ -36170,6 +36236,8 @@ mod tests {
                         reasoning_content: None,
                     },
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        success: None,
+                        attachments: Vec::new(),
                         tool_call_id: "tc-1".into(),
                         content: "log contents".into(),
                         tool_name: String::new(),
@@ -36185,13 +36253,20 @@ mod tests {
                         reasoning_content: None,
                     },
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        success: None,
+                        attachments: Vec::new(),
                         tool_call_id: "tc-2".into(),
                         content: "no errors".into(),
                         tool_name: String::new(),
                     }]),
                     ConversationMessage::Chat(ChatMessage {
+                        tool_calls: Vec::new(),
+                        tool_result: None,
+                        reasoning_content: None,
                         role: "assistant".into(),
                         content: "ack from prior turn".into(),
+
+                        attachments: Vec::new(),
                     }),
                 ],
             )
@@ -36731,16 +36806,22 @@ mod tests {
                     },
                     ConversationMessage::ToolResults(vec![
                         ToolResultMessage {
+                            success: None,
+                            attachments: Vec::new(),
                             tool_call_id: "duplicate".into(),
                             content: "first result".into(),
                             tool_name: "first".into(),
                         },
                         ToolResultMessage {
+                            success: None,
+                            attachments: Vec::new(),
                             tool_call_id: "orphan".into(),
                             content: "orphan result".into(),
                             tool_name: "shell".into(),
                         },
                         ToolResultMessage {
+                            success: None,
+                            attachments: Vec::new(),
                             tool_call_id: "duplicate".into(),
                             content: "second result".into(),
                             tool_name: "second".into(),

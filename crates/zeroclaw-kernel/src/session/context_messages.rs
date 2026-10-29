@@ -111,7 +111,7 @@ impl SessionCoordinator {
             else {
                 continue;
             };
-            if chat.role != "assistant" {
+            if chat.role != "assistant" || !chat.attachments.is_empty() {
                 continue;
             }
             let matching_provider = chat.content == provider_text;
@@ -252,8 +252,13 @@ impl SessionCoordinator {
             }
             if supported {
                 let message = ConversationMessage::Chat(ChatMessage {
+                    tool_calls: Vec::new(),
+                    tool_result: None,
+                    reasoning_content: None,
                     role: role.into(),
                     content: text,
+
+                    attachments: Vec::new(),
                 });
                 candidates.push((
                     canonical_json(&message).map_err(AppendError::from)?,

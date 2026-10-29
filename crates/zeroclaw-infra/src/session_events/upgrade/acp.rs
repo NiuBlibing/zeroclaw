@@ -30,10 +30,18 @@ pub(super) fn import_all(
                 .lookup_receipt(&stream, &format!("legacy-acp-root:{stream}"))
                 .map_err(storage)?
                 .is_none();
-        let data = source
+        let mut data = source
             .load_session(&id)
             .map_err(storage)?
             .ok_or_else(|| AppendError::Corrupt("ACP source disappeared during upgrade".into()))?;
+        for (index, message) in data.messages.iter_mut().enumerate() {
+            super::legacy_media::upgrade_conversation(message, index);
+        }
+        if let Some(context) = &mut data.retained_context {
+            for (index, message) in context.iter_mut().enumerate() {
+                super::legacy_media::upgrade_conversation(message, index);
+            }
+        }
         let checkpoint = source.legacy_checkpoint(&id).map_err(storage)?;
         let closed = source.is_session_killed(&id).map_err(storage)?;
         let metadata = source.legacy_metadata(&id).map_err(storage)?;

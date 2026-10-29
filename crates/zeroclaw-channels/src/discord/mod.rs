@@ -14,7 +14,7 @@ use zeroclaw_api::channel::{
     ChannelGatePrompt, ChannelMessage, GateChoiceEmphasis, SendMessage, await_approval_prompt_send,
 };
 use zeroclaw_api::media::{
-    MarkerKind, MediaAttachment, RenderedMarker, provider_loadable_image_mime_for,
+    AttachmentKind, AttachmentReference, MediaAttachment, provider_loadable_image_mime_for,
 };
 use zeroclaw_runtime::i18n;
 
@@ -1393,7 +1393,7 @@ async fn process_attachments(
         let is_audio = is_discord_audio_attachment(ct, name);
 
         // Audio with channel-level transcription configured: transcribe
-        // inline so the agent receives `[Voice] <transcript>` text rather
+        // inline so the agent receives the transcript as ordinary text rather
         // than opaque bytes through the media pipeline.
         let mut downloaded_audio_bytes = None;
         if is_audio && let Some(manager) = transcription_manager {
@@ -1417,7 +1417,7 @@ async fn process_attachments(
                                 trimmed.len()
                             )
                         );
-                        text_parts.push(format!("[Voice] {trimmed}"));
+                        text_parts.push(trimmed.to_string());
                         continue;
                     }
                 }
@@ -1448,20 +1448,17 @@ async fn process_attachments(
         // provider-loadability contract Telegram uses applies here: an image
         // the loader cannot reload (HEIC/TIFF/SVG/BMP) renders as a document
         // rather than an image the shared pipeline would try to re-inline.
-        let marker_kind = marker_kind_for(ct, name, &bytes, is_audio);
-        let marker_label = discord_marker_label(marker_kind);
-        let (marker_target, saved_locally) = match workspace_dir {
+        let attachment_kind = attachment_kind_for(ct, name, &bytes, is_audio);
+        let reference_target = match workspace_dir {
             Some(dir) => match save_attachment_bytes_to_workspace(dir, name, &bytes).await {
-                Ok(local_path) => (local_path.display().to_string(), true),
+                Ok(local_path) => local_path.display().to_string(),
                 Err(e) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"name": name, "kind": marker_label, "error": format!("{}", e)})), "attachment save failed, falling back to url");
-                    (url.to_string(), false)
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"name": name, "kind": format!("{:?}", attachment_kind), "error": format!("{}", e)})), "attachment save failed, falling back to url");
+                    url.to_string()
                 }
             },
-            None => (url.to_string(), false),
+            None => url.to_string(),
         };
-        text_parts.push(format!("[{marker_label}:{marker_target}]"));
-
         media.push(MediaAttachment {
             file_name: name.to_string(),
             data: bytes,
@@ -1470,7 +1467,7 @@ async fn process_attachments(
             } else {
                 Some(ct.to_string())
             },
-            // Record the exact rendered target for image URL fallbacks too.
+            // Record the exact target for URL fallbacks too.
             // They are deliberately not treated as channel-owned by the
             // shared pipeline: the raw bytes are available and can replace
             // the URL without relying on remote fetching. The saved name
@@ -1478,9 +1475,9 @@ async fn process_attachments(
             // identify the marker just rendered above — record the target and
             // disposition so a later stage reads the verdict rather than
             // re-deciding it from the payload.
-            marker: (saved_locally || marker_kind == MarkerKind::Image).then(|| RenderedMarker {
-                target: marker_target.clone(),
-                kind: marker_kind,
+            reference: Some(AttachmentReference {
+                target: reference_target.clone(),
+                kind: attachment_kind,
             }),
         });
     }
@@ -1571,39 +1568,32 @@ fn is_discord_audio_attachment(content_type: &str, filename: &str) -> bool {
 }
 
 /// Map a Discord attachment's content type, name, and bytes plus its
-/// audio-detection result to the canonical outbound marker kind. Pulled out of
+/// audio-detection result to the canonical outbound reference kind. Pulled out of
 /// `process_attachments` so the dispatch can be unit-tested without a live HTTP
 /// download.
 ///
-/// An `image/*` content type is only an [`MarkerKind::Image`] when the provider
+/// An `image/*` content type is only an [`AttachmentKind::Image`] when the provider
 /// loader would actually accept the format; the same HEIC/TIFF/SVG/BMP the
-/// Telegram path keeps out of `[IMAGE:]` markers render as documents here too,
-/// so the shared pipeline never reclassifies them into an `[IMAGE:data:...]`
-/// copy the provider rejects.
-fn marker_kind_for(content_type: &str, file_name: &str, data: &[u8], is_audio: bool) -> MarkerKind {
+/// Telegram path keeps as documents are represented as documents here too, so
+/// the shared pipeline never promises an image the provider rejects.
+fn attachment_kind_for(
+    content_type: &str,
+    file_name: &str,
+    data: &[u8],
+    is_audio: bool,
+) -> AttachmentKind {
     if content_type.starts_with("image/") {
         if provider_loadable_image_mime_for(file_name, data).is_some() {
-            MarkerKind::Image
+            AttachmentKind::Image
         } else {
-            MarkerKind::Document
+            AttachmentKind::Document
         }
     } else if is_audio {
-        MarkerKind::Audio
+        AttachmentKind::Audio
     } else if content_type.starts_with("video/") {
-        MarkerKind::Video
+        AttachmentKind::Video
     } else {
-        MarkerKind::Document
-    }
-}
-
-/// The uppercase `[KIND:target]` label Discord renders for a disposition. The
-/// label format is Discord's own; `MarkerKind` stays channel-agnostic.
-fn discord_marker_label(kind: MarkerKind) -> &'static str {
-    match kind {
-        MarkerKind::Image => "IMAGE",
-        MarkerKind::Audio => "AUDIO",
-        MarkerKind::Video => "VIDEO",
-        MarkerKind::Document => "DOCUMENT",
+        AttachmentKind::Document
     }
 }
 
@@ -1975,8 +1965,7 @@ impl Channel for DiscordChannel {
 
         let raw_content = crate::util::strip_tool_call_tags(&message.content);
 
-        // Embeds first: their `[EMBED:{json}]` payload can itself contain `[`/`]`,
-        // so they must be lifted out before the media-marker scan runs on the rest.
+        // Discord embed/component markup is independent of media attachments.
         let (content_without_embeds, embeds, embed_failures, embeds_truncated) =
             prepare_outgoing_embeds(&raw_content, self.workspace_dir.as_deref());
 
@@ -1988,10 +1977,11 @@ impl Channel for DiscordChannel {
             self.build_marker_components(&component_rows)
         };
 
-        let (cleaned_content, parsed_attachments) =
-            parse_attachment_markers(&content_without_components);
-        let (mut local_files, remote_urls, failures) =
-            classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
+        let cleaned_content = content_without_components;
+        let (mut local_files, remote_urls, failures) = classify_structured_outgoing_attachments(
+            &message.attachments,
+            self.workspace_dir.as_deref(),
+        );
 
         // Discord accepts max 10 files per message.
         if local_files.len() > 10 {
@@ -3948,8 +3938,8 @@ impl Channel for DiscordChannel {
         self.last_draft_edit.lock().remove(recipient);
 
         let text = &crate::util::strip_tool_call_tags(text);
-        // Lift `[EMBED:…]` out before the media-marker scan (its JSON can contain
-        // `[`/`]`); embeds attach to the first finalized message below, so a
+        // Render Discord embeds independently from attachment fields. Embeds
+        // attach to the first finalized message below, so a
         // streaming/draft reply renders embeds the same as a normal send.
         let (text_without_embeds, embeds, _embed_failures, _embeds_truncated) =
             prepare_outgoing_embeds(text, self.workspace_dir.as_deref());
@@ -3960,66 +3950,16 @@ impl Channel for DiscordChannel {
         } else {
             self.build_marker_components(&component_rows)
         };
-        let (cleaned_content, parsed_attachments) =
-            parse_attachment_markers(&text_without_components);
-        let (mut local_files, remote_urls, failures) =
-            classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
-        let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
-        let note = delivery_failure_note(&failures);
-        let content = compose_body_with_failure_note(&body, note.as_deref());
-        let reactions = decide_failure_reactions(&failures);
-
+        let content = text_without_components;
         let client = self.http_client();
 
-        // Path 1: file attachments — delete draft and POST fresh message with files.
-        if !local_files.is_empty() {
-            let _ = delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
-
-            if local_files.len() > 10 {
-                local_files.truncate(10);
-            }
-            let chunks = split_message_for_discord(&content);
-            let mut first_message_id: Option<String> = None;
-            for (i, chunk) in chunks.iter().enumerate() {
-                let new_id = if i == 0 {
-                    // Embeds + components + files ride the first message.
-                    let payload = DiscordOutgoing {
-                        content: Some(chunk.clone()),
-                        embeds: embeds.clone(),
-                        components: component_action_rows.clone(),
-                        ..Default::default()
-                    };
-                    send_discord_message_payload_with_files(
-                        &client,
-                        &self.bot_token,
-                        recipient,
-                        &payload,
-                        &local_files,
-                    )
-                    .await?
-                } else {
-                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?
-                };
-                if first_message_id.is_none() {
-                    first_message_id = Some(new_id);
-                }
-                if i < chunks.len() - 1 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            }
-            self.apply_failure_reactions(recipient, first_message_id.as_deref(), &reactions)
-                .await;
-            return Ok(());
-        }
-
-        // Path 2: text exceeds limit — delete draft and POST as chunked messages.
+        // Long text replaces the draft with chunked messages.
         if content.chars().count() > DISCORD_MAX_MESSAGE_LENGTH {
             let _ = delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
 
             let chunks = split_message_for_discord(&content);
-            let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
-                let new_id = if i == 0 {
+                if i == 0 {
                     // Embeds + components ride the first message.
                     let payload = DiscordOutgoing {
                         content: Some(chunk.clone()),
@@ -4028,19 +3968,14 @@ impl Channel for DiscordChannel {
                         ..Default::default()
                     };
                     send_discord_message_payload(&client, &self.bot_token, recipient, &payload)
-                        .await?
+                        .await?;
                 } else {
-                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?
+                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?;
                 };
-                if first_message_id.is_none() {
-                    first_message_id = Some(new_id);
-                }
                 if i < chunks.len() - 1 {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
-            self.apply_failure_reactions(recipient, first_message_id.as_deref(), &reactions)
-                .await;
             return Ok(());
         }
 
@@ -4050,7 +3985,7 @@ impl Channel for DiscordChannel {
             components: component_action_rows.clone(),
             ..Default::default()
         };
-        let reaction_target = match edit_discord_message_payload(
+        match edit_discord_message_payload(
             &client,
             &self.bot_token,
             recipient,
@@ -4059,7 +3994,7 @@ impl Channel for DiscordChannel {
         )
         .await
         {
-            Ok(()) => message_id.to_string(),
+            Ok(()) => {}
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -4070,11 +4005,9 @@ impl Channel for DiscordChannel {
                 );
                 let _ =
                     delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
-                send_discord_message_payload(&client, &self.bot_token, recipient, &payload).await?
+                send_discord_message_payload(&client, &self.bot_token, recipient, &payload).await?;
             }
         };
-        self.apply_failure_reactions(recipient, Some(&reaction_target), &reactions)
-            .await;
 
         Ok(())
     }
@@ -4589,7 +4522,7 @@ mod tests {
     /// real pipeline proves the two are joined by recorded provenance rather
     /// than by name — a basename comparison sends this image twice.
     #[tokio::test]
-    async fn saved_attachment_marker_joins_to_its_envelope_through_the_pipeline() {
+    async fn saved_attachment_reference_joins_to_its_envelope_through_the_pipeline() {
         use crate::orchestrator::media_pipeline::MediaPipeline;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4618,7 +4551,7 @@ mod tests {
 
         assert_eq!(media.len(), 1, "one attachment in, one envelope out");
         let saved = media[0]
-            .marker_target()
+            .reference_target()
             .expect("a saved attachment must record the target it rendered");
         // The recorded target is a native filesystem path, so the separator is
         // `\` on Windows and `/` elsewhere. Walk it as a `Path` instead of
@@ -4641,9 +4574,10 @@ mod tests {
             media[0].file_name,
             "the save name must differ from the sender name, or this test proves nothing"
         );
-        assert!(
-            text.contains(&format!("[IMAGE:{saved}]")),
-            "rendered text must reference exactly the recorded target: {text}"
+        assert!(text.is_empty());
+        assert_eq!(
+            media[0].reference.as_ref().unwrap().kind,
+            AttachmentKind::Image
         );
 
         let config = zeroclaw_config::schema::MediaPipelineConfig {
@@ -4652,16 +4586,19 @@ mod tests {
             ..Default::default()
         };
         let enriched = MediaPipeline::new(&config, None, true)
-            .process(&text, &media)
+            .process_message(&text, &media)
             .await;
 
         assert_eq!(
-            enriched, text,
+            enriched.content, text,
             "a Discord-saved image must not be inlined a second time"
         );
         assert!(
-            !enriched.contains("IMAGE:data:"),
-            "no base64 copy may be added alongside the path marker: {enriched}"
+            enriched
+                .attachments
+                .iter()
+                .all(|attachment| !attachment.target.starts_with("data:")),
+            "no base64 copy may be added alongside the path reference: {enriched:?}"
         );
     }
 
@@ -4701,14 +4638,11 @@ mod tests {
 
         assert_eq!(media.len(), 1, "one attachment in, one envelope out");
         assert_eq!(
-            media[0].marker.as_ref().map(|m| m.kind),
-            Some(MarkerKind::Document),
+            media[0].reference.as_ref().map(|m| m.kind),
+            Some(AttachmentKind::Document),
             "an unloadable image must be owned as a document, not an image"
         );
-        assert!(
-            text.contains("[DOCUMENT:") && !text.contains("[IMAGE:"),
-            "the unloadable image must render as a document marker: {text}"
-        );
+        assert!(text.is_empty());
 
         let config = zeroclaw_config::schema::MediaPipelineConfig {
             enabled: true,
@@ -4716,16 +4650,19 @@ mod tests {
             ..Default::default()
         };
         let enriched = MediaPipeline::new(&config, None, true)
-            .process(&text, &media)
+            .process_message(&text, &media)
             .await;
 
         assert_eq!(
-            enriched, text,
+            enriched.content, text,
             "a channel-owned document must not be reclassified and inlined as an image"
         );
         assert!(
-            !enriched.contains("IMAGE:data:"),
-            "no base64 image copy may be produced for an unloadable image: {enriched}"
+            enriched
+                .attachments
+                .iter()
+                .all(|attachment| !attachment.target.starts_with("data:")),
+            "no base64 image copy may be produced for an unloadable image: {enriched:?}"
         );
     }
 
@@ -4773,17 +4710,13 @@ mod tests {
 
         assert_eq!(media.len(), 1, "one attachment in, one envelope out");
         assert!(
-            media[0].marker_target().is_some(),
-            "a URL fallback must retain its exact channel marker target"
+            media[0].reference_target().is_some(),
+            "a URL fallback must retain its exact channel reference target"
         );
         assert_eq!(
-            media[0].channel_rendered_remote_image_target(),
+            media[0].reference_target(),
             attachments[0]["url"].as_str(),
             "the URL fallback must be exposed for exact replacement"
-        );
-        assert!(
-            !media[0].channel_rendered_owned_disposition(),
-            "a remote URL fallback must not be deferred by the shared pipeline"
         );
 
         let config = zeroclaw_config::schema::MediaPipelineConfig {
@@ -4792,16 +4725,19 @@ mod tests {
             ..Default::default()
         };
         let enriched = MediaPipeline::new(&config, None, true)
-            .process(&text, &media)
+            .process_message(&text, &media)
             .await;
 
         assert!(
-            enriched.contains("IMAGE:data:"),
-            "the loadable image's bytes must reach the provider as inline data, not be dropped: {enriched}"
+            enriched
+                .attachments
+                .iter()
+                .any(|attachment| attachment.target.starts_with("data:")),
+            "the loadable image's bytes must reach the provider as inline data, not be dropped: {enriched:?}"
         );
 
         let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
-            &[zeroclaw_api::model_provider::ChatMessage::user(enriched)],
+            &[enriched],
             &zeroclaw_config::schema::MultimodalConfig::default(),
         )
         .await
@@ -4809,7 +4745,11 @@ mod tests {
         assert!(prepared.contains_images);
         let provider_content = &prepared.messages[0].content;
         assert_eq!(
-            provider_content.matches("data:image/jpeg;base64,").count(),
+            prepared.messages[0]
+                .attachments
+                .iter()
+                .filter(|attachment| attachment.target.starts_with("data:image/jpeg;base64,"))
+                .count(),
             1,
             "provider preparation must receive one effective image: {provider_content}"
         );
@@ -4855,12 +4795,8 @@ mod tests {
         .await;
 
         assert_eq!(media.len(), 1, "one attachment in, one envelope out");
-        assert_eq!(media[0].marker_target(), Some(url.as_str()));
-        assert_eq!(
-            media[0].channel_rendered_remote_image_target(),
-            Some(url.as_str())
-        );
-        assert!(!media[0].channel_rendered_owned_disposition());
+        assert_eq!(media[0].reference_target(), Some(url.as_str()));
+        assert_eq!(media[0].reference_target(), Some(url.as_str()));
 
         let config = zeroclaw_config::schema::MediaPipelineConfig {
             enabled: true,
@@ -4868,11 +4804,16 @@ mod tests {
             ..Default::default()
         };
         let enriched = MediaPipeline::new(&config, None, true)
-            .process(&text, &media)
+            .process_message(&text, &media)
             .await;
 
-        assert!(enriched.contains("[IMAGE:data:image/jpeg;base64,"));
-        assert!(!enriched.contains(&url));
+        assert_eq!(enriched.attachments.len(), 1);
+        assert!(
+            enriched.attachments[0]
+                .target
+                .starts_with("data:image/jpeg;base64,")
+        );
+        assert!(!enriched.content.contains(&url));
     }
 
     #[tokio::test]
@@ -5079,6 +5020,7 @@ mod tests {
             false,
         );
         let msg = SendMessage {
+            locations: Vec::new(),
             content: "hello".into(),
             recipient: "interaction:999".into(),
             subject: None,
@@ -7300,10 +7242,8 @@ mod tests {
         let (text, media) =
             process_attachments(&attachments, &client, None, Some(&transcription)).await;
 
-        assert_eq!(
-            text,
-            format!("[AUDIO:{}]", attachments[0]["url"].as_str().unwrap())
-        );
+        assert!(text.is_empty());
+        assert_eq!(media[0].reference_target(), attachments[0]["url"].as_str());
         assert_eq!(media.len(), 1);
         assert_eq!(media[0].file_name, "voice.ogg");
         assert_eq!(media[0].mime_type.as_deref(), Some("audio/ogg"));
@@ -7347,10 +7287,8 @@ mod tests {
         let (text, media) =
             process_attachments(&attachments, &client, None, Some(&transcription)).await;
 
-        assert_eq!(
-            text,
-            format!("[AUDIO:{}]", attachments[0]["url"].as_str().unwrap())
-        );
+        assert!(text.is_empty());
+        assert_eq!(media[0].reference_target(), attachments[0]["url"].as_str());
         assert_eq!(media.len(), 1);
         assert_eq!(media[0].file_name, "voice.ogg");
         assert_eq!(media[0].mime_type.as_deref(), Some("audio/ogg"));
@@ -7373,98 +7311,98 @@ mod tests {
     }
 
     #[test]
-    fn marker_kind_for_classifies_each_mime_family() {
+    fn attachment_kind_for_classifies_each_mime_family() {
         assert_eq!(
-            marker_kind_for("image/png", "photo.png", b"", false),
-            MarkerKind::Image
+            attachment_kind_for("image/png", "photo.png", b"", false),
+            AttachmentKind::Image
         );
         assert_eq!(
-            marker_kind_for("image/jpeg", "photo.jpg", b"", false),
-            MarkerKind::Image
+            attachment_kind_for("image/jpeg", "photo.jpg", b"", false),
+            AttachmentKind::Image
         );
         assert_eq!(
-            marker_kind_for("video/mp4", "clip.mp4", b"", false),
-            MarkerKind::Video
+            attachment_kind_for("video/mp4", "clip.mp4", b"", false),
+            AttachmentKind::Video
         );
         assert_eq!(
-            marker_kind_for("application/pdf", "doc.pdf", b"", false),
-            MarkerKind::Document
+            attachment_kind_for("application/pdf", "doc.pdf", b"", false),
+            AttachmentKind::Document
         );
         assert_eq!(
-            marker_kind_for("application/zip", "archive.zip", b"", false),
-            MarkerKind::Document
+            attachment_kind_for("application/zip", "archive.zip", b"", false),
+            AttachmentKind::Document
         );
         assert_eq!(
-            marker_kind_for("", "blob", b"", false),
-            MarkerKind::Document
+            attachment_kind_for("", "blob", b"", false),
+            AttachmentKind::Document
         );
     }
 
     #[test]
-    fn marker_kind_for_demotes_an_unloadable_image_to_a_document() {
+    fn attachment_kind_for_demotes_an_unloadable_image_to_a_document() {
         // The provider loader rejects HEIC/TIFF/SVG/BMP, so an `image/*`
         // content type in one of those formats must render as a document
         // rather than an image the shared pipeline would try to re-inline.
         assert_eq!(
-            marker_kind_for("image/heic", "photo.heic", b"", false),
-            MarkerKind::Document
+            attachment_kind_for("image/heic", "photo.heic", b"", false),
+            AttachmentKind::Document
         );
         assert_eq!(
-            marker_kind_for("image/tiff", "scan.tiff", b"", false),
-            MarkerKind::Document
+            attachment_kind_for("image/tiff", "scan.tiff", b"", false),
+            AttachmentKind::Document
         );
         // A recognized-but-rejected extension wins over the payload: BMP bytes
         // that carry a PNG magic prefix stay a document, matching the loader's
         // precedence (an unrecognized extension like `.heic` instead defers to
         // the magic sniff, which is covered separately).
         assert_eq!(
-            marker_kind_for(
+            attachment_kind_for(
                 "image/bmp",
                 "photo.bmp",
                 &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
                 false
             ),
-            MarkerKind::Document
+            AttachmentKind::Document
         );
     }
 
     #[test]
-    fn marker_kind_for_recovers_a_loadable_image_from_its_magic_bytes() {
+    fn attachment_kind_for_recovers_a_loadable_image_from_its_magic_bytes() {
         // An extensionless upload still classifies as an image when the bytes
         // carry a provider-loadable magic signature (PNG here).
         assert_eq!(
-            marker_kind_for(
+            attachment_kind_for(
                 "image/png",
                 "photo",
                 &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
                 false
             ),
-            MarkerKind::Image
+            AttachmentKind::Image
         );
     }
 
     #[test]
-    fn marker_kind_for_treats_audio_flag_as_audio_regardless_of_content_type() {
+    fn attachment_kind_for_treats_audio_flag_as_audio_regardless_of_content_type() {
         // Filename-detected audio with no content_type should still classify
         // as AUDIO, matching the unified inbound pipeline.
         assert_eq!(
-            marker_kind_for("", "clip.ogg", b"", true),
-            MarkerKind::Audio
+            attachment_kind_for("", "clip.ogg", b"", true),
+            AttachmentKind::Audio
         );
         assert_eq!(
-            marker_kind_for("application/octet-stream", "clip.ogg", b"", true),
-            MarkerKind::Audio
+            attachment_kind_for("application/octet-stream", "clip.ogg", b"", true),
+            AttachmentKind::Audio
         );
     }
 
     #[test]
-    fn marker_kind_for_prefers_image_over_audio_when_content_type_is_image() {
+    fn attachment_kind_for_prefers_image_over_audio_when_content_type_is_image() {
         // Defensive: if a Discord attachment somehow tripped both heuristics,
         // a loadable image MIME wins so vision-capable providers still receive
         // image bytes through the MediaAttachment path.
         assert_eq!(
-            marker_kind_for("image/png", "photo.png", b"", true),
-            MarkerKind::Image
+            attachment_kind_for("image/png", "photo.png", b"", true),
+            AttachmentKind::Image
         );
     }
 
@@ -7515,28 +7453,6 @@ mod tests {
         let filter = vec!["111".to_string()];
         // Direct match with a parent_id present — parent is irrelevant.
         assert!(channel_passes_filter(&filter, "111", Some("999")));
-    }
-
-    #[test]
-    fn parse_attachment_markers_extracts_supported_markers() {
-        let input = "Report\n[IMAGE:https://example.com/a.png]\n[DOCUMENT:/tmp/a.pdf]";
-        let (cleaned, attachments) = parse_attachment_markers(input);
-
-        assert_eq!(cleaned, "Report");
-        assert_eq!(attachments.len(), 2);
-        assert_eq!(attachments[0].kind, DiscordAttachmentKind::Image);
-        assert_eq!(attachments[0].target, "https://example.com/a.png");
-        assert_eq!(attachments[1].kind, DiscordAttachmentKind::Document);
-        assert_eq!(attachments[1].target, "/tmp/a.pdf");
-    }
-
-    #[test]
-    fn parse_attachment_markers_keeps_invalid_marker_text() {
-        let input = "Hello [NOT_A_MARKER:foo] world";
-        let (cleaned, attachments) = parse_attachment_markers(input);
-
-        assert_eq!(cleaned, input);
-        assert!(attachments.is_empty());
     }
 
     #[test]
@@ -7738,30 +7654,7 @@ mod tests {
         );
         assert!(
             !note.contains("a.png") && !note.contains("b.pdf") && !note.contains("c.mp4"),
-            "user-facing failure note must not echo failed marker targets"
-        );
-    }
-
-    #[test]
-    fn composed_delivery_failure_note_redacts_parsed_marker_target() {
-        let content = "Done\n[IMAGE: /workspace/missing.png]";
-        let (cleaned_content, parsed_attachments) = parse_attachment_markers(content);
-        let (_locals, _remotes, failures) =
-            classify_outgoing_attachments(&parsed_attachments, None);
-        let note = delivery_failure_note(&failures);
-        let composed = compose_body_with_failure_note(&cleaned_content, note.as_deref());
-
-        // Locale-independent: the body must keep the original `Done` content,
-        // gain exactly one blank-line separator, and never echo the failed
-        // marker path. The previous literal English assertion was
-        // locale-dependent and broke on non-English CI runners.
-        assert!(
-            composed.starts_with("Done\n\n"),
-            "composed body must preserve original content with blank-line separator, got {composed:?}"
-        );
-        assert!(
-            !composed.contains("/workspace/missing.png"),
-            "composed outbound body must not echo failed marker targets"
+            "user-facing failure note must not echo failed reference targets"
         );
     }
 

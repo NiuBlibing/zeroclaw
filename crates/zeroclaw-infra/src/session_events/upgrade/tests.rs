@@ -102,6 +102,86 @@ fn sqlite_message_timestamps_survive_upgrade_to_each_native_backend() {
     }
 }
 
+#[test]
+fn legacy_tool_metadata_survives_storage_upgrade_and_context_reconstruction() {
+    use zeroclaw_api::model_provider::ConversationMessage;
+    use zeroclaw_api::session_events::context_read;
+    for sqlite in [false, true] {
+        for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = old_source(directory.path(), sqlite, 1);
+            let reasoning = r#"{"thinking":"literal [IMAGE:/reason]","signature":"opaque"}"#;
+            let arguments = r#"{"text":"[IMAGE:/argument]"}"#;
+            let output = r#"{"content":"literal tool JSON","tool_call_id":"not-identity"}"#;
+            source
+                .append(
+                    "gw_fixture",
+                    &ChatMessage::assistant(
+                        serde_json::json!({
+                            "content":"checking",
+                            "tool_calls":[{"id":"call-1","name":"shell","arguments":arguments}],
+                            "reasoning_content":reasoning,
+                        })
+                        .to_string(),
+                    ),
+                )
+                .unwrap();
+            source
+                .append(
+                    "gw_fixture",
+                    &ChatMessage {
+                        role: "tool".into(),
+                        content: serde_json::json!({
+                            "tool_call_id":"call-1","name":"shell","success":false,"content":output,
+                        })
+                        .to_string(),
+                        attachments: Vec::new(),
+                        tool_calls: Vec::new(),
+                        tool_result: None,
+                        reasoning_content: None,
+                    },
+                )
+                .unwrap();
+            drop(source);
+            upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
+            let store = open_event_store(directory.path(), target.name()).unwrap();
+            let stream = stream_id("gw_fixture").unwrap();
+            let page = store
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
+                .unwrap();
+            let projection = page.events.iter().find(|event| matches!(
+                &event.body.data,
+                EventData::ContextProjectionCreated { reason_key, .. } if reason_key == "legacy_import"
+            )).unwrap();
+            let messages: Vec<_> = context_read::context_refs(store.as_ref(), projection)
+                .unwrap()
+                .iter()
+                .filter_map(|reference| {
+                    context_read::resolve_message(store.as_ref(), &stream, reference).unwrap()
+                })
+                .collect();
+            assert_eq!(messages.len(), 3);
+            let ConversationMessage::AssistantToolCalls {
+                text,
+                tool_calls,
+                reasoning_content,
+            } = &messages[1]
+            else {
+                panic!("typed assistant metadata missing");
+            };
+            assert_eq!(text.as_deref(), Some("checking"));
+            assert_eq!(tool_calls[0].arguments, arguments);
+            assert_eq!(reasoning_content.as_deref(), Some(reasoning));
+            let ConversationMessage::ToolResults(results) = &messages[2] else {
+                panic!("typed tool identity missing");
+            };
+            assert_eq!(results[0].tool_call_id, "call-1");
+            assert_eq!(results[0].content, output);
+            assert_eq!(results[0].success, Some(false));
+        }
+    }
+}
+
 fn old_source(directory: &Path, sqlite: bool, count: usize) -> Box<dyn SessionBackend> {
     let source: Box<dyn SessionBackend> = if sqlite {
         Box::new(SqliteSessionBackend::new(directory).expect("SQLite source"))
@@ -155,6 +235,8 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
             reasoning_content: Some("retained reasoning token=fixture-secret".into()),
         });
         history.push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+            success: None,
+            attachments: Vec::new(),
             tool_call_id: "call-1".into(),
             content: "result api_key=fixture-secret".into(),
             tool_name: "read".into(),

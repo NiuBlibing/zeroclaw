@@ -1829,7 +1829,7 @@ pub async fn handle_api_session_messages(
                 let subject = crate::session_history::header_subject(&state, &headers)?;
                 let family = crate::session_history::family(&state, &id).await?;
                 let native = crate::session_history::query(&state, &family, subject.as_deref()).await?.ok_or_else(|| anyhow::Error::msg("session_not_found"))?;
-                let messages = native.query.messages(native.stream.clone()).await?.into_iter().map(|message| serde_json::json!({"message_id":message.message_id,"role":message.role,"content":message.text,"created_at":message.created_at.and_then(chrono::DateTime::from_timestamp_millis).map(|time| time.to_rfc3339()),"files":message.files,"unavailable_parts":message.unavailable_parts})).collect::<Vec<_>>();
+                let messages = native.query.messages(native.stream.clone()).await?.into_iter().map(|message| serde_json::json!({"message_id":message.message_id,"role":message.role,"content":message.text,"created_at":message.created_at.and_then(chrono::DateTime::from_timestamp_millis).map(|time| time.to_rfc3339()),"files":message.files,"attachments":message.attachments,"unavailable_parts":message.unavailable_parts})).collect::<Vec<_>>();
                 Ok(serde_json::json!({"session_id":id,"messages":messages,"session_persistence":true}))
         }.await);
     }

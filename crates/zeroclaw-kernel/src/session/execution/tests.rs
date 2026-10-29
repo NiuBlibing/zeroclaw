@@ -409,11 +409,13 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
         // checked at the real atomic admission boundary on both backends.
         let file = zeroclaw_api::session_events::capture::EngineFileInput {
             file_id: "fixture-file-owner-id".into(),
-            registration: serde_json::json!({"name":"fixture.txt", "path":"/fixture.txt"}),
-            representation: PayloadRecord::new(
-                PayloadId::new(),
-                "session.bytes/v1".into(),
-                b"frozen bytes".to_vec(),
+            registration: serde_json::json!({"source":"gateway_attachment", "name":"fixture.txt", "path":"/fixture.txt"}),
+            representation: PayloadRecord::json(
+                "session.attachment-reference/v1",
+                &zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Document,
+                    target: "/fixture.txt".into(),
+                },
             )
             .expect("representation"),
             policy_evidence: serde_json::json!({"source":"fixture_file_owner", "revision":1}),
@@ -512,7 +514,7 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
         interleaved.ingress_key = "fixture-interleaved".into();
         interleaved.parts = vec![
             EngineInputPart::Text("before".into()),
-            EngineInputPart::File(file),
+            EngineInputPart::File(file.clone()),
             EngineInputPart::Text("after".into()),
         ];
         coordinator
@@ -578,6 +580,67 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
             projected
                 .iter()
                 .any(|message| message.files == ["fixture-file-owner-id", "fixture-file-owner-id"])
+        );
+        let attached = projected
+            .iter()
+            .find(|message| message.files.len() == 2)
+            .expect("file message");
+        assert_eq!(attached.attachments.len(), 2);
+        assert!(
+            attached
+                .attachments
+                .iter()
+                .all(|reference| reference.target == "/fixture.txt")
+        );
+        // Channel ingress captures bytes and keeps the typed reference in the
+        // per-input metadata. Reusing a FileId must use the current input's
+        // reference, not its first registration or a later observation.
+        let mut channel = command.clone();
+        channel.turn_id = TurnId::new();
+        channel.message_id = MessageId::new();
+        channel.ingress_key = "fixture-channel-attachment".into();
+        let channel_reference = zeroclaw_api::media::AttachmentReference {
+            kind: zeroclaw_api::media::AttachmentKind::Document,
+            target: "/channel-file.txt".into(),
+        };
+        let mut channel_file = file.clone();
+        channel_file.registration = serde_json::json!({"reference": channel_reference});
+        channel_file.representation = PayloadRecord::new(
+            PayloadId::new(),
+            "session.bytes/v1".into(),
+            b"original bytes".to_vec(),
+        )
+        .expect("channel bytes");
+        channel.parts.push(EngineInputPart::File(channel_file));
+        coordinator
+            .execute_user_turn(
+                channel,
+                PrincipalId::shared_operator(),
+                Arc::new(Access),
+                Arc::new(Access),
+                &mut executor,
+            )
+            .await
+            .expect("channel attachment turn");
+        let projected = coordinator
+            .query(PrincipalId::shared_operator(), Arc::new(Access))
+            .messages(stream.clone())
+            .await
+            .expect("channel history");
+        assert!(
+            projected
+                .iter()
+                .any(|message| message.attachments.as_slice()
+                    == std::slice::from_ref(&channel_reference))
+        );
+        assert_eq!(
+            projected
+                .iter()
+                .find(|message| message.files.len() == 2)
+                .expect("original file history")
+                .attachments
+                .len(),
+            2
         );
         // The second input is durable while the first turn is still active.
         // Its settlement must ignore the preceding turn's later terminal event.

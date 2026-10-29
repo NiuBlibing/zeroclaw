@@ -28,7 +28,6 @@ pub mod schema;
 pub mod session_events;
 pub mod session_keys;
 pub mod tool;
-pub mod tool_carrier;
 pub mod turn_stop;
 pub mod vad;
 pub mod webhook;

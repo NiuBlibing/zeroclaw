@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use zeroclaw_api::session_events::{BranchId, SessionId};
 mod acp;
 pub(crate) mod legacy_acp;
+pub(super) mod legacy_media;
 
 pub fn upgrade_installation(
     data_dir: &Path,

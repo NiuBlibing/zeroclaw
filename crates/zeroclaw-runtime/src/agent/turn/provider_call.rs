@@ -1325,7 +1325,12 @@ mod streaming_fallback_tests {
             let token = tokio_util::sync::CancellationToken::new();
             let mut ctx = recovery_test_ctx(&observer, &pacing);
             ctx.cancellation_token = Some(&token);
-            let original = [ChatMessage::user("[IMAGE:data:image/png;base64,aGVsbG8=]")];
+            let original = [ChatMessage::user("").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/png;base64,aGVsbG8=".to_string(),
+                },
+            ])];
             let recovery = [ChatMessage::user("image omitted")];
             let call = call_provider(
                 &ctx,
@@ -1375,7 +1380,12 @@ mod streaming_fallback_tests {
             ..Default::default()
         };
         let ctx = recovery_test_ctx(&observer, &pacing);
-        let original = [ChatMessage::user("[IMAGE:data:image/png;base64,aGVsbG8=]")];
+        let original = [ChatMessage::user("").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/png;base64,aGVsbG8=".to_string(),
+            },
+        ])];
         let recovery = [ChatMessage::user("image omitted")];
         let started = tokio::time::Instant::now();
         let outcome = tokio::time::timeout(
@@ -2369,9 +2379,7 @@ mod streaming_fallback_tests {
                 .await
                 .expect("serve compatible recovery responses");
         });
-        let original = [ChatMessage::user(
-            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
-        )];
+        let original = [ChatMessage::user("inspect").with_attachments(vec![zeroclaw_api::media::AttachmentReference { kind: zeroclaw_api::media::AttachmentKind::Image, target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".to_string() }])];
         let recovery = [ChatMessage::user("inspect")];
         let provider = zeroclaw_providers::create_resilient_model_provider_with_options(
             "custom",
@@ -2819,7 +2827,7 @@ mod streaming_fallback_tests {
     impl ImageRecoveryPolicyProvider {
         fn record_request(&self, request: ChatRequest<'_>, policy: ToolRoundPolicy) -> bool {
             let has_image =
-                zeroclaw_providers::multimodal::count_image_markers(request.messages) > 0;
+                zeroclaw_providers::multimodal::count_image_attachments(request.messages) > 0;
             self.requests.lock().unwrap().push((policy, has_image));
             has_image
         }
@@ -2904,9 +2912,12 @@ mod streaming_fallback_tests {
                 let observer = NoopObserver;
                 let pacing = PacingConfig::default();
                 let ctx = recovery_test_ctx(&observer, &pacing);
-                let original = [ChatMessage::user(
-                    "inspect [IMAGE:https://example.test/image.png]",
-                )];
+                let original = [ChatMessage::user("inspect").with_attachments(vec![
+                    zeroclaw_api::media::AttachmentReference {
+                        kind: zeroclaw_api::media::AttachmentKind::Image,
+                        target: "https://example.test/image.png".to_string(),
+                    },
+                ])];
                 let recovery = [ChatMessage::user("inspect")];
                 let outcome = call_provider(
                     &ctx,
@@ -2977,7 +2988,7 @@ mod streaming_fallback_tests {
         ) -> anyhow::Result<ChatResponse> {
             self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
             assert_eq!(
-                zeroclaw_providers::multimodal::count_image_markers(request.messages),
+                zeroclaw_providers::multimodal::count_image_attachments(request.messages),
                 usize::from(self.draft_before_error || self.thinking_before_error),
                 "activity permits original-request fallback, not image-free recovery"
             );
@@ -3108,7 +3119,12 @@ mod streaming_fallback_tests {
         let token = tokio_util::sync::CancellationToken::new();
         let mut ctx = recovery_test_ctx(&observer, &pacing);
         ctx.cancellation_token = Some(&token);
-        let original = [ChatMessage::user("[IMAGE:data:image/png;base64,AAAA]")];
+        let original = [ChatMessage::user("").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/png;base64,AAAA".to_string(),
+            },
+        ])];
         let recovery = [ChatMessage::user("[image removed]")];
 
         let call = call_provider(
@@ -3165,9 +3181,12 @@ mod streaming_fallback_tests {
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
         let ctx = recovery_test_ctx(&observer, &pacing);
-        let original = [ChatMessage::user(
-            "inspect [IMAGE:data:image/png;base64,AAAA]",
-        )];
+        let original = [ChatMessage::user("inspect").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/png;base64,AAAA".to_string(),
+            },
+        ])];
         let recovery = [ChatMessage::user("inspect")];
 
         let outcome = call_provider(
@@ -3221,7 +3240,12 @@ mod streaming_fallback_tests {
             let observer = NoopObserver;
             let pacing = PacingConfig::default();
             let ctx = recovery_test_ctx(&observer, &pacing);
-            let original = [ChatMessage::user("[IMAGE:data:image/png;base64,AAAA]")];
+            let original = [ChatMessage::user("").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/png;base64,AAAA".to_string(),
+                },
+            ])];
             let recovery = [ChatMessage::user("[image removed]")];
 
             let outcome = call_provider(
@@ -3341,9 +3365,12 @@ mod streaming_fallback_tests {
             let observer = NoopObserver;
             let pacing = PacingConfig::default();
             let ctx = recovery_test_ctx(&observer, &pacing);
-            let original = [ChatMessage::user(
-                "inspect [IMAGE:data:image/png;base64,AAAA]",
-            )];
+            let original = [ChatMessage::user("inspect").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/png;base64,AAAA".to_string(),
+                },
+            ])];
             let recovery = [ChatMessage::user("inspect")];
             let outcome = call_provider(
                 &ctx,
@@ -3400,7 +3427,12 @@ mod streaming_fallback_tests {
             let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
             ctx.on_delta = Some(&draft_tx);
             ctx.event_tx = committed_output.then_some(&event_tx);
-            let original = [ChatMessage::user("[IMAGE:data:image/png;base64,AAAA]")];
+            let original = [ChatMessage::user("").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/png;base64,AAAA".to_string(),
+                },
+            ])];
             let recovery = [ChatMessage::user("[image removed]")];
 
             let outcome = call_provider(
