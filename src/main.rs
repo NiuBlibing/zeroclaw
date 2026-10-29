@@ -20126,7 +20126,7 @@ mod tests {
                 .expect("resource-keyed sections are ignored, not rejected")
                 .is_none()
         );
-        assert_eq!(config.cost.rates.providers.models.openai.len(), 0);
+        assert!(config.cost.rates.providers.models.openai.is_empty());
     }
 
     #[test]
@@ -20138,7 +20138,7 @@ mod tests {
             err.to_string().contains("reserved"),
             "message should name the reserved alias: {err}"
         );
-        assert_eq!(config.agents.len(), 0);
+        assert!(config.agents.is_empty());
 
         assert_eq!(
             init_map_alias(&mut config, "agents.researcher")

@@ -446,14 +446,14 @@ path = "/sop/test"
     fn load_sops_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let sops = load_sops_from_directory(dir.path(), SopExecutionMode::Supervised);
-        assert_eq!(sops.len(), 0);
+        assert!(sops.is_empty());
     }
 
     #[test]
     fn load_sops_nonexistent_dir() {
         let sops =
             load_sops_from_directory(Path::new("/nonexistent/path"), SopExecutionMode::Supervised);
-        assert_eq!(sops.len(), 0);
+        assert!(sops.is_empty());
     }
 
     #[test]

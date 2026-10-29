@@ -96,7 +96,7 @@ mod tests {
     fn reexported_config_default_is_constructible() {
         let config = Config::default();
 
-        assert_eq!(config.providers.models.len(), 0);
+        assert!(config.providers.models.is_empty());
     }
 
     #[test]
