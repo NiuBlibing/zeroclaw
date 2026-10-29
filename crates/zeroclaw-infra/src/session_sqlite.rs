@@ -59,6 +59,45 @@ pub(crate) fn has_committed_jsonl_import_receipts(workspace_dir: &Path) -> Resul
     committed_jsonl_import_receipts_exist(&conn)
 }
 
+/// One statement, so the transition is atomic: every turn still marked
+/// running becomes an error, keeping its turn id.
+const SETTLE_RUNNING_TURNS_SQL: &str = "UPDATE session_metadata \
+     SET state = 'error', turn_started_at = NULL WHERE state = 'running'";
+
+impl SqliteSessionBackend {
+    /// Where the legacy store for `workspace_dir` lives, whether or not it
+    /// exists. Startup recovery uses this path without opening the backend.
+    pub fn db_path(workspace_dir: &Path) -> PathBuf {
+        workspace_dir.join("sessions").join("sessions.db")
+    }
+
+    /// Settle turns left marked `running` by a previous process. The caller
+    /// must already own the data directory and invoke this before admitting a
+    /// new turn. The transcript remains intact and no turn is restarted.
+    pub fn recover_abandoned_turns_at(workspace_dir: &Path) -> std::io::Result<usize> {
+        let db_path = Self::db_path(workspace_dir);
+        if !db_path.try_exists()? {
+            return Ok(0);
+        }
+        let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(std::io::Error::other)?;
+        let tracks_run_state = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('session_metadata') WHERE name = 'state'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .is_some();
+        if !tracks_run_state {
+            return Ok(0);
+        }
+        conn.execute(SETTLE_RUNNING_TURNS_SQL, [])
+            .map_err(std::io::Error::other)
+    }
+}
+
 impl SqliteSessionBackend {
     /// Read original rows and clocks without swallowing migration errors.
     pub(crate) fn upgrade_messages(
