@@ -85,7 +85,10 @@ impl SessionRepository {
     ) -> Result<R> {
         let view = self.view()?;
         let record = view.required(session_id)?;
-        let owner: Option<String> = view::RepositoryView::value(&record, "principal_id", None)?;
+        let owner: Option<String> = record
+            .owner_principal_id
+            .as_ref()
+            .map(|owner| owner.0.clone());
         effect(owner.as_deref())
     }
 
@@ -199,10 +202,9 @@ impl SessionRepository {
 
         let native = self.view()?;
 
-        native
+        Ok(native
             .record(session_uuid)?
-            .map(|record| view::RepositoryView::value(&record, "principal_id", None))
-            .transpose()
+            .map(|record| record.owner_principal_id.map(|owner| owner.0)))
     }
 
     pub fn session_owner_and_surface(
@@ -217,7 +219,10 @@ impl SessionRepository {
             .record(session_uuid)?
             .map(|record| {
                 Ok((
-                    view::RepositoryView::value(&record, "principal_id", None)?,
+                    record
+                        .owner_principal_id
+                        .as_ref()
+                        .map(|owner| owner.0.clone()),
                     view::RepositoryView::value(&record, "interaction_surface", None)?,
                 ))
             })
@@ -248,7 +253,10 @@ impl SessionRepository {
         let native = self.view()?;
 
         let record = native.required(session_uuid)?;
-        let owner: Option<String> = view::RepositoryView::value(&record, "principal_id", None)?;
+        let owner: Option<String> = record
+            .owner_principal_id
+            .as_ref()
+            .map(|owner| owner.0.clone());
         let _authority = authorize(owner.as_deref())?;
         let surface: Option<String> =
             view::RepositoryView::value(&record, "interaction_surface", None)?;
@@ -579,7 +587,10 @@ impl SessionRepository {
         let Some(record) = native.record(session_uuid)? else {
             return Ok(SessionKillTransition::Missing);
         };
-        let owner: Option<String> = view::RepositoryView::value(&record, "principal_id", None)?;
+        let owner: Option<String> = record
+            .owner_principal_id
+            .as_ref()
+            .map(|owner| owner.0.clone());
         let _authority = authorize(owner.as_deref())?;
         native.kill(session_uuid, owner_principal_id)
     }

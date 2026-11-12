@@ -110,6 +110,7 @@ mod tests {
                 EventData::SessionStarted {
                     owning_agent: "fixture".into(),
                     capture_mode: CaptureMode::Native,
+                    owner_principal_id: None,
                 },
                 EventActor::default(),
             )

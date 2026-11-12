@@ -464,6 +464,23 @@ impl GatewayAuthority {
         }
         verify_history_subject(&self.pairing, self.subject.as_deref())
     }
+
+    fn observe_authentication(
+        &self,
+        binding: PayloadRecord,
+    ) -> Result<PayloadRecord, SessionError> {
+        let Some(admission) = &self.dashboard else {
+            return Ok(binding);
+        };
+        let observation = admission
+            .authentication_observation()
+            .map_err(|error| SessionError::PermissionDenied(error.to_string()))?;
+        let mut value: serde_json::Value = serde_json::from_slice(&binding.body)
+            .map_err(|error| SessionError::InvalidAdmission(error.to_string()))?;
+        value["authentication"] = serde_json::to_value(observation)
+            .map_err(|error| SessionError::InvalidAdmission(error.to_string()))?;
+        Ok(PayloadRecord::json(&binding.codec, &value).map_err(AppendError::from)?)
+    }
 }
 
 fn verify_history_subject(
@@ -509,7 +526,8 @@ impl SessionAccessPolicy for GatewayAuthority {
         stream: &SessionId,
     ) -> Result<(), SessionError> {
         self.current()?;
-        self.base.authorize_reasoning(actor, stream)
+        self.base
+            .authorize_actor(actor, stream, SessionAccess::Read)
     }
     fn authorize(
         &self,
@@ -574,11 +592,11 @@ impl PermissionResolver for GatewayAuthority {
 impl EngineSessionAuthority for GatewayAuthority {
     fn execution_binding(&self, input: &EngineTurnInput) -> Result<PayloadRecord, SessionError> {
         self.current()?;
-        self.base.execution_binding(input)
+        self.observe_authentication(self.base.execution_binding(input)?)
     }
     fn maintenance_binding(&self) -> Result<PayloadRecord, SessionError> {
         self.current()?;
-        self.base.maintenance_binding()
+        self.observe_authentication(self.base.maintenance_binding()?)
     }
     fn diagnostic(&self, error: &anyhow::Error) -> Option<String> {
         self.base.diagnostic(error)
@@ -590,6 +608,7 @@ pub(crate) fn authority(
     alias: &str,
     subject: Option<&str>,
 ) -> anyhow::Result<Arc<dyn EngineSessionAuthority>> {
+    let principal_id = history_principal()?;
     let capability =
         AgentExecutionCapability::from_parts(state.config.clone(), state.agent_lifecycle.clone());
     let authority = Arc::new(GatewayAuthority {
@@ -599,7 +618,7 @@ pub(crate) fn authority(
                 .map_err(|error| SessionError::PermissionDenied(error.to_string()))?
                 .into(),
             actor: EventActor::Principal {
-                principal_id: PrincipalId::shared_operator().0,
+                principal_id: principal_id.0,
             },
             stream,
             origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
@@ -612,6 +631,13 @@ pub(crate) fn authority(
     });
     authority.current()?;
     Ok(authority)
+}
+
+fn history_principal() -> anyhow::Result<PrincipalId> {
+    match crate::dashboard_session::history_admission() {
+        Some(admission) => admission.principal_id().map(PrincipalId),
+        None => Ok(PrincipalId::shared_operator()),
+    }
 }
 pub(crate) fn header_subject(
     state: &AppState,
@@ -653,7 +679,7 @@ pub(crate) async fn open(
                 family.into(),
                 "gateway",
                 alias.into(),
-                PrincipalId::shared_operator(),
+                history_principal()?,
                 authority,
                 ContextSnapshot {
                     messages: vec![],
@@ -676,7 +702,7 @@ pub(crate) async fn query(
     };
     let authority = authority(state, descriptor.stream, &descriptor.owning_agent, subject)?;
     source
-        .query(family.into(), PrincipalId::shared_operator(), authority)
+        .query(family.into(), history_principal()?, authority)
         .await
 }
 pub(crate) fn input(
@@ -744,7 +770,7 @@ pub(crate) async fn command(
             family.into(),
             "gateway",
             descriptor.owning_agent,
-            PrincipalId::shared_operator(),
+            history_principal()?,
             authority,
             ContextSnapshot {
                 messages: vec![],
@@ -960,6 +986,7 @@ pub(crate) mod tests {
                 EventData::SessionStarted {
                     owning_agent: "web".into(),
                     capture_mode: CaptureMode::Native,
+                    owner_principal_id: None,
                 },
                 EventActor::Principal {
                     principal_id: PrincipalId::shared_operator().0,

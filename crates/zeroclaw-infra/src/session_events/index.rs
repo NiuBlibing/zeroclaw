@@ -19,6 +19,7 @@ pub(crate) fn ensure_sqlite_schema(connection: &Connection) -> Result<(), Append
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS session_index (
                session_id TEXT PRIMARY KEY,
+               owner_principal_id TEXT,
                creation_source TEXT,
                title TEXT,
                created_at INTEGER NOT NULL,
@@ -49,6 +50,13 @@ pub(crate) fn ensure_sqlite_schema(connection: &Connection) -> Result<(), Append
                ON session_index(deleted, category, project, provider, model);",
         )
         .map_err(map_sqlite)?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS session_index_owner_activity
+             ON session_index(owner_principal_id, deleted, closed, last_activity DESC)",
+            [],
+        )
+        .map_err(map_sqlite)?;
     Ok(())
 }
 
@@ -71,13 +79,14 @@ where
 pub(crate) fn read_records(
     data_dir: &Path,
     backend: NativeBackend,
+    owner: Option<&zeroclaw_api::principal::PrincipalId>,
 ) -> Result<Vec<SessionIndexRecord>, ReadError> {
     let mut records = match backend {
         NativeBackend::Sqlite => {
             let store = SqliteEventStore::open(data_dir)
                 .map_err(|error| ReadError::StorageUnavailable(error.to_string()))?;
             let connection = store.conn.lock();
-            load_sqlite_records(&connection)?
+            load_sqlite_records(&connection, owner)?
         }
         NativeBackend::Jsonl => load_jsonl_records(
             &data_dir
@@ -87,7 +96,8 @@ pub(crate) fn read_records(
     }
     .into_values()
     .filter(|record| {
-        !record.deleted
+        owner.is_none_or(|owner| record.owner_principal_id.as_ref() == Some(owner))
+            && !record.deleted
             && record
                 .metadata
                 .get("session_kind")
@@ -119,7 +129,7 @@ where
     // The table is a disposable projection. If an individual row or its
     // derived metadata cannot be decoded, rebuild the projection from the
     // canonical event streams instead of making the session store unusable.
-    let existing = rebuildable(load_sqlite_records(&connection))?;
+    let existing = rebuildable(load_sqlite_records(&connection, None))?;
     let tx = connection.unchecked_transaction().map_err(map_sqlite)?;
     let mut seen = BTreeSet::new();
     for stream in streams {
@@ -216,12 +226,13 @@ fn upsert_sqlite(
         .map_err(|error| AppendError::Corrupt(error.to_string()))?;
     tx.execute(
         "INSERT INTO session_index (
-            session_id,creation_source,title,created_at,last_activity,
+            session_id,owner_principal_id,creation_source,title,created_at,last_activity,
             first_user_message_id,first_user_preview,cwd,git_remote,git_branch,git_commit,
             provider,model,category,project,parent_session_id,parent_agent,
             owning_agent,closed,deleted,head_sequence,message_count,running,metadata_json
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
          ON CONFLICT(session_id) DO UPDATE SET
+            owner_principal_id=excluded.owner_principal_id,
             creation_source=excluded.creation_source,title=excluded.title,
             created_at=excluded.created_at,last_activity=excluded.last_activity,
             first_user_message_id=excluded.first_user_message_id,first_user_preview=excluded.first_user_preview,
@@ -234,6 +245,7 @@ fn upsert_sqlite(
             running=excluded.running,metadata_json=excluded.metadata_json",
         params![
             record.session_id.as_str(),
+            record.owner_principal_id.as_ref().map(|owner| owner.as_str()),
             record.creation_source,
             record.title,
             record.created_at,
@@ -265,6 +277,7 @@ fn upsert_sqlite(
 
 fn load_sqlite_records(
     connection: &Connection,
+    owner: Option<&zeroclaw_api::principal::PrincipalId>,
 ) -> Result<BTreeMap<String, SessionIndexRecord>, ReadError> {
     let table_exists: bool = connection
         .query_row(
@@ -276,60 +289,68 @@ fn load_sqlite_records(
     if !table_exists {
         return Ok(BTreeMap::new());
     }
-    let mut statement = connection
-        .prepare("SELECT session_id,creation_source,title,created_at,last_activity,first_user_message_id,first_user_preview,cwd,git_remote,git_branch,git_commit,provider,model,category,project,parent_session_id,parent_agent,owning_agent,closed,deleted,head_sequence,message_count,running,metadata_json FROM session_index")
-        .map_err(read_error)?;
+    let mut sql = String::from(
+        "SELECT session_id,owner_principal_id,creation_source,title,created_at,last_activity,first_user_message_id,first_user_preview,cwd,git_remote,git_branch,git_commit,provider,model,category,project,parent_session_id,parent_agent,owning_agent,closed,deleted,head_sequence,message_count,running,metadata_json FROM session_index",
+    );
+    if owner.is_some() {
+        sql.push_str(" WHERE owner_principal_id=?1");
+    }
+    let mut statement = connection.prepare(&sql).map_err(read_error)?;
     let rows = statement
-        .query_map([], |row| {
-            let metadata: Vec<u8> = row.get(23)?;
-            let head: i64 = row.get(20)?;
-            let message_count: i64 = row.get(21)?;
-            let head_sequence = u64::try_from(head)
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(20, head))?;
-            let message_count = usize::try_from(message_count)
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(21, message_count))?;
-            Ok(SessionIndexRecord {
-                session_id: zeroclaw_api::session_events::SessionId::parse(
-                    row.get::<_, String>(0)?,
-                )
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
+        .query_map(
+            rusqlite::params_from_iter(owner.map(|owner| owner.as_str())),
+            |row| {
+                let metadata: Vec<u8> = row.get(24)?;
+                let head: i64 = row.get(21)?;
+                let message_count: i64 = row.get(22)?;
+                let head_sequence = u64::try_from(head)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(21, head))?;
+                let message_count = usize::try_from(message_count)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(22, message_count))?;
+                Ok(SessionIndexRecord {
+                    session_id: zeroclaw_api::session_events::SessionId::parse(
+                        row.get::<_, String>(0)?,
                     )
-                })?,
-                creation_source: row.get(1)?,
-                title: row.get(2)?,
-                created_at: row.get(3)?,
-                last_activity: row.get(4)?,
-                first_user_message_id: parse_optional(row.get(5)?),
-                first_user_preview: row.get(6)?,
-                cwd: row.get(7)?,
-                git_remote: row.get(8)?,
-                git_branch: row.get(9)?,
-                git_commit: row.get(10)?,
-                provider: row.get(11)?,
-                model: row.get(12)?,
-                category: row.get(13)?,
-                project: row.get(14)?,
-                parent_session_id: parse_optional(row.get(15)?),
-                parent_agent: row.get(16)?,
-                owning_agent: row.get(17)?,
-                closed: row.get(18)?,
-                deleted: row.get(19)?,
-                head_sequence,
-                message_count,
-                running: row.get(22)?,
-                metadata: serde_json::from_slice(&metadata).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        23,
-                        rusqlite::types::Type::Blob,
-                        Box::new(error),
-                    )
-                })?,
-            })
-        })
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    owner_principal_id: parse_optional(row.get(1)?),
+                    creation_source: row.get(2)?,
+                    title: row.get(3)?,
+                    created_at: row.get(4)?,
+                    last_activity: row.get(5)?,
+                    first_user_message_id: parse_optional(row.get(6)?),
+                    first_user_preview: row.get(7)?,
+                    cwd: row.get(8)?,
+                    git_remote: row.get(9)?,
+                    git_branch: row.get(10)?,
+                    git_commit: row.get(11)?,
+                    provider: row.get(12)?,
+                    model: row.get(13)?,
+                    category: row.get(14)?,
+                    project: row.get(15)?,
+                    parent_session_id: parse_optional(row.get(16)?),
+                    parent_agent: row.get(17)?,
+                    owning_agent: row.get(18)?,
+                    closed: row.get(19)?,
+                    deleted: row.get(20)?,
+                    head_sequence,
+                    message_count,
+                    running: row.get(23)?,
+                    metadata: serde_json::from_slice(&metadata).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            24,
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })?,
+                })
+            },
+        )
         .map_err(read_error)?;
     let mut out = BTreeMap::new();
     for row in rows {
@@ -406,6 +427,45 @@ mod tests {
     use crate::session_events::scoped::EventStorePool;
     use crate::session_events::upgrade::upgrade_installation;
     use serde_json::json;
+
+    #[test]
+    fn discovery_owner_filter_uses_root_ownership_in_both_backends() {
+        use zeroclaw_api::principal::PrincipalId;
+        for backend in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+            let directory = tempfile::tempdir().unwrap();
+            upgrade_installation(directory.path(), backend, |_| "agent".into()).unwrap();
+            let pool = EventStorePool::default();
+            let catalog = SessionCatalog::open(directory.path(), &pool)
+                .unwrap()
+                .unwrap();
+            for (id, owner) in [
+                ("first", Some("owner-a")),
+                ("second", Some("owner-b")),
+                ("unscoped", None),
+            ] {
+                catalog
+                    .commands()
+                    .create(id, "rpc", "agent", vec![("principal_id", json!(owner))])
+                    .unwrap();
+            }
+            let owner = PrincipalId("owner-a".into());
+            let scoped = catalog
+                .query()
+                .indexed_summaries_for_owner(Some(&owner))
+                .unwrap();
+            assert_eq!(scoped.len(), 1);
+            assert_eq!(scoped[0].0, "first");
+            assert_eq!(scoped[0].1.owner_principal_id.as_ref(), Some(&owner));
+            assert!(!scoped[0].1.fields.contains_key("principal_id"));
+            assert_eq!(catalog.query().indexed_summaries().unwrap().len(), 3);
+            assert!(
+                catalog
+                    .commands()
+                    .change(&scoped[0].1, vec![("owner_principal_id", json!("owner-b"))])
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn sqlite_index_is_rebuilt_from_canonical_events() {

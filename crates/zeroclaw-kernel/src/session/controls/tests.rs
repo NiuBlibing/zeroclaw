@@ -108,6 +108,7 @@ fn session(directory: &std::path::Path, backend: &str) -> (EngineSession, Arc<Au
         EventData::SessionStarted {
             owning_agent: "fixture".into(),
             capture_mode: CaptureMode::Native,
+            owner_principal_id: None,
         },
         EventActor::default(),
     )
@@ -3335,6 +3336,7 @@ fn copied_session(source: &EngineSession) -> EngineSession {
         EventData::SessionStarted {
             owning_agent: "fixture".into(),
             capture_mode: CaptureMode::Native,
+            owner_principal_id: None,
         },
         EventActor::default(),
     )

@@ -127,6 +127,10 @@ fn import_one(
             EventData::SessionStarted {
                 owning_agent: data.agent_alias,
                 capture_mode: zeroclaw_api::session_events::CaptureMode::LegacyMessageOnly,
+                owner_principal_id: data
+                    .principal_id
+                    .clone()
+                    .map(zeroclaw_api::principal::PrincipalId),
             },
             EventActor::default(),
         )?;
@@ -147,7 +151,6 @@ fn import_one(
         let mut events = vec![root, imported];
         let mut payloads = vec![evidence];
         for (field, value) in [
-            ("principal_id".into(), serde_json::json!(data.principal_id)),
             (
                 "created_at".into(),
                 serde_json::json!(data.created_at.timestamp_millis()),

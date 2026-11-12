@@ -563,19 +563,32 @@ plan and user control commands use the admitted coordinator instead.
 Source resolution reads canonical events on a blocking worker, including any
 wait for the installation lock, without blocking the async reactor.
 
+The root event stores `owner_principal_id` independently of its event actor.
+The owner is the canonical principal admitted when the session is created;
+resuming it as an administrator does not transfer ownership. Copies, temporary
+sessions and child sessions inherit that owner. Legacy imports preserve an
+existing owner and leave sessions with no recorded owner unscoped. Creation
+source and session ID never infer an owner.
+
+RPC and authenticated dashboard execution bindings also record a nonsecret
+`authentication` observation: actor kind, authentication method, authentication
+provider alias, trust domain and verified MFA status. It contains no tokens,
+cookies, raw claims, grants or credential lifetimes. This is historical audit
+evidence; current entrance policy remains the only authorization authority.
+
 ACP, RPC and CLI use the same API `Session` model. `SessionCatalog` exposes
 query and command capabilities over the configured event store; the old ACP
 SQL implementation is private to the installation importer and explicit test
 fixtures. A shared pure reducer computes timestamps, ownership, message counts
-and lifecycle state. A derived stream without a local ownership fact exposes
-an absent owner; execution authority still comes from its parent request.
+and lifecycle state. Child roots record the parent's durable owner; execution
+authority still comes from the currently admitted parent request.
 Summary reads resolve only each metadata field's last effective assignment
 and structural seed identities. Imported observations fill missing fields;
 they cannot override a value already recorded by native execution. Detail reads attach a context
 reference without duplicating metadata. Session discovery also maintains a
 rebuildable `session_index` projection: SQLite stores it as a table beside the
 event rows, while JSONL stores the same logical rows in `session-index.jsonl`.
-It contains session identity, title, creation and activity times, first
+It contains session identity, durable owner, title, creation and activity times, first
 user message identity and bounded preview, workspace and Git fields, provider
 and model, category/project, parent session/agent, lifecycle flags, message
 count and the projected event head. The event stream remains canonical; the
@@ -584,15 +597,17 @@ stale row is rebuilt from committed events. Full message bodies are resolved
 from payloads rather than copied into the index.
 History discovery reads those indexed summaries directly, filters with current
 authorization before applying its result limit, and validates the selected
-records again before disclosure. A reader bound to a session also checks that
+records again before disclosure. Scoped discovery uses the typed owner predicate
+(and its SQLite index); operators retain their current policy's wider visibility.
+Owner filtering accelerates discovery and never replaces current authorization.
+A reader bound to a session also checks that
 session's current authorization. Discovery no longer replays every session's
 history to construct its list. Index synchronization still checks installation
 session heads, so enumeration is not constant-time in the session count.
 `title` is the only session title field in native events, projections and
 backend metadata. The upgrader translates the old SQLite `name` column to
-`title`; native reads do not recognize `name` as an alias. Existing RPC `name`
-parameters and response fields are
-converted at the protocol boundary.
+`title`; native reads do not recognize `name` as an alias. The shared RPC
+protocol also uses `title` for session names.
 Agent rename, deletion and interrupted-rename residue checks use this standard
 repository across all sources. Deletion appends closure events and retains
 historical attribution; these operations never write archived legacy backends.

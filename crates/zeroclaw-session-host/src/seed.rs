@@ -5,6 +5,7 @@ pub(super) struct SessionSeed<'a> {
     pub source: &'a str,
     pub alias: &'a str,
     pub actor: EventActor,
+    pub owner_principal_id: Option<PrincipalId>,
     pub context: ContextSnapshot,
 }
 
@@ -19,6 +20,7 @@ impl SessionSeed<'_> {
             EventData::SessionStarted {
                 owning_agent: self.alias.into(),
                 capture_mode: CaptureMode::Native,
+                owner_principal_id: self.owner_principal_id,
             },
             self.actor.clone(),
         )?;

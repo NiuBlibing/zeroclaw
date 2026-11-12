@@ -559,6 +559,7 @@ mod tests {
             Ok(zeroclaw_providers::ChatResponse {
                 text: Some("Nothing to save.".into()),
                 tool_calls: Vec::new(),
+                output_blocks: Vec::new(),
                 usage: None,
                 reasoning_content: None,
             })
@@ -616,7 +617,8 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("skill review fixture should complete");
         provider.temperatures.lock().unwrap().clone()
     }
 

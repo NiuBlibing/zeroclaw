@@ -151,6 +151,29 @@ impl Default for Digest {
 /// a date/time implementation.
 pub type Timestamp = i64;
 
+/// Non-secret, historical attribution for one authenticated operation.
+/// Credential lifetime and effective grants remain live entrance authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticationObservation {
+    pub actor_kind: crate::principal::ActorKind,
+    pub auth_method: crate::principal::AuthMethod,
+    pub auth_provider_alias: Option<String>,
+    pub trust_domain: String,
+    pub mfa_verified: bool,
+}
+
+impl From<&crate::principal::Principal> for AuthenticationObservation {
+    fn from(principal: &crate::principal::Principal) -> Self {
+        Self {
+            actor_kind: principal.actor,
+            auth_method: principal.auth_method,
+            auth_provider_alias: principal.provider_alias.clone(),
+            trust_domain: principal.trust_domain.clone(),
+            mfa_verified: principal.mfa_verified,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum EventActor {
@@ -995,12 +1018,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn authentication_observation_contains_attribution_without_credential_state() {
+        use crate::principal::{AuthMethod, AuthenticatedIdentity, Principal};
+        let identity = AuthenticatedIdentity::shared_operator(AuthMethod::SharedOperator)
+            .with_provider_alias("test-provider")
+            .with_mfa_verified(true)
+            .with_expires_at(123)
+            .with_revalidate_by(100)
+            .with_claims(serde_json::Map::from_iter([(
+                "private_claim".into(),
+                serde_json::json!("test"),
+            )]));
+        let value = serde_json::to_value(AuthenticationObservation::from(
+            &Principal::from_identity(&identity),
+        ))
+        .unwrap();
+        assert_eq!(value["auth_provider_alias"], "test-provider");
+        assert_eq!(value["mfa_verified"], true);
+        assert_eq!(value.as_object().unwrap().len(), 5);
+        for excluded in [
+            "claims",
+            "expires_at",
+            "revalidate_by",
+            "grants",
+            "token",
+            "id",
+        ] {
+            assert!(value.get(excluded).is_none());
+        }
+    }
+
+    #[test]
     fn event_kind_is_in_the_outer_envelope() {
         let event = SessionEvent::typed(
             SessionId::new(),
             EventData::SessionStarted {
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
+                owner_principal_id: None,
             },
             EventActor::default(),
         )
@@ -1081,6 +1136,7 @@ mod tests {
             EventData::SessionStarted {
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
+                owner_principal_id: None,
             },
             EventActor::default(),
         )

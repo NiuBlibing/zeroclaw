@@ -30,6 +30,7 @@ fn root(stream: &SessionId) -> SessionEvent {
         EventData::SessionStarted {
             owning_agent: "fixture".into(),
             capture_mode: CaptureMode::Native,
+            owner_principal_id: None,
         },
         EventActor::default(),
     )
@@ -181,12 +182,14 @@ async fn child_settlement_requires_the_bound_turn_after_reopen() {
                 None,
                 EventData::DerivedSessionStarted {
                     execution_turn_id: Some(bound_turn.clone()),
+                    owner_principal_id: None,
                 },
             );
             derived.causation_id = Some(requested.event_id.clone());
             let mut malformed = derived.clone();
             malformed.body.data = EventData::DerivedSessionStarted {
                 execution_turn_id: Some(TurnId::from("")),
+                owner_principal_id: None,
             };
             assert!(
                 store

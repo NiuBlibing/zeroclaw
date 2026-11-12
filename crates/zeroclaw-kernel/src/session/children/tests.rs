@@ -118,6 +118,7 @@ fn session(store: Arc<dyn SessionEventStore>) -> EngineSession {
         EventData::SessionStarted {
             owning_agent: "fixture".into(),
             capture_mode: CaptureMode::Native,
+            owner_principal_id: Some(PrincipalId("parent-owner".into())),
         },
         EventActor::default(),
     )
@@ -250,6 +251,11 @@ async fn dropped_child_initializer_waiter_settles_a_later_worker_result() {
             ))
             .expect("child stream");
             let child_history = port.owner.stream_history(&child).expect("child history");
+            assert!(matches!(
+                &child_history[0].body.data,
+                EventData::DerivedSessionStarted { owner_principal_id: Some(owner), .. }
+                    if owner.as_str() == "parent-owner"
+            ));
             assert_eq!(
                 child_history
                     .iter()

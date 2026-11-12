@@ -459,6 +459,7 @@ impl SessionQuery<'_> {
         }
         Ok(Some(SessionIndexRecord {
             session_id: stream.clone(),
+            owner_principal_id: session.owner_principal_id.clone(),
             creation_source: session.creation_source().map(str::to_owned),
             title: session
                 .fields
@@ -508,6 +509,13 @@ impl SessionQuery<'_> {
     /// Read the rebuildable discovery projection without replaying every
     /// session. Full history remains available through `detail`/`summary`.
     pub fn index_records(&self) -> Result<Vec<SessionIndexRecord>, ReadError> {
+        self.index_records_for_owner(None)
+    }
+
+    fn index_records_for_owner(
+        &self,
+        owner: Option<&zeroclaw_api::principal::PrincipalId>,
+    ) -> Result<Vec<SessionIndexRecord>, ReadError> {
         self.catalog
             .refresh_index()
             .map_err(|error| ReadError::StorageUnavailable(error.to_string()))?;
@@ -523,6 +531,7 @@ impl SessionQuery<'_> {
                 .parent()
                 .ok_or_else(|| ReadError::Corrupt("session directory parent missing".into()))?,
             backend,
+            owner,
         )
     }
 
@@ -532,8 +541,15 @@ impl SessionQuery<'_> {
     pub fn indexed_summaries(
         &self,
     ) -> Result<Vec<(String, zeroclaw_api::session_events::catalog::Session)>, ReadError> {
+        self.indexed_summaries_for_owner(None)
+    }
+
+    pub fn indexed_summaries_for_owner(
+        &self,
+        owner: Option<&zeroclaw_api::principal::PrincipalId>,
+    ) -> Result<Vec<(String, zeroclaw_api::session_events::catalog::Session)>, ReadError> {
         let mut result = Vec::new();
-        for record in self.index_records()? {
+        for record in self.index_records_for_owner(owner)? {
             let key = record.session_id.as_str().to_owned();
             let mut fields = match record.metadata {
                 serde_json::Value::Object(values) => values.into_iter().collect(),
@@ -571,6 +587,7 @@ impl SessionQuery<'_> {
                 key,
                 zeroclaw_api::session_events::catalog::Session {
                     owning_agent: record.owning_agent,
+                    owner_principal_id: record.owner_principal_id,
                     fields,
                     closed: record.closed,
                     deleted: record.deleted,
@@ -664,14 +681,6 @@ impl SessionQuery<'_> {
                     .ok_or_else(|| ReadError::Gap("derived session parent missing".into()))?;
                 if let Some(agent) = parent.session.owning_agent {
                     detail.session.owning_agent = Some(agent);
-                    if !detail.session.fields.contains_key("principal_id")
-                        && let Some(principal) = parent.session.fields.get("principal_id")
-                    {
-                        detail
-                            .session
-                            .fields
-                            .insert("principal_id".into(), principal.clone());
-                    }
                     break;
                 }
             }
@@ -836,7 +845,6 @@ pub(crate) fn metadata_payload(
     let structural = matches!(
         field,
         "creation_source"
-            | "principal_id"
             | "created_at"
             | "last_activity"
             | "owning_agent"
@@ -949,8 +957,7 @@ impl SessionCommand<'_> {
             .filter(|(key, _)| {
                 matches!(
                     key.as_str(),
-                    "principal_id"
-                        | "workspace_dir"
+                    "workspace_dir"
                         | "cwd"
                         | "interaction_surface"
                         | "title"
@@ -966,6 +973,10 @@ impl SessionCommand<'_> {
             })
             .map(|(key, value)| (key.as_str(), value.clone()))
             .collect::<Vec<_>>();
+        fields.push((
+            "principal_id",
+            serde_json::json!(source_metadata.owner_principal_id),
+        ));
         fields.push((
             "session_kind",
             serde_json::json!(if temporary { "temporary" } else { "copy" }),
@@ -1063,12 +1074,26 @@ impl SessionCommand<'_> {
                 "session already exists".into(),
             ));
         }
+        let owner_principal_id = fields
+            .iter()
+            .find(|(key, _)| *key == "principal_id")
+            .map(|(_, value)| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|error| {
+                AppendError::InvalidReference(format!("invalid session owner: {error}"))
+            })?
+            .flatten();
+        let fields = fields
+            .into_iter()
+            .filter(|(key, _)| *key != "principal_id")
+            .collect();
         let branch = BranchId::parse(format!("branch-{stream}"))?;
         let mut root = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
                 owning_agent: alias.into(),
                 capture_mode: CaptureMode::Native,
+                owner_principal_id,
             },
             EventActor::System {
                 component: "session_catalog".into(),
@@ -1094,10 +1119,12 @@ impl SessionCommand<'_> {
         record: &Session,
         fields: Vec<(&str, serde_json::Value)>,
     ) -> Result<(), AppendError> {
-        if fields
-            .iter()
-            .any(|(field, _)| matches!(*field, "session_kind" | "temporary_owner_id"))
-        {
+        if fields.iter().any(|(field, _)| {
+            matches!(
+                *field,
+                "session_kind" | "temporary_owner_id" | "principal_id" | "owner_principal_id"
+            )
+        }) {
             return Err(AppendError::InvalidReference(
                 "session lifetime is immutable".into(),
             ));
@@ -1211,7 +1238,12 @@ mod tests {
         let source_id = SessionId::parse("source-session").expect("source id");
         catalog
             .commands()
-            .create("source-session", "rpc", "agent", vec![])
+            .create(
+                "source-session",
+                "rpc",
+                "agent",
+                vec![("principal_id", serde_json::json!("owner"))],
+            )
             .expect("source");
         let source = catalog
             .query()
@@ -1323,5 +1355,7 @@ mod tests {
             Some("temporary")
         );
         assert!(!temporary.closed);
+        assert_eq!(copied.1.owner_principal_id, source.owner_principal_id);
+        assert_eq!(temporary.owner_principal_id, source.owner_principal_id);
     }
 }

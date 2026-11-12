@@ -784,6 +784,7 @@ fn acp_registration_completes_an_existing_native_root_with_exact_owner_once() {
             EventData::SessionStarted {
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
+                owner_principal_id: Some(zeroclaw_api::principal::PrincipalId("owner".into())),
             },
             EventActor::Principal {
                 principal_id: "owner".into(),

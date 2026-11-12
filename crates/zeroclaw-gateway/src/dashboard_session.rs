@@ -588,6 +588,34 @@ pub(crate) struct HistoryAdmission {
 }
 
 impl HistoryAdmission {
+    pub(crate) fn authentication_observation(
+        &self,
+    ) -> anyhow::Result<zeroclaw_api::session_events::AuthenticationObservation> {
+        let auth = self
+            .auth
+            .upgrade()
+            .ok_or_else(|| anyhow::Error::msg("dashboard authentication unavailable"))?;
+        let sessions = auth.sessions.sessions.lock();
+        let session = sessions
+            .get(&self.key)
+            .ok_or_else(|| anyhow::Error::msg("dashboard session ended"))?;
+        Ok((&session.auth.principal).into())
+    }
+    /// The verified caller bound to this dashboard connection. Resolve the
+    /// cookie to the principal already held by the gateway; operating on an
+    /// existing session does not change that session's owner.
+    pub(crate) fn principal_id(&self) -> anyhow::Result<String> {
+        let auth = self
+            .auth
+            .upgrade()
+            .ok_or_else(|| anyhow::Error::msg("dashboard authentication unavailable"))?;
+        let sessions = auth.sessions.sessions.lock();
+        let session = sessions
+            .get(&self.key)
+            .ok_or_else(|| anyhow::Error::msg("dashboard session ended"))?;
+        Ok(session.auth.principal.id.as_str().to_owned())
+    }
+
     pub(crate) fn current(&self, config: &zeroclaw_config::schema::Config) -> anyhow::Result<()> {
         let auth = self
             .auth
@@ -3809,6 +3837,12 @@ mod tests {
                 key: session.key,
                 auth: Arc::downgrade(&fixture.auth),
             };
+            assert_eq!(admission.principal_id().unwrap(), session.principal().id.0);
+            let observation = admission.authentication_observation().unwrap();
+            assert_eq!(
+                observation,
+                zeroclaw_api::session_events::AuthenticationObservation::from(session.principal())
+            );
             let directory = tempfile::tempdir().unwrap();
             let mut state = fixture.state.clone();
             state.native_sessions = Some(crate::session_history::tests::Source::new(
@@ -3821,11 +3855,23 @@ mod tests {
                     crate::session_history::header_subject(&state, &HeaderMap::new()).unwrap(),
                     None
                 );
+                let authority =
+                    crate::session_history::authority(&state, "signed-history".into(), "web", None)
+                        .unwrap();
+                let binding: serde_json::Value =
+                    serde_json::from_slice(&authority.maintenance_binding().unwrap().body).unwrap();
+                assert_eq!(
+                    binding["authentication"],
+                    serde_json::to_value(&observation).unwrap()
+                );
                 crate::session_history::open(&state, "signed-history", "web", None).await
             })
             .await
             .unwrap()
             .unwrap();
+            port.append_assistant("OIDC history observation")
+                .await
+                .unwrap();
             port.restore_context().await.unwrap();
 
             admission.current(&config).unwrap();

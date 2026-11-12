@@ -154,17 +154,13 @@ impl NativeSessionHub {
         let initialize_session_id = session_id.clone();
         let creation_source = creation_source.to_owned();
         let initialize_stream = stream.clone();
-        let actor = match &subject {
-            EventActor::Principal { principal_id } => {
-                match authority.session_owner(&PrincipalId(principal_id.clone())) {
-                    Some(principal_id) => EventActor::Principal { principal_id },
-                    None => EventActor::System {
-                        component: "unscoped_session_creation".into(),
-                    },
-                }
-            }
-            EventActor::System { .. } | EventActor::ChannelResponder { .. } => subject.clone(),
+        let owner_principal_id = match &subject {
+            EventActor::Principal { principal_id } => authority
+                .session_owner(&PrincipalId(principal_id.clone()))
+                .map(PrincipalId),
+            EventActor::System { .. } | EventActor::ChannelResponder { .. } => None,
         };
+        let actor = subject.clone();
         let store =
             tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<dyn SessionEventStore>> {
                 let lease = Arc::new(
@@ -184,6 +180,7 @@ impl NativeSessionHub {
                         source: &creation_source,
                         alias: &alias,
                         actor,
+                        owner_principal_id,
                         context: initial,
                     }
                     .publish(store.as_ref(), &initialize_stream)?;
@@ -302,7 +299,11 @@ impl EngineSessionSource for NativeSessionHub {
             let catalog = SessionCatalog::open(&directory, &stores)?
                 .ok_or_else(|| anyhow::Error::msg("native session storage is unavailable"))?;
             let mut visible = Vec::new();
-            for (_, summary) in catalog.query().indexed_summaries()? {
+            let owner = policy.session_owner_scope()?;
+            for (_, summary) in catalog
+                .query()
+                .indexed_summaries_for_owner(owner.as_ref())?
+            {
                 if summary.closed
                     || policy
                         .session_agent_scope()
@@ -444,13 +445,7 @@ impl EngineSessionSource for NativeSessionHub {
         let Some(record) = catalog_record(directory, stream, self.stores.clone()).await? else {
             return Ok(None);
         };
-        let owner = record
-            .fields
-            .get("principal_id")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?
-            .flatten();
+        let owner = record.owner_principal_id.map(|owner| owner.0);
         let owning_agent = record
             .owning_agent
             .ok_or_else(|| anyhow::Error::msg("native source owning agent missing"))?;

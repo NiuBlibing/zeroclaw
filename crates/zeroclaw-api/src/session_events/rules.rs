@@ -512,12 +512,13 @@ impl HistoryIndex {
                     if incoming && event.body.kind() == EventKind::DerivedSessionStarted {
                         let EventData::DerivedSessionStarted {
                             execution_turn_id: Some(turn),
+                            ..
                         } = &event.body.data
                         else {
                             return Err(reference("child derivation requires execution binding"));
                         };
                         TurnId::parse(turn.as_str())?;
-                        if turns.contains_key(turn) || child_derivations.values().filter_map(|id| prior.get(id)).any(|item| matches!(&item.body.data, EventData::DerivedSessionStarted { execution_turn_id: Some(bound) } if bound == turn)) {
+                        if turns.contains_key(turn) || child_derivations.values().filter_map(|id| prior.get(id)).any(|item| matches!(&item.body.data, EventData::DerivedSessionStarted { execution_turn_id: Some(bound) , .. } if bound == turn)) {
                             return Err(invalid("child execution identity already bound"));
                         }
                         let parent = event
@@ -527,6 +528,27 @@ impl HistoryIndex {
                             .ok_or_else(|| reference("derived stream requires parent request"))?;
                         if parent.body.kind() != EventKind::ChildInvocationRequested {
                             return Err(reference("invalid child origin"));
+                        }
+                        let owner = prior.values().find_map(|entry| {
+                            if entry.session_id != parent.session_id {
+                                return None;
+                            }
+                            match &entry.body.data {
+                                EventData::SessionStarted {
+                                    owner_principal_id, ..
+                                }
+                                | EventData::DerivedSessionStarted {
+                                    owner_principal_id, ..
+                                } => Some(owner_principal_id),
+                                _ => None,
+                            }
+                        });
+                        if let EventData::DerivedSessionStarted {
+                            owner_principal_id, ..
+                        } = &event.body.data
+                            && owner != Some(owner_principal_id)
+                        {
+                            return Err(reference("child owner differs from parent"));
                         }
                         if child_derivations.contains_key(&parent.event_id) {
                             return Err(invalid("parent request already created a child"));
@@ -557,7 +579,7 @@ impl HistoryIndex {
                             .branch_id
                             .clone()
                             .ok_or_else(|| reference("accepted turn missing branch"))?;
-                        if incoming && child_derivations.values().filter_map(|id| prior.get(id)).any(|item| matches!(&item.body.data, EventData::DerivedSessionStarted { execution_turn_id: Some(bound) } if bound == turn)
+                        if incoming && child_derivations.values().filter_map(|id| prior.get(id)).any(|item| matches!(&item.body.data, EventData::DerivedSessionStarted { execution_turn_id: Some(bound) , .. } if bound == turn)
                             && (item.session_id != event.session_id || item.branch_id.as_ref() != Some(&branch))) {
                             return Err(reference("child execution is bound to another stream or branch"));
                         }
@@ -1339,6 +1361,7 @@ pub(super) fn validate_child_terminal(
 ) -> Result<(), AppendError> {
     let EventData::DerivedSessionStarted {
         execution_turn_id: Some(execution_turn_id),
+        ..
     } = &derived.body.data
     else {
         return Err(reference("invalid child derivation"));

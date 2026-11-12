@@ -5,9 +5,11 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct Session {
-    /// Derived streams have no local owner until an attribution event exists.
-    /// Their execution authority is resolved from the committed parent request.
+    /// Derived sessions resolve their agent attribution from the committed
+    /// parent request until a local attribution event exists.
     pub owning_agent: Option<String>,
+    /// Durable owner used for scoped discovery and access checks.
+    pub owner_principal_id: Option<crate::principal::PrincipalId>,
     pub fields: BTreeMap<String, Value>,
     pub closed: bool,
     pub deleted: bool,
@@ -24,6 +26,8 @@ pub struct Session {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionIndexRecord {
     pub session_id: SessionId,
+    /// `None` is retained for legacy and unscoped sessions.
+    pub owner_principal_id: Option<crate::principal::PrincipalId>,
     pub creation_source: Option<String>,
     pub title: Option<String>,
     pub created_at: i64,
@@ -148,13 +152,20 @@ impl SessionReducer {
                 return Err(ReadError::Corrupt("duplicate session root".into()));
             }
             self.importing = importing;
-            let mut fields = BTreeMap::new();
-            if let EventActor::Principal { principal_id } = &event.actor {
-                fields.insert("principal_id".into(), serde_json::json!(principal_id));
-            }
+            let fields = BTreeMap::new();
+            let owner_principal_id = match &event.body.data {
+                EventData::SessionStarted {
+                    owner_principal_id, ..
+                }
+                | EventData::DerivedSessionStarted {
+                    owner_principal_id, ..
+                } => owner_principal_id.clone(),
+                _ => None,
+            };
             self.record = Some(SessionDetail {
                 session: Session {
                     owning_agent: owning_agent.map(str::to_owned),
+                    owner_principal_id,
                     fields,
                     closed: false,
                     deleted: false,
@@ -406,6 +417,7 @@ mod tests {
             1,
             EventData::SessionStarted {
                 owning_agent: "agent".into(),
+                owner_principal_id: None,
                 capture_mode: if legacy {
                     CaptureMode::LegacyMessageOnly
                 } else {
@@ -413,6 +425,29 @@ mod tests {
                 },
             },
         )
+    }
+
+    #[test]
+    fn durable_owner_is_independent_of_event_actor() {
+        let session = SessionId::new();
+        let mut root = root(&session, false);
+        root.actor = EventActor::Principal {
+            principal_id: "administrator".into(),
+        };
+        if let EventData::SessionStarted {
+            owner_principal_id, ..
+        } = &mut root.body.data
+        {
+            *owner_principal_id = Some(crate::principal::PrincipalId("original-owner".into()));
+        }
+        let mut reducer = SessionReducer::new(session, false);
+        reducer.apply(&root, None).unwrap();
+        let detail = reducer.finish().unwrap().unwrap();
+        assert_eq!(
+            detail.owner_principal_id.as_ref().map(|id| id.as_str()),
+            Some("original-owner")
+        );
+        assert!(!detail.fields.contains_key("principal_id"));
     }
 
     fn metadata(
@@ -658,6 +693,7 @@ mod tests {
                     1,
                     EventData::DerivedSessionStarted {
                         execution_turn_id: Some(TurnId::new()),
+                        owner_principal_id: None,
                     },
                 ),
                 None,

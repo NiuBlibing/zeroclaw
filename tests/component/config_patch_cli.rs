@@ -1085,6 +1085,7 @@ fn seed_native_provider_rename_family(
         EventData::SessionStarted {
             owning_agent: "fixture".into(),
             capture_mode: CaptureMode::Native,
+            owner_principal_id: None,
         },
         EventActor::System {
             component: "fixture".into(),

@@ -772,6 +772,11 @@ fn validate_semantic_payloads(
     }
     let invalid = |reason: &str| AppendError::InvalidReference(reason.into());
     match &event.body.data {
+        EventData::SessionMetadataChanged { field, .. }
+            if matches!(field.as_str(), "owner_principal_id" | "principal_id") =>
+        {
+            return Err(invalid("session owner is fixed by the root event"));
+        }
         EventData::SessionMetadataChanged {
             field,
             new_value_ref,

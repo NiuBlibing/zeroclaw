@@ -43,7 +43,10 @@ impl RepositoryView {
                 record.owning_agent.as_deref() == Some(alias),
                 "session owning agent differs"
             );
-            let owner: Option<String> = Self::value(&record, "principal_id", None)?;
+            let owner: Option<String> = record
+                .owner_principal_id
+                .as_ref()
+                .map(|owner| owner.0.clone());
             let expected: Option<String> = fields
                 .iter()
                 .find(|(key, _)| *key == "principal_id")
@@ -53,7 +56,9 @@ impl RepositoryView {
             anyhow::ensure!(owner == expected, "session principal differs");
             let changed = fields
                 .into_iter()
-                .filter(|(key, value)| record.fields.get(*key) != Some(value))
+                .filter(|(key, value)| {
+                    *key != "principal_id" && record.fields.get(*key) != Some(value)
+                })
                 .collect::<Vec<_>>();
             if !changed.is_empty() {
                 self.0.commands().change(&record, changed)?;
@@ -136,7 +141,10 @@ impl RepositoryView {
         }
         Ok(SessionTranscript {
             session_uuid: id.into(),
-            principal_id: Self::value(record, "principal_id", None)?,
+            principal_id: record
+                .owner_principal_id
+                .as_ref()
+                .map(|owner| owner.0.clone()),
             agent_alias: record
                 .owning_agent
                 .clone()
@@ -156,7 +164,10 @@ impl RepositoryView {
 
     pub fn summary(id: String, record: Session) -> Result<SessionListEntry> {
         Ok(SessionListEntry {
-            principal_id: Self::value(&record, "principal_id", None)?,
+            principal_id: record
+                .owner_principal_id
+                .as_ref()
+                .map(|owner| owner.0.clone()),
             workspace_dir: Self::value(&record, "workspace_dir", String::new())?,
             latest_context_input_tokens: Self::value(&record, "latest_context_input_tokens", 0)?,
             created_at: chrono::DateTime::from_timestamp_millis(record.created_at)
@@ -180,7 +191,10 @@ impl RepositoryView {
         let Some(record) = self.record(id)? else {
             return Ok(false);
         };
-        let principal: Option<String> = Self::value(&record, "principal_id", None)?;
+        let principal: Option<String> = record
+            .owner_principal_id
+            .as_ref()
+            .map(|owner| owner.0.clone());
         if owner.is_some_and(|owner| principal.as_deref() != Some(owner)) {
             return Ok(false);
         }
@@ -192,7 +206,10 @@ impl RepositoryView {
         let Some(record) = self.record(id)? else {
             return Ok(SessionKillTransition::Missing);
         };
-        let principal: Option<String> = Self::value(&record, "principal_id", None)?;
+        let principal: Option<String> = record
+            .owner_principal_id
+            .as_ref()
+            .map(|owner| owner.0.clone());
         if owner.is_some_and(|owner| principal.as_deref() != Some(owner)) {
             return Ok(SessionKillTransition::Missing);
         }

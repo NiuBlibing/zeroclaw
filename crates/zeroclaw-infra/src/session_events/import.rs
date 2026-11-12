@@ -126,6 +126,15 @@ pub(super) fn import_snapshot(
             EventData::SessionStarted {
                 owning_agent: command.owning_agent.into(),
                 capture_mode: CaptureMode::LegacyMessageOnly,
+                owner_principal_id: metadata
+                    .iter()
+                    .find(|(field, _)| field == "principal_id")
+                    .map(|(_, value)| serde_json::from_value(value.clone()))
+                    .transpose()
+                    .map_err(|error| {
+                        AppendError::Corrupt(format!("invalid legacy owner: {error}"))
+                    })?
+                    .flatten(),
             },
             EventActor::default(),
         )?;
@@ -156,11 +165,11 @@ pub(super) fn import_snapshot(
         imported.branch_id = Some(command.branch.clone());
         let mut events = vec![root, imported];
         let mut payloads = vec![evidence];
-        for (field, value) in metadata {
-            let codec = if matches!(
-                field.as_str(),
-                "principal_id" | "created_at" | "last_activity"
-            ) {
+        for (field, value) in metadata
+            .into_iter()
+            .filter(|(field, _)| field != "principal_id")
+        {
+            let codec = if matches!(field.as_str(), "created_at" | "last_activity") {
                 "session.authority/v1"
             } else {
                 "session.bytes/v1"

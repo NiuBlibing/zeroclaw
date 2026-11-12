@@ -8,6 +8,28 @@ use zeroclaw_api::session_events::capture::{
 };
 use zeroclaw_api::session_events::*;
 
+/// Ownership is inherited from the durable parent root, never from the actor
+/// that happens to dispatch or recover a child.
+fn parent_owner(
+    store: &dyn SessionEventStore,
+    session: &SessionId,
+) -> Result<Option<zeroclaw_api::principal::PrincipalId>, SessionError> {
+    let root = store.read_page(session, &EventCursor::beginning(session.clone()), None, 1)?;
+    match root.events.first().map(|event| &event.body.data) {
+        Some(
+            EventData::SessionStarted {
+                owner_principal_id, ..
+            }
+            | EventData::DerivedSessionStarted {
+                owner_principal_id, ..
+            },
+        ) => Ok(owner_principal_id.clone()),
+        _ => Err(SessionError::InvalidAdmission(
+            "parent session root missing".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -128,6 +150,7 @@ impl SessionCoordinator {
                 child.clone(),
                 EventData::DerivedSessionStarted {
                     execution_turn_id: Some(TurnId::new()),
+                    owner_principal_id: parent_owner(owner.store.as_ref(), &request.session_id)?,
                 },
                 request.actor.clone(),
             )
@@ -358,6 +381,10 @@ impl SessionCoordinator {
                     child_scope.clone(),
                     EventData::DerivedSessionStarted {
                         execution_turn_id: Some(child_turn),
+                        owner_principal_id: parent_owner(
+                            owner.store.as_ref(),
+                            &requested.session_id,
+                        )?,
                     },
                     requested.actor.clone(),
                 )
@@ -654,7 +681,7 @@ impl ChildBinding {
                     return Ok(false);
                 }
                 let derived = history.first().ok_or_else(|| SessionError::StoreUnhealthy("child derivation missing".into()))?;
-                if !matches!(&derived.body.data, EventData::DerivedSessionStarted {execution_turn_id:Some(bound)} if bound==&turn)
+                if !matches!(&derived.body.data, EventData::DerivedSessionStarted {execution_turn_id:Some(bound), .. } if bound==&turn)
                     || derived.causation_id.as_ref()!=Some(&parent.event_id)
                     || history.iter().any(|event| !matches!(event.body.kind(), EventKind::DerivedSessionStarted | EventKind::ContextProjectionCreated | EventKind::SessionMetadataChanged | EventKind::SessionClosed))
                 {

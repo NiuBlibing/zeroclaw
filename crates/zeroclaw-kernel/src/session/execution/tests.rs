@@ -307,6 +307,7 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
             EventData::SessionStarted {
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
+                owner_principal_id: None,
             },
             EventActor::default(),
         )

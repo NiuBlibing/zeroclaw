@@ -19,6 +19,7 @@ fn seed(
         EventData::SessionStarted {
             owning_agent: "fixture".into(),
             capture_mode: CaptureMode::Native,
+            owner_principal_id: None,
         },
         EventActor::System {
             component: "fixture".into(),
@@ -351,6 +352,7 @@ fn installation_migration_preserves_shared_nested_content() {
             EventData::SessionStarted {
                 owning_agent: "other".into(),
                 capture_mode: CaptureMode::Native,
+                owner_principal_id: None,
             },
             EventActor::default(),
         )

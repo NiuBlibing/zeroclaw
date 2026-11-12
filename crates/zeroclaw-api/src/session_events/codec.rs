@@ -127,7 +127,7 @@ macro_rules! event_data {
     }
 }
 event_data! {
-    SessionStarted { owning_agent: String, capture_mode: CaptureMode },
+    SessionStarted { owning_agent: String, capture_mode: CaptureMode, owner_principal_id: Option<crate::principal::PrincipalId> },
     SessionMetadataChanged { field: String, new_value_ref: StoredPayloadRef },
     BranchCreated { parent_branch_id: BranchId, parent_cursor: EventCursor },
     TurnAccepted { input_ref: StoredPayloadRef, ingress_ref: StoredPayloadRef, reply_route_ref: Option<StoredPayloadRef> },
@@ -171,7 +171,7 @@ event_data! {
     DeliveryCompleted { started_event_id: EventId, verified_receipt_ref: StoredPayloadRef },
     DeliveryFailed { started_event_id: EventId, error_ref: StoredPayloadRef },
     ChildInvocationRequested { relation: String, execution_mode: ChildExecutionMode, target_agent_ref: StoredPayloadRef, input_projection_ref: StoredPayloadRef, policy_evidence_ref: StoredPayloadRef, task_id: Option<String> },
-    DerivedSessionStarted { execution_turn_id: Option<TurnId> },
+    DerivedSessionStarted { execution_turn_id: Option<TurnId>, owner_principal_id: Option<crate::principal::PrincipalId> },
     ChildInvocationCompleted { child_terminal_cursor: EventCursor, consumed_result_ref: Option<StoredPayloadRef> },
     ChildInvocationRejected { requested_event_id: EventId, reason_key: String, policy_evidence_ref: Option<StoredPayloadRef> },
     ChildCancellationRequested { requested_event_id: EventId, reason_key: String, target_scope_ref: TargetRef },
@@ -195,6 +195,7 @@ pub struct ChildTerminalEvidence {
 
 /// Read-side state derived from the current erasure chain, never persisted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct UnavailableContentPart {
     pub part_index: usize,
     pub disposition: super::payloads::PayloadDisposition,
