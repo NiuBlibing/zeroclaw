@@ -190,7 +190,7 @@ impl CostLedger {
                         .map_err(|error| anyhow::Error::msg(error.to_string()))?,
                 ),
                 crate::session_events::installation::NativeBackend::Jsonl => std::sync::Arc::new(
-                    crate::session_events::jsonl::JsonlEventStore::open(&workspace)
+                    crate::session_events::JsonlEventStore::open(&workspace)
                         .map_err(|error| anyhow::Error::msg(error.to_string()))?,
                 ),
             };
@@ -509,6 +509,7 @@ mod tests {
             EventData::SessionStarted {
                 owning_agent: "cost-test".into(),
                 capture_mode: CaptureMode::Native,
+                owner_principal_id: None,
             },
             EventActor::System {
                 component: "cost-test".into(),

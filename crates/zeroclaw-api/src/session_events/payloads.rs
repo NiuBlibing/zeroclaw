@@ -15,6 +15,7 @@ pub fn content_leaf_codecs() -> impl Iterator<Item = &'static str> {
     codecs::content_leaf_names()
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PayloadDisposition {
     Present,

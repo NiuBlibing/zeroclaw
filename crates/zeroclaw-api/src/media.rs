@@ -29,6 +29,7 @@ pub enum MediaKind {
 }
 
 /// The attachment capability selected by its producing adapter.
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AttachmentKind {
