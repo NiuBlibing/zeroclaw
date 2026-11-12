@@ -10,24 +10,6 @@ pub mod session_queue;
 pub mod session_repository;
 pub mod stall_watchdog;
 
-/// Explicit bridge for pre-event-store protocol test harnesses. Shipped
-/// entrances must use the admitted execution port for transcript mutations.
-#[macro_export]
-macro_rules! legacy_fixture_call {
-    ($repository:expr, $method:ident($($argument:expr),* $(,)?)) => {
-        $crate::legacy_fixture_call!($repository, $method($($argument),*) => ())
-    };
-    ($repository:expr, $method:ident($($argument:expr),* $(,)?) => $result:ty) => {{
-        #[cfg(any(test, feature = "test-util"))]
-        { $repository.$method($($argument),*) }
-        #[cfg(not(any(test, feature = "test-util")))]
-        {
-            let _ = (&$repository, $(&$argument),*);
-            Err::<$result, anyhow::Error>(anyhow::Error::msg("legacy transcript operations require the session execution port"))
-        }
-    }};
-}
-
 use std::net::SocketAddr;
 use std::path::Path;
 

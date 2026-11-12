@@ -175,13 +175,12 @@ fn legacy_channel_metadata_supplies_the_creation_protocol() {
 
 #[test]
 fn acp_public_ids_are_opaque_even_when_they_look_like_transcript_wrappers() {
-    use crate::session_repository::SessionRepository;
     for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
         let directory = tempfile::tempdir().unwrap();
         drop(old_source(directory.path(), true, 1));
-        let acp = SessionRepository::legacy_fixture(directory.path()).unwrap();
+        let acp = super::legacy_acp::LegacyAcpStore::new(directory.path()).unwrap();
         for id in ["gw_fixture", "rpc_client"] {
-            acp.create_session(id, "acp", "fixture", "/workspace", None)
+            acp.create_session(id, "fixture", "/workspace", None)
                 .unwrap();
         }
         drop(acp);
@@ -414,10 +413,9 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
     use zeroclaw_api::session_events::context_read;
     for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
         let directory = tempfile::tempdir().unwrap();
-        let old = SessionRepository::legacy_fixture(directory.path()).unwrap();
+        let old = super::legacy_acp::LegacyAcpStore::new(directory.path()).unwrap();
         old.create_session_with_interaction_surface(
             "live",
-            "acp",
             "fixture",
             "/workspace",
             Some("cli"),
@@ -448,7 +446,7 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
         let retained = history[128..].to_vec();
         old.persist_retained_context_seed("live", &retained, true)
             .unwrap();
-        old.set_latest_context_input_tokens("live", 123).unwrap();
+        old.set_token_count("live", 123).unwrap();
         let plan: Vec<zeroclaw_api::plan::PlanEntry> =
             serde_json::from_value(serde_json::json!([{"content":"audit","status":"in_progress"}]))
                 .unwrap();
@@ -464,7 +462,7 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
         old.begin_turn_checkpoint("live", "interrupted-turn", std::slice::from_ref(&pending))
             .unwrap();
         let before = old.load_session("live").unwrap().unwrap();
-        old.create_session("closed", "acp", "fixture", "/closed", None)
+        old.create_session("closed", "fixture", "/closed", None)
             .unwrap();
         old.mark_session_killed("closed").unwrap();
         upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
@@ -567,8 +565,10 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
         let head = store.head(&stream).unwrap();
         upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
         assert_eq!(store.head(&stream).unwrap(), head);
-        old.touch_session("live").unwrap();
-        old.set_latest_context_input_tokens("live", 456).unwrap();
+        current.touch_session("live").unwrap();
+        current
+            .set_latest_context_input_tokens("live", 456)
+            .unwrap();
         assert_eq!(
             current
                 .load_session("live")
@@ -697,8 +697,8 @@ fn acp_upgrade_resumes_metadata_history_chunks_and_archived_source() {
             "installation_archived",
         ] {
             let directory = tempfile::tempdir().unwrap();
-            let old = SessionRepository::legacy_fixture(directory.path()).unwrap();
-            old.create_session("interrupted", "acp", "fixture", "/workspace", Some("owner"))
+            let old = super::legacy_acp::LegacyAcpStore::new(directory.path()).unwrap();
+            old.create_session("interrupted", "fixture", "/workspace", Some("owner"))
                 .unwrap();
             let messages: Vec<_> = (0..130)
                 .map(|index| ConversationMessage::Chat(ChatMessage::user(format!("row {index}"))))
@@ -747,13 +747,12 @@ fn acp_upgrade_resumes_metadata_history_chunks_and_archived_source() {
 
 #[test]
 fn colliding_acp_and_transcript_ids_leave_both_sources_available() {
-    use crate::session_repository::SessionRepository;
     for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
         let directory = tempfile::tempdir().expect("directory");
         let old = old_source(directory.path(), true, 1);
         drop(old);
-        let acp = SessionRepository::legacy_fixture(directory.path()).expect("ACP source");
-        acp.create_session("fixture", "acp", "fixture", "/workspace", None)
+        let acp = super::legacy_acp::LegacyAcpStore::new(directory.path()).expect("ACP source");
+        acp.create_session("fixture", "fixture", "/workspace", None)
             .expect("colliding source");
         drop(acp);
         assert!(matches!(

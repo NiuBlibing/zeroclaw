@@ -31,7 +31,7 @@ use zeroclaw_api::jsonrpc::{
     SopRunOverlayRequest, SopRunRequest, SopRunResponse, SopRunsRequest, SopSaveRequest,
     SopSelectRequest,
 };
-use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
+use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
@@ -266,19 +266,6 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
         message: msg.into(),
         data: None,
     }
-}
-
-async fn run_blocking_rpc<T>(
-    operation: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
-    failure: &'static str,
-) -> Result<T, JsonRpcError>
-where
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(operation)
-        .await
-        .map_err(|error| rpc_err(INTERNAL_ERROR, format!("{failure}: {error}")))?
-        .map_err(|error| rpc_err(INTERNAL_ERROR, format!("{failure}: {error}")))
 }
 
 /// Bind an operator-level or unbound session workspace to its resolved
@@ -1318,8 +1305,8 @@ fn credential_is_live(
 /// now: a live credential, a fresh resolution, a generation that did not move
 /// underneath that resolution, and the method's coarse grant.
 /// What a prompt's final authorization needs, captured so it can be judged
-/// again at each effect after the last wait before it: the ACP checkpoint
-/// write and the Agent guard the execution task runs the turn under.
+/// again at each effect after the last wait before it, including the Agent
+/// guard the execution task runs the turn under.
 struct PromptAdmission {
     /// A handle on the prompting connection, for its binding and policy.
     dispatcher: RpcDispatcher,
@@ -1859,6 +1846,79 @@ impl zeroclaw_kernel::session::engine::EngineSessionAuthority for RpcHistoryAuth
     }
 }
 
+struct RpcHistoryDiscovery {
+    dispatcher: RpcDispatcher,
+    method: Method,
+}
+impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryDiscovery {
+    fn session_owner_scope(
+        &self,
+    ) -> Result<Option<zeroclaw_api::principal::PrincipalId>, zeroclaw_kernel::session::SessionError>
+    {
+        let grants = self
+            .dispatcher
+            .recheck_authority_after_admission(self.method)
+            .map_err(|error| {
+                zeroclaw_kernel::session::SessionError::PermissionDenied(error.message)
+            })?;
+        Ok(self
+            .dispatcher
+            .scoped_principal_id_from(grants.as_ref())
+            .map(zeroclaw_api::principal::PrincipalId))
+    }
+
+    fn authorize_summary(
+        &self,
+        actor: &zeroclaw_api::session_events::EventActor,
+        summary: &zeroclaw_api::session_events::views::SessionSummary,
+    ) -> Result<(), zeroclaw_kernel::session::SessionError> {
+        let principal = self
+            .dispatcher
+            .auth
+            .as_ref()
+            .ok_or_else(|| {
+                zeroclaw_kernel::session::SessionError::PermissionDenied(
+                    "RPC discovery admission missing".into(),
+                )
+            })?
+            .principal
+            .id
+            .clone();
+        let reader = RpcHistoryReader {
+            dispatcher: self.dispatcher.spawn_handle(),
+            agent_alias: summary.owning_agent.clone().ok_or_else(|| {
+                zeroclaw_kernel::session::SessionError::PermissionDenied(
+                    "RPC history agent missing".into(),
+                )
+            })?,
+            record: Some(crate::rpc::session::SessionRecord {
+                live_generation: None,
+                durable: None,
+                owner: summary
+                    .owner_principal_id
+                    .as_ref()
+                    .map(|owner| owner.0.clone()),
+            }),
+            principal,
+            stream: summary.head.session_id.clone(),
+            method: self.method,
+        };
+        use zeroclaw_kernel::session::query::SessionAccess;
+        reader.authorize_actor(actor, &summary.head.session_id, SessionAccess::Read)
+    }
+
+    fn authorize(
+        &self,
+        _: &zeroclaw_api::principal::PrincipalId,
+        _: &zeroclaw_api::session_events::SessionId,
+        _: zeroclaw_kernel::session::query::SessionAccess,
+    ) -> Result<(), zeroclaw_kernel::session::SessionError> {
+        Err(zeroclaw_kernel::session::SessionError::PermissionDenied(
+            "RPC discovery requires a catalog summary".into(),
+        ))
+    }
+}
+
 struct RpcHistoryReader {
     dispatcher: RpcDispatcher,
     agent_alias: String,
@@ -1939,6 +1999,22 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryReader {
             ));
         }
         Ok(())
+    }
+}
+
+fn native_history_read_error(error: anyhow::Error) -> JsonRpcError {
+    if error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<zeroclaw_kernel::session::SessionError>(),
+            Some(zeroclaw_kernel::session::SessionError::PermissionDenied(_))
+        )
+    }) {
+        rpc_err(FORBIDDEN, "Native history access denied")
+    } else {
+        rpc_err(
+            INTERNAL_ERROR,
+            format!("Native history read failed: {error}"),
+        )
     }
 }
 
@@ -2958,25 +3034,6 @@ impl RpcDispatcher {
                     });
                 }
             }
-        } else {
-            #[cfg(test)]
-            for key in [
-                format!("rpc_{session_id}"),
-                format!("gw_{session_id}"),
-                session_id.to_string(),
-            ] {
-                if let Some(meta) = self
-                    .ctx
-                    .session_backend
-                    .as_ref()
-                    .and_then(|backend| backend.get_session_metadata(&key))
-                {
-                    owners.push(meta.principal_id);
-                    if chat_durable.is_none() {
-                        chat_durable = Some(DurableSession::Chat { key });
-                    }
-                }
-            }
         }
         if let Some(store) = self.ctx.session_repository.as_ref() {
             let store = store.clone();
@@ -3626,40 +3683,6 @@ impl RpcDispatcher {
         if let Some(event) = event {
             forward_turn_event(&self.rpc, session_id, &event).await;
         }
-    }
-
-    async fn persist_seed_trim_before_notice(
-        &self,
-        session_id: &str,
-        event: Option<&TurnEvent>,
-    ) -> Result<(), JsonRpcError> {
-        let Some(store) = self.ctx.session_repository.as_ref() else {
-            return Ok(());
-        };
-        let Some(TurnEvent::HistoryTrimmed {
-            dropped_messages,
-            retained_context: Some(snapshot),
-            ..
-        }) = event
-        else {
-            return Ok(());
-        };
-        if *dropped_messages == 0 {
-            return Ok(());
-        }
-        let store = Arc::clone(store);
-        let session_id = session_id.to_string();
-        let retained = snapshot.retained_messages.clone();
-        let breadcrumb = snapshot.breadcrumb;
-        tokio::task::spawn_blocking(move || {
-            zeroclaw_infra::legacy_fixture_call!(
-                store,
-                persist_retained_context_seed(&session_id, &retained, breadcrumb)
-            )
-        })
-        .await
-        .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-        .map_err(|error| session_effect_error(error, "Failed to persist ACP seed trim"))
     }
 
     /// Commit one prepared config snapshot.
@@ -5395,9 +5418,8 @@ impl RpcDispatcher {
             }
         }
 
-        // Validate the durable owner and surface before consuming a checkpoint,
-        // including resumes with an explicit cwd. Reload after recovery so the
-        // Agent sees promoted history rather than the pre-recovery snapshot.
+        // Validate the durable owner and surface, including resumes with an
+        // explicit cwd. Reload after surface binding to use current metadata.
         let mut preloaded_acp: Option<Box<zeroclaw_infra::session_repository::SessionTranscript>> =
             None;
         if resuming
@@ -5498,26 +5520,8 @@ impl RpcDispatcher {
                     }
                     let store_cloned = store.clone();
                     let sid = session_id.clone();
-                    let marker = crate::i18n::get_required_cli_string("turn-stream-interrupted");
-                    let expected_owner = data.principal_id.clone();
-                    let owner_for_reload = expected_owner.clone();
-                    let native_owned = if let Some(source) = &self.ctx.native_sessions {
-                        source
-                            .describe(session_id.to_owned())
-                            .await
-                            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-                            .is_some()
-                    } else {
-                        false
-                    };
+                    let owner_for_reload = data.principal_id.clone();
                     let recovered = tokio::task::spawn_blocking(move || {
-                        if !native_owned {
-                            zeroclaw_infra::legacy_fixture_call!(store_cloned, recover_turn_checkpoint_for_owner(
-                                &sid,
-                                &marker,
-                                expected_owner.as_deref(),
-                            ) => bool)?;
-                        }
                         let reloaded = store_cloned.load_session_for_restore(&sid)?;
                         anyhow::ensure!(
                             !matches!(
@@ -5525,7 +5529,7 @@ impl RpcDispatcher {
                                 zeroclaw_infra::session_repository::SessionRestore::Restorable(data)
                                     if data.principal_id != owner_for_reload
                             ),
-                            "ACP session owner changed during checkpoint recovery"
+                            "ACP session owner changed during metadata reload"
                         );
                         Ok::<_, anyhow::Error>(reloaded)
                     })
@@ -5536,9 +5540,7 @@ impl RpcDispatcher {
                             format!("Failed to recover ACP session: {join}"),
                         )
                     })?
-                    .map_err(|e| {
-                        session_effect_error(e, "Failed to recover ACP session")
-                    })?;
+                    .map_err(|e| session_effect_error(e, "Failed to recover ACP session"))?;
                     match recovered {
                         zeroclaw_infra::session_repository::SessionRestore::Restorable(data) => {
                             preloaded_acp = Some(data);
@@ -6093,9 +6095,6 @@ impl RpcDispatcher {
                         .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
                     }
                 }
-            } else if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
-                self.persist_seed_trim_before_notice(&session_id, seed_event.as_ref())
-                    .await?;
             }
             Ok::<_, JsonRpcError>((message_count, seed_event, plan))
         }
@@ -6156,34 +6155,6 @@ impl RpcDispatcher {
         // so a session never reports success and then reappears after a
         // restart as nobody's. An unscoped creator's stamp is attribution
         // only, so its failure is logged and creation proceeds.
-        #[cfg(test)]
-        if let (Some(owner), Some(backend)) =
-            (effective_owner.clone(), self.ctx.session_backend.as_ref())
-            && !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
-            && native_restore.is_none()
-            && let Err(error) = backend.set_session_principal(&format!("rpc_{session_id}"), &owner)
-        {
-            if resume_scope.is_some() {
-                self.ctx.sessions.remove(&session_id).await;
-                return Err(rpc_err(
-                    INTERNAL_ERROR,
-                    format!(
-                        "Failed to record the session owner; the session was not created: {error}"
-                    ),
-                ));
-            }
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "session_id": session_id,
-                        "error": error.to_string(),
-                    })),
-                "session/new: could not record the creating principal on the persisted row"
-            );
-        }
 
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
@@ -6762,8 +6733,6 @@ impl RpcDispatcher {
                 "Session not found or not owned by this principal",
             ));
         }
-        let expected_owner = data.principal_id.clone();
-
         if let Some(value) = data.interaction_surface.as_deref()
             && crate::agent::prompt::InteractionSurface::from_persisted(value).is_none()
         {
@@ -6781,100 +6750,7 @@ impl RpcDispatcher {
             return Ok(None);
         }
 
-        // Check the durable row's workspace before promoting its checkpoint.
-        // The recovered row is bound to its canonical path again below.
-        {
-            let config = self.ctx.config.read();
-            self.authorize_session_binding(
-                Method::SessionPrompt,
-                grants,
-                &config,
-                &data.agent_alias,
-                &data.workspace_dir,
-            )?;
-        }
-
-        let native_owned = if let Some(source) = &self.ctx.native_sessions {
-            source
-                .describe(sid.to_owned())
-                .await
-                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-                .is_some()
-        } else {
-            false
-        };
-        if !native_owned
-            && let Err(error) = recover_acp_checkpoint(
-                self.spawn_handle(),
-                Method::SessionPrompt,
-                Arc::clone(&store),
-                sid,
-                data.principal_id.clone(),
-            )
-            .await
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"session_id": sid, "error": error})),
-                "Failed to recover interrupted ACP turn before rehydration"
-            );
-            return Err(error);
-        }
-
-        let sid_owned = sid.to_string();
-        let store_for_reload = Arc::clone(&store);
-        let loaded = tokio::task::spawn_blocking(move || {
-            store_for_reload.load_session_for_restore(&sid_owned)
-        })
-        .await;
-        let data = match loaded {
-            Ok(Ok(zeroclaw_infra::session_repository::SessionRestore::Restorable(data))) => data,
-            Ok(Ok(zeroclaw_infra::session_repository::SessionRestore::Killed)) => {
-                return Ok(None);
-            }
-            Ok(Ok(zeroclaw_infra::session_repository::SessionRestore::Missing)) => {
-                return Ok(None);
-            }
-            Ok(Err(error)) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read)
-                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "session_id": sid,
-                            "error": error.to_string(),
-                        })),
-                    "session/prompt: failed to reload ACP session after checkpoint recovery"
-                );
-                return Ok(None);
-            }
-            Err(error) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read)
-                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "session_id": sid,
-                            "error": error.to_string(),
-                        })),
-                    "session/prompt: failed to reload ACP session after checkpoint recovery"
-                );
-                return Ok(None);
-            }
-        };
-        if data.principal_id != expected_owner {
-            return Err(rpc_err(
-                FORBIDDEN,
-                "Session not found or not owned by this principal",
-            ));
-        }
-
-        // Rebind the recovered row to the currently authorized canonical
-        // workspace, not the pre-recovery row's spelling or earlier binding.
+        // Bind persisted metadata to the currently authorized canonical workspace.
         let current_grants = self.recheck_authority_after_admission(Method::SessionPrompt)?;
         let workspace_dir = {
             let config = self.ctx.config.read();
@@ -7119,9 +6995,7 @@ impl RpcDispatcher {
                 Ok(())
             }
         } else {
-            self.persist_seed_trim_before_notice(sid, seed_event.as_ref())
-                .await
-                .map_err(|error| error.message)
+            Ok(())
         };
         if let Err(error) = seed_persisted {
             ::zeroclaw_log::record!(
@@ -7843,7 +7717,7 @@ impl RpcDispatcher {
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
         // The handler Agent wait and the execution task's later Agent wait
-        // are distinct admission boundaries. Do not mutate tools/checkpoints
+        // are distinct admission boundaries. Do not mutate tools or metadata
         // here: the task performs preparation only after its final acquisition.
         let (model_provider, model) = {
             self.ctx
@@ -7885,8 +7759,6 @@ impl RpcDispatcher {
             workspace: workspace.clone(),
             has_environment,
         };
-        #[cfg(test)]
-        let persist_session_state = !matches!(chat_mode, crate::rpc::types::ChatMode::Acp);
         let session_key = admitted
             .as_ref()
             .and_then(|record| match record.durable.as_ref() {
@@ -7954,13 +7826,6 @@ impl RpcDispatcher {
         } else {
             None
         };
-        #[cfg(test)]
-        if native_session.is_none()
-            && persist_session_state
-            && let Some(ref backend) = self.ctx.session_backend
-        {
-            let _ = backend.set_session_state(&session_key, "running", Some(&turn_id));
-        }
 
         ::zeroclaw_log::record!(
             INFO,
@@ -7969,66 +7834,7 @@ impl RpcDispatcher {
                 .with_attrs(::serde_json::json!({ "session_id": sid })),
             "turn dispatch: registered cancel token, starting turn"
         );
-        let checkpoint_error = Arc::new(tokio::sync::Mutex::new(None::<String>));
-        let checkpoint_turn_id =
-            if native_session.is_none() && matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
-                let turn_id = uuid::Uuid::new_v4().to_string();
-                let session_id = sid.to_string();
-                let turn_id_for_store = turn_id.clone();
-                let initial = vec![ConversationMessage::Chat(
-                    ChatMessage::user(&prompt).with_attachments(prompt_attachments.clone()),
-                )];
-                let checkpoint_admission = admission.duplicate();
-                let persisted = if let Some(store) = self.ctx.session_repository.clone() {
-                    match tokio::task::spawn_blocking(move || {
-                        // Judged on the thread that writes the checkpoint, with no
-                        // await before the write: the prompt enters the session's
-                        // journal only if its caller may still run it.
-                        if let Err(denied) = checkpoint_admission.check() {
-                            return Ok(Err(denied));
-                        }
-                        zeroclaw_infra::legacy_fixture_call!(
-                            store,
-                            begin_turn_checkpoint(&session_id, &turn_id_for_store, &initial)
-                        )
-                        .map(Ok)
-                    })
-                    .await
-                    {
-                        Ok(Ok(Ok(()))) => Ok(()),
-                        Ok(Ok(Err(denied))) => {
-                            return Err(self
-                                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
-                                .await);
-                        }
-                        Ok(Err(error)) => Err(error.to_string()),
-                        Err(join) => Err(join.to_string()),
-                    }
-                } else {
-                    Err("ACP session store is not available".to_string())
-                };
-                if let Err(error) = persisted {
-                    cancel_registration.finish();
-                    self.ctx.sessions.remove(sid).await;
-                    if let Some(ref hooks) = self.ctx.hooks {
-                        hooks.fire_session_end(sid, "rpc").await;
-                    }
-                    let message = format!("Failed to begin ACP turn checkpoint: {error}");
-                    self.emit_turn_complete(
-                        sid,
-                        crate::rpc::types::TurnCompletionOutcome::Failed,
-                        message.clone(),
-                        req.client_turn_generation,
-                        None,
-                        TurnCompleteExtras::default(),
-                    )
-                    .await;
-                    return Err(rpc_err(INTERNAL_ERROR, message));
-                }
-                Some(turn_id)
-            } else {
-                None
-            };
+        let metadata_error = Arc::new(tokio::sync::Mutex::new(None::<String>));
         // Capture live attribution fields for the turn span. Context limits are
         // emitted by the model-call event itself so a mid-session route switch
         // cannot leave the meter on a precomputed provider/model snapshot.
@@ -8043,9 +7849,8 @@ impl RpcDispatcher {
         // the latest TodoWrite plan (store-then-emit) before the plan
         // notification goes out. See `persist_plan_if_any`.
         let sessions_for_plan = self.ctx.sessions.clone();
-        let checkpoint_turn_id_for_events = checkpoint_turn_id.clone();
-        let checkpoint_error_for_events = Arc::clone(&checkpoint_error);
-        let checkpoint_cancel = cancel.clone();
+        let metadata_error_for_events = Arc::clone(&metadata_error);
+        let metadata_cancel = cancel.clone();
         let metadata_port = native_session.clone();
         let acp_token_store =
             if native_session.is_none() && matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
@@ -8152,17 +7957,16 @@ impl RpcDispatcher {
                 let acp_token_store = acp_token_store.clone();
                 let metadata_port = metadata_port.clone();
                 let sessions_for_plan = sessions_for_plan.clone();
-                let checkpoint_turn_id = checkpoint_turn_id_for_events.clone();
-                let checkpoint_error = Arc::clone(&checkpoint_error_for_events);
-                let checkpoint_cancel = checkpoint_cancel.clone();
+                let metadata_error = Arc::clone(&metadata_error_for_events);
+                let metadata_cancel = metadata_cancel.clone();
                 usage_fold_for_events.lock().apply(&event);
                 async move {
                     if let Some(port) = &metadata_port
                         && let Some(value) = zeroclaw_api::session_events::capture::SessionMetadataObservation::from_turn_event(&event)
                         && let Err(error) = port.observe_metadata(value).await
                     {
-                        *checkpoint_error.lock().await = Some(error.to_string());
-                        checkpoint_cancel.cancel();
+                        *metadata_error.lock().await = Some(error.to_string());
+                        metadata_cancel.cancel();
                         return;
                     }
                     if let (
@@ -8184,22 +7988,10 @@ impl RpcDispatcher {
                     }
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
-                    // Usage already carries the serving call's context limits.
-                    // Keep checkpoint persistence ahead of the same projection.
-                    if checkpoint_error.lock().await.is_some() {
-                        return;
-                    }
-                    if let Err(error) = persist_checkpoint_event_before_notification(
-                        acp_token_store.as_ref(),
-                        checkpoint_turn_id.as_deref(),
-                        &sid,
-                        &event,
-                        &rpc,
-                    )
-                    .await
+                    if metadata_error.lock().await.is_none()
+                        && let Some(notification) = notification_for_turn_event(&sid, &event)
                     {
-                        *checkpoint_error.lock().await = Some(error);
-                        checkpoint_cancel.cancel();
+                        let _ = rpc.send_raw(notification).await;
                     }
                 }
             }),
@@ -8254,34 +8046,15 @@ impl RpcDispatcher {
             .take();
         if let Some(error) = refused_preparation {
             cancel_registration.finish();
-            if checkpoint_turn_id.is_some() && error.code == INTERNAL_ERROR {
-                // ACP checkpoint failures require eviction before recovery;
-                // a Chat state-write refusal leaves the live session valid.
-                // Never let a refused caller remove an incarnation after a wait.
-                if let Some(generation) = self.ctx.sessions.get_generation(sid).await
-                    && matches!(
-                        self.ctx
-                            .sessions
-                            .remove_generation_authorized(sid, generation, |owner| {
-                                self.session_effect_lease(Method::SessionPrompt, owner)
-                            })
-                            .await,
-                        Ok(true)
-                    )
-                    && let Some(hooks) = self.ctx.hooks.as_ref()
-                {
-                    hooks.fire_session_end(sid, "rpc").await;
-                }
-            }
             return Err(self
                 .refuse_admitted_prompt(sid, req.client_turn_generation, error)
                 .await);
         }
 
-        let checkpoint_write_error = checkpoint_error.lock().await.take();
-        if let Some(error) = checkpoint_write_error.as_ref() {
+        let metadata_write_error = metadata_error.lock().await.take();
+        if let Some(error) = metadata_write_error.as_ref() {
             outcome = Err(crate::rpc::turn::TurnError::AgentError(format!(
-                "ACP turn checkpoint failed: {error}"
+                "Session metadata capture failed: {error}"
             )));
         }
 
@@ -8289,81 +8062,6 @@ impl RpcDispatcher {
         // cause map). Every cancel firing site records its cause before firing;
         // a cancel with no recorded cause is a bug, not user attribution.
         let cancel_cause = cancel_registration.finish();
-
-        if native_session.is_none() && matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
-            let live_turn_messages = acp_checkpoint_live_messages(&outcome);
-            let retained_context = {
-                let agent = live_agent.lock().await;
-                let mut snapshot = agent.retained_context_snapshot();
-                if matches!(outcome, Ok(TurnOutcome::Cancelled { .. })) {
-                    crate::agent::Agent::strip_interruption_marker_from(
-                        &mut snapshot.retained_messages,
-                    );
-                }
-                (snapshot.retained_messages, snapshot.breadcrumb)
-            };
-            let checkpoint_result = if let Some(error) = checkpoint_write_error.clone() {
-                Err(error)
-            } else if let (Some(store), Some(turn_id)) = (
-                self.ctx.session_repository.as_ref(),
-                checkpoint_turn_id.as_deref(),
-            ) {
-                finish_acp_checkpoint_with_context(
-                    store,
-                    sid,
-                    turn_id,
-                    &outcome,
-                    retained_context.0.clone(),
-                    retained_context.1,
-                    authorized.as_ref().and_then(|record| record.owner.clone()),
-                )
-                .await
-            } else {
-                Ok(AcpCheckpointFinish::Finalized)
-            };
-            match checkpoint_result {
-                Ok(AcpCheckpointFinish::Finalized) => {
-                    if let Some(expected_suffix) = live_turn_messages {
-                        let transcript_suffix = acp_checkpoint_transcript_messages(&outcome)
-                            .unwrap_or_else(|| expected_suffix.clone());
-                        let provider_suffix =
-                            zeroclaw_api::session_events::transcript::provider_safe_history(
-                                &transcript_suffix,
-                            );
-                        let converged = {
-                            let mut agent = live_agent.lock().await;
-                            agent.replace_history_suffix(&expected_suffix, provider_suffix)
-                        };
-                        if !converged {
-                            // Durable state is already provider-safe. Drop a
-                            // structurally divergent live generation so the
-                            // next prompt must rehydrate that state.
-                            self.ctx.sessions.remove(sid).await;
-                        }
-                    }
-                }
-                Ok(AcpCheckpointFinish::RecoveryRequired) => {
-                    self.ctx.sessions.remove(sid).await;
-                }
-                Err(detail) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"session_id": sid, "error": detail})),
-                        "Failed to persist ACP turn"
-                    );
-                    if self.ctx.sessions.remove(sid).await
-                        && let Some(ref hooks) = self.ctx.hooks
-                    {
-                        hooks.fire_session_end(sid, "rpc").await;
-                    }
-                    outcome = Err(crate::rpc::turn::TurnError::AgentError(format!(
-                        "Failed to persist ACP turn: {detail}"
-                    )));
-                }
-            }
-        }
 
         // ── Durable turn-verdict audit row ───────────────────────────────
         // Every turn termination writes one attributed row to the ACP session
@@ -8481,13 +8179,6 @@ impl RpcDispatcher {
                 final_context_limits,
                 ..
             }) => {
-                #[cfg(test)]
-                if native_session.is_none()
-                    && persist_session_state
-                    && let Some(ref backend) = self.ctx.session_backend
-                {
-                    let _ = backend.set_session_state(&session_key, "idle", None);
-                }
                 let usage = usage_fold.lock().totals(final_context_limits);
                 let safeguard_wire = safeguard_fallback
                     .as_ref()
@@ -8518,13 +8209,6 @@ impl RpcDispatcher {
                 ))
             }
             Ok(TurnOutcome::Cancelled { partial_text, .. }) => {
-                #[cfg(test)]
-                if native_session.is_none()
-                    && persist_session_state
-                    && let Some(ref backend) = self.ctx.session_backend
-                {
-                    let _ = backend.set_session_state(&session_key, "idle", None);
-                }
                 let cancel_message = match cancel_cause {
                     Some(cause) => {
                         format!(
@@ -8582,13 +8266,6 @@ impl RpcDispatcher {
                 // The execution task refused the caller on the Agent guard
                 // before the turn started: nothing ran, so the session is idle
                 // again and the caller receives the refusal, with no totals.
-                #[cfg(test)]
-                if native_session.is_none()
-                    && persist_session_state
-                    && let Some(ref backend) = self.ctx.session_backend
-                {
-                    let _ = backend.set_session_state(&session_key, "idle", None);
-                }
                 Err(self
                     .refuse_admitted_prompt(
                         &req.session_id,
@@ -8598,13 +8275,6 @@ impl RpcDispatcher {
                     .await)
             }
             Err(e) => {
-                #[cfg(test)]
-                if native_session.is_none()
-                    && persist_session_state
-                    && let Some(ref backend) = self.ctx.session_backend
-                {
-                    let _ = backend.set_session_state(&session_key, "error", Some(&turn_id));
-                }
                 let user_message = e.user_message().map(str::to_owned);
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -9616,48 +9286,10 @@ impl RpcDispatcher {
                 message_count: count,
             });
         }
-        #[cfg(not(test))]
-        return Err(rpc_err(
+        Err(rpc_err(
             INTERNAL_ERROR,
             "Native session history is unavailable",
-        ));
-        #[cfg(test)]
-        {
-            let backend = self
-                .ctx
-                .session_backend
-                .as_ref()
-                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
-            let message = zeroclaw_providers::ChatMessage::assistant(&req.content);
-            backend.append(&key, &message).map_err(|e| {
-                rpc_err(
-                    INTERNAL_ERROR,
-                    format!("Failed to append session message: {e}"),
-                )
-            })?;
-            // A live agent persists its own history over the durable row after
-            // its next turn, so it has to see the append too.
-            if self.ctx.sessions.get_agent(sid).await.is_some() {
-                self.ctx
-                    .sessions
-                    .seed_history(sid, std::slice::from_ref(&message))
-                    .await;
-            }
-            if let Some(event_tx) = self.ctx.event_tx.as_ref() {
-                let _ = event_tx.send(serde_json::json!({
-                    "type": "message",
-                    "session_id": sid,
-                    "role": "assistant",
-                    "content": req.content,
-                    "source": "rpc",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                }));
-            }
-            to_result(SessionAppendResult {
-                session_id: req.session_id.clone(),
-                message_count: backend.load(&key).len(),
-            })
-        }
+        ))
     }
 
     /// Generate and install a summary through the native maintenance lifecycle.
@@ -9758,26 +9390,10 @@ impl RpcDispatcher {
                 title: name.into(),
             });
         }
-        #[cfg(not(test))]
-        return Err(rpc_err(
+        Err(rpc_err(
             INTERNAL_ERROR,
             "Native session history is unavailable",
-        ));
-        #[cfg(test)]
-        {
-            let backend = self
-                .ctx
-                .session_backend
-                .as_ref()
-                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
-            backend
-                .set_session_title(&key, name)
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to rename session: {e}")))?;
-            to_result(SessionRenameResult {
-                session_id: req.session_id.clone(),
-                title: name.to_string(),
-            })
-        }
+        ))
     }
 
     /// Create a chat session, run one prompt, and close the session: the
@@ -9917,118 +9533,12 @@ impl RpcDispatcher {
     }
 
     // Kept exclusively for fixtures exercising pre-upgrade transcript semantics.
-    #[cfg(test)]
-    async fn legacy_session_list_fixture(&self, params: &Value) -> RpcResult {
-        let backend = self.ctx.session_backend.as_ref();
-        if backend.is_none() && self.ctx.native_sessions.is_none() {
-            return Err(rpc_err(INTERNAL_ERROR, "Session persistence is disabled"));
-        }
-        let req: SessionListParams = parse_params(params)?;
-        let config = self.ctx.config.read().clone();
-        let visible_ids = self.owner_visible_session_ids().await;
-
-        // Use FTS when a query is provided, plain list otherwise.
-        let all = if let Some(backend) = backend {
-            if let Some(ref keyword) = req.query {
-                if keyword.trim().is_empty() {
-                    backend.list_sessions_with_metadata()
-                } else {
-                    use zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionQuery;
-                    backend.search(&SessionQuery {
-                        keyword: Some(keyword.clone()),
-                        limit: req.limit,
-                    })
-                }
-            } else {
-                backend.list_sessions_with_metadata()
-            }
-        } else {
-            vec![]
-        };
-        // A running RPC chat session is one with a live turn: its durable
-        // state row is only as fresh as the last turn that wrote it. Gateway
-        // and channel sessions are judged by that durable state.
-        let durable_running: Option<std::collections::HashSet<String>> =
-            req.running.unwrap_or(false).then(|| {
-                backend
-                    .map(|backend| backend.list_running_sessions())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|meta| meta.key)
-                    .collect()
-            });
-        let is_running = |key: &str| match &durable_running {
-            None => true,
-            Some(durable) => match key.strip_prefix("rpc_") {
-                Some(sid) => self.ctx.sessions.has_inflight_turn(sid),
-                None => durable.contains(key),
-            },
-        };
-
-        // Scoped principals see only their own sessions; legacy NULL-owner
-        // rows stay invisible to them rather than shared.
-        let scope = self.scoped_principal_id();
-        let mut sessions: Vec<SessionEntry> = all
-            .into_iter()
-            .filter(|meta| match scope.as_deref() {
-                Some(mine) => meta.principal_id.as_deref() == Some(mine),
-                None => true,
-            })
-            .filter(|meta| is_running(&meta.key))
-            .filter(|meta| meta.agent_alias.is_some() || meta.channel_id.is_some())
-            .filter_map(|meta| {
-                let agent_alias = meta.agent_alias.clone().or_else(|| {
-                    meta.channel_id
-                        .as_deref()
-                        .and_then(|c| config.agent_for_channel(c))
-                        .map(str::to_string)
-                });
-                let session_id = meta
-                    .key
-                    .strip_prefix("rpc_")
-                    .or_else(|| meta.key.strip_prefix("gw_"))
-                    .map(str::to_string)
-                    .unwrap_or_else(|| meta.key.clone());
-                if visible_ids
-                    .as_ref()
-                    .is_some_and(|ids| !ids.contains(&session_id))
-                {
-                    return None;
-                }
-                Some(SessionEntry {
-                    session_id,
-
-                    created_at: meta.created_at.to_rfc3339(),
-                    last_activity: meta.last_activity.to_rfc3339(),
-                    message_count: meta.message_count,
-                    agent_alias,
-                    channel_id: meta.channel_id,
-                    title: meta.title,
-                    creation_source: Some("rpc".to_owned()),
-                })
-            })
-            .collect();
-        sessions.sort_by(|left, right| {
-            right
-                .last_activity
-                .cmp(&left.last_activity)
-                .then_with(|| left.session_id.cmp(&right.session_id))
-        });
-        if let Some(limit) = req.limit {
-            sessions.truncate(limit);
-        }
-        to_result(SessionListResult { sessions })
-    }
 
     async fn handle_session_list(&self, params: &Value) -> RpcResult {
         self.list_sessions(params, Method::SessionList).await
     }
 
     async fn list_sessions(&self, params: &Value, method: Method) -> RpcResult {
-        #[cfg(test)]
-        if self.ctx.native_sessions.is_none() {
-            return self.legacy_session_list_fixture(params).await;
-        }
         let source = self
             .ctx
             .native_sessions
@@ -10036,55 +9546,38 @@ impl RpcDispatcher {
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
         let req: SessionListParams = parse_params(params)?;
         let visible_ids = self.owner_visible_session_ids().await;
-        let session_ids = source
-            .sessions()
+        let principal = self
+            .auth
+            .as_ref()
+            .ok_or_else(|| {
+                rpc_err(
+                    AUTH_REQUIRED,
+                    "Native history requires authenticated admission",
+                )
+            })?
+            .principal
+            .id
+            .clone();
+        let actor = zeroclaw_api::session_events::EventActor::Principal {
+            principal_id: principal.0,
+        };
+        let policy = Arc::new(RpcHistoryDiscovery {
+            dispatcher: self.spawn_handle(),
+            method,
+        });
+        let summaries = source
+            .list(actor.clone(), policy.clone(), usize::MAX)
             .await
-            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
-        let scope = self.scoped_principal_id();
-        let mut sessions: Vec<SessionEntry> = Vec::new();
-        for session_id in session_ids {
+            .map_err(native_history_read_error)?;
+        let mut sessions = Vec::new();
+        for summary in summaries {
+            let session_id = summary.head.session_id.to_string();
             if visible_ids
                 .as_ref()
                 .is_some_and(|ids| !ids.contains(&session_id))
             {
                 continue;
             }
-            let descriptor = source
-                .describe(session_id.clone())
-                .await
-                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Native session disappeared"))?;
-            if scope
-                .as_deref()
-                .is_some_and(|mine| descriptor.owner.as_deref() != Some(mine))
-            {
-                continue;
-            }
-            let grants = self.recheck_authority_after_admission(method)?;
-            if let Some(grants) = grants.as_ref()
-                && self
-                    .selector_session_agent_with_grants(method, grants, &descriptor.owning_agent)
-                    .is_err()
-            {
-                continue;
-            }
-            let durable = DurableSession::Chat {
-                key: session_id.clone(),
-            };
-            let record = crate::rpc::session::SessionRecord {
-                live_generation: None,
-                durable: Some(durable),
-                owner: descriptor.owner,
-            };
-            let native = self
-                .native_history_query(&session_id, Some(&record), method)
-                .await?
-                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Native history missing"))?;
-            let summary = native
-                .query
-                .summary(native.stream.clone())
-                .await
-                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
             if summary.closed {
                 continue;
             }
@@ -10101,15 +9594,28 @@ impl RpcDispatcher {
                 let title_match = summary
                     .title()
                     .is_some_and(|title| title.to_lowercase().contains(&needle));
-                if !title_match
-                    && native
+                if !title_match {
+                    let record = crate::rpc::session::SessionRecord {
+                        live_generation: None,
+                        durable: None,
+                        owner: summary
+                            .owner_principal_id
+                            .as_ref()
+                            .map(|owner| owner.0.clone()),
+                    };
+                    let native = self
+                        .native_history_query(&session_id, Some(&record), method)
+                        .await?
+                        .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Native history missing"))?;
+                    if native
                         .query
                         .search_messages(native.stream, keyword, 1)
                         .await
                         .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
                         .is_empty()
-                {
-                    continue;
+                    {
+                        continue;
+                    }
                 }
             }
             let date = |millis| {
@@ -10117,96 +9623,52 @@ impl RpcDispatcher {
                     .map(|date| date.to_rfc3339())
                     .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Invalid event timestamp"))
             };
-            sessions.push(SessionEntry {
+            let entry = SessionEntry {
                 session_id,
 
                 created_at: date(summary.created_at)?,
                 last_activity: date(summary.last_activity)?,
                 message_count: summary.message_count,
-                agent_alias: Some(descriptor.owning_agent),
+                agent_alias: summary.owning_agent.clone(),
                 channel_id: summary.channel_id().map(str::to_owned),
                 title: summary.title().map(str::to_owned),
                 creation_source: summary.creation_source().map(str::to_owned),
-            });
+            };
+            sessions.push((entry, summary));
         }
         sessions.sort_by(|left, right| {
             right
+                .0
                 .last_activity
-                .cmp(&left.last_activity)
-                .then_with(|| left.session_id.cmp(&right.session_id))
+                .cmp(&left.0.last_activity)
+                .then_with(|| left.0.session_id.cmp(&right.0.session_id))
         });
         if let Some(limit) = req.limit {
             sessions.truncate(limit);
         }
-        to_result(SessionListResult { sessions })
+        // Message search can await I/O after index discovery. Recheck the
+        // final selection against current grants before disclosing it.
+        use zeroclaw_kernel::session::query::SessionAccessPolicy;
+        for (_, summary) in &sessions {
+            policy
+                .authorize_summary(&actor, summary)
+                .map_err(|error| native_history_read_error(error.into()))?;
+        }
+        self.recheck_authority_after_admission(method)?;
+        to_result(SessionListResult {
+            sessions: sessions.into_iter().map(|(entry, _)| entry).collect(),
+        })
     }
 
     /// Both panes enumerate the canonical session catalog. The entrance does
     /// not define another namespace or rewrite the recorded creation source.
     async fn handle_session_list_acp(&self, params: &Value) -> RpcResult {
-        if self.ctx.native_sessions.is_some() {
-            if params.is_null() {
-                return self
-                    .list_sessions(&serde_json::json!({}), Method::SessionListAcp)
-                    .await;
-            }
-            return self.list_sessions(params, Method::SessionListAcp).await;
-        }
-        #[cfg(test)]
-        {
-            self.legacy_acp_session_list_fixture().await
-        }
-        #[cfg(not(test))]
-        {
-            Err(rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))
-        }
-    }
-
-    #[cfg(test)]
-    async fn legacy_acp_session_list_fixture(&self) -> RpcResult {
-        let store = self
-            .ctx
-            .session_repository
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?;
-
-        let summaries = store
-            .list_sessions()
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("acp session list failed: {e}")))?;
-
-        let scope = self.scoped_principal_id();
-        let visible_ids = self.owner_visible_session_ids().await;
-        let mut sessions = Vec::new();
-        for summary in summaries {
-            if scope
-                .as_deref()
-                .is_some_and(|mine| summary.principal_id.as_deref() != Some(mine))
-                || visible_ids
-                    .as_ref()
-                    .is_some_and(|ids| !ids.contains(&summary.session_uuid))
-            {
-                continue;
-            }
-            self.resolve_session_record_for_mode(
-                &summary.session_uuid,
-                Some(&ChatMode::Acp),
-                scope.as_deref(),
-            )
-            .await?;
-            sessions.push(SessionEntry {
-                session_id: summary.session_uuid.clone(),
-
-                created_at: summary.created_at.to_rfc3339(),
-                last_activity: summary.last_activity.to_rfc3339(),
-                message_count: summary.message_count,
-                agent_alias: Some(summary.agent_alias),
-                channel_id: None,
-                title: None,
-                creation_source: Some("acp".to_owned()),
-            });
-        }
-
-        to_result(SessionListResult { sessions })
+        let params = if params.is_null() {
+            &serde_json::json!({})
+        } else {
+            params
+        };
+        self.list_sessions(params, Method::SessionListAcp).await
     }
 
     async fn native_history_query(
@@ -10246,21 +9708,7 @@ impl RpcDispatcher {
         source
             .query(family.into(), principal, policy)
             .await
-            .map_err(|error| {
-                if error.chain().any(|cause| {
-                    matches!(
-                        cause.downcast_ref::<zeroclaw_kernel::session::SessionError>(),
-                        Some(zeroclaw_kernel::session::SessionError::PermissionDenied(_))
-                    )
-                }) {
-                    rpc_err(FORBIDDEN, "Native history access denied")
-                } else {
-                    rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Native history read failed: {error}"),
-                    )
-                }
-            })
+            .map_err(native_history_read_error)
     }
 
     async fn native_session_command(
@@ -10658,20 +10106,25 @@ impl RpcDispatcher {
                 "cursor pagination cannot be combined with before_index",
             ));
         }
-        if matches!(
-            authorized
-                .as_ref()
-                .and_then(|record| record.durable.as_ref()),
-            Some(DurableSession::Acp)
-        ) && let Some(native) = self
-            .native_history_query(
-                &req.session_id,
-                authorized.as_ref(),
-                Method::SessionMessages,
-            )
-            .await?
+        let durable = authorized
+            .as_ref()
+            .and_then(|record| record.durable.as_ref());
+        if cursor_mode && !matches!(durable, Some(DurableSession::Acp)) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "cursor pagination requires an ACP session",
+            ));
+        }
+        let native_key = match durable {
+            Some(DurableSession::Acp) => Some(req.session_id.as_str()),
+            Some(DurableSession::Chat { key }) => Some(key.as_str()),
+            None => None,
+        };
+        if let Some(key) = native_key
+            && let Some(native) = self
+                .native_history_query(key, authorized.as_ref(), Method::SessionMessages)
+                .await?
         {
-            // Native reads never promote the obsolete ACP checkpoint.
             if cursor_mode {
                 let cursor = req
                     .cursor
@@ -10763,268 +10216,25 @@ impl RpcDispatcher {
             })
             .map(|value| (value, authorized));
         }
-        let initial_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
-        // Live reads do not queue behind a running turn. Reaped reads need
-        // admission because checkpoint recovery changes durable history.
-        let mut session_guard = if initial_identity.is_none() {
-            Some(
-                self.ctx
-                    .sessions
-                    .session_queue
-                    .acquire(&req.session_id)
-                    .await
-                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
-            )
-        } else {
-            None
-        };
-        let mut live_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
-        if live_identity.is_none() && session_guard.is_none() {
-            session_guard = Some(
-                self.ctx
-                    .sessions
-                    .session_queue
-                    .acquire(&req.session_id)
-                    .await
-                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
-            );
-            live_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
-        }
-        let record = if session_guard.is_some() {
-            // Admission can outlast the caller's authority: judge the record
-            // by the authority and ownership scope in force now.
-            let grants = self.recheck_authority_after_admission(Method::SessionMessages)?;
-            self.revalidate_admitted_session(
-                &req.session_id,
-                authorized.as_ref(),
-                self.scoped_principal_id_from(grants.as_ref()).as_deref(),
-            )
-            .await?
-        } else {
-            authorized
-        };
-        let durable = record.as_ref().and_then(|record| record.durable.clone());
-        let expected_owner = record.as_ref().and_then(|record| record.owner.clone());
-        let mut cursor_result = None;
-        let messages = match durable {
-            Some(DurableSession::Acp) => {
-                let store =
-                    self.ctx.session_repository.as_ref().ok_or_else(|| {
-                        rpc_err(INTERNAL_ERROR, "ACP session store is not available")
-                    })?;
-                if live_identity.is_none() && !self.ctx.sessions.has_inflight_turn(&req.session_id)
-                {
-                    let store_for_surface = Arc::clone(store);
-                    let sid = req.session_id.clone();
-                    let owner_for_surface = expected_owner.clone();
-                    let supported = run_blocking_rpc(
-                        move || {
-                            let metadata = if cursor_mode {
-                                store_for_surface.session_owner_and_surface(&sid)?
-                            } else {
-                                store_for_surface
-                                    .load_session(&sid)?
-                                    .map(|data| (data.principal_id, data.interaction_surface))
-                            };
-                            Ok(metadata.is_none_or(|(owner, surface)| {
-                                owner == owner_for_surface
-                                    && surface.as_deref().is_none_or(|value| {
-                                        crate::agent::prompt::InteractionSurface::from_persisted(
-                                            value,
-                                        )
-                                        .is_some()
-                                    })
-                            }))
-                        },
-                        "Failed to validate ACP interaction surface",
-                    )
-                    .await?;
-                    if supported {
-                        recover_acp_checkpoint(
-                            self.spawn_handle(),
-                            Method::SessionMessages,
-                            Arc::clone(store),
-                            &req.session_id,
-                            expected_owner.clone(),
-                        )
-                        .await?;
-                    }
-                }
-                if cursor_mode {
-                    match zeroclaw_infra::legacy_fixture_call!(store, load_message_page(
-                        &req.session_id,
-                        req.limit.unwrap_or(100),
-                        req.cursor.as_deref(),
-                    ) => zeroclaw_infra::session_repository::SessionMessagePage)
-                    {
-                        Ok(page) => {
-                            if page.principal_id != expected_owner {
-                                return Err(rpc_err(
-                                    FORBIDDEN,
-                                    "Session not found or not owned by this principal",
-                                ));
-                            }
-                            cursor_result = Some((page.next_cursor, page.has_older));
-                            conversation_message_entries(&page.messages)
-                        }
-                        Err(error) => {
-                            let message = error.to_string();
-                            if message.starts_with("unknown ACP session:") {
-                                return Err(rpc_err(
-                                    INVALID_PARAMS,
-                                    "cursor pagination requires an ACP session",
-                                ));
-                            }
-                            return Err(rpc_err(
-                                if message.contains("invalid ACP session cursor")
-                                    || message.contains("cursor page limit")
-                                {
-                                    INVALID_PARAMS
-                                } else {
-                                    INTERNAL_ERROR
-                                },
-                                format!("Failed to load ACP session messages: {message}"),
-                            ));
-                        }
-                    }
-                } else {
-                    let store_for_load = Arc::clone(store);
-                    let sid = req.session_id.clone();
-                    let data = run_blocking_rpc(
-                        move || store_for_load.load_session(&sid),
-                        "Failed to load ACP session messages",
-                    )
-                    .await?;
-                    if let Some(data) = data {
-                        if data.principal_id != expected_owner {
-                            return Err(rpc_err(
-                                FORBIDDEN,
-                                "Session not found or not owned by this principal",
-                            ));
-                        }
-                        conversation_message_entries(&data.messages)
-                    } else {
-                        Vec::new()
-                    }
-                }
-            }
-            Some(DurableSession::Chat { key }) => {
-                if cursor_mode {
-                    return Err(rpc_err(
-                        INVALID_PARAMS,
-                        "cursor pagination requires an ACP session",
-                    ));
-                }
-                if let Some(native) = self
-                    .native_history_query(&key, record.as_ref(), Method::SessionMessages)
-                    .await?
-                {
-                    native
-                        .query
-                        .messages(native.stream)
-                        .await
-                        .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-                        .into_iter()
-                        .map(|message| MessageEntry {
-                            message_id: Some(message.message_id.to_string()),
-                            file_ids: message.files,
-                            unavailable_parts: message.unavailable_parts,
-                            role: message.role,
-                            content: message.text,
-                            kind: MessageEntryKind::Message,
-                            tool_call_id: None,
-                            tool_name: None,
-                            tool_input: None,
-                            tool_output: None,
-                        })
-                        .collect()
-                } else {
-                    #[cfg(not(test))]
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        "Native session history is unavailable",
-                    ));
-                    #[cfg(test)]
-                    {
-                        let backend = self.ctx.session_backend.as_ref().ok_or_else(|| {
-                            rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
-                        })?;
-                        backend
-                            .try_load(&key)
-                            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-                            .into_iter()
-                            .map(|message| MessageEntry {
-                                message_id: None,
-                                file_ids: vec![],
-                                unavailable_parts: vec![],
-                                role: message.role,
-                                content: message.content,
-                                kind: MessageEntryKind::Message,
-                                tool_call_id: None,
-                                tool_name: None,
-                                tool_input: None,
-                                tool_output: None,
-                            })
-                            .collect()
-                    }
-                }
-            }
-            None => {
-                if cursor_mode {
-                    return Err(rpc_err(
-                        INVALID_PARAMS,
-                        "cursor pagination requires an ACP session",
-                    ));
-                }
-                if self.ctx.native_sessions.is_none() && self.ctx.session_repository.is_none() {
-                    return Err(rpc_err(INTERNAL_ERROR, "Session persistence is disabled"));
-                }
-                Vec::new()
-            }
-        };
-
-        if let Some(identity) = live_identity.as_ref()
-            && !self
-                .ctx
-                .sessions
-                .matches_generation_and_mode(&req.session_id, identity)
-                .await
+        if durable.is_none()
+            && (self.ctx.native_sessions.is_some() || self.ctx.session_repository.is_some())
         {
-            return Err(rpc_err(
-                SESSION_NOT_FOUND,
-                "Session was replaced while reading messages",
-            ));
+            self.ensure_session_incarnation(&req.session_id, expected_generation)
+                .await?;
+            return to_result(SessionMessagesResult {
+                session_id: req.session_id,
+                messages: Vec::new(),
+                total: 0,
+                start: 0,
+                next_cursor: None,
+                has_older: None,
+            })
+            .map(|value| (value, authorized));
         }
-        self.ensure_session_incarnation(&req.session_id, expected_generation)
-            .await?;
-        if let Some((next_cursor, has_older)) = cursor_result {
-            // Cursor mode intentionally does not serialize legacy `total` or
-            // `start`: obtaining either exact value would require an
-            // unbounded full-history projection.
-            return to_result(serde_json::json!({
-                "session_id": req.session_id,
-                "messages": messages,
-                "next_cursor": next_cursor,
-                "has_older": has_older,
-            }))
-            .map(|value| (value, record));
-        }
-
-        let total = messages.len();
-        let limit = req.limit.unwrap_or(total);
-        let end = req.before_index.map(|i| i.min(total)).unwrap_or(total);
-        let start = end.saturating_sub(limit);
-        let messages = messages[start..end].to_vec();
-
-        to_result(SessionMessagesResult {
-            session_id: req.session_id,
-            messages,
-            total,
-            start,
-            next_cursor: None,
-            has_older: None,
-        })
-        .map(|value| (value, record))
+        Err(rpc_err(
+            INTERNAL_ERROR,
+            "Native session history is unavailable",
+        ))
     }
 
     async fn handle_session_state(&self, params: &Value) -> RpcResult {
@@ -11110,40 +10320,6 @@ impl RpcDispatcher {
             });
         }
 
-        #[cfg(test)]
-        {
-            // Gateway/legacy sessions that are not live in the RPC session store
-            // retain their persisted-state fallback, read from exactly the chat
-            // row the resolver authorized. Chat and ACP sessions above must never
-            // use this metadata as a live-turn barrier.
-            let backend = self
-                .ctx
-                .session_backend
-                .as_ref()
-                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
-            if let Some(DurableSession::Chat { key }) = record.and_then(|r| r.durable) {
-                match backend.get_session_state(&key) {
-                    Ok(Some(ss)) => {
-                        self.ensure_session_incarnation(&req.session_id, expected_generation)
-                            .await?;
-                        return to_result(SessionStateResult {
-                            session_id: req.session_id,
-                            state: ss.state,
-                            turn_id: ss.turn_id,
-                            turn_started_at: ss.turn_started_at.map(|t| t.to_rfc3339()),
-                            plan: None,
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            format!("Failed to get session state: {e}"),
-                        ));
-                    }
-                }
-            }
-        }
         Err(rpc_err(SESSION_NOT_FOUND, "Session not found"))
     }
 
@@ -11316,27 +10492,11 @@ impl RpcDispatcher {
                     })?
                 }
                 Some(DurableSession::Chat { key }) => {
-                    #[cfg(not(test))]
-                    {
-                        let _ = key;
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            "Native session history is unavailable",
-                        ));
-                    }
-                    #[cfg(test)]
-                    {
-                        let backend = self.ctx.session_backend.as_ref().ok_or_else(|| {
-                            rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
-                        })?;
-                        match expected_owner.as_deref() {
-                            Some(owner) => backend.delete_session_owned(&key, owner),
-                            None => backend.delete_session(&key),
-                        }
-                        .map_err(|e| {
-                            rpc_err(INTERNAL_ERROR, format!("Failed to delete session: {e}"))
-                        })?
-                    }
+                    let _ = key;
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        "Native session history is unavailable",
+                    ));
                 }
                 None => false,
             }
@@ -13561,22 +12721,6 @@ impl RpcDispatcher {
                     .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
                 {
                     *backend_counts.entry(descriptor.owning_agent).or_default() += 1;
-                }
-            }
-        }
-        #[cfg(test)]
-        if self.ctx.native_sessions.is_none()
-            && let Some(ref backend) = self.ctx.session_backend
-        {
-            for meta in backend.list_sessions_with_metadata() {
-                let alias = meta.agent_alias.or_else(|| {
-                    meta.channel_id
-                        .as_deref()
-                        .and_then(|c| config.agent_for_channel(c))
-                        .map(str::to_string)
-                });
-                if let Some(a) = alias {
-                    *backend_counts.entry(a).or_default() += 1;
                 }
             }
         }
@@ -16333,266 +15477,6 @@ fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: 
 #[cfg(test)]
 fn context_usage_model_window(cfg: &zeroclaw_config::schema::Config, agent_alias: &str) -> u64 {
     cfg.effective_model_context_window(agent_alias) as u64
-}
-
-fn checkpoint_fragment_for_event(event: &TurnEvent) -> Option<ConversationMessage> {
-    match event {
-        TurnEvent::Chunk { delta } => {
-            Some(ConversationMessage::Chat(ChatMessage::assistant(delta)))
-        }
-        TurnEvent::ToolCall { id, name, args } => {
-            let call = ToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                arguments: serde_json::to_string(args).unwrap_or_else(|_| "null".to_string()),
-                extra_content: None,
-            };
-            Some(ConversationMessage::AssistantToolCalls {
-                text: None,
-                tool_calls: vec![call],
-                reasoning_content: None,
-            })
-        }
-        TurnEvent::ToolResult {
-            id, name, output, ..
-        } => {
-            let content = zeroclaw_api::session_events::transcript::bounded_tool_output(output);
-            Some(ConversationMessage::ToolResults(vec![ToolResultMessage {
-                success: None,
-                tool_call_id: id.clone(),
-                content,
-                tool_name: name.clone(),
-                attachments: Vec::new(),
-            }]))
-        }
-        _ => None,
-    }
-}
-
-async fn recover_acp_checkpoint(
-    current: RpcDispatcher,
-    method: Method,
-    store: Arc<zeroclaw_infra::session_repository::SessionRepository>,
-    session_id: &str,
-    expected_owner: Option<String>,
-) -> Result<(), JsonRpcError> {
-    current
-        .ctx
-        .sessions
-        .wait_test_effect_pause("restore-recovery")
-        .await;
-    let session_id = session_id.to_string();
-    let marker = crate::i18n::get_required_cli_string("turn-stream-interrupted");
-    match tokio::task::spawn_blocking(move || {
-        let _authority = current.session_effect_lease(method, expected_owner.as_deref())
-            .map_err(SessionEffectDenied)?;
-        zeroclaw_infra::legacy_fixture_call!(store, recover_turn_checkpoint_for_owner(&session_id, &marker, expected_owner.as_deref()) => bool)
-    })
-    .await
-    {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(session_effect_error(
-            error,
-            "Failed to recover interrupted ACP turn",
-        )),
-        Err(join) => Err(rpc_err(
-            INTERNAL_ERROR,
-            format!("Failed to recover interrupted ACP turn: {join}"),
-        )),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AcpCheckpointFinish {
-    Finalized,
-    RecoveryRequired,
-}
-
-async fn finish_acp_checkpoint_with_context(
-    store: &Arc<zeroclaw_infra::session_repository::SessionRepository>,
-    session_id: &str,
-    turn_id: &str,
-    outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
-    retained_messages: Vec<ConversationMessage>,
-    breadcrumb: bool,
-    expected_owner: Option<String>,
-) -> Result<AcpCheckpointFinish, String> {
-    let messages = acp_checkpoint_transcript_messages(outcome);
-    if messages.is_none() && matches!(outcome, Ok(TurnOutcome::Cancelled { .. }) | Err(_)) {
-        return Ok(AcpCheckpointFinish::RecoveryRequired);
-    }
-    let store = Arc::clone(store);
-    let session_id = session_id.to_string();
-    let turn_id = turn_id.to_string();
-    match tokio::task::spawn_blocking(move || {
-        zeroclaw_infra::legacy_fixture_call!(
-            store,
-            finalize_turn_checkpoint_with_context_for_owner(
-                &session_id,
-                &turn_id,
-                messages.as_deref().unwrap_or_default(),
-                &retained_messages,
-                breadcrumb,
-                expected_owner.as_deref(),
-            )
-        )
-    })
-    .await
-    {
-        Ok(Ok(())) => Ok(AcpCheckpointFinish::Finalized),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(join) => Err(join.to_string()),
-    }
-}
-
-fn acp_checkpoint_transcript_messages(
-    outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
-) -> Option<Vec<ConversationMessage>> {
-    let messages = match outcome {
-        Ok(TurnOutcome::Completed { messages, .. }) => return Some(messages.clone()),
-        Ok(TurnOutcome::Cancelled { messages, .. }) if !messages.is_empty() => messages.clone(),
-        Ok(TurnOutcome::Cancelled { .. }) | Err(_) => return None,
-    };
-
-    Some(project_acp_transcript_messages(messages))
-}
-
-fn acp_checkpoint_live_messages(
-    outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
-) -> Option<Vec<ConversationMessage>> {
-    match outcome {
-        Ok(TurnOutcome::Cancelled { messages, .. }) if !messages.is_empty() => {
-            Some(messages.clone())
-        }
-        Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::Cancelled { .. }) | Err(_) => None,
-    }
-}
-
-fn project_acp_transcript_messages(
-    mut messages: Vec<ConversationMessage>,
-) -> Vec<ConversationMessage> {
-    // The Agent appends one terminal synthetic marker on cancellation. Remove
-    // exactly that suffix, preserving any preceding provider text (including a
-    // model-authored copy of the same marker), then record neutral provenance.
-    let interruption = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
-    let terminal_suffix = format!("\n\n{interruption}");
-    let partial = match messages.last() {
-        Some(ConversationMessage::Chat(chat)) if chat.role == "assistant" => {
-            if chat.content == interruption {
-                Some(String::new())
-            } else {
-                chat.content
-                    .strip_suffix(&terminal_suffix)
-                    .map(ToOwned::to_owned)
-            }
-        }
-        _ => None,
-    };
-    if let Some(partial) = partial {
-        if partial.is_empty() {
-            messages.pop();
-        } else if let Some(ConversationMessage::Chat(chat)) = messages.last_mut() {
-            chat.content = partial;
-        }
-        messages.push(ConversationMessage::Chat(ChatMessage::system(
-            crate::i18n::get_required_cli_string("turn-stream-interrupted"),
-        )));
-    }
-    messages
-}
-
-async fn persist_checkpoint_event_before_notification(
-    acp_store: Option<&Arc<zeroclaw_infra::session_repository::SessionRepository>>,
-    turn_id: Option<&str>,
-    session_id: &str,
-    event: &TurnEvent,
-    rpc: &Arc<RpcOutbound>,
-) -> Result<(), String> {
-    let notification = notification_for_turn_event(session_id, event);
-    let checkpoint_write = async {
-        let mut observed_frontier = None;
-        if let (Some(store), Some(turn_id)) = (acp_store, turn_id)
-            && let Some(fragment) = checkpoint_fragment_for_event(event)
-        {
-            let store = Arc::clone(store);
-            let sid_for_store = session_id.to_string();
-            let turn_id = turn_id.to_string();
-            let persisted = tokio::task::spawn_blocking(move || {
-                zeroclaw_infra::legacy_fixture_call!(store, append_turn_checkpoint(&sid_for_store, &turn_id, &[fragment]) => i64)
-            })
-            .await;
-            match persisted {
-                Ok(Ok(frontier)) => observed_frontier = Some(frontier),
-                Ok(Err(error)) => return Err(error.to_string()),
-                Err(join) => return Err(join.to_string()),
-            }
-        }
-        if let (
-            Some(store),
-            Some(turn_id),
-            TurnEvent::HistoryTrimmed {
-                dropped_messages,
-                retained_context: Some(snapshot),
-                ..
-            },
-        ) = (acp_store, turn_id, event)
-            && *dropped_messages > 0
-        {
-            let store = Arc::clone(store);
-            let sid_for_store = session_id.to_string();
-            let turn_id = turn_id.to_string();
-            let retained_messages = snapshot.retained_messages.clone();
-            let breadcrumb = snapshot.breadcrumb;
-            let observed_frontier = if let Some(frontier) = observed_frontier {
-                frontier
-            } else {
-                let store = Arc::clone(&store);
-                let sid_for_store = session_id.to_string();
-                let turn_for_frontier = turn_id.to_string();
-                match tokio::task::spawn_blocking(move || {
-                    zeroclaw_infra::legacy_fixture_call!(store, checkpoint_frontier(&sid_for_store, &turn_for_frontier) => i64)
-                })
-                .await
-                {
-                    Ok(Ok(frontier)) => frontier,
-                    Ok(Err(error)) => return Err(error.to_string()),
-                    Err(join) => return Err(join.to_string()),
-                }
-            };
-            let persisted = tokio::task::spawn_blocking(move || {
-                zeroclaw_infra::legacy_fixture_call!(
-                    store,
-                    persist_retained_context_at_frontier(
-                        &sid_for_store,
-                        &turn_id,
-                        &retained_messages,
-                        breadcrumb,
-                        observed_frontier,
-                    )
-                )
-            })
-            .await;
-            match persisted {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return Err(error.to_string()),
-                Err(join) => return Err(join.to_string()),
-            }
-        }
-        Ok(())
-    };
-    send_after_checkpoint_write(checkpoint_write, notification, Arc::clone(rpc)).await
-}
-
-async fn send_after_checkpoint_write(
-    checkpoint_write: impl std::future::Future<Output = Result<(), String>>,
-    notification: Option<String>,
-    rpc: Arc<RpcOutbound>,
-) -> Result<(), String> {
-    checkpoint_write.await?;
-    if let Some(notification) = notification {
-        let _ = rpc.send_raw(notification).await;
-    }
-    Ok(())
 }
 
 /// Persist a `TurnEvent::Plan` before it is emitted, so a racing
@@ -28642,7 +27526,6 @@ mod tests {
             ));
             let context = Arc::get_mut(&mut ctx).expect("context");
             context.native_sessions = Some(source);
-            context.session_backend = None;
             context.session_repository = Some(repository);
             let (tx, _rx) = tokio::sync::mpsc::channel(64);
             let mut dispatcher = RpcDispatcher::new(ctx, tx, "native-commands-fixture".into());
@@ -29279,9 +28162,10 @@ mod tests {
             *context_token_budget = Some(max_ctx);
             *model_context_window = Some(model_ctx);
         }
-        persist_checkpoint_event_before_notification(None, None, "s1", &event, &rpc)
-            .await
-            .unwrap();
+        assert!(
+            rpc.send_raw(notification_for_turn_event("s1", &event).unwrap())
+                .await
+        );
         let json = rx.try_recv().expect("usage must reach the RPC writer");
         let v = parse(&json);
 
@@ -31541,12 +30425,8 @@ mod tests {
                     zeroclaw_infra::session_repository::SessionRepository::new(&config.data_dir)
                         .expect("ACP"),
                 );
-                let mut ctx = RpcContext::for_persistence_tests(
-                    config,
-                    sessions.clone(),
-                    None,
-                    Some(acp.clone()),
-                );
+                let mut ctx =
+                    RpcContext::for_persistence_tests(config, sessions.clone(), Some(acp.clone()));
                 let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
                     ctx.config.clone(),
                 ));
@@ -31650,15 +30530,6 @@ mod tests {
                             .messages
                             .iter()
                             .any(|message| matches!(message, zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.content.contains("fixture answer")))
-                    );
-                    assert!(
-                        acp.append_turn(
-                            sid,
-                            &[zeroclaw_api::model_provider::ConversationMessage::Chat(
-                                zeroclaw_api::model_provider::ChatMessage::user("obsolete writer")
-                            )]
-                        )
-                        .is_err()
                     );
                 }
                 sessions.remove(sid).await;
@@ -31790,6 +30661,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_prompt_request_reply_is_the_declared_empty_ack() {
+        for backend in ["sqlite", "jsonl"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = make_acp_test_config(&tmp);
+            config.channels.session_backend = backend.into();
+            let (mut dispatcher, sessions) = make_native_test_dispatcher(config);
+            let sid = "rpc-prompt-ack";
+            dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias":"test-agent", "chat_mode":"chat", "session_id":sid,
+                }))
+                .await
+                .unwrap();
+            sessions
+                .get_agent(sid)
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .set_model_provider(Box::new(DummyModelProvider));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            dispatcher.rpc = Arc::new(RpcOutbound::new(tx));
+            dispatcher
+                .process_line(
+                    &json!({
+                        "jsonrpc":"2.0", "id":7, "method":"session/prompt",
+                        "params":{"session_id":sid,"prompt":"hello"},
+                    })
+                    .to_string(),
+                )
+                .await;
+            let (response, completion) = tokio::time::timeout(RPC_TEST_DEADLOCK_GUARD, async {
+                let mut response = None;
+                let mut completion = None;
+                while response.is_none() || completion.is_none() {
+                    let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                    if frame["id"] == 7 {
+                        response = Some(frame);
+                    } else if frame["method"] == notification::SESSION_UPDATE
+                        && frame["params"]["type"] == "turn_complete"
+                    {
+                        completion = Some(frame);
+                    }
+                }
+                (response.unwrap(), completion.unwrap())
+            })
+            .await
+            .expect("prompt must acknowledge and notify completion");
+            assert_eq!(response["result"], json!({}), "{response}");
+            assert_eq!(completion["params"]["content"], "ok", "{completion}");
+            assert_eq!(
+                Method::SessionPrompt.contract().result,
+                zeroclaw_rpc_proto::Shape::Typed("SessionPromptAck")
+            );
+            serde_json::from_value::<crate::rpc::types::SessionPromptAck>(
+                response["result"].clone(),
+            )
+            .unwrap();
+            assert!(
+                serde_json::from_value::<crate::rpc::types::SessionPromptResult>(
+                    response["result"].clone()
+                )
+                .is_err()
+            );
+            dispatcher.connection_cancel.cancel();
+        }
+    }
+
+    #[tokio::test]
     async fn native_events_wire_query_subscription_cursor_and_live_revocation() {
         use zeroclaw_api::session_events::{EventActor, EventCursor, capture::ContextSnapshot};
         use zeroclaw_kernel::session::engine::EngineSessionSource;
@@ -31801,7 +30741,7 @@ mod tests {
                 4, 10, 60,
             ));
             let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-            let mut ctx = RpcContext::for_persistence_tests(config, sessions, None, None);
+            let mut ctx = RpcContext::for_persistence_tests(config, sessions, None);
             let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
                 ctx.config.clone(),
             ));
@@ -31948,16 +30888,14 @@ mod tests {
             4, 10, 60,
         ));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let legacy =
+            zeroclaw_infra::session_events::upgrade::fixtures::LegacyAcpFixture::new(&data_dir)
+                .expect("legacy ACP migration source");
         let acp_store = Arc::new(
-            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(&data_dir)
-                .expect("legacy ACP migration source"),
+            zeroclaw_infra::session_repository::SessionRepository::new(&data_dir).unwrap(),
         );
-        let ctx = RpcContext::for_persistence_tests(
-            config,
-            sessions.clone(),
-            None,
-            Some(acp_store.clone()),
-        );
+        let ctx =
+            RpcContext::for_persistence_tests(config, sessions.clone(), Some(acp_store.clone()));
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "legacy-import-tools".into());
         dispatcher.set_authenticated_for_test();
@@ -31972,10 +30910,10 @@ mod tests {
         let previous = "22222222-2222-4222-8222-222222222222";
         let foreign = "33333333-3333-4333-8333-333333333333";
         let unknown = "44444444-4444-4444-8444-444444444444";
-        acp_store
-            .create_session(previous, "rpc", "test-agent", "/previous", None)
+        legacy
+            .create_session(previous, "test-agent", "/previous", None)
             .unwrap();
-        acp_store
+        legacy
             .append_turn(
                 previous,
                 &[ConversationMessage::Chat(ChatMessage::assistant(
@@ -31983,19 +30921,13 @@ mod tests {
                 ))],
             )
             .unwrap();
-        acp_store
-            .create_session(foreign, "rpc", "other-agent", "/foreign", None)
+        legacy
+            .create_session(foreign, "other-agent", "/foreign", None)
             .unwrap();
-        acp_store
-            .create_session(
-                current,
-                "rpc",
-                "test-agent",
-                data_dir.to_str().unwrap(),
-                None,
-            )
+        legacy
+            .create_session(current, "test-agent", data_dir.to_str().unwrap(), None)
             .unwrap();
-        acp_store
+        legacy
             .append_turn(
                 current,
                 &[ConversationMessage::Chat(ChatMessage::assistant(
@@ -32838,141 +31770,6 @@ mod tests {
             rx.try_recv().is_err(),
             "one seed trim must emit exactly one notification"
         );
-    }
-
-    #[test]
-    fn checkpoint_projection_keeps_visible_events_without_reasoning() {
-        let chunk = checkpoint_fragment_for_event(&TurnEvent::Chunk {
-            delta: "checking".to_string(),
-        });
-        let call = checkpoint_fragment_for_event(&TurnEvent::ToolCall {
-            id: "call-1".to_string(),
-            name: "shell".to_string(),
-            args: serde_json::json!({"command": "pwd"}),
-        });
-        let result = checkpoint_fragment_for_event(&TurnEvent::ToolResult {
-            id: "call-1".to_string(),
-            name: "shell".to_string(),
-            output: "/tmp".to_string(),
-            artifact: None,
-        });
-        assert!(
-            checkpoint_fragment_for_event(&TurnEvent::Thinking {
-                delta: "hidden".to_string(),
-            })
-            .is_none()
-        );
-        assert!(matches!(
-            chunk,
-            Some(ConversationMessage::Chat(chat))
-                if chat.role == "assistant" && chat.content == "checking"
-        ));
-        assert!(matches!(
-            call,
-            Some(ConversationMessage::AssistantToolCalls {
-                text: None,
-                tool_calls,
-                reasoning_content: None,
-            }) if tool_calls[0].id == "call-1"
-        ));
-        assert!(matches!(
-            result,
-            Some(ConversationMessage::ToolResults(results))
-                if results[0].tool_call_id == "call-1" && results[0].content == "/tmp"
-        ));
-    }
-
-    #[test]
-    fn checkpoint_projection_bounds_tool_output() {
-        let output = "x".repeat(16 * 1024 + 10);
-        let fragment = checkpoint_fragment_for_event(&TurnEvent::ToolResult {
-            id: "call-1".to_string(),
-            name: "shell".to_string(),
-            output,
-            artifact: None,
-        });
-        assert!(matches!(
-            fragment,
-            Some(ConversationMessage::ToolResults(results))
-                if results[0].content.ends_with("…[truncated]")
-                    && results[0].content.len() <= 16 * 1024 + "…[truncated]".len()
-        ));
-    }
-
-    #[test]
-    fn acp_cancel_projection_neutralizes_only_the_terminal_synthetic_marker() {
-        let marker = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
-        let neutral = crate::i18n::get_required_cli_string("turn-stream-interrupted");
-        let authored = format!("model-authored {marker}");
-        let outcome = Ok(TurnOutcome::Cancelled {
-            partial_text: format!("{authored}\n\n{marker}"),
-            messages: vec![
-                ConversationMessage::Chat(ChatMessage::user("question")),
-                ConversationMessage::Chat(ChatMessage::assistant(format!(
-                    "{authored}\n\n{marker}"
-                ))),
-            ],
-        });
-
-        let transcript = acp_checkpoint_transcript_messages(&outcome).unwrap();
-        assert!(matches!(
-            transcript.as_slice(),
-            [
-                ..,
-                ConversationMessage::Chat(message),
-                ConversationMessage::Chat(neutral_message)
-            ] if message.role == "assistant"
-                && message.content == authored
-                && neutral_message.role == "system"
-                && neutral_message.content == neutral
-        ));
-        let provider = zeroclaw_api::session_events::transcript::provider_safe_history(&transcript);
-        assert!(!provider.iter().any(|message| matches!(
-            message,
-            ConversationMessage::Chat(chat) if chat.content == neutral
-        )));
-
-        let model_authored = vec![
-            ConversationMessage::Chat(ChatMessage::assistant(authored.clone())),
-            ConversationMessage::Chat(ChatMessage::assistant("following text")),
-        ];
-        let preserved = project_acp_transcript_messages(model_authored);
-        assert!(matches!(
-            preserved.as_slice(),
-            [
-                ConversationMessage::Chat(authored_message),
-                ConversationMessage::Chat(following_message)
-            ] if authored_message.content == authored
-                && following_message.content == "following text"
-        ));
-    }
-
-    #[tokio::test]
-    async fn checkpoint_notification_waits_for_write() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let checkpoint_write = async move {
-            started_tx.send(()).unwrap();
-            release_rx.await.unwrap();
-            Ok::<(), String>(())
-        };
-
-        let task = zeroclaw_spawn::spawn!(send_after_checkpoint_write(
-            checkpoint_write,
-            Some(r#"{"type":"ready"}"#.into()),
-            Arc::clone(&rpc),
-        ));
-        started_rx.await.unwrap();
-        assert!(
-            rx.try_recv().is_err(),
-            "notification must wait for the write"
-        );
-
-        release_tx.send(()).unwrap();
-        task.await.unwrap().unwrap();
-        assert_eq!(rx.try_recv().unwrap(), r#"{"type":"ready"}"#);
     }
 
     #[test]
@@ -36144,7 +34941,7 @@ mod tests {
                 4, 10, 60,
             ));
             let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-            let mut ctx = RpcContext::for_persistence_tests(config, sessions, None, None);
+            let mut ctx = RpcContext::for_persistence_tests(config, sessions, None);
             let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
                 ctx.config.clone(),
             ));
@@ -36441,7 +35238,7 @@ mod tests {
                     zeroclaw_infra::session_repository::SessionRepository::new(&config.data_dir)
                         .expect("ACP store"),
                 );
-                let mut ctx = RpcContext::for_persistence_tests(config, sessions, None, Some(acp));
+                let mut ctx = RpcContext::for_persistence_tests(config, sessions, Some(acp));
                 let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
                     ctx.config.clone(),
                 ));
@@ -38071,7 +36868,6 @@ mod tests {
             agent_lifecycle: test_authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions: Arc::clone(&sessions),
-            session_backend: None,
             native_sessions: None,
             memory: None,
             cost_tracker: None,
@@ -38125,7 +36921,6 @@ mod tests {
             agent_lifecycle: test_authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions: Arc::clone(&sessions),
-            session_backend: None,
             native_sessions: None,
             memory: None,
             cost_tracker: None,
@@ -38315,7 +37110,6 @@ mod tests {
             agent_lifecycle: test_authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions: Arc::clone(&sessions),
-            session_backend: None,
             native_sessions: None,
             memory: None,
             cost_tracker: None,
@@ -39864,7 +38658,13 @@ mod tests {
             // The daemon's own values (daemon/mod.rs).
             let queue = Arc::new(SessionActorQueue::new(32, 30, 600));
             let sessions = Arc::new(SessionStore::new(64, queue));
-            let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+            let repository = zeroclaw_session_host::open_repository(&config).unwrap();
+            let mut ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+            let context = Arc::get_mut(&mut ctx).unwrap();
+            context.session_repository = Some(Arc::new(repository));
+            context.native_sessions = Some(Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                context.config.clone(),
+            )));
             (tmp, sessions, ctx)
         }
 
@@ -39911,6 +38711,79 @@ mod tests {
                 .await
                 .expect("session/new");
             opened["session_id"].as_str().unwrap().to_string()
+        }
+
+        #[tokio::test]
+        async fn retirement_requires_the_same_typed_tool_history_and_reasoning() {
+            use zeroclaw_api::model_provider::{
+                ChatMessage, ConversationMessage, ToolCall, ToolResultMessage,
+            };
+            use zeroclaw_api::session_events::capture::ContextSnapshot;
+            let (_tmp, sessions, ctx) = context(None);
+            let mut client = remote(&ctx, "tui_tool_history");
+            let sid = open(&client).await;
+            let record = client
+                .authorize_session_owner(&sid, Method::SessionCompact)
+                .await
+                .unwrap();
+            let port = client
+                .native_session_command(&sid, &sid, record.as_ref(), Method::SessionCompact)
+                .await
+                .unwrap()
+                .unwrap();
+            let messages = vec![
+                ConversationMessage::Chat(ChatMessage::user("remember the tool")),
+                ConversationMessage::AssistantToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".into(),
+                        name: "shell".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    reasoning_content: Some("retained reasoning".into()),
+                },
+                ConversationMessage::ToolResults(vec![ToolResultMessage {
+                    tool_call_id: "call-1".into(),
+                    tool_name: "shell".into(),
+                    content: "retained result".into(),
+                    success: Some(true),
+                    attachments: vec![],
+                }]),
+            ];
+            port.replace_context(
+                ContextSnapshot {
+                    messages: messages.clone(),
+                    history_has_trim_breadcrumb: Some(false),
+                },
+                "fixture",
+            )
+            .await
+            .unwrap();
+            let mut changed = messages.clone();
+            let ConversationMessage::AssistantToolCalls {
+                reasoning_content, ..
+            } = &mut changed[1]
+            else {
+                panic!("fixture variant")
+            };
+            *reasoning_content = Some("unsaved reasoning".into());
+            let agent = sessions.get_agent(&sid).await.unwrap();
+            {
+                let mut agent = agent.lock().await;
+                agent.seed_conversation_history(changed);
+                agent.set_history_has_trim_breadcrumb(false);
+            }
+            drop(port);
+            disconnect(&ctx, &mut client).await;
+            let now = Instant::now() + TIMEOUT;
+            assert!(retire_orphaned_sessions(&ctx, now).await.is_empty());
+            let mut live = vec![ConversationMessage::Chat(ChatMessage::system(
+                "regenerated system prompt",
+            ))];
+            live.extend(messages);
+            agent.lock().await.seed_conversation_history(live);
+            assert_eq!(retire_orphaned_sessions(&ctx, now).await, vec![sid]);
         }
 
         #[tokio::test]

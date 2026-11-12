@@ -28,6 +28,15 @@ pub trait SessionAccessPolicy: Send + Sync {
     fn session_agent_scope(&self) -> Option<&str> {
         None
     }
+    /// Discovery holds the catalog's read boundary, so immutable ownership and
+    /// current metadata can be checked without replaying each session again.
+    fn authorize_summary(
+        &self,
+        actor: &EventActor,
+        summary: &SessionSummary,
+    ) -> Result<(), SessionError> {
+        self.authorize_actor(actor, &summary.head.session_id, SessionAccess::Read)
+    }
     /// Reading ordinary history does not disclose model reasoning or opaque
     /// continuation bytes. Hosts opt in using their current trusted authority.
     fn authorize_reasoning(

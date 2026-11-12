@@ -1127,8 +1127,6 @@ pub async fn run_with_authority(
             channel_generation_control: Some(channel_generation_control.clone()),
             sessions,
             native_sessions: native_sessions.clone(),
-            #[cfg(test)]
-            session_backend: None,
             memory: rpc_memory,
             // Process-global tracker shared with the gateway and channel
             // supervisor. Without this the RPC/zerocode-TUI turn path has no

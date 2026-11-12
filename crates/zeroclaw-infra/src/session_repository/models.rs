@@ -61,13 +61,3 @@ pub struct SessionListEntry {
     pub last_activity: DateTime<Utc>,
     pub message_count: usize,
 }
-
-#[derive(Debug)]
-pub struct SessionMessagePage {
-    /// Owner read in the same transaction as the page, for RPC authorization
-    /// revalidation without loading the complete transcript.
-    pub principal_id: Option<String>,
-    pub messages: Vec<ConversationMessage>,
-    pub next_cursor: Option<String>,
-    pub has_older: bool,
-}

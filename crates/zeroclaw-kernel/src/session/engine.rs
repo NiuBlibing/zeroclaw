@@ -76,8 +76,9 @@ pub trait EngineSessionSource: Send + Sync {
     ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
         anyhow::bail!("system_session_source_unsupported")
     }
-    /// Resolve an existing native source without admission, recovery or write
-    /// ownership. Read-only callers cannot create a session by querying it.
+    /// Resolve existing history without execution admission. The host may
+    /// first settle abandoned executions under its exclusive ownership proof;
+    /// querying never creates a session or re-executes a prior effect.
     async fn query(
         &self,
         session_id: String,

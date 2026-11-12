@@ -103,7 +103,82 @@ impl NativeSessionHub {
             })
             .await??;
         }
+        self.recover_abandoned(&directory).await?;
         Ok((directory, backend))
+    }
+
+    /// Before exposing discovery or history, settle only executions whose
+    /// physical owner has disappeared. Live and escaped writers retain the
+    /// same lease and are skipped, even when another host queries them.
+    async fn recover_abandoned(&self, directory: &std::path::Path) -> anyhow::Result<()> {
+        let stores = self.stores.clone();
+        let directory = directory.to_owned();
+        let candidates = tokio::task::spawn_blocking({
+            let stores = stores.clone();
+            let directory = directory.clone();
+            move || -> anyhow::Result<_> {
+                let catalog = SessionCatalog::open(&directory, &stores)?
+                    .ok_or_else(|| anyhow::Error::msg("native catalog missing"))?;
+                let mut roots = std::collections::BTreeSet::new();
+                for record in catalog.query().index_records()? {
+                    if !record.running {
+                        continue;
+                    }
+                    let mut root = record.session_id;
+                    let mut visited = std::collections::HashSet::new();
+                    loop {
+                        anyhow::ensure!(visited.insert(root.clone()), "cyclic session derivation");
+                        let page = catalog.store().read_page(
+                            &root,
+                            &EventCursor::beginning(root.clone()),
+                            None,
+                            1,
+                        )?;
+                        let Some(event) = page.events.first() else {
+                            break;
+                        };
+                        if !matches!(event.body.data, EventData::DerivedSessionStarted { .. }) {
+                            break;
+                        }
+                        let cause = event
+                            .causation_id
+                            .as_ref()
+                            .ok_or_else(|| anyhow::Error::msg("child origin absent"))?;
+                        let parent = catalog
+                            .store()
+                            .read_event(cause)?
+                            .ok_or_else(|| anyhow::Error::msg("parent request absent"))?;
+                        anyhow::ensure!(
+                            matches!(parent.body.data, EventData::ChildInvocationRequested { .. }),
+                            "invalid child origin"
+                        );
+                        root = parent.session_id;
+                    }
+                    roots.insert(root);
+                }
+                Ok(roots)
+            }
+        })
+        .await??;
+        for stream in candidates {
+            let store = tokio::task::spawn_blocking({
+                let directory = directory.clone();
+                let stores = stores.clone();
+                let stream = stream.clone();
+                move || -> anyhow::Result<_> {
+                    let Some(lease) = zeroclaw_infra::session_events::ownership::SessionExecutionLease::try_acquire(&directory, stream.as_str())? else {
+                        return Ok(None);
+                    };
+                    Ok(Some(stores.open_session(&directory, stream.as_str(), Some(Arc::new(lease)))?))
+                }
+            }).await??;
+            if let Some(store) = store {
+                Arc::new(SessionCoordinator::new(Arc::new(store)))
+                    .recover_session(stream, Arc::new(ExclusiveSessionRecovery))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn open_session(
@@ -295,7 +370,7 @@ impl EngineSessionSource for NativeSessionHub {
         let (directory, _) = self.prepare().await?;
         let stores = self.stores.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            use zeroclaw_kernel::session::{SessionError, query::SessionAccess};
+            use zeroclaw_kernel::session::SessionError;
             let catalog = SessionCatalog::open(&directory, &stores)?
                 .ok_or_else(|| anyhow::Error::msg("native session storage is unavailable"))?;
             let mut visible = Vec::new();
@@ -311,8 +386,7 @@ impl EngineSessionSource for NativeSessionHub {
                 {
                     continue;
                 }
-                match policy.authorize_actor(&actor, &summary.head.session_id, SessionAccess::Read)
-                {
+                match policy.authorize_summary(&actor, &summary) {
                     Ok(()) => visible.push(summary),
                     Err(SessionError::PermissionDenied(_)) => continue,
                     Err(error) => return Err(error.into()),
@@ -327,7 +401,7 @@ impl EngineSessionSource for NativeSessionHub {
             visible.truncate(limit);
             // Revalidate immediately before disclosing the selected records.
             for summary in &visible {
-                policy.authorize_actor(&actor, &summary.head.session_id, SessionAccess::Read)?;
+                policy.authorize_summary(&actor, summary)?;
             }
             Ok(visible)
         })

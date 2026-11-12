@@ -612,10 +612,11 @@ Agent rename, deletion and interrupted-rename residue checks use this standard
 repository across all sources. Deletion appends closure events and retains
 historical attribution; these operations never write archived legacy backends.
 
-Production RPC contexts use only the standard session model. History
+RPC contexts use only the standard session model. History
 search, messages, state, rename, append and deletion use its authorized query
-and command ports. The old transcript backend and its fallback behavior are
-compiled only for explicit compatibility fixtures, not daemon execution.
+and command ports. Old-format readers and fixture builders are confined to
+installation migration; protocol tests exercise the same native paths as
+daemon execution.
 
 Channels restore persisted context through the admitted standard session port
 before building a provider request. Their bounded in-memory conversation buffer
@@ -643,6 +644,13 @@ CLI and session-host startup share kernel session recovery. After the host prove
 exclusive ownership, recovery settles descendants before their parent, including
 child requests committed before child stream creation. It preserves uncertain
 outcomes and never replays provider or tool execution.
+
+The session host also checks abandoned running sessions before discovery and
+history reads, so a restart cannot leave their list entries indefinitely marked
+as running until the next prompt. A busy execution lease keeps a live session
+untouched. Both Gateway and RPC discovery consume the metadata index and recheck
+current access against each selected summary; ordinary listings do not replay
+each session's message history. Message search loads history only when needed.
 
 SQLite control-file publication supports Windows using synced files and the
 same directory-flush contract as config publication. Windows does not provide

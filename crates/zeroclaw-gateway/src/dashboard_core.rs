@@ -1848,7 +1848,7 @@ mod tests {
         AliasedAgentConfig, Config, OidcConfig, OidcValidation, PermissionProfileConfig,
         RiskProfileConfig, RuntimeProfileConfig, WireApi,
     };
-    use zeroclaw_infra::session_backend::SessionBackend as _;
+    use zeroclaw_infra::session_repository::SessionRepository;
     use zeroclaw_rpc_proto::MAX_FRAME_BYTES;
     use zeroclaw_runtime::rpc::context::RpcContext;
     use zeroclaw_runtime::rpc::inproc::InprocConnector;
@@ -2215,10 +2215,13 @@ mod tests {
             ctx.tui_registry = Arc::new(zeroclaw_runtime::rpc::tui_identity::TuiRegistry::new(
                 &key_dir,
             ));
-            ctx.session_backend = Some(Arc::new(
-                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir)
-                    .expect("sqlite session backend"),
+            ctx.session_repository = Some(Arc::new(
+                zeroclaw_session_host::open_repository(config)
+                    .expect("standard session repository"),
             ));
+            ctx.native_sessions = Some(Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                ctx.config.clone(),
+            )));
             let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
             hooks.register(Box::new(GatedHooks {
                 start: Arc::clone(gates.0),
@@ -2750,6 +2753,21 @@ mod tests {
         .expect("the handshake succeeds")
     }
 
+    fn stored_transcript(
+        fixture: &Fixture,
+        core_id: &str,
+    ) -> Vec<zeroclaw_api::model_provider::ChatMessage> {
+        SessionRepository::new(&fixture.config.data_dir)
+            .expect("standard session repository")
+            .load_session(core_id)
+            .expect("stored context")
+            .expect("stored session")
+            .messages
+            .iter()
+            .flat_map(zeroclaw_api::model_provider::ConversationMessage::chat_messages)
+            .collect()
+    }
+
     /// Wait until the core no longer holds `core_id` live, then show its
     /// transcript is still there: closed, not deleted.
     async fn assert_closed_not_deleted(fixture: &Fixture, core_id: &str) {
@@ -2766,10 +2784,7 @@ mod tests {
         })
         .await
         .expect("the conversation is closed");
-        let durable =
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&fixture.config.data_dir)
-                .expect("sqlite session backend");
-        let transcript = durable.load(&format!("rpc_{core_id}"));
+        let transcript = stored_transcript(fixture, core_id);
         assert!(
             transcript
                 .iter()
@@ -2801,12 +2816,12 @@ mod tests {
         // The core ran the chat as alice: on disk, where it outlives every
         // connection, the conversation is hers.
         let durable =
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&fixture.config.data_dir)
-                .expect("sqlite session backend");
+            SessionRepository::new(&fixture.config.data_dir).expect("standard session repository");
         assert_eq!(
             durable
-                .get_session_metadata(&format!("rpc_{core_id}"))
-                .and_then(|metadata| metadata.principal_id)
+                .session_principal(&core_id)
+                .expect("stored owner")
+                .flatten()
                 .as_deref(),
             Some(alice_session.principal().id.as_str()),
             "the conversation belongs to the signed-in principal"
@@ -3683,10 +3698,7 @@ mod tests {
             Some(crate::dashboard_session::WS_CLOSE_SESSION_ENDED),
             "{frames:?}"
         );
-        let durable =
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&fixture.config.data_dir)
-                .expect("sqlite session backend");
-        let transcript = durable.load(&format!("rpc_{core_id}"));
+        let transcript = stored_transcript(&fixture, &core_id);
         assert!(
             !transcript
                 .iter()
@@ -3718,10 +3730,7 @@ mod tests {
             "{frames:?}"
         );
         assert_closed_not_deleted(&fixture, &core_id).await;
-        let durable =
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&fixture.config.data_dir)
-                .expect("sqlite session backend");
-        let transcript = durable.load(&format!("rpc_{core_id}"));
+        let transcript = stored_transcript(&fixture, &core_id);
         assert!(
             !transcript
                 .iter()

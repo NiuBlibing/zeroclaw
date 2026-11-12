@@ -17,7 +17,9 @@ use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     ACP_PROTOCOL_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
 };
-use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall};
+#[cfg(test)]
+use zeroclaw_api::model_provider::ToolCall;
+use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_repository::SessionRepository;
@@ -67,9 +69,7 @@ enum TerminalOutcome {
     Success {
         response: String,
     },
-    Cancelled {
-        persist_error: Option<String>,
-    },
+    Cancelled,
     Failed {
         /// Raw diagnostic, for the failure log line.
         error: String,
@@ -77,7 +77,6 @@ enum TerminalOutcome {
         /// still live, so the localized delivery projection reaches the client
         /// instead of the raw diagnostic.
         rpc_error: RpcError,
-        persist_error: Option<String>,
     },
 }
 
@@ -1429,8 +1428,7 @@ impl AcpServer {
         if restore_trim_event.is_some() {
             // Seed-time trim only fires when the restored history exceeded
             // the structured cap, so it dropped rows, not just relabeled
-            // them. Mirror the terminal-path persistence contract
-            // (`replace_transcript`) so the retained projection and
+            // them. Commit the retained context so the projection and
             // corrected breadcrumb are durable before the session goes
             // live; otherwise a later restart reloads the untruncated
             // transcript and resurrects the turns this trim just dropped.
@@ -1450,13 +1448,7 @@ impl AcpServer {
                     zeroclaw_runtime::agent::Agent::session_execution_diagnostic(&error)
                 })
             } else {
-                Self::replace_transcript(
-                    self.store.clone(),
-                    session_id.clone(),
-                    agent.history().to_vec(),
-                    agent.history_has_trim_breadcrumb(),
-                )
-                .await
+                Err("Native session history is unavailable".to_owned())
             };
             if let Err(e) = persisted {
                 self.loading_sessions.lock().await.remove(&session_id);
@@ -1817,13 +1809,7 @@ impl AcpServer {
                     zeroclaw_runtime::agent::Agent::session_execution_diagnostic(&error)
                 })
             } else {
-                Self::replace_transcript(
-                    self.store.clone(),
-                    session_id.clone(),
-                    agent.history().to_vec(),
-                    agent.history_has_trim_breadcrumb(),
-                )
-                .await
+                Err("Native session history is unavailable".to_owned())
             };
             if let Err(e) = persisted {
                 self.loading_sessions.lock().await.remove(&session_id);
@@ -2221,11 +2207,8 @@ impl AcpServer {
         let metadata_port = native.clone();
         let metadata_cancel = cancel_token.clone();
         let mut metadata_error = None;
-        let persist_store = if native.is_some() { None } else { self.store.clone() };
-        let persist_session_id = session_id.clone();
         let turn_handle = zeroclaw_spawn::spawn!(async move {
             let mut session = session_arc.lock().await;
-            let history_trim_generation_before_turn = session.agent.history_trim_generation();
             if let Some(port)=&native {
                 let restored=async {
                     if let Some(selection)=port.restore_model_override().await? {session.agent.restore_session_model_selection(selection)?;}
@@ -2237,7 +2220,7 @@ impl AcpServer {
                     }
                     Ok::<_,anyhow::Error>(())
                 }.await;
-                if let Err(error)=restored {let (error,rpc_error)=acp_turn_failure(&error);return TerminalOutcome::Failed {error,rpc_error,persist_error:None};}
+                if let Err(error)=restored {let (error,rpc_error)=acp_turn_failure(&error);return TerminalOutcome::Failed {error,rpc_error};}
             }
             let (turn_alias, turn_provider, turn_model) = session.agent.attribution_fields();
             // Stamp the resolved per-turn alias so `/api/cost?agent=<alias>`
@@ -2335,139 +2318,17 @@ impl AcpServer {
             // The match is the task's return value; its guard (`session`) drops
             // only after this — i.e. after terminal persistence has committed.
             match result {
-                Ok(success) => {
-                    // Successful turns keep best-effort persistence: the client
-                    // already has the response, so a persist failure is logged
-                    // but not surfaced. When this turn actually dropped older
-                    // history, replace the whole durable transcript from the
-                    // agent's own authoritative post-turn history, so the trim
-                    // is reflected durably too; otherwise append the delta, so
-                    // any earlier content only durable storage still
-                    // remembers (e.g. a degraded-away attachment reference) is
-                    // preserved.
-                    let _ =
-                        if session.agent.history_trim_generation() != history_trim_generation_before_turn {
-
-                        let full_history = session.agent.history().to_vec();
-                        let trim_breadcrumb = session.agent.history_has_trim_breadcrumb();
-                        Self::replace_transcript(
-                            persist_store,
-                            persist_session_id,
-                            full_history,
-                            trim_breadcrumb,
-                        )
-                        .await
-                    } else {
-                        Self::append_transcript(persist_store, persist_session_id, success.new_messages)
-                            .await
-                    };
-                    TerminalOutcome::Success {
-                        response: success.response,
-                    }
-                }
-                Err(failure) if was_cancelled => {
-                    // The failed/cancelled durability contract is the whole point
-                    // of this change, so retain a persistence failure and surface
-                    // it to the caller instead of reporting a clean cancellation.
-                    let trimmed_this_turn =
-                        session.agent.history_trim_generation() != history_trim_generation_before_turn;
-                    let persist_error = if trimmed_this_turn {
-                        // Build the persisted transcript from the agent's own
-                        // authoritative history (including the trim that
-                        // happened this turn), not just this turn's delta.
-                        let full_history = session.agent.history().to_vec();
-                        let trim_breadcrumb = session.agent.history_has_trim_breadcrumb();
-                        Self::replace_transcript(
-                            persist_store,
-                            persist_session_id,
-                            Self::cancelled_turn_transcript(full_history),
-                            trim_breadcrumb,
-                        )
-                        .await
-                        .err()
-                    } else {
-                        Self::append_transcript(
-                            persist_store,
-                            persist_session_id,
-                            Self::cancelled_turn_transcript(failure.new_messages),
-                        )
-                        .await
-                        .err()
-                    };
-                    // Reconcile the LIVE agent history to match the durable
-                    // projection: the tool loop appended a generic
-                    // `turn-interrupted-by-user` marker, but ACP records
-                    // cancellation as a structured, replay-only event. Drop the
-                    // live marker so the next prompt on this still-active session
-                    // does not re-send "[interrupted by user]" to the provider.
+                Ok(success) => TerminalOutcome::Success { response: success.response },
+                Err(_) if was_cancelled => {
                     session.agent.strip_trailing_interruption_marker();
-                    TerminalOutcome::Cancelled { persist_error }
+                    TerminalOutcome::Cancelled
                 }
                 Err(failure) => {
                     let (error, rpc_error) = acp_turn_failure(&failure.error);
-                    // A rejected prompt (e.g. empty/whitespace) fails before
-                    // producing any transcript, leaving `new_messages` empty.
-                    // Keep the old no-write behavior there so repeating an
-                    // invalid request doesn't accrete assistant-only failure
-                    // markers into `session/load`. Only persist — with the
-                    // marker — when the turn produced visible work.
-                    let persist_error = if failure.new_messages.is_empty() {
-                        None
-                    } else {
-                        let trimmed_this_turn = session.agent.history_trim_generation()
-                            != history_trim_generation_before_turn;
-                        // The failed turn is the trailing span of the live
-                        // history (its prompt is the last user message and
-                        // nothing appends after a failure). Snapshot it, with
-                        // this turn's trim state, BEFORE degrading media: the
-                        // durable transcript keeps the original attachment for
-                        // client replay, while the LIVE agent copy below is
-                        // degraded so a vision-capable provider does not
-                        // re-attach the same rejected image to the very next
-                        // prompt of this still-active session.
-                        let full_history = session.agent.history().to_vec();
-                        let trim_breadcrumb = session.agent.history_has_trim_breadcrumb();
-                        let degraded = session.agent.degrade_trailing_turn_media();
-                        if degraded > 0 {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write).with_category(::zeroclaw_log::EventCategory::Channel)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                                    .with_attrs(::serde_json::json!({
-                                        "session_id": persist_session_id,
-                                        "degraded_image_refs": degraded,
-                                    })),
-                                "Degraded rejected attachments in live ACP history after a failed turn"
-                            );
-                        }
-                        if trimmed_this_turn {
-                            Self::replace_transcript(
-                                persist_store,
-                                persist_session_id,
-                                Self::failed_turn_transcript(full_history),
-                                trim_breadcrumb,
-                            )
-                            .await
-                        } else {
-                            // Not the full authoritative history: the
-                            // pre-degrade delta this turn produced, so
-                            // existing durable content (which may itself hold
-                            // an earlier degraded-away attachment reference)
-                            // stays untouched.
-                            Self::append_transcript(
-                                persist_store,
-                                persist_session_id,
-                                Self::failed_turn_transcript(failure.new_messages),
-                            )
-                            .await
-                        }
-                        .err()
-                    };
-                    TerminalOutcome::Failed {
-                        error,
-                        rpc_error,
-                        persist_error,
+                    if !failure.new_messages.is_empty() {
+                        session.agent.degrade_trailing_turn_media();
                     }
+                    TerminalOutcome::Failed { error, rpc_error }
                 }
             }
         });
@@ -2582,7 +2443,7 @@ impl AcpServer {
         // notifications, and logs for each outcome.
         let result_text = match outcome {
             TerminalOutcome::Success { response } => response,
-            TerminalOutcome::Cancelled { persist_error } => {
+            TerminalOutcome::Cancelled => {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Channel)
@@ -2595,24 +2456,11 @@ impl AcpServer {
                 );
                 self.write_notification(&Self::turn_cancelled_notification(&session_id))
                     .await;
-                // The turn was cancelled live, but if its transcript could not be
-                // committed the durability contract was not met — surface that
-                // rather than reporting a clean cancellation.
-                if let Some(detail) = persist_error {
-                    return Err(RpcError {
-                        code: INTERNAL_ERROR,
-                        message: format!(
-                            "Turn cancelled, but its transcript could not be persisted and may be lost on reload: {detail}"
-                        ),
-                        data: None,
-                    });
-                }
                 return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
             }
             TerminalOutcome::Failed {
                 error,
-                mut rpc_error,
-                persist_error,
+                rpc_error,
             } => {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -2623,15 +2471,6 @@ impl AcpServer {
                         })),
                     "ACP session/prompt turn failed"
                 );
-                if let Some(detail) = persist_error {
-                    // The turn already failed; say so, and say that its
-                    // transcript did not survive either, without losing the
-                    // localized message the client renders.
-                    rpc_error.message = format!(
-                        "{} (its transcript also could not be persisted: {detail})",
-                        rpc_error.message
-                    );
-                }
                 return Err(rpc_error);
             }
         };
@@ -2769,24 +2608,6 @@ impl AcpServer {
         }
     }
 
-    /// Assemble the persisted transcript for a failed turn: the messages the
-    /// turn produced before the error (user prompt, completed tool activity,
-    /// any partial assistant text) plus a trailing failure boundary so the
-    /// reloaded transcript explains why the turn stopped.
-    ///
-    /// The boundary is the reserved [`FAILURE_TURN_SENTINEL`], not the localized
-    /// marker: restore paths must recognize a failed turn no matter which locale
-    /// was active when it was persisted (or when it is restored). Localized text
-    /// is projected from the sentinel at the two projection boundaries —
-    /// provider seed (`project_failure_sentinels`) and client replay
-    /// (`history_notifications_for_message`) — never stored.
-    fn failed_turn_transcript(mut messages: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
-        messages.push(ConversationMessage::Chat(ChatMessage::assistant(
-            FAILURE_TURN_SENTINEL.to_string(),
-        )));
-        messages
-    }
-
     /// A restored message is the durable failed-turn boundary exactly when it
     /// is an assistant message carrying the reserved, locale-independent
     /// [`FAILURE_TURN_SENTINEL`]. Structural, never a localized comparison: the
@@ -2813,53 +2634,6 @@ impl AcpServer {
             if Self::is_failure_sentinel(message) {
                 *message = ConversationMessage::Chat(ChatMessage::assistant(localized.clone()));
             }
-        }
-    }
-
-    /// Build the persisted transcript for a client-cancelled turn. The runtime
-    /// tags a cancelled turn with a generic `turn-interrupted-by-user` assistant
-    /// marker, but on ACP the actor is unverified and live cancellation reports
-    /// the distinct client-channel event instead. So drop that generic marker
-    /// (it must never seed provider history or replay as a user interruption)
-    /// and append a structured, replay-only cancellation event that
-    /// `session/load` renders through the same client-cancel update shape the
-    /// live turn produced (see `turn_cancelled_notification` /
-    /// `is_cancellation_event`). The visible transcript — prompt, completed tool
-    /// activity, partial assistant text — is preserved.
-    fn cancelled_turn_transcript(
-        mut messages: Vec<ConversationMessage>,
-    ) -> Vec<ConversationMessage> {
-        let interrupted =
-            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
-        if let Some(ConversationMessage::Chat(chat)) = messages.last_mut()
-            && chat.role == "assistant"
-        {
-            if chat.content == interrupted {
-                messages.pop();
-            } else if let Some(prefix) = chat.content.strip_suffix(&format!("\n\n{interrupted}")) {
-                chat.content = prefix.to_string();
-            }
-        }
-        messages.push(Self::cancellation_event());
-        messages
-    }
-
-    /// Structured ACP cancellation event. Carried inside the existing
-    /// `AssistantToolCalls` variant as a single sentinel tool call so it
-    /// round-trips through the store without a new schema, is recognisable by
-    /// tool name (not by localized text), is excluded from provider history at
-    /// the `session/load` seed boundary, and replays as the client-cancel
-    /// `turn-cancelled` update.
-    fn cancellation_event() -> ConversationMessage {
-        ConversationMessage::AssistantToolCalls {
-            text: None,
-            tool_calls: vec![ToolCall {
-                id: CANCELLATION_EVENT_TOOL_ID.to_string(),
-                name: CANCELLATION_EVENT_TOOL_NAME.to_string(),
-                arguments: CANCELLATION_EVENT_TOOL_ARGS.to_string(),
-                extra_content: None,
-            }],
-            reasoning_content: None,
         }
     }
 
@@ -3046,114 +2820,6 @@ impl AcpServer {
             }
         }
         repaired
-    }
-
-    /// Durably append a turn's new messages to the ACP session store. Safe
-    /// exactly when the turn did not change the agent's history generation:
-    /// the existing durable rows are still the live agent's own
-    /// unmodified prefix (possibly with in-place content rewrites this
-    /// append does not touch), so appending the delta cannot resurrect
-    /// anything the agent actually dropped. Best-effort: an empty slice is a
-    /// no-op, and a store error is logged while the live session continues in
-    /// memory.
-    async fn append_transcript(
-        store: Option<Arc<SessionRepository>>,
-        session_id: String,
-        messages: Vec<ConversationMessage>,
-    ) -> Result<(), String> {
-        let Some(store) = store else {
-            return Ok(());
-        };
-        if messages.is_empty() {
-            return Ok(());
-        }
-        let persisted = tokio::task::spawn_blocking(move || {
-            zeroclaw_infra::legacy_fixture_call!(store, append_turn(&session_id, &messages))
-        })
-        .await;
-        let error = match persisted {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e.to_string()),
-            Err(join) => Some(join.to_string()),
-        };
-        match error {
-            None => Ok(()),
-            Some(detail) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Channel)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "error": detail,
-                        })),
-                    "Failed to persist turn; session continues in memory"
-                );
-                Err(detail)
-            }
-        }
-    }
-
-    /// Durably replace the ACP session store's transcript and breadcrumb flag
-    /// with the agent's own authoritative post-turn state, as one atomic pair.
-    /// Takes an owned store handle rather than `&self` so terminal persistence
-    /// can run inside the per-session turn task while it still holds the
-    /// session lock. That ordering is what lets `session/close` and
-    /// `session/stop` — which await the same lock — observe the committed
-    /// terminal transcript before they return and before the session can be
-    /// reloaded from stale rows.
-    ///
-    /// A delta-append here would leave stale durable rows whenever the live
-    /// agent had already trimmed older turns before this turn was cancelled or
-    /// failed: the next `session/load` would then resurrect turns the client
-    /// was told had been discarded. Replacing the whole transcript and its
-    /// breadcrumb together — mirroring the RPC ACP bridge's
-    /// `replace_messages_and_breadcrumb` counterpart — keeps the durable state
-    /// and the live agent's committed history in agreement.
-    ///
-    /// Best-effort: a store error is logged while the live session continues
-    /// in memory. Shared by the successful, failed, and cancelled turn paths.
-    /// Returns `Ok(())` when the rows were committed, and `Err(detail)` when
-    /// the SQLite replace or its blocking task failed, so callers enforcing the
-    /// failed/cancelled durability contract can surface the loss instead of
-    /// reporting a clean terminal result.
-    async fn replace_transcript(
-        store: Option<Arc<SessionRepository>>,
-        session_id: String,
-        full_history: Vec<ConversationMessage>,
-        trim_breadcrumb: bool,
-    ) -> Result<(), String> {
-        let Some(store) = store else {
-            return Ok(());
-        };
-        let persisted = tokio::task::spawn_blocking(move || {
-            zeroclaw_infra::legacy_fixture_call!(
-                store,
-                replace_messages_and_breadcrumb(&session_id, &full_history, trim_breadcrumb)
-            )
-        })
-        .await;
-        let error = match persisted {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e.to_string()),
-            Err(join) => Some(join.to_string()),
-        };
-        match error {
-            None => Ok(()),
-            Some(detail) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Channel)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "error": detail,
-                        })),
-                    "Failed to persist turn; session continues in memory"
-                );
-                Err(detail)
-            }
-        }
     }
 
     fn prompt_result(session_id: String, stop_reason: &'static str, text: String) -> Value {
@@ -7368,14 +7034,6 @@ mod tests {
                     .latest_context_input_tokens,
                 2
             );
-            assert!(
-                store
-                    .append_turn(
-                        sid,
-                        &[ConversationMessage::Chat(ChatMessage::user("obsolete"))]
-                    )
-                    .is_err()
-            );
             server.process_line(&serde_json::json!({"jsonrpc":"2.0","id":3,"method":"session/close","params":{"sessionId":sid}}).to_string()).await;
             assert!(response(&mut rx, 3).await.get("error").is_none());
             server.process_line(&serde_json::json!({"jsonrpc":"2.0","id":4,"method":"session/resume","params":{"sessionId":sid}}).to_string()).await;
@@ -7784,106 +7442,6 @@ mod tests {
         assert_eq!(dropped.len(), 1);
         assert!(matches!(&dropped[0].0, ConversationMessage::Chat(c) if c.role == "user"));
         assert_eq!(dropped[0].1, 0);
-    }
-
-    #[test]
-    fn cancelled_turn_transcript_swaps_generic_marker_for_structured_event() {
-        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
-
-        let interrupted =
-            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
-
-        // The runtime tags a cancelled turn with a standalone generic marker.
-        let standalone = AcpServer::cancelled_turn_transcript(vec![
-            ConversationMessage::Chat(ChatMessage::user("do the thing")),
-            ConversationMessage::Chat(ChatMessage::assistant(interrupted.clone())),
-        ]);
-        // Generic marker gone; a structured cancellation event took its place.
-        assert!(
-            !standalone.iter().any(|m| matches!(
-                m,
-                ConversationMessage::Chat(c) if c.content == interrupted
-            )),
-            "generic interruption marker must not be persisted: {standalone:?}"
-        );
-        assert!(
-            AcpServer::is_cancellation_event(standalone.last().unwrap()),
-            "transcript must end with the structured cancellation event"
-        );
-
-        // When the marker is folded onto partial assistant text, only the marker
-        // suffix is stripped; the partial text is preserved.
-        let folded = AcpServer::cancelled_turn_transcript(vec![ConversationMessage::Chat(
-            ChatMessage::assistant(format!("partial answer\n\n{interrupted}")),
-        )]);
-        match &folded[0] {
-            ConversationMessage::Chat(chat) => assert_eq!(chat.content, "partial answer"),
-            other => panic!("expected preserved partial text, got {other:?}"),
-        }
-        assert!(AcpServer::is_cancellation_event(folded.last().unwrap()));
-    }
-
-    #[test]
-    fn is_cancellation_event_ignores_real_tool_call_sharing_the_sentinel_name() {
-        use zeroclaw_api::model_provider::{ConversationMessage, ToolCall};
-
-        // The genuine sentinel is still recognised.
-        assert!(
-            AcpServer::is_cancellation_event(&AcpServer::cancellation_event()),
-            "the structured cancellation event must be recognised"
-        );
-
-        // A real native/custom/MCP tool call that merely shares the reserved
-        // name — but carries a genuine call id and real arguments — must NOT be
-        // classified as a cancellation, so it is never stripped from provider
-        // history and replayed as a client cancel.
-        let real_call = ConversationMessage::AssistantToolCalls {
-            text: None,
-            tool_calls: vec![ToolCall {
-                id: "call_abc123".to_string(),
-                name: CANCELLATION_EVENT_TOOL_NAME.to_string(),
-                arguments: r#"{"target":"prod"}"#.to_string(),
-                extra_content: None,
-            }],
-            reasoning_content: None,
-        };
-        assert!(
-            !AcpServer::is_cancellation_event(&real_call),
-            "an ordinary tool call named turn-cancelled must remain a tool call"
-        );
-
-        // Even with the reserved id and empty args, accompanying assistant text
-        // means it is not the bare sentinel shape.
-        let with_text = ConversationMessage::AssistantToolCalls {
-            text: Some("here you go".to_string()),
-            tool_calls: vec![ToolCall {
-                id: CANCELLATION_EVENT_TOOL_ID.to_string(),
-                name: CANCELLATION_EVENT_TOOL_NAME.to_string(),
-                arguments: CANCELLATION_EVENT_TOOL_ARGS.to_string(),
-                extra_content: None,
-            }],
-            reasoning_content: None,
-        };
-        assert!(
-            !AcpServer::is_cancellation_event(&with_text),
-            "a tool call with surrounding assistant text is not the sentinel"
-        );
-
-        // The restore seed excludes the true sentinel but keeps the real
-        // same-named call, so it survives into provider history.
-        let seed: Vec<_> = [real_call, AcpServer::cancellation_event()]
-            .into_iter()
-            .filter(|message| !AcpServer::is_cancellation_event(message))
-            .collect();
-        assert_eq!(
-            seed.len(),
-            1,
-            "only the true sentinel is filtered from provider history"
-        );
-        assert!(
-            !AcpServer::is_cancellation_event(&seed[0]),
-            "the real same-named tool call survives into provider history"
-        );
     }
 
     #[test]

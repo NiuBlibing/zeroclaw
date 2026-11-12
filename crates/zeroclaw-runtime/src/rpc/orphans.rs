@@ -170,8 +170,7 @@ async fn retire(
 /// Native entrances share the same retained-context projection. Compare its
 /// typed messages and trim state with the live agent before retiring it. A
 /// missing, unreadable or different projection keeps the session live. This
-/// check never writes, so it cannot recreate deleted history. The old chat
-/// transcript path below is confined to migration-era test fixtures.
+/// check never writes, so it cannot recreate deleted history.
 async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool {
     // Verify the committed retained context, including typed tool/reasoning
     // fields. Merely having a source does not prove that this turn persisted.
@@ -182,12 +181,18 @@ async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool 
         let Ok(agent) = tokio::time::timeout(AGENT_WAIT, agent.lock()).await else {
             return false;
         };
-        let messages: Vec<_> = agent
-            .history()
-            .iter()
-            .flat_map(zeroclaw_api::model_provider::ConversationMessage::chat_messages)
-            .collect();
-        let live = match zeroclaw_api::session_events::canonical_json(&messages) {
+        // Normalize equivalent typed variants on both sides. Generated system
+        // prompts are rebuilt on resume and do not require durable retention.
+        let canonical = |messages: &[zeroclaw_api::model_provider::ConversationMessage]| {
+            zeroclaw_api::session_events::canonical_json(
+                &messages
+                    .iter()
+                    .flat_map(zeroclaw_api::model_provider::ConversationMessage::chat_messages)
+                    .filter(|message| message.role != "system")
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let live = match canonical(agent.history()) {
             Ok(live) => live,
             Err(_) => return false,
         };
@@ -203,81 +208,13 @@ async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool 
                     return Ok(false);
                 };
                 Ok(stored.trim_breadcrumb == trim_breadcrumb
-                    && zeroclaw_api::session_events::canonical_json(&stored.messages)? == live)
+                    && canonical(&stored.messages)? == live)
             })
             .await,
             Ok(Ok(true))
         );
     }
 
-    #[cfg(not(test))]
-    {
-        let _ = session;
-        false
-    }
-
-    #[cfg(test)]
-    if matches!(
-        ctx.sessions.chat_mode(&session.id).await,
-        Some(crate::rpc::types::ChatMode::Acp)
-    ) {
-        return true;
-    }
-
-    #[cfg(test)]
-    {
-        let Some(agent) = ctx.sessions.get_agent(&session.id).await else {
-            return false;
-        };
-        let Ok(agent) = tokio::time::timeout(AGENT_WAIT, agent.lock()).await else {
-            return false;
-        };
-        let live = zeroclaw_providers::durable_chat_messages(agent.history());
-        drop(agent);
-        let Some(backend) = ctx.session_backend.as_ref() else {
-            return live.is_empty();
-        };
-        let stored = match backend.try_load(&format!("rpc_{}", session.id)) {
-            Ok(stored) => stored,
-            Err(error) => return keep_live(session, "could not read its stored history", &error),
-        };
-        let held = stored.len() >= live.len()
-            && stored
-                .iter()
-                .zip(&live)
-                .all(|(stored, live)| stored.role == live.role && stored.content == live.content);
-        if !held {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "session_id": session.id,
-                        "stored_messages": stored.len(),
-                        "live_messages": live.len(),
-                    })),
-                "An orphaned session's store does not hold all of its history; keeping it live"
-            );
-        }
-        held
-    }
-}
-
-#[cfg(test)]
-fn keep_live(session: &OwnedSession, what: &str, error: &std::io::Error) -> bool {
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read)
-            .with_category(::zeroclaw_log::EventCategory::Agent)
-            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-            .with_attrs(::serde_json::json!({
-                "session_id": session.id,
-                "problem": what,
-                "error": error.to_string(),
-            })),
-        "Keeping an orphaned session live: its history is not safely stored"
-    );
     false
 }
 

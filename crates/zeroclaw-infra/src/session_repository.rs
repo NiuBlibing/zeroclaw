@@ -5,8 +5,6 @@ use crate::session_events::{catalog::SessionCatalog, scoped::EventStorePool};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::{Path, PathBuf};
-#[cfg(any(test, feature = "test-util"))]
-use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_log::{Action, EventOutcome};
 mod models;
@@ -38,23 +36,9 @@ impl zeroclaw_api::session_events::management::AgentSessionPort for SessionRepos
     }
 }
 
-macro_rules! legacy_fixture {
-    ($repository:expr, $method:ident($($argument:expr),* $(,)?)) => {
-        #[cfg(any(test, feature = "test-util"))]
-        if let Some(legacy) = $repository.fixture()? {
-            return legacy.$method($($argument),*);
-        }
-    };
-}
-
-#[cfg(any(test, feature = "test-util"))]
-mod legacy_fixture;
-
 pub struct SessionRepository {
     data_dir: PathBuf,
     stores: EventStorePool,
-    #[cfg(any(test, feature = "test-util"))]
-    legacy_fixture: Option<crate::session_events::upgrade::legacy_acp::LegacyAcpStore>,
 }
 
 impl SessionRepository {
@@ -64,8 +48,6 @@ impl SessionRepository {
         Ok(Self {
             data_dir: data_dir.into(),
             stores: Default::default(),
-            #[cfg(any(test, feature = "test-util"))]
-            legacy_fixture: None,
         })
     }
 
@@ -92,33 +74,6 @@ impl SessionRepository {
         effect(owner.as_deref())
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn legacy_fixture(data_dir: &Path) -> Result<Self> {
-        let mut repository = Self::new(data_dir)?;
-        if !data_dir.join("sessions/session-format.json").try_exists()? {
-            repository.legacy_fixture =
-                Some(crate::session_events::upgrade::legacy_acp::LegacyAcpStore::new(data_dir)?);
-        }
-        Ok(repository)
-    }
-
-    #[cfg(any(test, feature = "test-util"))]
-    fn fixture(
-        &self,
-    ) -> Result<Option<&crate::session_events::upgrade::legacy_acp::LegacyAcpStore>> {
-        Ok(
-            if self
-                .data_dir
-                .join("sessions/session-format.json")
-                .try_exists()?
-            {
-                None
-            } else {
-                self.legacy_fixture.as_ref()
-            },
-        )
-    }
-
     fn view(&self) -> Result<view::RepositoryView> {
         let catalog = self.catalog()?;
         Ok(view::RepositoryView(catalog))
@@ -131,11 +86,6 @@ impl SessionRepository {
         workspace_dir: &str,
         principal_id: Option<&str>,
     ) -> Result<i64> {
-        legacy_fixture!(
-            self,
-            create_session(session_uuid, agent_alias, workspace_dir, principal_id)
-        );
-
         self.create_session_with_interaction_surface(
             session_uuid,
             creation_source,
@@ -155,17 +105,6 @@ impl SessionRepository {
         interaction_surface: Option<&str>,
         principal_id: Option<&str>,
     ) -> Result<i64> {
-        legacy_fixture!(
-            self,
-            create_session_with_interaction_surface(
-                session_uuid,
-                agent_alias,
-                workspace_dir,
-                interaction_surface,
-                principal_id,
-            )
-        );
-
         let native = self.view()?;
 
         native.create(
@@ -188,8 +127,6 @@ impl SessionRepository {
         session_uuid: &str,
         owner_principal_id: &str,
     ) -> Result<bool> {
-        legacy_fixture!(self, delete_session_owned(session_uuid, owner_principal_id));
-
         let native = self.view()?;
 
         native.delete(session_uuid, Some(owner_principal_id))
@@ -198,8 +135,6 @@ impl SessionRepository {
     // Distinguish a missing session from an existing unscoped session.
     #[allow(clippy::option_option)]
     pub fn session_principal(&self, session_uuid: &str) -> Result<Option<Option<String>>> {
-        legacy_fixture!(self, session_principal(session_uuid));
-
         let native = self.view()?;
 
         Ok(native
@@ -211,8 +146,6 @@ impl SessionRepository {
         &self,
         session_uuid: &str,
     ) -> Result<Option<(Option<String>, Option<String>)>> {
-        legacy_fixture!(self, session_owner_and_surface(session_uuid));
-
         let native = self.view()?;
 
         native
@@ -234,11 +167,6 @@ impl SessionRepository {
         session_uuid: &str,
         interaction_surface: &str,
     ) -> Result<String> {
-        legacy_fixture!(
-            self,
-            bind_interaction_surface_if_unset(session_uuid, interaction_surface)
-        );
-
         self.bind_interaction_surface_if_unset_authorized(session_uuid, interaction_surface, |_| {
             Ok(())
         })
@@ -274,8 +202,6 @@ impl SessionRepository {
     }
 
     pub fn load_session(&self, session_uuid: &str) -> Result<Option<SessionTranscript>> {
-        legacy_fixture!(self, load_session(session_uuid));
-
         let native = self.view()?;
 
         native
@@ -289,8 +215,6 @@ impl SessionRepository {
         session_uuid: &str,
         agent_alias: &str,
     ) -> Result<Option<SessionTranscript>> {
-        legacy_fixture!(self, load_session_for_agent(session_uuid, agent_alias));
-
         let native = self.view()?;
 
         native
@@ -305,8 +229,6 @@ impl SessionRepository {
         session_uuid: &str,
         agent_alias: &str,
     ) -> Result<SessionOwnership> {
-        legacy_fixture!(self, classify_session_for_agent(session_uuid, agent_alias));
-
         let native = self.view()?;
 
         Ok(match native.record(session_uuid)? {
@@ -319,8 +241,6 @@ impl SessionRepository {
     }
 
     pub fn is_live_session_for_agent(&self, session_uuid: &str, agent_alias: &str) -> Result<bool> {
-        legacy_fixture!(self, is_live_session_for_agent(session_uuid, agent_alias));
-
         let native = self.view()?;
 
         Ok(native.record(session_uuid)?.is_some_and(|record| {
@@ -329,16 +249,12 @@ impl SessionRepository {
     }
 
     pub fn list_session_ids(&self) -> Result<Vec<String>> {
-        legacy_fixture!(self, list_session_ids());
-
         let native = self.view()?;
 
         Ok(native.summaries()?.into_iter().map(|(id, _)| id).collect())
     }
 
     pub fn load_session_for_restore(&self, session_uuid: &str) -> Result<SessionRestore> {
-        legacy_fixture!(self, load_session_for_restore(session_uuid));
-
         let native = self.view()?;
 
         Ok(match native.detail(session_uuid)? {
@@ -351,8 +267,6 @@ impl SessionRepository {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionListEntry>> {
-        legacy_fixture!(self, list_sessions());
-
         let native = self.view()?;
 
         native
@@ -364,8 +278,6 @@ impl SessionRepository {
     }
 
     pub fn list_live_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<SessionListEntry>> {
-        legacy_fixture!(self, list_live_sessions_by_agent(agent_alias));
-
         let native = self.view()?;
 
         native
@@ -379,8 +291,6 @@ impl SessionRepository {
     }
 
     pub fn contains_session(&self, session_uuid: &str) -> Result<bool> {
-        legacy_fixture!(self, contains_session(session_uuid));
-
         let native = self.view()?;
 
         Ok(native.record(session_uuid)?.is_some())
@@ -391,11 +301,6 @@ impl SessionRepository {
         session_uuid: &str,
         latest_context_input_tokens: u64,
     ) -> Result<()> {
-        legacy_fixture!(
-            self,
-            set_token_count(session_uuid, latest_context_input_tokens)
-        );
-
         let native = self.view()?;
 
         native.change(
@@ -408,8 +313,6 @@ impl SessionRepository {
     }
 
     pub fn clear_latest_context_input_tokens(&self, session_uuid: &str) -> Result<()> {
-        legacy_fixture!(self, clear_token_count(session_uuid));
-
         let native = self.view()?;
 
         native.change(
@@ -424,11 +327,6 @@ impl SessionRepository {
         input_tokens: Option<u64>,
         accepted: bool,
     ) -> Result<()> {
-        legacy_fixture!(
-            self,
-            persist_usage_snapshot(session_uuid, input_tokens, accepted)
-        );
-
         if !accepted {
             return Ok(());
         }
@@ -439,16 +337,12 @@ impl SessionRepository {
     }
 
     pub fn set_plan(&self, session_uuid: &str, entries: &[PlanEntry]) -> Result<()> {
-        legacy_fixture!(self, set_plan(session_uuid, entries));
-
         let native = self.view()?;
 
         native.change(session_uuid, vec![("plan", serde_json::json!(entries))])
     }
 
     pub fn get_plan(&self, session_uuid: &str) -> Result<Vec<PlanEntry>> {
-        legacy_fixture!(self, get_plan(session_uuid));
-
         let native = self.view()?;
 
         native
@@ -465,24 +359,18 @@ impl SessionRepository {
         outcome: EventOutcome,
         payload: Option<&str>,
     ) -> Result<()> {
-        legacy_fixture!(self, append_event(session_uuid, action, outcome, payload));
-
         let native = self.view()?;
 
         native.change(session_uuid, vec![("protocol_observation", serde_json::json!({"action":action.as_str(),"outcome":outcome.as_str(),"payload":payload}))])
     }
 
     pub fn delete_session(&self, session_uuid: &str) -> Result<bool> {
-        legacy_fixture!(self, delete_session(session_uuid));
-
         let native = self.view()?;
 
         native.delete(session_uuid, None)
     }
 
     pub fn count_live_sessions_by_agent(&self, agent_alias: &str) -> Result<usize> {
-        legacy_fixture!(self, count_live_sessions_by_agent(agent_alias));
-
         let native = self.view()?;
 
         Ok(native
@@ -495,8 +383,6 @@ impl SessionRepository {
     }
 
     pub fn list_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<SessionListEntry>> {
-        legacy_fixture!(self, list_sessions_by_agent(agent_alias));
-
         let native = self.view()?;
 
         native
@@ -508,8 +394,6 @@ impl SessionRepository {
     }
 
     pub fn projected_message_count(&self, session_uuid: &str) -> Result<Option<usize>> {
-        legacy_fixture!(self, projected_message_count(session_uuid));
-
         let native = self.view()?;
 
         Ok(native
@@ -518,8 +402,6 @@ impl SessionRepository {
     }
 
     pub fn delete_sessions_by_agent(&self, agent_alias: &str) -> Result<usize> {
-        legacy_fixture!(self, delete_sessions_by_agent(agent_alias));
-
         let native = self.view()?;
 
         let records = native.summaries()?;
@@ -535,8 +417,6 @@ impl SessionRepository {
     }
 
     pub fn rename_sessions_by_agent(&self, from: &str, to: &str) -> Result<usize> {
-        legacy_fixture!(self, rename_sessions_by_agent(from, to));
-
         let native = self.view()?;
 
         let records = native.summaries()?;
@@ -555,8 +435,6 @@ impl SessionRepository {
     }
 
     pub fn mark_session_killed_atomic(&self, session_uuid: &str) -> Result<SessionKillTransition> {
-        legacy_fixture!(self, mark_session_killed_atomic(session_uuid));
-
         self.mark_session_killed_atomic_for_owner(session_uuid, None)
     }
 
@@ -565,11 +443,6 @@ impl SessionRepository {
         session_uuid: &str,
         owner_principal_id: Option<&str>,
     ) -> Result<SessionKillTransition> {
-        legacy_fixture!(
-            self,
-            mark_session_killed_atomic_for_owner(session_uuid, owner_principal_id)
-        );
-
         self.mark_session_killed_atomic_for_owner_authorized(
             session_uuid,
             owner_principal_id,
@@ -596,8 +469,6 @@ impl SessionRepository {
     }
 
     pub fn mark_session_killed(&self, session_uuid: &str) -> Result<bool> {
-        legacy_fixture!(self, mark_session_killed(session_uuid));
-
         Ok(matches!(
             self.mark_session_killed_atomic(session_uuid)?,
             SessionKillTransition::Marked | SessionKillTransition::AlreadyKilled
@@ -605,8 +476,6 @@ impl SessionRepository {
     }
 
     pub fn is_session_killed(&self, session_uuid: &str) -> Result<bool> {
-        legacy_fixture!(self, is_session_killed(session_uuid));
-
         let native = self.view()?;
 
         Ok(native
@@ -615,8 +484,6 @@ impl SessionRepository {
     }
 
     pub fn touch_session(&self, session_uuid: &str) -> Result<()> {
-        legacy_fixture!(self, touch_session(session_uuid));
-
         let native = self.view()?;
 
         if let Some(record) = native.record(session_uuid)? {
@@ -742,9 +609,10 @@ mod tests {
         for backend in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
             let directory = tempfile::tempdir().expect("directory");
             let legacy =
-                SessionRepository::legacy_fixture(directory.path()).expect("legacy fixture");
+                crate::session_events::upgrade::legacy_acp::LegacyAcpStore::new(directory.path())
+                    .expect("legacy fixture");
             legacy
-                .create_session("original", "acp", "agent", "/workspace", Some("owner"))
+                .create_session("original", "agent", "/workspace", Some("owner"))
                 .expect("source");
             let messages = vec![ConversationMessage::Chat(ChatMessage::user(
                 "original input",

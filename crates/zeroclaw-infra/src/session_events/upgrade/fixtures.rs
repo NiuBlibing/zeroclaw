@@ -4,3 +4,5 @@
 pub mod session_backend;
 pub mod session_store;
 pub mod sqlite;
+
+pub use super::legacy_acp::LegacyAcpStore as LegacyAcpFixture;

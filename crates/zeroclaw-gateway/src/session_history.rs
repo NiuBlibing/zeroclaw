@@ -779,6 +779,55 @@ pub(crate) async fn command(
         )
         .await
 }
+struct GatewayHistoryDiscovery {
+    state: AppState,
+    subject: Option<String>,
+    dashboard: Option<crate::dashboard_session::HistoryAdmission>,
+}
+impl SessionAccessPolicy for GatewayHistoryDiscovery {
+    fn authorize_summary(
+        &self,
+        actor: &EventActor,
+        summary: &views::SessionSummary,
+    ) -> Result<(), SessionError> {
+        let alias = summary.owning_agent.as_deref().ok_or_else(|| {
+            SessionError::PermissionDenied("gateway history agent missing".into())
+        })?;
+        let capability = AgentExecutionCapability::from_parts(
+            self.state.config.clone(),
+            self.state.agent_lifecycle.clone(),
+        );
+        let authority = GatewayAuthority {
+            base: Arc::new(AgentHistoryAuthority {
+                admission: capability
+                    .admit(alias)
+                    .map_err(|error| SessionError::PermissionDenied(error.to_string()))?
+                    .into(),
+                actor: actor.clone(),
+                stream: summary.head.session_id.clone(),
+                origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
+                parent_alias: None,
+            }),
+            pairing: self.state.pairing.clone(),
+            subject: self.subject.clone(),
+            dashboard: self.dashboard.clone(),
+            live: self.state.config.clone(),
+        };
+        authority.authorize_actor(actor, &summary.head.session_id, SessionAccess::Read)
+    }
+
+    fn authorize(
+        &self,
+        _: &PrincipalId,
+        _: &SessionId,
+        _: SessionAccess,
+    ) -> Result<(), SessionError> {
+        Err(SessionError::PermissionDenied(
+            "gateway discovery requires a catalog summary".into(),
+        ))
+    }
+}
+
 pub(crate) async fn list(
     state: &AppState,
     subject: Option<&str>,
@@ -790,14 +839,22 @@ pub(crate) async fn list(
         .as_ref()
         .ok_or_else(|| anyhow::Error::msg("native_session_source_missing"))?;
     let mut sessions = Vec::new();
-    for session_id in source.sessions().await? {
-        let native = match query(state, &session_id, subject).await {
-            Ok(Some(native)) => native,
-            Ok(None) => continue,
-            Err(error) if history_access_denied(&error) => continue,
-            Err(error) => return Err(error),
-        };
-        let summary = native.query.summary(native.stream.clone()).await?;
+    let actor = EventActor::Principal {
+        principal_id: history_principal()?.0,
+    };
+    let summaries = source
+        .list(
+            actor,
+            Arc::new(GatewayHistoryDiscovery {
+                state: state.clone(),
+                subject: subject.map(str::to_owned),
+                dashboard: crate::dashboard_session::history_admission(),
+            }),
+            usize::MAX,
+        )
+        .await?;
+    for summary in summaries {
+        let session_id = summary.head.session_id.to_string();
         if summary.closed || (running_only && !summary.running) {
             continue;
         }
@@ -972,6 +1029,7 @@ pub(crate) mod tests {
         pub stream: SessionId,
         branch: BranchId,
         family: String,
+        query_calls: std::sync::atomic::AtomicUsize,
     }
     impl Source {
         pub(crate) fn new(directory: &std::path::Path, backend: &str, family: &str) -> Arc<Self> {
@@ -1030,11 +1088,32 @@ pub(crate) mod tests {
                 stream,
                 branch,
                 family: family.into(),
+                query_calls: std::sync::atomic::AtomicUsize::new(0),
             })
         }
     }
     #[async_trait::async_trait]
     impl EngineSessionSource for Source {
+        async fn list(
+            &self,
+            actor: EventActor,
+            policy: Arc<dyn SessionAccessPolicy>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<views::SessionSummary>> {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let summary = self
+                .owner
+                .query(
+                    PrincipalId::shared_operator(),
+                    Arc::new(UnrestrictedFixture),
+                )
+                .summary(self.stream.clone())
+                .await?;
+            policy.authorize_summary(&actor, &summary)?;
+            Ok(vec![summary])
+        }
         async fn sessions(&self) -> anyhow::Result<Vec<String>> {
             Ok(vec![self.family.clone()])
         }
@@ -1093,6 +1172,8 @@ pub(crate) mod tests {
             principal: PrincipalId,
             policy: Arc<dyn SessionAccessPolicy>,
         ) -> anyhow::Result<Option<SessionReadHandle>> {
+            self.query_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if family != self.family {
                 return Ok(None);
             }
@@ -1161,9 +1242,15 @@ pub(crate) mod tests {
             assert_eq!(value["messages"][0]["content"], "historical notice");
             assert!(value["messages"][0]["message_id"].is_string());
             assert!(value["messages"][0]["created_at"].is_string());
+            let query_calls = source.query_calls.load(std::sync::atomic::Ordering::SeqCst);
             assert_eq!(
                 list(&state, None, false).await.expect("list")["sessions"][0]["title"],
                 "native title"
+            );
+            assert_eq!(
+                source.query_calls.load(std::sync::atomic::Ordering::SeqCst),
+                query_calls,
+                "listing must use summaries rather than opening each history"
             );
             let policy = Arc::new(UnrestrictedFixture);
             let query = source

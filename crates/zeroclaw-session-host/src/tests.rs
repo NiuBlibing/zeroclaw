@@ -7,6 +7,332 @@ use zeroclaw_kernel::session::{EffectIntent, PermissionResolver, SessionError};
 struct Authority(AtomicBool);
 
 #[tokio::test]
+async fn abandoned_execution_worker() {
+    use zeroclaw_api::session_events::capture::*;
+    let Some(path) = std::env::var_os("ZEROCLAW_SESSION_RECOVERY_FIXTURE") else {
+        return;
+    };
+    let mut config = zeroclaw_config::schema::Config {
+        data_dir: std::path::PathBuf::from(path),
+        ..Default::default()
+    };
+    config.channels.session_backend = std::env::var("ZEROCLAW_SESSION_RECOVERY_BACKEND").unwrap();
+    let live = zeroclaw_config::live::LiveConfig::new(config);
+    let hub = NativeSessionHub::new(live.handle());
+    let port = hub
+        .open(
+            "abandoned".into(),
+            "rpc",
+            "fixture".into(),
+            PrincipalId::shared_operator(),
+            Arc::new(Authority(AtomicBool::new(true))),
+            ContextSnapshot {
+                messages: vec![],
+                history_has_trim_breadcrumb: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+    async fn crash_in_tool() -> anyhow::Result<String> {
+        let observer = current_provider_admission()
+            .unwrap()
+            .admit(ProviderDispatchIntent {
+                requested_route: None,
+                previous_attempt_event_id: None,
+                provider_ref: "fixture".into(),
+                model: "fixture".into(),
+                messages: vec![ChatMessage::user("run tool")],
+                tools: None,
+                temperature: None,
+                thinking: None,
+                tool_round_policy: Default::default(),
+            })
+            .await?;
+        let arguments = PayloadRecord::json(
+            "session.tool-arguments/v1",
+            &serde_json::json!({"command":"fixture"}),
+        )?;
+        let call = PayloadRecord::json(
+            "session.tool-call/v1",
+            &serde_json::json!({
+                "name":"shell", "provider_call_id":"call-1", "arguments_ref":StoredPayloadRef::from(&arguments),
+            }),
+        )?;
+        let response = PayloadRecord::json(
+            "session.response/v1",
+            &ProviderResponsePayload {
+                blocks: vec![ResponseBlock::ToolCall {
+                    tool_call_ref: StoredPayloadRef::from(&call),
+                }],
+                completion: ContentCompletion::Complete,
+                finish_evidence_ref: None,
+                usage_ref: None,
+                reasoning_absence: Some("not_returned".into()),
+            },
+        )?;
+        observer
+            .observe(
+                EventData::ProviderAttemptCompleted {
+                    response_ref: StoredPayloadRef::from(&response),
+                    served_attribution_ref: None,
+                    last_progress_event_id: None,
+                },
+                vec![arguments, call, response],
+            )
+            .await?;
+        let tool = current_tool_admission()
+            .unwrap()
+            .prepare(ToolPreparationIntent {
+                proposed_name: "shell".into(),
+                provider_call_id: Some("call-1".into()),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command":"fixture"}),
+                approval_requirement: "not_required".into(),
+                trusted_route: serde_json::json!({}),
+            })
+            .await?;
+        let _running = tool.start().await?;
+        // Bypass Drop to exercise real process loss after the start commit.
+        std::process::exit(86);
+    }
+    port.execute(
+        EngineTurnInput {
+            execution_workspace: None,
+            reply_route: None,
+            turn_id: TurnId::new().to_string(),
+            agent_alias: Some("fixture".into()),
+            ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+            parts: vec![EngineInputPart::Text("crash fixture".into())],
+            provider_ref: "fixture".into(),
+            model: "fixture".into(),
+        },
+        Box::pin(async {
+            if std::env::var_os("ZEROCLAW_SESSION_RECOVERY_CHILD").is_some() {
+                current_provider_admission()
+                    .unwrap()
+                    .begin_child(ChildDispatchIntent {
+                        relation: "delegate".into(),
+                        target_agent: "child".into(),
+                        prompt: "child input".into(),
+                        execution_mode: ChildExecutionMode::Sync,
+                        task_id: None,
+                    })
+                    .await?
+                    .execute(Box::pin(crash_in_tool()))
+                    .await
+            } else {
+                crash_in_tool().await
+            }
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn discovery_recovers_crashed_root_and_child_tools_before_any_continuation() {
+    for backend in ["sqlite", "jsonl"] {
+        for child in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().to_owned();
+            let output = tokio::task::spawn_blocking(move || {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "tests::abandoned_execution_worker",
+                        "--nocapture",
+                    ])
+                    .env("ZEROCLAW_SESSION_RECOVERY_FIXTURE", path)
+                    .env("ZEROCLAW_SESSION_RECOVERY_BACKEND", backend);
+                if child {
+                    command.env("ZEROCLAW_SESSION_RECOVERY_CHILD", "1");
+                }
+                command.output().unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut config = zeroclaw_config::schema::Config {
+                data_dir: directory.path().into(),
+                ..Default::default()
+            };
+            config.channels.session_backend = backend.into();
+            let live = zeroclaw_config::live::LiveConfig::new(config);
+            let hub = NativeSessionHub::new(live.handle());
+            let actor = EventActor::Principal {
+                principal_id: PrincipalId::shared_operator().0,
+            };
+            if !child {
+                let history = hub
+                    .query(
+                        "abandoned".into(),
+                        PrincipalId::shared_operator(),
+                        Arc::new(Authority(AtomicBool::new(true))),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!history.query.summary(history.stream).await.unwrap().running);
+            }
+            let summaries = hub
+                .list(
+                    actor.clone(),
+                    Arc::new(Authority(AtomicBool::new(true))),
+                    usize::MAX,
+                )
+                .await
+                .unwrap();
+            assert_eq!(summaries.len(), if child { 2 } else { 1 });
+            assert!(summaries.iter().all(|summary| !summary.running));
+            let catalog = SessionCatalog::open(directory.path(), &hub.stores)
+                .unwrap()
+                .unwrap();
+            let mut unknown_tools = 0;
+            for summary in &summaries {
+                let page = catalog
+                    .store()
+                    .read_page(
+                        &summary.head.session_id,
+                        &EventCursor::beginning(summary.head.session_id.clone()),
+                        None,
+                        256,
+                    )
+                    .unwrap();
+                for event in &page.events {
+                    if let EventData::InvocationOutcomeUnknown {
+                        last_observed_event_id,
+                        ..
+                    } = &event.body.data
+                    {
+                        let observed = catalog
+                            .store()
+                            .read_event(last_observed_event_id)
+                            .unwrap()
+                            .unwrap();
+                        if matches!(observed.body.data, EventData::ToolEffectStarted { .. }) {
+                            unknown_tools += 1;
+                        }
+                    }
+                }
+                assert!(
+                    !page.events.iter().any(|event| matches!(
+                        event.body.data,
+                        EventData::ToolEffectCompleted { .. }
+                    ))
+                );
+            }
+            assert_eq!(unknown_tools, 1);
+            drop(catalog);
+            let again = hub
+                .list(
+                    actor,
+                    Arc::new(Authority(AtomicBool::new(true))),
+                    usize::MAX,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                summaries
+                    .iter()
+                    .map(|summary| &summary.head)
+                    .collect::<Vec<_>>(),
+                again
+                    .iter()
+                    .map(|summary| &summary.head)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn discovery_does_not_recover_an_execution_owned_by_another_host() {
+    use zeroclaw_api::session_events::capture::{EngineInputPart, EngineTurnInput};
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: directory.path().into(),
+            ..Default::default()
+        };
+        config.channels.session_backend = backend.into();
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let hub = NativeSessionHub::new(live.handle());
+        let authority = Arc::new(Authority(AtomicBool::new(true)));
+        let port = hub
+            .open(
+                "live-execution".into(),
+                "rpc",
+                "fixture".into(),
+                PrincipalId::shared_operator(),
+                authority.clone(),
+                ContextSnapshot {
+                    messages: vec![],
+                    history_has_trim_breadcrumb: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let turn = port.execute(
+            EngineTurnInput {
+                execution_workspace: None,
+                reply_route: None,
+                turn_id: TurnId::new().to_string(),
+                agent_alias: Some("fixture".into()),
+                ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                parts: vec![EngineInputPart::Text("live input".into())],
+                provider_ref: "fixture".into(),
+                model: "fixture".into(),
+            },
+            Box::pin(async {
+                started.send(()).unwrap();
+                released.await.unwrap();
+                Ok("completed once".into())
+            }),
+        );
+        tokio::pin!(turn);
+        tokio::select! {
+            result = &mut turn => panic!("execution finished before release: {result:?}"),
+            signal = ready => signal.unwrap(),
+        }
+        let reader = NativeSessionHub::new(live.handle());
+        let actor = EventActor::Principal {
+            principal_id: PrincipalId::shared_operator().0,
+        };
+        let summaries = reader.list(actor, authority, usize::MAX).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].running);
+        release.send(()).unwrap();
+        assert_eq!(turn.await.unwrap(), "completed once");
+        let catalog = SessionCatalog::open(directory.path(), &hub.stores)
+            .unwrap()
+            .unwrap();
+        let page = catalog
+            .store()
+            .read_page(
+                &summaries[0].head.session_id,
+                &EventCursor::beginning(summaries[0].head.session_id.clone()),
+                None,
+                256,
+            )
+            .unwrap();
+        assert!(
+            !page
+                .events
+                .iter()
+                .any(|event| matches!(event.body.data, EventData::RecoveryObserved { .. }))
+        );
+    }
+}
+
+#[tokio::test]
 async fn index_listing_filters_authority_before_limit_and_preserves_source_metadata() {
     struct OnlyVisible;
     impl SessionAccessPolicy for OnlyVisible {

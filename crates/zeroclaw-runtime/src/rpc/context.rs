@@ -11,8 +11,6 @@ use zeroclaw_api::channel::{ApprovalReplyResult, ChannelApprovalResponse};
 use zeroclaw_config::cost::tracker::CostTracker;
 use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
-#[cfg(test)]
-use zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend;
 use zeroclaw_infra::session_repository::SessionRepository;
 
 use super::session::SessionStore;
@@ -287,10 +285,6 @@ pub struct RpcContext {
     /// In-memory session store for active RPC sessions.
     pub sessions: Arc<SessionStore>,
 
-    /// Legacy transcript backend used only by compatibility fixtures.
-    #[cfg(test)]
-    pub session_backend: Option<Arc<dyn SessionBackend>>,
-
     /// Injected application composition; this transport cannot construct a
     /// session writer or select an independent backend.
     pub native_sessions: Option<Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource>>,
@@ -410,8 +404,6 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
-            #[cfg(test)]
-            session_backend: None,
             native_sessions: None,
             memory: None,
             cost_tracker: None,
@@ -454,8 +446,6 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
-            #[cfg(test)]
-            session_backend: None,
             native_sessions: None,
             memory: None,
             cost_tracker: None,
@@ -488,8 +478,6 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
-            #[cfg(test)]
-            session_backend: None,
             native_sessions: None,
             memory: None,
             cost_tracker: None,
@@ -531,8 +519,6 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
-            #[cfg(test)]
-            session_backend: None,
             native_sessions: None,
             memory: None,
             cost_tracker: None,
@@ -615,8 +601,6 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
-            #[cfg(test)]
-            session_backend: None,
             native_sessions: None,
             memory: None,
             cost_tracker: None,
@@ -653,8 +637,6 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
-            #[cfg(test)]
-            session_backend: None,
             native_sessions: None,
             memory: None,
             cost_tracker: None,
@@ -697,8 +679,6 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
-            #[cfg(test)]
-            session_backend: None,
             native_sessions: None,
             memory: None,
             cost_tracker: None,
@@ -734,8 +714,6 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
-            #[cfg(test)]
-            session_backend: None,
             native_sessions: None,
             memory: Some(memory),
             cost_tracker: None,
@@ -772,8 +750,6 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
-            #[cfg(test)]
-            session_backend: None,
             native_sessions: None,
             memory: None,
             cost_tracker: Some(cost_tracker),
@@ -800,7 +776,6 @@ impl RpcContext {
     pub fn for_persistence_tests(
         config: Config,
         sessions: Arc<SessionStore>,
-        session_backend: Option<Arc<dyn SessionBackend>>,
         session_repository: Option<Arc<SessionRepository>>,
     ) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
@@ -811,7 +786,6 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
-            session_backend,
             native_sessions: None,
             memory: None,
             cost_tracker: None,
@@ -849,8 +823,6 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
-            #[cfg(test)]
-            session_backend: None,
             native_sessions: None,
             memory: None,
             cost_tracker: None,
@@ -911,7 +883,7 @@ mod tests {
             ))
         };
         let first = RpcContext::minimal(Config::default(), sessions());
-        let second = RpcContext::for_persistence_tests(Config::default(), sessions(), None, None);
+        let second = RpcContext::for_persistence_tests(Config::default(), sessions(), None);
 
         let _held = first
             .begin_config_commit()
