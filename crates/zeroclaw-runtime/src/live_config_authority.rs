@@ -38,8 +38,14 @@ impl LiveConfigAuthority {
     /// Create the authority for one daemon generation. The initial config
     /// is the first publication of a fresh epoch.
     pub fn new(config: Config) -> Self {
+        #[cfg(test)]
+        let config = zeroclaw_config::migration::admit_test_input(&config);
+        #[cfg(test)]
+        let live = LiveConfig::new_raw_for_tests(config);
+        #[cfg(not(test))]
+        let live = LiveConfig::new(config);
         Self {
-            live: LiveConfig::new(config),
+            live,
             config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             agent_lifecycle: AgentLifecycleCoordinator::default(),
             application_results: Arc::default(),
@@ -58,7 +64,24 @@ impl LiveConfigAuthority {
     pub(crate) fn for_tests(config: Config) -> Self {
         Self {
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            ..Self::new(config)
+            live: LiveConfig::new_raw_for_tests(zeroclaw_config::migration::admit_test_input(
+                &config,
+            )),
+            agent_lifecycle: AgentLifecycleCoordinator::default(),
+            application_results: Arc::default(),
+        }
+    }
+
+    /// Test-only authority retaining historical typed input for RPC property
+    /// edit fixtures. Canonical production-like test authorities use
+    /// [`Self::for_tests`] above.
+    #[cfg(test)]
+    pub(crate) fn for_tests_raw(config: Config) -> Self {
+        Self {
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            live: LiveConfig::new_raw_for_tests(config),
+            agent_lifecycle: AgentLifecycleCoordinator::default(),
+            application_results: Arc::default(),
         }
     }
 
@@ -70,7 +93,11 @@ impl LiveConfigAuthority {
     pub(crate) fn for_tests_sharing_writer(config: Config, writer: &Self) -> Self {
         Self {
             config_write_lock: Arc::clone(&writer.config_write_lock),
-            ..Self::new(config)
+            live: LiveConfig::new_raw_for_tests(zeroclaw_config::migration::admit_test_input(
+                &config,
+            )),
+            agent_lifecycle: AgentLifecycleCoordinator::default(),
+            application_results: Arc::default(),
         }
     }
 
@@ -208,6 +235,7 @@ impl LiveConfigAuthority {
     /// commits instead of using this.
     #[cfg(any(test, feature = "test-util"))]
     pub fn publish_for_test(&self, config: Config) -> zeroclaw_config::live::ConfigRevision {
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let revision = self.live.next_revision().expect("test revision available");
         self.live
             .publish(revision, config)

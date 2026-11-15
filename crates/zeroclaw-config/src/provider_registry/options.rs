@@ -5,6 +5,15 @@ use serde::{Deserialize, Serialize};
 use super::Override;
 use crate::schema::{CacheTtl, ToolResultImagePolicy, WireApi};
 
+pub(crate) fn option_fields(capability: &str) -> &'static [&'static str] {
+    match capability {
+        "chat" => ChatOptionsPatch::FIELDS,
+        "tts" => TtsOptionsPatch::FIELDS,
+        "asr" => AsrOptionsPatch::FIELDS,
+        _ => &[],
+    }
+}
+
 macro_rules! options_patch {
     ($name:ident { $($field:ident: $type:ty),* $(,)? }) => {
         #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -277,6 +286,55 @@ options = { extract_text_tool_calls = true }
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_extraction_defaults_use_the_selected_driver_and_model_options() {
+        let mut config = crate::schema::Config::default();
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "proxy.prod")
+            .unwrap();
+        provider.kind = Some("groq".to_owned());
+        assert_eq!(
+            crate::migration::admit_test_input(&config).model_text_extraction("openai.proxy.prod"),
+            TextExtraction {
+                reasoning: true,
+                tool_calls: true
+            }
+        );
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "proxy.prod")
+            .unwrap();
+        provider.models.insert(
+            "native.model".to_owned(),
+            crate::schema::ModelEntryConfig {
+                native_tools: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crate::migration::admit_test_input(&config).model_text_extraction("openai.proxy.prod"),
+            TextExtraction {
+                reasoning: true,
+                tool_calls: false
+            }
+        );
+        assert_eq!(
+            crate::migration::admit_test_input(&config)
+                .model_text_extraction("openai.proxy.prod.native.model"),
+            TextExtraction {
+                reasoning: true,
+                tool_calls: false
+            }
+        );
+        assert_eq!(
+            config.model_text_extraction("not-configured"),
+            TextExtraction::default()
+        );
     }
 
     #[test]
