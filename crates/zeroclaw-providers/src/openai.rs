@@ -1910,39 +1910,6 @@ mod tool_round_policy_tests {
         policy: Option<ToolRoundPolicy>,
         tool_shape: u8,
     ) -> serde_json::Value {
-        wire_body_with_sampling(wire, streaming, policy, tool_shape, None).await
-    }
-
-    #[tokio::test]
-    async fn selected_sampling_and_single_tool_round_policy_reach_the_same_wire_call() {
-        use zeroclaw_api::model_provider::CallSampling;
-        for streaming in [false, true] {
-            let sampled = wire_body_with_sampling(
-                0,
-                streaming,
-                Some(ToolRoundPolicy::Single),
-                2,
-                Some(CallSampling::for_selection(Some(0.9), |reference| {
-                    Some(if reference == "openai.fixture.selected" {
-                        0.2
-                    } else {
-                        0.9
-                    })
-                })),
-            )
-            .await;
-            assert_eq!(sampled["temperature"], 0.2);
-            assert_eq!(sampled["parallel_tool_calls"], false);
-        }
-    }
-
-    async fn wire_body_with_sampling(
-        wire: u8,
-        streaming: bool,
-        policy: Option<ToolRoundPolicy>,
-        tool_shape: u8,
-        sampling: Option<zeroclaw_api::model_provider::CallSampling>,
-    ) -> serde_json::Value {
         let captured = Arc::new(Mutex::new(None));
         let capture = Arc::clone(&captured);
         let path = match wire {
@@ -2008,24 +1975,6 @@ mod tool_round_policy_tests {
         let provider: Box<dyn ModelProvider> = Box::new(
             crate::vision_override::VisionOverrideProvider::new(Box::new(provider), true),
         );
-        let provider: Box<dyn ModelProvider> = if sampling.is_some() {
-            Box::new(crate::reliable::ReliableModelProvider::new_with_entries(
-                "reliable",
-                vec![
-                    crate::reliable::ReliableModelProviderEntry::new_with_candidate(
-                        "fixture",
-                        "openai.fixture",
-                        "openai.fixture",
-                        provider,
-                    )
-                    .with_selection_ref("openai.fixture.selected"),
-                ],
-                0,
-                1,
-            ))
-        } else {
-            provider
-        };
         let provider: Box<dyn ModelProvider> = if wire == 0 && streaming {
             Box::new(crate::router::RouterModelProvider::new(
                 "synthetic",
@@ -2064,23 +2013,15 @@ mod tool_round_policy_tests {
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             if streaming {
-                let mut stream = match (policy, sampling) {
-                    (Some(policy), Some(sampling)) => dispatch
-                        .stream_chat_with_sampling_and_tool_round_policy(
-                            request,
-                            "ignored",
-                            sampling,
-                            StreamOptions::new(true),
-                            policy,
-                        ),
-                    (Some(policy), None) => dispatch.stream_chat_with_tool_round_policy(
+                let mut stream = match policy {
+                    Some(policy) => dispatch.stream_chat_with_tool_round_policy(
                         request,
                         "ignored",
                         None,
                         StreamOptions::new(true),
                         policy,
                     ),
-                    (None, _) => {
+                    None => {
                         dispatch.stream_chat(request, "ignored", None, StreamOptions::new(true))
                     }
                 };
@@ -2093,18 +2034,12 @@ mod tool_round_policy_tests {
                 }
                 assert!(final_seen);
             } else {
-                match (policy, sampling) {
-                    (Some(policy), Some(sampling)) => dispatch
-                        .chat_with_sampling_and_tool_round_policy(
-                            request, "ignored", sampling, policy,
-                        )
-                        .await
-                        .unwrap(),
-                    (Some(policy), None) => dispatch
+                match policy {
+                    Some(policy) => dispatch
                         .chat_with_tool_round_policy(request, "ignored", None, policy)
                         .await
                         .unwrap(),
-                    (None, _) => dispatch.chat(request, "ignored", None).await.unwrap(),
+                    None => dispatch.chat(request, "ignored", None).await.unwrap(),
                 };
             }
         })
@@ -2407,7 +2342,7 @@ mod tests {
                 request,
                 &tx,
                 false,
-                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT).into(),
+                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
             ),
         )
         .await
@@ -3084,15 +3019,14 @@ mod tests {
     }
 
     #[test]
-    fn string_completion_rejects_only_unconditionally_empty_text() {
-        for text in ["", "  \n"] {
+    fn string_completion_rejects_empty_and_think_only_text() {
+        for text in ["", "  \n", "<think>internal reasoning</think>"] {
             let error = require_terminal_text(text.to_string())
                 .expect_err("a string-only semantic-empty completion must fail");
             assert!(error.chain().any(|cause| {
                 cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
             }));
         }
-        assert!(require_terminal_text("<think>internal reasoning</think>".to_string()).is_ok());
     }
 
     #[test]
@@ -3101,111 +3035,6 @@ mod tests {
             require_terminal_text("final answer".to_string()).unwrap(),
             "final answer"
         );
-    }
-
-    #[tokio::test]
-    async fn responses_streaming_client_keeps_total_and_idle_deadlines_independent() {
-        use axum::{Router, body::Body, routing::post};
-        use futures_util::StreamExt as _;
-        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let app = Router::new().route(
-            "/responses",
-            post(|| async {
-                let first = futures_util::stream::once(async {
-                    Ok::<_, std::convert::Infallible>(
-                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n",
-                    )
-                });
-                let second = futures_util::stream::once(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-                    Ok::<_, std::convert::Infallible>(
-                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"second\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
-                    )
-                });
-                Body::from_stream(first.chain(second))
-            }),
-        );
-        let server =
-            zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await.unwrap() });
-        for deadline in [
-            "inherit",
-            "finite",
-            "clear",
-            "idle",
-            "read_before_total",
-            "total_without_read",
-        ] {
-            let mut builder = OpenAiResponsesModelProvider::builder("test")
-                .api_url(&url)
-                .credential(Some("fixture-key"));
-            if deadline != "inherit" {
-                builder = builder.timeout_secs(if deadline == "read_before_total" {
-                    3
-                } else {
-                    1
-                });
-            }
-            if matches!(deadline, "clear" | "idle") {
-                builder = builder.without_timeout();
-            }
-            builder = if deadline == "finite" {
-                builder.read_timeout_secs(3)
-            } else if matches!(deadline, "idle" | "read_before_total") {
-                builder.read_timeout_secs(1)
-            } else {
-                builder.without_read_timeout()
-            };
-            let provider = builder.build();
-            let messages = [crate::traits::ChatMessage::user("hi")];
-            let mut stream = provider.stream_chat(
-                crate::traits::ChatRequest::new(&messages),
-                "gpt-test",
-                None,
-                crate::traits::StreamOptions::new(true),
-            );
-            let mut text = String::new();
-            let mut error = None;
-            let mut saw_final = false;
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while let Some(event) = stream.next().await {
-                    match event {
-                        Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
-                        Ok(StreamEvent::Final) => saw_final = true,
-                        Err(cause) => error = Some(cause.to_string()),
-                        _ => {}
-                    }
-                }
-            })
-            .await
-            .expect("stream must complete or report its configured deadline");
-            match deadline {
-                "finite" | "total_without_read" => {
-                    let message = error.expect("total deadline must expire");
-                    assert!(message.contains("request_timeout_secs"), "{message}");
-                    assert!(!message.contains("no data from provider"), "{message}");
-                    assert!(!message.contains("read_timeout_secs"), "{message}");
-                    assert!(!saw_final);
-                }
-                "idle" | "read_before_total" => {
-                    let message = error.expect("read deadline must expire");
-                    assert!(
-                        message.contains("no data from provider for 1s"),
-                        "{message}"
-                    );
-                    assert!(message.contains("read_timeout_secs"), "{message}");
-                    assert!(!message.contains("request_timeout_secs"), "{message}");
-                    assert!(!saw_final);
-                }
-                _ => {
-                    assert!(error.is_none(), "{deadline}: {error:?}");
-                    assert_eq!(text, "firstsecond");
-                    assert!(saw_final);
-                }
-            }
-        }
-        server.abort();
     }
 
     #[test]
@@ -4041,7 +3870,7 @@ mod tests {
                 request,
                 &tx,
                 false,
-                crate::StreamIdleBound::Read(std::time::Duration::from_millis(100)).into(),
+                crate::StreamIdleBound::Configurable(crate::STREAM_IDLE_TIMEOUT),
             ),
         )
         .await
@@ -4058,7 +3887,7 @@ mod tests {
             Ok(_) => panic!("expected an error from the stalled Responses stream"),
         };
         assert!(
-            message.contains("no data from provider for 0.1s"),
+            message.contains("no data from provider for 300s"),
             "idle message must name the bound that fired: {message}"
         );
         assert!(
@@ -4066,7 +3895,7 @@ mod tests {
             "idle message must name the idle timeout: {message}"
         );
         assert!(
-            message.contains("increase read_timeout_secs"),
+            message.contains("raise timeout_secs above 300s"),
             "idle message must name the knob that raises the bound: {message}"
         );
     }

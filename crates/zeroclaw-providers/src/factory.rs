@@ -523,6 +523,67 @@ pub fn dispatch_family_factory(
     zeroclaw_config::for_each_model_provider_slot!(emit_dispatch)
 }
 
+pub(crate) fn fallback_auth_ready_for_alias(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    key: Option<&str>,
+    opts: &ModelProviderRuntimeOptions,
+) -> bool {
+    let provider_kind = opts
+        .provider_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(family);
+
+    // openai missing-entry fallback: keep construction symmetric with
+    // `dispatch_family_factory`. `wire_api` does not influence auth-readiness,
+    // but constructing the same chat-anchored fallback avoids any future
+    // divergence if that changes.
+    if provider_kind == "openai" {
+        let default_cfg = openai_missing_entry_fallback_config();
+        let cfg = config
+            .providers
+            .models
+            .openai
+            .get(alias)
+            .unwrap_or(&default_cfg);
+        return cfg.fallback_auth_ready(key, opts);
+    }
+
+    macro_rules! emit_auth_ready {
+        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+            match provider_kind {
+                "openai-compatible" | "openai_compatible" => {
+                    let default_cfg = zeroclaw_config::schema::ModelProviderConfig::default();
+                    let cfg = config
+                        .providers
+                        .models
+                        .find("openai", alias)
+                        .unwrap_or(&default_cfg);
+                    cfg.fallback_auth_ready(key, opts)
+                }
+                $(
+                    $type_str => {
+                        let default_cfg: $cfg_ty;
+                        let cfg: &$cfg_ty = match config.providers.models.$field.get(alias) {
+                            Some(c) => c,
+                            None => {
+                                default_cfg = <$cfg_ty>::default();
+                                &default_cfg
+                            }
+                        };
+                        cfg.fallback_auth_ready(key, opts)
+                    }
+                )+
+                _ => has_api_key(key),
+            }
+        }
+    }
+    zeroclaw_config::for_each_model_provider_slot!(emit_auth_ready)
+}
+
 use zeroclaw_config::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
     AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
