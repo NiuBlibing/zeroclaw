@@ -10,6 +10,12 @@ pub mod embedding_fixtures;
 mod model_routes;
 pub(crate) mod provider_inputs;
 
+/// Structural V5 input changes shared by explicit migration and dirty saves.
+/// Unrelated V3/V4 documents can retain their original TOML representation.
+pub(crate) fn document_needs_structural_migration(value: &toml::Value) -> bool {
+    model_routes::needs_migration(value) || provider_inputs::document_needs_migration(value)
+}
+
 /// Legacy input adapter for the canonical registry. Keep this conversion in
 /// config; downstream consumers only resolve exact model references.
 pub(crate) fn legacy_chat_definition(
@@ -1574,17 +1580,16 @@ pub fn migrate_file(input: &str) -> Result<Option<String>> {
 /// Other files at or above it are edited in place, so
 /// everything the migration does not change keeps its exact bytes: quoting,
 /// number spelling, comments. Older files need the structural steps and are
-/// rebuilt from the migrated value. Raise this if a later version adds a
-/// structural migration step.
-pub(crate) const FIRST_RETIREMENT_ONLY_VERSION: u32 = 5;
+/// rebuilt from the migrated value. Conditional V5 structural changes are
+/// checked separately by [`document_needs_structural_migration`].
+pub(crate) const FIRST_RETIREMENT_ONLY_VERSION: u32 = 3;
 
 /// [`migrate_file`], also returning what the migration changed or assumed.
 pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<MigrationNotice>)>> {
     let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
     let from = detect_version(&value)?;
-    if from == CURRENT_SCHEMA_VERSION
-        && !model_routes::needs_migration(&value)
-        && !provider_inputs::document_needs_migration(&value)
+    if (FIRST_RETIREMENT_ONLY_VERSION..=CURRENT_SCHEMA_VERSION).contains(&from)
+        && !document_needs_structural_migration(&value)
         && let Ok(mut doc) = input.parse::<toml_edit::DocumentMut>()
     {
         let selector_omitted = !value

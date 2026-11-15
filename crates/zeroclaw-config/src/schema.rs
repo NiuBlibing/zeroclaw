@@ -27471,7 +27471,7 @@ async fn prepare_on_disk_config_for_save(
     }
     Ok(
         if version < crate::migration::FIRST_RETIREMENT_ONLY_VERSION
-            || crate::migration::provider_inputs::document_needs_migration(&value)
+            || crate::migration::document_needs_structural_migration(&value)
         {
             OnDiskConfig::NeedsStructuralMigration
         } else {
