@@ -2342,7 +2342,7 @@ mod tests {
                 request,
                 &tx,
                 false,
-                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT).into(),
             ),
         )
         .await
@@ -3870,7 +3870,7 @@ mod tests {
                 request,
                 &tx,
                 false,
-                crate::StreamIdleBound::Configurable(crate::STREAM_IDLE_TIMEOUT),
+                crate::StreamIdleBound::Configurable(crate::STREAM_IDLE_TIMEOUT).into(),
             ),
         )
         .await

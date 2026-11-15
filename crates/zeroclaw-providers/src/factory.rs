@@ -1666,15 +1666,6 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
     }
 }
 
-/// Bare Qwen dispatch historically uses the CN region. Persisted profiles keep
-/// their configured endpoint, whose schema default for new entries is Intl.
-fn qwen_missing_entry_fallback_config() -> QwenModelProviderConfig {
-    QwenModelProviderConfig {
-        endpoint: zeroclaw_config::schema::QwenEndpoint::Cn,
-        ..Default::default()
-    }
-}
-
 impl FamilyProviderFactory for QwenModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
 
@@ -1685,8 +1676,6 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        use zeroclaw_config::schema::ModelEndpoint;
-
         let alias_oauth: Option<crate::QwenOauthCredentials> = self
             .oauth_refresh_token
             .as_deref()
@@ -1725,7 +1714,7 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
         let base_url = api_url
             .map(ToString::to_string)
             .or_else(|| oauth_context.base_url.clone())
-            .unwrap_or_else(|| self.endpoint.uri().to_string());
+            .unwrap_or_else(|| crate::QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
         let b = if oauth_context.credential.is_some() {
             OpenAiCompatibleModelProvider::builder(alias)
                 .display_name("Qwen Code")
