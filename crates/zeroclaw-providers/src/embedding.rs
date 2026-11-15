@@ -153,6 +153,40 @@ pub fn build_embedding_provider(config: EmbeddingProviderConfig) -> Box<dyn Embe
     Box::new(OpenAiEmbedding::from_config(config))
 }
 
+pub fn create_embedding_provider(
+    model_provider: &str,
+    api_key: Option<&str>,
+    model: &str,
+    dims: usize,
+) -> Box<dyn EmbeddingProvider> {
+    match model_provider {
+        "openai" => {
+            let key = api_key.unwrap_or("");
+            Box::new(OpenAiEmbedding::new(
+                "https://api.openai.com",
+                key,
+                model,
+                dims,
+            ))
+        }
+        "openrouter" => {
+            let key = api_key.unwrap_or("");
+            Box::new(OpenAiEmbedding::new(
+                "https://openrouter.ai/api/v1",
+                key,
+                model,
+                dims,
+            ))
+        }
+        name if name.starts_with("custom:") => {
+            let base_url = name.strip_prefix("custom:").unwrap_or("");
+            let key = api_key.unwrap_or("");
+            Box::new(OpenAiEmbedding::new(base_url, key, model, dims))
+        }
+        _ => Box::new(NoopEmbedding),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
