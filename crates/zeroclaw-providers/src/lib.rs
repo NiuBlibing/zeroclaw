@@ -688,11 +688,11 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
-    /// Explicit provider implementation from `[providers.models.<family>.<alias>].kind`.
-    /// When unset, provider resolution falls back to the configured family.
+    /// Provider implementation materialized from the selected connection's kind.
+    /// Direct provider construction may supply a built-in kind instead.
     pub provider_kind: Option<String>,
     pub provider_api_url: Option<String>,
     pub zeroclaw_dir: Option<PathBuf>,
@@ -707,6 +707,14 @@ pub struct ModelProviderRuntimeOptions {
     /// HTTP request timeout in seconds for LLM model_provider API calls.
     /// `None` uses the model_provider's built-in default (120s for compatible model_providers).
     pub provider_timeout_secs: Option<u64>,
+    /// Explicitly disable the adapter's total request timeout.
+    pub provider_timeout_disabled: bool,
+    /// Optional per-read idle timeout for streaming and HTTP response bodies.
+    /// `None` keeps the adapter's existing idle policy unless disabled below.
+    pub provider_read_timeout_secs: Option<u64>,
+    /// Explicitly disable the adapter's read-idle timeout. This is distinct
+    /// from `None`, which means inherit the adapter baseline.
+    pub provider_read_timeout_disabled: bool,
     /// Extra HTTP headers to include in model_provider API requests.
     pub extra_headers: std::collections::HashMap<String, String>,
     /// Custom API path suffix for OpenAI-compatible model_providers
@@ -715,6 +723,9 @@ pub struct ModelProviderRuntimeOptions {
     /// Maximum output tokens for LLM model_provider API requests.
     /// `None` uses the model_provider's built-in default.
     pub provider_max_tokens: Option<u32>,
+    /// Construction-time projection of the selected model capacity.
+    /// Config remains canonical; rebuilt bindings rematerialize this value.
+    pub provider_context_window: Option<usize>,
     /// When true, system messages are merged into the first user message before
     /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
     pub merge_system_into_user: bool,
@@ -790,9 +801,13 @@ impl Default for ModelProviderRuntimeOptions {
             reasoning_effort: None,
             reasoning_effort_passthrough: false,
             provider_timeout_secs: None,
+            provider_timeout_disabled: false,
+            provider_read_timeout_secs: None,
+            provider_read_timeout_disabled: false,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
             provider_max_tokens: None,
+            provider_context_window: None,
             merge_system_into_user: false,
             provider_extra: None,
             replay_assistant_reasoning: None,
@@ -859,9 +874,13 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         reasoning_effort: config.runtime.reasoning_effort.clone(),
         reasoning_effort_passthrough: entry.is_some_and(|e| e.reasoning_effort_passthrough),
         provider_timeout_secs: Some(entry.and_then(|e| e.timeout_secs).unwrap_or(120)),
+        provider_timeout_disabled: false,
+        provider_read_timeout_secs: None,
+        provider_read_timeout_disabled: false,
         extra_headers: entry.map(|e| e.extra_headers.clone()).unwrap_or_default(),
         api_path: None,
         provider_max_tokens: entry.and_then(|e| e.max_tokens),
+        provider_context_window: entry.and_then(|e| e.context_window),
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
