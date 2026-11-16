@@ -1254,6 +1254,7 @@ impl TranscriptionManager {
     #[must_use]
     pub fn with_typed_providers(self, typed: &TranscriptionProviders) -> Self {
         let mut config = Config::default();
+        config.transcription.enabled = true;
         config.providers.transcription = typed.clone();
         let config = zeroclaw_config::migration::admit_test_input(&config);
         let mut manager =
@@ -1891,9 +1892,10 @@ mod tests {
         };
 
         let mut config = zeroclaw_config::schema::Config::default();
+        config.transcription.enabled = true;
         config.providers.transcription = typed.clone();
         TranscriptionManager::from_config_for_agent(&config, None)
-            .expect("invalid typed providers should be skipped when transcription is disabled");
+            .expect("invalid typed providers should be skipped after warning");
         assert_events(
             "config manager",
             std::iter::from_fn(|| rx.try_recv().ok()).collect(),
