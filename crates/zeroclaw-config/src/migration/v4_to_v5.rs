@@ -71,17 +71,26 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
         }
     }
 
-    let mixed: Vec<_> = strict_refs.intersection(&non_strict_refs).cloned().collect();
+    let mixed: Vec<_> = strict_refs
+        .intersection(&non_strict_refs)
+        .cloned()
+        .collect();
     if let Some(reference) = mixed.into_iter().next() {
         bail!(
             "cannot migrate V4 strict_tool_parsing for model_provider {reference}: it is used by both strict and non-strict agents; set model options.extract_text_tool_calls explicitly for separate model references and retry"
         );
     }
 
-    let Some(providers) = root.get_mut("providers").and_then(toml::Value::as_table_mut) else {
+    let Some(providers) = root
+        .get_mut("providers")
+        .and_then(toml::Value::as_table_mut)
+    else {
         return Ok(());
     };
-    let Some(models) = providers.get_mut("models").and_then(toml::Value::as_table_mut) else {
+    let Some(models) = providers
+        .get_mut("models")
+        .and_then(toml::Value::as_table_mut)
+    else {
         return Ok(());
     };
     for reference in strict_refs {
@@ -107,10 +116,7 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
     Ok(())
 }
 
-fn legacy_profile_reference(
-    models: &toml::Table,
-    model_provider: &str,
-) -> Option<String> {
+fn legacy_profile_reference(models: &toml::Table, model_provider: &str) -> Option<String> {
     let (family, alias) = model_provider.split_once('.')?;
     let family_table = models.get(family)?.as_table()?;
     if family_table.contains_key(alias) {
@@ -183,8 +189,7 @@ strict_tool_parsing = true
         let output = migrate_file(input).unwrap().unwrap();
         let value: toml::Value = toml::from_str(&output).unwrap();
         assert_eq!(
-            value["providers"]["models"]["openai.main"]["options"]
-                ["extract_text_tool_calls"]
+            value["providers"]["models"]["openai.main"]["options"]["extract_text_tool_calls"]
                 .as_bool(),
             Some(false)
         );
@@ -211,7 +216,10 @@ model_provider = "openai.main"
 strict_tool_parsing = true
 "#;
         let error = migrate_file(input).unwrap_err().to_string();
-        assert!(error.contains("both strict and non-strict agents"), "{error}");
+        assert!(
+            error.contains("both strict and non-strict agents"),
+            "{error}"
+        );
     }
 
     #[test]
