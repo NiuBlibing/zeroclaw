@@ -68,7 +68,8 @@ to migration input and explicitly admitted test fixtures.
 Structural disk migration uses the same normalization and rewrites only the
 provider-related sections and references, preserving unrelated fields and
 comments. A V4 stamp alone does not exempt historical provider tables from this
-step. No schema-version bump beyond V4 is introduced.
+step. The released V4 layout remains frozen; the registry reshaping is the
+V4-to-V5 migration boundary and current files are written as V5.
 
 ## Env overrides are not saved
 

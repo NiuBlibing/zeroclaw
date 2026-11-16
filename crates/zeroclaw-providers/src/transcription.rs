@@ -1127,15 +1127,14 @@ pub struct TranscriptionManager {
     agent_transcription_provider: String,
 }
 
-/// Canonical models enable this capability directly; the legacy enable flag
-/// applies to the legacy section. Consumers share this admission rule.
+/// Speech processing remains explicitly opt-in at the workspace boundary.
+/// V4 migration projects dormant provider definitions into canonical models,
+/// so the persisted `enabled` flag is the activation source of truth. This
+/// also keeps a legacy `enabled = false` configuration disabled after
+/// migration; adding a model alone never silently turns on microphone input.
 #[must_use]
 pub fn is_enabled(config: &Config) -> bool {
     config.transcription.enabled
-        || config
-            .providers
-            .models
-            .has_canonical_capability(Capability::Asr)
 }
 
 impl TranscriptionManager {

@@ -14,22 +14,21 @@ impl Config {
             if route.hint.trim().is_empty() {
                 warnings.push("embedding route with empty hint".into());
             }
-            if route.model.trim().is_empty() {
-                warnings.push(format!(
-                    "embedding route \"{}\" has empty model",
-                    route.hint
-                ));
-            }
-            let invalid = registry.as_ref().is_none_or(|registry| {
+            let resolved = registry.as_ref().and_then(|registry| {
                 registry
                     .resolve_embedding(&route.model_provider.trim().into())
-                    .is_err()
+                    .ok()
             });
-            if invalid {
-                warnings.push(format!(
+            match resolved {
+                Some(resolved) if resolved.model.trim().is_empty() => warnings.push(format!(
+                    "embedding route \"{}\" has empty model",
+                    route.hint
+                )),
+                Some(_) => {}
+                None => warnings.push(format!(
                     "embedding route \"{}\" uses invalid model_provider \"{}\"",
                     route.hint, route.model_provider
-                ));
+                )),
             }
         }
         if let Some(hint) = self
