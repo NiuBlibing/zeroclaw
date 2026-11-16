@@ -78,6 +78,7 @@ pub use traits::{
 };
 
 use anyhow::Context;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(test)]
@@ -647,15 +648,28 @@ enum EmbeddingIdentityOutcome {
     Failed,
 }
 
-fn legacy_embedding_provider_matches_current(stored: &str, current: &str) -> bool {
+fn legacy_embedding_provider_digest(stored: &str) -> Option<String> {
     // Before the registry cutover the OpenAI-compatible adapter persisted the
     // configured provider spelling (`openai`, `openrouter`, or
     // `custom:<url>`). The canonical adapter now persists one protocol
     // namespace plus an endpoint/header digest. When model and dimensions are
     // unchanged, these historical names identify the same OpenAI-compatible
     // vector space and may be upgraded in place without nulling vectors.
-    current.starts_with("openai:")
-        && (stored == "openai" || stored == "openrouter" || stored.starts_with("custom:"))
+    let base_url = match stored {
+        "openai" => "https://api.openai.com/v1",
+        "openrouter" => "https://openrouter.ai/api/v1",
+        custom if custom.starts_with("custom:") => {
+            custom.strip_prefix("custom:").unwrap_or_default()
+        }
+        _ => return None,
+    };
+    let mut digest = Sha256::new();
+    digest.update(base_url.trim_end_matches('/').as_bytes());
+    Some(format!("openai:{:x}", digest.finalize()))
+}
+
+fn legacy_embedding_provider_matches_current(stored: &str, current: &str) -> bool {
+    legacy_embedding_provider_digest(stored).is_some_and(|expected| expected == current)
 }
 
 fn reconcile_embedding_identity(
@@ -1418,7 +1432,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            let current = ident("openai:canonical-endpoint", "model-a", 4);
+            let current = ident(
+                &legacy_embedding_provider_digest(legacy_provider).unwrap(),
+                "model-a",
+                4,
+            );
             assert_eq!(
                 reconcile_embedding_identity(&mem, &current, false),
                 EmbeddingIdentityOutcome::Match,

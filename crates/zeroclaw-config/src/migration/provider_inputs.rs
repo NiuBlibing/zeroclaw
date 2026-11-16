@@ -483,7 +483,23 @@ fn promote_embedding_bindings(
                 })
                 .and_then(|(_, model)| current.connections.get(model.provider()))
                 .cloned();
-            inherited.unwrap_or(serde_json::from_value(json!({"kind":reference}))?)
+            let mut base: registry::ProviderConnection =
+                serde_json::from_value(json!({"kind":reference}))?;
+            if api_key.is_none()
+                && let Some(inherited) = inherited
+                && let (Ok(mut base), Ok(inherited)) =
+                    (serde_json::to_value(&base), serde_json::to_value(inherited))
+            {
+                // Bare `openai`/`openrouter` keeps its documented endpoint.
+                // Only inherit the historical chat credential; copying the
+                // whole connection would accidentally route embeddings to a
+                // custom chat gateway.
+                if let Some(auth) = inherited.get("auth") {
+                    base["auth"] = auth.clone();
+                }
+                base = serde_json::from_value(base)?;
+            }
+            base
         } else {
             // Keep dangling references for Config::validate and startup repair;
             // the migration boundary must not discard unrelated sections.
@@ -919,32 +935,35 @@ fn normalize_definitions_inner(config: &mut Config, validate: bool) -> Result<()
         .keys()
         .cloned()
         .collect();
-    let migrated_tts_refs: HashSet<ModelRef> = config
-        .providers
-        .tts
-        .iter_entries()
-        .filter_map(|(family, alias, _)| {
-            let legacy = ModelRef::from(format!("{family}.{alias}"));
-            let candidate = if canonical_model_refs.contains(&legacy) {
-                ModelRef::from(format!("tts.{family}.{alias}"))
-            } else {
-                legacy
-            };
-            (!canonical_model_refs.contains(&candidate)).then_some(candidate)
+    // `providers_for_input` also folds the section-only `[transcription]` /
+    // `[tts]` forms into `current`, so derive this set from the completed
+    // projection instead of looking only at the typed provider maps. This
+    // covers both historical spellings and collision-renamed references while
+    // still leaving every model that was already canonical untouched.
+    let migrated_tts_refs: HashSet<ModelRef> = current
+        .models
+        .iter()
+        .filter_map(|(reference, model)| {
+            (!canonical_model_refs.contains(reference)
+                && matches!(
+                    model,
+                    ModelDefinition::Tts(model)
+                        if model.provider.as_str().starts_with("legacy.tts.")
+                ))
+            .then_some(reference.clone())
         })
         .collect();
-    let migrated_asr_refs: HashSet<ModelRef> = config
-        .providers
-        .transcription
-        .iter_entries()
-        .filter_map(|(family, alias, _)| {
-            let legacy = ModelRef::from(format!("{family}.{alias}"));
-            let candidate = if canonical_model_refs.contains(&legacy) {
-                ModelRef::from(format!("asr.{family}.{alias}"))
-            } else {
-                legacy
-            };
-            (!canonical_model_refs.contains(&candidate)).then_some(candidate)
+    let migrated_asr_refs: HashSet<ModelRef> = current
+        .models
+        .iter()
+        .filter_map(|(reference, model)| {
+            (!canonical_model_refs.contains(reference)
+                && matches!(
+                    model,
+                    ModelDefinition::Asr(model)
+                        if model.provider.as_str().starts_with("legacy.asr.")
+                ))
+            .then_some(reference.clone())
         })
         .collect();
     if !config.tts.enabled || !config.transcription.enabled {
@@ -1631,6 +1650,33 @@ mod tests {
             .resolve_embedding(&ModelRef::from(reference))
             .unwrap();
         assert_eq!(resolved.selection.connection.api_key(), Some("chat-key"));
+    }
+
+    #[test]
+    fn explicit_embedding_credential_keeps_bare_provider_endpoint() {
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("openai", "gateway").unwrap();
+        profile.model = Some("chat-model".into());
+        profile.uri = Some("https://gateway.example/v1".into());
+        profile.api_key = Some("chat-key".into());
+        config.memory.embedding_provider = "openai".into();
+        config.memory.embedding_model = "text-embedding-3-small".into();
+        config.memory.embedding_dimensions = 1536;
+        config.memory.embedding_api_key = Some("embedding-key".into());
+
+        normalize(&mut config).unwrap();
+
+        let reference = config.memory.embedding_model_ref.clone().unwrap();
+        let registry = config.provider_registry().unwrap();
+        let resolved = registry
+            .resolve_embedding(&ModelRef::from(reference))
+            .unwrap();
+        assert_eq!(resolved.selection.connection.kind(), "openai");
+        assert_eq!(resolved.selection.connection.uri(), None);
+        assert_eq!(
+            resolved.selection.connection.api_key(),
+            Some("embedding-key")
+        );
     }
 
     #[test]
