@@ -152,6 +152,11 @@ from the same connection URI: `/v1/audio/speech` for TTS and
 `openai-compatible`, and vLLM connections when the server exposes those
 endpoints. The request body remains the native OpenAI speech or transcription
 contract; it is not simulated through chat completions.
+Canonical TTS and ASR model entries are active when their `enabled` field is
+omitted. A migrated V4 entry can carry `enabled = false` when its historical
+workspace switch was disabled; this marker keeps dormant credentials from
+activating speech processing after migration. Remove the marker or set the
+workspace speech switch to enable the capability deliberately.
 For fields that support explicit clearing, the string `"null"` means clear and
 inheritance is represented by leaving the field unset. A literal string value
 `"null"` uses `{ value = "null" }` where that field supports the escape.
