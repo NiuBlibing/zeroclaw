@@ -483,21 +483,22 @@ fn promote_embedding_bindings(
                 })
                 .and_then(|(_, model)| current.connections.get(model.provider()))
                 .cloned();
-            let mut base: registry::ProviderConnection =
+            let base: registry::ProviderConnection =
                 serde_json::from_value(json!({"kind":reference}))?;
             if api_key.is_none()
                 && let Some(inherited) = inherited
                 && let Some(inherited_key) = inherited.api_key()
-                && let Ok(mut base) = serde_json::to_value(&base)
             {
                 // Bare `openai`/`openrouter` keeps its documented endpoint.
                 // Only inherit the historical chat credential; copying the
                 // whole connection would accidentally route embeddings to a
                 // custom chat gateway.
-                base["auth"] = json!({"mode":"api_key", "api_key":inherited_key});
-                base = serde_json::from_value(base)?;
+                let mut raw = serde_json::to_value(&base)?;
+                raw["auth"] = json!({"mode":"api_key", "api_key":inherited_key});
+                serde_json::from_value(raw)?
+            } else {
+                base
             }
-            base
         } else {
             // Keep dangling references for Config::validate and startup repair;
             // the migration boundary must not discard unrelated sections.
