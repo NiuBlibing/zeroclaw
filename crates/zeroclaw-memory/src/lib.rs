@@ -1448,6 +1448,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_custom_identity_with_changed_endpoint_invalidates_vectors() {
+        let tmp = TempDir::new().unwrap();
+        let mem = static_sqlite(tmp.path(), 4);
+        mem.record_embedding_identity(&ident("custom:https://old.example/v1", "model-a", 4))
+            .unwrap();
+        mem.store("legacy", "pre-existing row", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let current = ident(
+            &legacy_embedding_provider_digest("custom:https://new.example/v1").unwrap(),
+            "model-a",
+            4,
+        );
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &current, false),
+            EmbeddingIdentityOutcome::Invalidated(1)
+        );
+        assert_eq!(embedded_rows(&mem), 0);
+    }
+
+    #[tokio::test]
     async fn identity_mismatch_invalidates_vectors() {
         let tmp = TempDir::new().unwrap();
         let mem = static_sqlite(tmp.path(), 4);
