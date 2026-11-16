@@ -272,13 +272,13 @@ pub fn build_spec() -> serde_json::Value {
             "get": {
                 "tags": ["config"],
                 "summary": "Read the canonical provider registry",
-                "description": "Returns masked connections, exact-key capability models, presets and fallback references.",
+                "description": "Returns masked connections, exact-key capability models, presets, fallback references and an opaque concurrency revision. Preserve the complete snapshot as the expected document when saving; the revision changes when credentials change and is invalidated by a server restart.",
                 "responses": { "200": { "description": "Masked registry document with an opaque concurrency revision.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RegistrySnapshot" } } } } }
             },
             "put": {
                 "tags": ["config"],
                 "summary": "Replace the canonical provider registry atomically",
-                "description": "Requires config create/update/delete grants and write access to providers. Rejects stale expected documents. Preserves unchanged masked credentials and legacy typed provider maps. Validates all references before the normal config commit and reload flow.",
+                "description": "Requires config create/update/delete grants and write access to providers. Rejects stale expected documents, including concurrent credential changes. Preserves unchanged masked credentials. Validates all references before the normal config commit and reload flow.",
                 "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RegistryEdit" } } } },
                 "responses": { "200": { "description": "Registry saved.", "content": { "application/json": { "schema": { "type": "object", "properties": { "saved": { "type": "boolean" } }, "required": ["saved"] } } } }, "400": error_responses["400"].clone() }
             }

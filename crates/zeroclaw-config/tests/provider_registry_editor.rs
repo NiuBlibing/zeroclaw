@@ -992,3 +992,24 @@ fn model_wire_api_override_does_not_require_shared_api_defaults() {
         );
     }
 }
+
+#[test]
+fn native_transport_model_rejects_wire_api_override() {
+    for kind in ["hailo_ollama", "gemini_cli", "grok_cli", "kilocli"] {
+        let result =
+            serde_json::from_value::<zeroclaw_config::provider_registry::ProviderRegistry>(json!({
+                "connections": { "provider": { "kind": kind, "capabilities": ["chat"] } },
+                "models": { "chat": {
+                    "capability": "chat", "provider": "provider", "model": "model-one",
+                    "api": { "wire_api": "responses" }
+                } }
+            }));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("wire API overrides are unsupported"),
+            "{kind}"
+        );
+    }
+}

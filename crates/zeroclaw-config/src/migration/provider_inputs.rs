@@ -408,6 +408,32 @@ fn promote_embedding_bindings(
     current: &ProviderRegistry,
     candidate: &mut ProviderRegistry,
 ) -> Result<()> {
+    let agents = &config.agents;
+    let inherited_key = |reference: &str, explicit: Option<&str>| -> Result<Option<String>> {
+        if explicit.is_some()
+            || !matches!(reference.trim(), "openai" | "openrouter")
+                && !reference.trim().starts_with("custom:")
+        {
+            return Ok(None);
+        }
+        // V4 passed the consuming agent's chat credential to a bare embedding
+        // provider. Prefer those actual bindings, never an arbitrary profile
+        // merely because it has the same provider family. V5 has one explicit
+        // workspace embedding binding, so different agent credentials require
+        // the operator to choose that binding's credential during migration.
+        let keys: HashSet<&str> = agents
+            .values()
+            .filter_map(|agent| current.models.get(agent.model_provider.trim()))
+            .filter_map(|model| current.connections.get(model.provider()))
+            .filter_map(registry::ProviderConnection::api_key)
+            .filter(|key| !key.trim().is_empty())
+            .collect();
+        ensure!(
+            keys.len() <= 1,
+            "cannot migrate inherited embedding credentials from agents with different chat keys; set memory.embedding_api_key or the embedding route api_key explicitly and retry"
+        );
+        Ok(keys.into_iter().next().map(str::to_owned))
+    };
     fn promote(
         candidate: &mut ProviderRegistry,
         current: &ProviderRegistry,
@@ -573,6 +599,11 @@ fn promote_embedding_bindings(
         .map(str::trim)
         .map(str::to_owned);
     for route in &mut config.embedding_routes {
+        let explicit_key = route
+            .api_key
+            .as_deref()
+            .or(config.memory.embedding_api_key.as_deref());
+        let inherited = inherited_key(&route.model_provider, explicit_key)?;
         if let Some(reference) = promote(
             candidate,
             current,
@@ -581,10 +612,7 @@ fn promote_embedding_bindings(
             route
                 .dimensions
                 .unwrap_or(config.memory.embedding_dimensions),
-            route
-                .api_key
-                .as_deref()
-                .or(config.memory.embedding_api_key.as_deref()),
+            explicit_key.or(inherited.as_deref()),
             &format!("embedding.route.{}", route.hint),
         )? {
             route.model_provider = reference.to_string();
@@ -611,13 +639,15 @@ fn promote_embedding_bindings(
         let reference = if let Some(reference) = selected {
             Some(reference)
         } else {
+            let explicit_key = config.memory.embedding_api_key.as_deref();
+            let inherited = inherited_key(&config.memory.embedding_provider, explicit_key)?;
             promote(
                 candidate,
                 current,
                 &config.memory.embedding_provider,
                 &config.memory.embedding_model,
                 config.memory.embedding_dimensions,
-                config.memory.embedding_api_key.as_deref(),
+                explicit_key.or(inherited.as_deref()),
                 "embedding.memory",
             )?
         };
@@ -1676,6 +1706,57 @@ mod tests {
             resolved.selection.connection.api_key(),
             Some("embedding-key")
         );
+    }
+
+    #[test]
+    fn embedding_migration_uses_the_consuming_agent_credential() {
+        let mut config = Config::default();
+        for (family, key) in [("openai", "unused-key"), ("custom", "active-key")] {
+            let profile = config.providers.models.ensure(family, "work").unwrap();
+            profile.model = Some("chat-model".into());
+            profile.uri = Some("https://gateway.example/v1".into());
+            profile.api_key = Some(key.into());
+        }
+        config.agents.insert(
+            "worker".into(),
+            crate::schema::AliasedAgentConfig {
+                model_provider: "custom.work".into(),
+                ..Default::default()
+            },
+        );
+        config.memory.embedding_provider = "openai".into();
+        config.memory.embedding_model = "text-embedding-3-small".into();
+        config.memory.embedding_dimensions = 1536;
+        normalize(&mut config).unwrap();
+        let registry = config.provider_registry().unwrap();
+        let reference = ModelRef::from(config.memory.embedding_model_ref.unwrap());
+        let resolved = registry.resolve_embedding(&reference).unwrap();
+        assert_eq!(resolved.selection.connection.api_key(), Some("active-key"));
+        assert_eq!(resolved.selection.connection.uri(), None);
+    }
+
+    #[test]
+    fn embedding_migration_refuses_ambiguous_agent_credentials() {
+        let mut config = Config::default();
+        for (alias, key) in [("first", "first-key"), ("second", "second-key")] {
+            let profile = config.providers.models.ensure("openai", alias).unwrap();
+            profile.model = Some("chat-model".into());
+            profile.api_key = Some(key.into());
+            config.agents.insert(
+                alias.into(),
+                crate::schema::AliasedAgentConfig {
+                    model_provider: format!("openai.{alias}").into(),
+                    ..Default::default()
+                },
+            );
+        }
+        config.memory.embedding_provider = "openai".into();
+        config.memory.embedding_model = "text-embedding-3-small".into();
+        config.memory.embedding_dimensions = 1536;
+        let error = normalize(&mut config).unwrap_err().to_string();
+        assert!(error.contains("different chat keys"), "{error}");
+        assert!(!error.contains("first-key"));
+        assert!(!error.contains("second-key"));
     }
 
     #[test]

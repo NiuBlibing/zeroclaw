@@ -120,7 +120,7 @@ impl ProviderRegistry {
             .ok_or_else(|| RegistryError::model(name, "provider", "connection does not exist"))?;
         match model {
             ModelDefinition::Chat(config) => {
-                self.validate_chat(name, config)?;
+                self.validate_chat(name, config, connection)?;
             }
             ModelDefinition::Embedding(config) => {
                 if config.model.trim().is_empty() {
@@ -166,6 +166,7 @@ impl ProviderRegistry {
         &self,
         name: &ModelRef,
         config: &ChatModelConfig,
+        connection: &ProviderConnection,
     ) -> Result<(), RegistryError> {
         if config
             .model
@@ -209,6 +210,24 @@ impl ProviderRegistry {
         // selection/resolve_chat already checks the connection's chat
         // capability. A shared api.chat defaults table is optional, so its
         // absence cannot invalidate a model-level protocol override.
+        if config
+            .api
+            .as_ref()
+            .is_some_and(|api| api.wire_api.is_some())
+            && matches!(
+                connection,
+                ProviderConnection::HailoOllama(_)
+                    | ProviderConnection::GeminiCli(_)
+                    | ProviderConnection::GrokCli(_)
+                    | ProviderConnection::KiloCli(_)
+            )
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.wire_api",
+                "wire API overrides are unsupported by the connection kind",
+            ));
+        }
         if let Some(preset) = config.preset.as_ref() {
             ensure_preset(self, name, preset, Capability::Chat)?;
         }

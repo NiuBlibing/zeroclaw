@@ -126,6 +126,12 @@ the upstream ID and dimensions. Saving the registry promotes existing legacy
 embedding bindings before retiring their provider profiles, preserving the
 shared connection and any explicit consumer credentials.
 
+For bare V4 embedding providers, migration preserves the provider's official
+endpoint and inherits only the consuming agent's missing credential. If agents
+used different chat credentials, set `memory.embedding_api_key` (or the route's
+`api_key`) explicitly before migration; V5 requires one explicit credential per
+embedding connection instead of silently choosing an agent's key.
+
 `connections.<name>.uri` is the shared endpoint; capability tables derive
 their paths and do not define a second URI. API defaults are applied first,
 then the API preset/options, model preset/options, and finally invocation
