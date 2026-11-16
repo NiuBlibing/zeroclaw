@@ -130,10 +130,10 @@ fn legacy_profile_reference(models: &toml::Table, model_provider: &str) -> Optio
     // historical model selector.
     let mut candidate = alias;
     while let Some((prefix, _)) = candidate.rsplit_once('.') {
+        candidate = prefix;
         if family_table.contains_key(candidate) {
             return Some(format!("{family}.{candidate}"));
         }
-        candidate = prefix;
     }
     None
 }
@@ -148,6 +148,7 @@ pub(super) fn migrate(value: toml::Value) -> Result<toml::Value> {
 #[cfg(test)]
 mod tests {
     use super::super::{GenerateOptions, generate, migrate_file};
+    use super::legacy_profile_reference;
 
     #[test]
     fn released_v4_generation_stays_frozen() {
@@ -223,6 +224,56 @@ strict_tool_parsing = true
             error.contains("both strict and non-strict agents"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn strict_nested_model_binding_preserves_text_tool_opt_out() {
+        let input = r#"
+schema_version = 4
+
+[providers.models.ollama.main]
+model = "llama3"
+[providers.models.ollama.main.models.fast]
+model = "llama3-fast"
+
+[agents.worker]
+model_provider = "ollama.main.fast"
+runtime_profile = "strict"
+
+[runtime_profiles.strict]
+strict_tool_parsing = true
+"#;
+        let output = migrate_file(input).unwrap().unwrap();
+        let value: toml::Value = toml::from_str(&output).unwrap();
+        assert_eq!(
+            value["providers"]["models"]["ollama.main.fast"]["options"]["extract_text_tool_calls"]
+                .as_bool(),
+            Some(false)
+        );
+        assert!(!output.contains("strict_tool_parsing"));
+    }
+
+    #[test]
+    fn legacy_strict_profile_lookup_uses_longest_exact_toml_key() {
+        let models: toml::Value = toml::from_str(
+            r#"
+[ollama.main]
+[ollama."main.us"]
+"#,
+        )
+        .unwrap();
+        for (input, expected) in [
+            ("ollama.main.fast", Some("ollama.main")),
+            ("ollama.main.us.fast", Some("ollama.main.us")),
+            ("ollama.main.us", Some("ollama.main.us")),
+            ("ollama.unknown.fast", None),
+        ] {
+            assert_eq!(
+                legacy_profile_reference(models.as_table().unwrap(), input).as_deref(),
+                expected,
+                "{input}"
+            );
+        }
     }
 
     #[test]

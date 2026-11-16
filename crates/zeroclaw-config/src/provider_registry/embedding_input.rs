@@ -4,15 +4,24 @@ use super::{ModelRef, ProviderRegistry};
 use crate::schema::Config;
 use anyhow::Result;
 
+/// Structured diagnostics; presentation belongs to the calling UI or CLI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddingInputWarning {
+    EmptyRouteHint,
+    EmptyRouteModel { hint: String },
+    InvalidRouteModel { hint: String, model_ref: String },
+    UnmatchedHint { hint: String },
+}
+
 impl Config {
     /// Report invalid embedding bindings using the same canonical resolver as
     /// provider construction. Historical provider syntax is never interpreted.
-    pub fn embedding_input_warnings(&self) -> Vec<String> {
+    pub fn embedding_input_warnings(&self) -> Vec<EmbeddingInputWarning> {
         let mut warnings = Vec::new();
         let registry = self.provider_registry().ok();
         for route in &self.embedding_routes {
             if route.hint.trim().is_empty() {
-                warnings.push("embedding route with empty hint".into());
+                warnings.push(EmbeddingInputWarning::EmptyRouteHint);
             }
             let resolved = registry.as_ref().and_then(|registry| {
                 registry
@@ -20,10 +29,11 @@ impl Config {
                     .ok()
             });
             match resolved {
-                Some(resolved) if resolved.model.trim().is_empty() => warnings.push(format!(
-                    "embedding route \"{}\" has empty model",
-                    route.hint
-                )),
+                Some(resolved) if resolved.model.trim().is_empty() => {
+                    warnings.push(EmbeddingInputWarning::EmptyRouteModel {
+                        hint: route.hint.clone(),
+                    })
+                }
                 Some(_) => {}
                 None => {
                     // A pre-admission legacy fixture can still carry the
@@ -31,15 +41,14 @@ impl Config {
                     // while canonical routes above derive the model solely
                     // from the resolved model reference.
                     if route.model.trim().is_empty() {
-                        warnings.push(format!(
-                            "embedding route \"{}\" has empty model",
-                            route.hint
-                        ));
+                        warnings.push(EmbeddingInputWarning::EmptyRouteModel {
+                            hint: route.hint.clone(),
+                        });
                     }
-                    warnings.push(format!(
-                        "embedding route \"{}\" uses invalid model_provider \"{}\"",
-                        route.hint, route.model_provider
-                    ));
+                    warnings.push(EmbeddingInputWarning::InvalidRouteModel {
+                        hint: route.hint.clone(),
+                        model_ref: route.model_provider.clone(),
+                    });
                 }
             }
         }
@@ -54,9 +63,7 @@ impl Config {
                 .iter()
                 .any(|route| route.hint.trim() == hint)
         {
-            warnings.push(format!(
-                "embedding model hint \"{hint}\" has no matching [[embedding_routes]] entry exists"
-            ));
+            warnings.push(EmbeddingInputWarning::UnmatchedHint { hint: hint.into() });
         }
         warnings
     }

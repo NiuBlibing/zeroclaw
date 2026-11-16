@@ -935,3 +935,60 @@ fn registry_edits_preserve_only_unchanged_external_secret_references() {
     delete_entry(&mut config, "connections", "gateway.prod/renamed").unwrap();
     assert!(config.onepassword_reference_snapshots.is_empty());
 }
+
+#[test]
+fn registry_revision_detects_concurrent_masked_credential_changes() {
+    let mut config = admit(config());
+    let stale = snapshot(&config).unwrap();
+    let mut rotated = stale.clone();
+    rotated["connections"]["gateway.prod"]["auth"]["api_key"] = json!("rotated-secret");
+    stage(
+        &mut config,
+        RegistryEdit {
+            expected: stale.clone(),
+            registry: rotated,
+        },
+    )
+    .unwrap();
+    let current = snapshot(&config).unwrap();
+    assert_eq!(current["connections"], stale["connections"]);
+    assert_ne!(current["revision"], stale["revision"]);
+    for replacement in [json!("stale-replacement"), serde_json::Value::Null] {
+        let mut registry = stale.clone();
+        registry["connections"]["gateway.prod"]["auth"]["api_key"] = replacement;
+        let error = stage(
+            &mut config,
+            RegistryEdit {
+                expected: stale.clone(),
+                registry,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("changed; reload"), "{error}");
+        assert_eq!(snapshot(&config).unwrap(), current);
+    }
+    assert_eq!(
+        config.providers.connections[&"gateway.prod".into()].api_key(),
+        Some("rotated-secret")
+    );
+}
+
+#[test]
+fn model_wire_api_override_does_not_require_shared_api_defaults() {
+    for kind in ["openai", "custom", "vllm"] {
+        let registry: zeroclaw_config::provider_registry::ProviderRegistry =
+            serde_json::from_value(json!({
+                "connections": { "provider": { "kind": kind, "uri": "https://example.test/v1", "capabilities": ["chat"] } },
+                "models": { "chat": {
+                    "capability": "chat", "provider": "provider", "model": "model-one",
+                    "api": { "wire_api": "responses" }
+                } }
+            }))
+            .unwrap();
+        let resolved = registry.resolve_chat(&"chat".into()).unwrap();
+        assert_eq!(
+            resolved.wire_api,
+            Some(zeroclaw_config::schema::WireApi::Responses)
+        );
+    }
+}

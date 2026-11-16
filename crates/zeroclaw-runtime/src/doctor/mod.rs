@@ -1303,7 +1303,29 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         }
     }
 
-    for message in config.embedding_input_warnings() {
+    for warning in config.embedding_input_warnings() {
+        use crate::i18n::{get_required_cli_string, get_required_cli_string_with_args};
+        use zeroclaw_config::provider_registry::embedding_input::EmbeddingInputWarning;
+
+        let message = match warning {
+            EmbeddingInputWarning::EmptyRouteHint => {
+                get_required_cli_string("cli-doctor-embedding-route-empty-hint")
+            }
+            EmbeddingInputWarning::EmptyRouteModel { hint } => get_required_cli_string_with_args(
+                "cli-doctor-embedding-route-empty-model",
+                &[("hint", &hint)],
+            ),
+            EmbeddingInputWarning::InvalidRouteModel { hint, model_ref } => {
+                get_required_cli_string_with_args(
+                    "cli-doctor-embedding-route-invalid-model",
+                    &[("hint", &hint), ("model_ref", &model_ref)],
+                )
+            }
+            EmbeddingInputWarning::UnmatchedHint { hint } => get_required_cli_string_with_args(
+                "cli-doctor-embedding-unmatched-hint",
+                &[("hint", &hint)],
+            ),
+        };
         items.push(DiagItem::warn(cat, message));
     }
 

@@ -2,14 +2,31 @@
 //! keys throughout; no flattened property path is used to address an entity.
 
 use anyhow::{Context, Result, ensure};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Sha256;
+use std::sync::LazyLock;
 
 #[path = "editor_mutations.rs"]
 mod mutations;
 pub use mutations::{create_entry, delete_entry, rename_entry};
 
 use crate::{schema::Config, traits::MASKED_SECRET};
+
+// This process-local signing key creates an opaque revision from canonical
+// state, including credentials. No config revision or registry copy is stored.
+// Restarting the process deliberately requires editors to reload their baseline.
+static REVISION_KEY: LazyLock<[u8; 32]> = LazyLock::new(rand::random);
+
+#[derive(Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct RegistrySnapshot {
+    #[serde(flatten)]
+    pub registry: super::ProviderRegistry,
+    /// Opaque concurrency token. Changes to masked credentials change it too.
+    pub revision: String,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -25,10 +42,13 @@ pub struct RegistryEdit {
 /// A request-time, masked projection of the canonical source, never a cache.
 pub fn snapshot(config: &Config) -> Result<Value> {
     let mut registry = config.provider_registry()?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(REVISION_KEY.as_slice())?;
+    mac.update(&serde_json::to_vec(&registry)?);
+    let revision = hex::encode(mac.finalize().into_bytes());
     for connection in registry.connections.values_mut() {
         connection.mask_secrets();
     }
-    let mut document = serde_json::to_value(registry)?;
+    let mut document = serde_json::to_value(RegistrySnapshot { registry, revision })?;
     for section in ["connections", "models", "model_presets", "fallback"] {
         document[section] = document
             .get(section)
@@ -65,8 +85,14 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
         snapshot(config)? == edit.expected,
         "provider registry changed; reload before saving"
     );
+    let mut document = edit.registry;
+    // A caller may edit the snapshot directly. Its token belongs to the CAS
+    // envelope, never to persisted provider configuration.
+    if let Some(document) = document.as_object_mut() {
+        document.remove("revision");
+    }
     let mut registry: super::ProviderRegistry =
-        serde_json::from_value(edit.registry).context("invalid provider registry")?;
+        serde_json::from_value(document).context("invalid provider registry")?;
     for (id, connection) in &mut registry.connections {
         if let Some(current) = config.providers.connections.get(id) {
             connection.restore_secrets_from(current);

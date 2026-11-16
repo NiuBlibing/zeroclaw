@@ -88,6 +88,7 @@ pub fn build_spec() -> serde_json::Value {
             "SecretResponse":   schema_value::<SecretResponse>(),
             "ListResponse":     schema_value::<ListResponse>(),
             "ProviderRegistry": schema_value::<zeroclaw_config::provider_registry::ProviderRegistry>(),
+            "RegistrySnapshot": schema_value::<zeroclaw_config::provider_registry::editor::RegistrySnapshot>(),
             "RegistryEdit": schema_value::<zeroclaw_config::provider_registry::editor::RegistryEdit>(),
             "PatchOp":          schema_value::<PatchOp>(),
             "PatchResponse":    schema_value::<PatchResponse>(),
@@ -272,7 +273,7 @@ pub fn build_spec() -> serde_json::Value {
                 "tags": ["config"],
                 "summary": "Read the canonical provider registry",
                 "description": "Returns masked connections, exact-key capability models, presets and fallback references.",
-                "responses": { "200": { "description": "Masked registry document.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProviderRegistry" } } } } }
+                "responses": { "200": { "description": "Masked registry document with an opaque concurrency revision.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RegistrySnapshot" } } } } }
             },
             "put": {
                 "tags": ["config"],

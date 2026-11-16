@@ -1782,3 +1782,8 @@ turn-repeated-success-advisory = The same tool call returned the same successful
 turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
 turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
 turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
+# Configuration diagnostics: canonical embedding registry
+cli-doctor-embedding-route-empty-hint = embedding route with empty hint
+cli-doctor-embedding-route-empty-model = embedding route "{ $hint }" has empty model
+cli-doctor-embedding-route-invalid-model = embedding route "{ $hint }" uses invalid model_provider "{ $model_ref }"
+cli-doctor-embedding-unmatched-hint = embedding model hint "{ $hint }": no matching [[embedding_routes]] entry exists

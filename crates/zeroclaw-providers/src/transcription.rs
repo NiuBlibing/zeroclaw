@@ -1252,19 +1252,16 @@ impl TranscriptionManager {
 
     #[cfg(test)]
     #[must_use]
-    pub fn with_typed_providers(self, typed: &TranscriptionProviders) -> Self {
+    pub fn with_typed_providers(mut self, typed: &TranscriptionProviders) -> Self {
         let mut config = Config::default();
         config.transcription.enabled = true;
         config.providers.transcription = typed.clone();
         let config = zeroclaw_config::migration::admit_test_input(&config);
-        let mut manager =
-            Self::from_config_with_provider(&config, self.agent_transcription_provider.clone())
-                .unwrap();
-        manager
-            .transcription_providers
-            .extend(self.transcription_providers);
-        manager.max_audio_bytes = self.max_audio_bytes;
-        manager
+        // This test builder exercises registration, including diagnostics for
+        // invalid entries. The production constructor separately rejects an
+        // enabled manager with no usable model.
+        self.register_canonical_providers(&config).unwrap();
+        self
     }
 
     /// Set the resolved agent `transcription_provider` alias. Called by
