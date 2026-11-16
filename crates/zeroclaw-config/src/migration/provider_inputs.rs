@@ -1702,6 +1702,27 @@ mod tests {
     }
 
     #[test]
+    fn section_only_disabled_asr_is_marked_dormant() {
+        let mut config: Config = toml::from_str(
+            r#"
+            [transcription]
+            enabled = false
+
+            [transcription.openai]
+            api_key = "legacy-key"
+            model = "whisper-1"
+            "#,
+        )
+        .unwrap();
+
+        normalize(&mut config).unwrap();
+
+        let registry = config.provider_registry().unwrap();
+        let model = registry.models.get(&ModelRef::from("asr.openai")).unwrap();
+        assert!(matches!(model, ModelDefinition::Asr(model) if model.enabled == Some(false)));
+    }
+
+    #[test]
     fn embedding_route_binding_snapshot_restores_a_collection() {
         let mut config = Config::default();
         config
