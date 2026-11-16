@@ -487,16 +487,14 @@ fn promote_embedding_bindings(
                 serde_json::from_value(json!({"kind":reference}))?;
             if api_key.is_none()
                 && let Some(inherited) = inherited
-                && let (Ok(mut base), Ok(inherited)) =
-                    (serde_json::to_value(&base), serde_json::to_value(inherited))
+                && let Some(inherited_key) = inherited.api_key()
+                && let Ok(mut base) = serde_json::to_value(&base)
             {
                 // Bare `openai`/`openrouter` keeps its documented endpoint.
                 // Only inherit the historical chat credential; copying the
                 // whole connection would accidentally route embeddings to a
                 // custom chat gateway.
-                if let Some(auth) = inherited.get("auth") {
-                    base["auth"] = auth.clone();
-                }
+                base["auth"] = json!({"mode":"api_key", "api_key":inherited_key});
                 base = serde_json::from_value(base)?;
             }
             base
