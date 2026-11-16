@@ -25,10 +25,22 @@ impl Config {
                     route.hint
                 )),
                 Some(_) => {}
-                None => warnings.push(format!(
-                    "embedding route \"{}\" uses invalid model_provider \"{}\"",
-                    route.hint, route.model_provider
-                )),
+                None => {
+                    // A pre-admission legacy fixture can still carry the
+                    // route-owned model field. Keep its actionable warning,
+                    // while canonical routes above derive the model solely
+                    // from the resolved model reference.
+                    if route.model.trim().is_empty() {
+                        warnings.push(format!(
+                            "embedding route \"{}\" has empty model",
+                            route.hint
+                        ));
+                    }
+                    warnings.push(format!(
+                        "embedding route \"{}\" uses invalid model_provider \"{}\"",
+                        route.hint, route.model_provider
+                    ));
+                }
             }
         }
         if let Some(hint) = self
