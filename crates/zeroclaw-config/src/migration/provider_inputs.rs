@@ -411,6 +411,10 @@ fn promote_embedding_bindings(
     let agents = &config.agents;
     let inherited_key = |reference: &str, explicit: Option<&str>| -> Result<Option<String>> {
         if explicit.is_some()
+            || current
+                .models
+                .get(reference.trim())
+                .is_some_and(|model| model.capability() == Capability::Embedding)
             || !matches!(reference.trim(), "openai" | "openrouter")
                 && !reference.trim().starts_with("custom:")
         {
@@ -1757,6 +1761,61 @@ mod tests {
         assert!(error.contains("different chat keys"), "{error}");
         assert!(!error.contains("first-key"));
         assert!(!error.contains("second-key"));
+    }
+
+    #[test]
+    fn exact_embedding_route_key_keeps_its_credential_with_distinct_agent_keys() {
+        for model_ref in ["openai", "openrouter"] {
+            let mut config = Config {
+                providers: serde_json::from_value(json!({
+                    "connections": {
+                        "embedding": { "kind": "openai", "auth": { "mode": "api_key", "api_key": "embedding-key" } },
+                        "first": { "kind": "openai", "auth": { "mode": "api_key", "api_key": "first-key" } },
+                        "second": { "kind": "openai", "auth": { "mode": "api_key", "api_key": "second-key" } }
+                    },
+                    "models": {
+                        model_ref: { "capability": "embedding", "provider": "embedding", "model": "text-embedding-3-small" },
+                        "chat.first": { "capability": "chat", "provider": "first", "model": "chat-model" },
+                        "chat.second": { "capability": "chat", "provider": "second", "model": "chat-model" }
+                    }
+                }))
+                .unwrap(),
+                ..Config::default()
+            };
+            for alias in ["first", "second"] {
+                config.agents.insert(
+                    alias.into(),
+                    crate::schema::AliasedAgentConfig {
+                        model_provider: format!("chat.{alias}").into(),
+                        ..Default::default()
+                    },
+                );
+            }
+            config.memory.embedding_model = "hint:semantic".into();
+            config
+                .embedding_routes
+                .push(crate::schema::EmbeddingRouteConfig {
+                    hint: "semantic".into(),
+                    model_provider: model_ref.into(),
+                    model: String::new(),
+                    dimensions: None,
+                    api_key: None,
+                });
+            normalize(&mut config).unwrap();
+            assert_eq!(config.embedding_routes[0].model_provider, model_ref);
+            assert_eq!(
+                config.memory.embedding_model_ref.as_deref(),
+                Some(model_ref)
+            );
+            let registry = config.provider_registry().unwrap();
+            let reference = ModelRef::from(model_ref);
+            let resolved = registry.resolve_embedding(&reference).unwrap();
+            assert_eq!(
+                resolved.selection.connection.api_key(),
+                Some("embedding-key")
+            );
+            assert_eq!(registry.models.len(), 3);
+        }
     }
 
     #[test]
