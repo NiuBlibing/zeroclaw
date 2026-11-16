@@ -234,7 +234,7 @@ schema_version = 4
 [providers.models.ollama.main]
 model = "llama3"
 [providers.models.ollama.main.models.fast]
-model = "llama3-fast"
+id = "llama3-fast"
 
 [agents.worker]
 model_provider = "ollama.main.fast"

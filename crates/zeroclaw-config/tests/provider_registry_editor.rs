@@ -968,7 +968,7 @@ fn registry_revision_detects_concurrent_masked_credential_changes() {
         assert_eq!(snapshot(&config).unwrap(), current);
     }
     assert_eq!(
-        config.providers.connections[&"gateway.prod".into()].api_key(),
+        config.providers.connections["gateway.prod"].api_key(),
         Some("rotated-secret")
     );
 }

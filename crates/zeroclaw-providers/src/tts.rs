@@ -1918,6 +1918,7 @@ voice = "legacy-voice"
             .unwrap(),
             ..Config::default()
         };
+        config.tts.enabled = true;
         let manager = TtsManager::from_config_for_agent(&config, None).unwrap();
         assert!(manager.tts_providers.contains_key("openai.voice"));
         assert!(!manager.voice_by_alias.contains_key("openai.voice"));
@@ -2066,6 +2067,7 @@ voice = "legacy-voice"
 
     fn config_with_openai_wav_alias() -> Config {
         let mut cfg = Config::default();
+        cfg.tts.enabled = true;
         cfg.agents.insert(
             "default".into(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -2232,6 +2234,7 @@ voice = "legacy-voice"
         // with no `api_key`. `OpenAiTtsProvider::new` bails before it ever
         // reads `uri`, so the provider never registers.
         let mut cfg = Config::default();
+        cfg.tts.enabled = true;
         cfg.providers.tts.openai.insert(
             "stoa".to_string(),
             zeroclaw_config::schema::OpenAITtsProviderConfig {
