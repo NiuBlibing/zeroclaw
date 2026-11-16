@@ -2598,6 +2598,7 @@ max_audio_bytes = 26214400
     fn local_whisper_registered_when_config_present() {
         let config = TranscriptionConfig {
             local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+            enabled: true,
             ..TranscriptionConfig::default()
         };
 

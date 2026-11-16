@@ -7,6 +7,7 @@ use crate::providers::{Providers, TranscriptionProviderEntry};
 use crate::schema::{Config, ModelEntryConfig, ModelSelection};
 use anyhow::{Context, Result, ensure};
 use serde_json::json;
+use std::collections::HashSet;
 use zeroclaw_api::capability::Capability;
 
 fn project_provider_tables(
@@ -457,7 +458,32 @@ fn promote_embedding_bindings(
         } else if let Some(uri) = reference.strip_prefix("custom:") {
             serde_json::from_value(json!({"kind":"custom", "uri":uri}))?
         } else if matches!(reference, "openai" | "openrouter") {
-            serde_json::from_value(json!({"kind":reference}))?
+            // V4 treated a bare OpenAI-family embedding provider as inheriting
+            // the active chat provider's credential when
+            // `memory.embedding_api_key` was omitted.  The canonical registry
+            // must make that credential explicit before the legacy field is
+            // retired; otherwise the migrated embedding request is accepted
+            // by config validation but rejected by the upstream API.
+            let inherited = current
+                .models
+                .iter()
+                .filter(|(model_ref, model)| {
+                    model.capability() == Capability::Chat
+                        && model_ref
+                            .as_str()
+                            .strip_prefix(&format!("{reference}."))
+                            .is_some()
+                })
+                .min_by_key(|(model_ref, _)| {
+                    if model_ref.as_str() == format!("{reference}.default") {
+                        0
+                    } else {
+                        1
+                    }
+                })
+                .and_then(|(_, model)| current.connections.get(model.provider()))
+                .cloned();
+            inherited.unwrap_or(serde_json::from_value(json!({"kind":reference}))?)
         } else {
             // Keep dangling references for Config::validate and startup repair;
             // the migration boundary must not discard unrelated sections.
@@ -883,22 +909,57 @@ fn normalize_definitions_inner(config: &mut Config, validate: bool) -> Result<()
     }
     let current = project(config)?;
     let mut registry = current.clone();
+    // Only definitions that came from the retired typed maps may inherit the
+    // old workspace enable switch.  Existing V5 models are authoritative even
+    // when their provider id happens to retain a historical-looking prefix.
+    let canonical_model_refs: HashSet<ModelRef> = config
+        .providers
+        .models
+        .canonical_models
+        .keys()
+        .cloned()
+        .collect();
+    let migrated_tts_refs: HashSet<ModelRef> = config
+        .providers
+        .tts
+        .iter_entries()
+        .filter_map(|(family, alias, _)| {
+            let legacy = ModelRef::from(format!("{family}.{alias}"));
+            let candidate = if canonical_model_refs.contains(&legacy) {
+                ModelRef::from(format!("tts.{family}.{alias}"))
+            } else {
+                legacy
+            };
+            (!canonical_model_refs.contains(&candidate)).then_some(candidate)
+        })
+        .collect();
+    let migrated_asr_refs: HashSet<ModelRef> = config
+        .providers
+        .transcription
+        .iter_entries()
+        .filter_map(|(family, alias, _)| {
+            let legacy = ModelRef::from(format!("{family}.{alias}"));
+            let candidate = if canonical_model_refs.contains(&legacy) {
+                ModelRef::from(format!("asr.{family}.{alias}"))
+            } else {
+                legacy
+            };
+            (!canonical_model_refs.contains(&candidate)).then_some(candidate)
+        })
+        .collect();
     if !config.tts.enabled || !config.transcription.enabled {
-        for model in registry.models.values_mut() {
-            match model {
-                ModelDefinition::Tts(model)
-                    if !config.tts.enabled
-                        && model.provider.as_str().starts_with("legacy.tts.") =>
-                {
-                    model.enabled = Some(false);
-                }
-                ModelDefinition::Asr(model)
-                    if !config.transcription.enabled
-                        && model.provider.as_str().starts_with("legacy.asr.") =>
-                {
-                    model.enabled = Some(false);
-                }
-                _ => {}
+        for (reference, model) in &mut registry.models {
+            if let ModelDefinition::Tts(model) = model
+                && !config.tts.enabled
+                && migrated_tts_refs.contains(reference)
+            {
+                model.enabled = Some(false);
+            }
+            if let ModelDefinition::Asr(model) = model
+                && !config.transcription.enabled
+                && migrated_asr_refs.contains(reference)
+            {
+                model.enabled = Some(false);
             }
         }
     }
@@ -1101,6 +1162,7 @@ pub(crate) fn migrate_document(mut document: toml::Value) -> Result<toml::Value>
         "agents",
         "memory",
         "embedding_routes",
+        "tts",
         "transcription",
         "decision_models",
     ] {
@@ -1549,6 +1611,49 @@ mod tests {
                 .unwrap()
                 .contains("env-fixture-secret")
         );
+    }
+
+    #[test]
+    fn bare_embedding_provider_preserves_chat_connection_credential() {
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("openai", "work").unwrap();
+        profile.model = Some("chat-model".into());
+        profile.api_key = Some("chat-key".into());
+        config.memory.embedding_provider = "openai".into();
+        config.memory.embedding_model = "text-embedding-3-small".into();
+        config.memory.embedding_dimensions = 1536;
+
+        normalize(&mut config).unwrap();
+
+        let reference = config.memory.embedding_model_ref.clone().unwrap();
+        let registry = config.provider_registry().unwrap();
+        let resolved = registry
+            .resolve_embedding(&ModelRef::from(reference))
+            .unwrap();
+        assert_eq!(resolved.selection.connection.api_key(), Some("chat-key"));
+    }
+
+    #[test]
+    fn document_migration_keeps_enabled_speech_models_active() {
+        let document: toml::Value = toml::from_str(
+            r#"
+            schema_version = 4
+
+            [tts]
+            enabled = true
+
+            [providers.tts.piper.local]
+            uri = "http://127.0.0.1:5000"
+            model = "en_US-lessac-medium"
+            "#,
+        )
+        .unwrap();
+
+        let migrated = migrate_document(document).unwrap();
+        let config: Config = migrated.try_into().unwrap();
+        let registry = config.provider_registry().unwrap();
+        let model = registry.models.get(&ModelRef::from("piper.local")).unwrap();
+        assert!(matches!(model, ModelDefinition::Tts(model) if model.enabled != Some(false)));
     }
 
     #[test]

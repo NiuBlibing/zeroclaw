@@ -647,6 +647,17 @@ enum EmbeddingIdentityOutcome {
     Failed,
 }
 
+fn legacy_embedding_provider_matches_current(stored: &str, current: &str) -> bool {
+    // Before the registry cutover the OpenAI-compatible adapter persisted the
+    // configured provider spelling (`openai`, `openrouter`, or
+    // `custom:<url>`). The canonical adapter now persists one protocol
+    // namespace plus an endpoint/header digest. When model and dimensions are
+    // unchanged, these historical names identify the same OpenAI-compatible
+    // vector space and may be upgraded in place without nulling vectors.
+    current.starts_with("openai:")
+        && (stored == "openai" || stored == "openrouter" || stored.starts_with("custom:"))
+}
+
 fn reconcile_embedding_identity(
     mem: &SqliteMemory,
     current: &zeroclaw_api::embedding::EmbeddingIdentity,
@@ -684,10 +695,14 @@ fn reconcile_embedding_identity(
         Some(stored)
             if stored.model == current.model
                 && stored.dimensions == current.dimensions
-                && current
+                && (current
                     .provider
                     .strip_prefix(&format!("{}:", stored.provider))
-                    .is_some() =>
+                    .is_some()
+                    || legacy_embedding_provider_matches_current(
+                        &stored.provider,
+                        &current.provider,
+                    )) =>
         {
             // Older stores stamped only the provider name. The current
             // OpenAI-compatible identity also includes an endpoint/header
@@ -1390,6 +1405,28 @@ mod tests {
             EmbeddingIdentityOutcome::Adopted
         );
         assert_eq!(embedded_rows(&mem), 1);
+    }
+
+    #[tokio::test]
+    async fn identity_upgrade_from_legacy_openai_compatible_names_keeps_vectors() {
+        for legacy_provider in ["openrouter", "custom:https://api.example.com/v1"] {
+            let tmp = TempDir::new().unwrap();
+            let mem = static_sqlite(tmp.path(), 4);
+            let stored = ident(legacy_provider, "model-a", 4);
+            mem.record_embedding_identity(&stored).unwrap();
+            mem.store("legacy", "pre-existing row", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+
+            let current = ident("openai:canonical-endpoint", "model-a", 4);
+            assert_eq!(
+                reconcile_embedding_identity(&mem, &current, false),
+                EmbeddingIdentityOutcome::Match,
+                "legacy provider {legacy_provider} must be upgraded in place"
+            );
+            assert_eq!(embedded_rows(&mem), 1);
+            assert_eq!(mem.stored_embedding_identity().unwrap(), Some(current));
+        }
     }
 
     #[tokio::test]

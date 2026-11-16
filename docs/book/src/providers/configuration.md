@@ -156,7 +156,8 @@ Canonical TTS and ASR model entries are active when their `enabled` field is
 omitted. A migrated V4 entry can carry `enabled = false` when its historical
 workspace switch was disabled; this marker keeps dormant credentials from
 activating speech processing after migration. Remove the marker or set the
-workspace speech switch to enable the capability deliberately.
+model's `enabled` field to `true` when activating the capability deliberately.
+The workspace speech switch must also be `true`.
 For fields that support explicit clearing, the string `"null"` means clear and
 inheritance is represented by leaving the field unset. A literal string value
 `"null"` uses `{ value = "null" }` where that field supports the escape.
