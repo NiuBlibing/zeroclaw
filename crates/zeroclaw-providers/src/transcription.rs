@@ -1696,6 +1696,7 @@ mod tests {
 
         let config = TranscriptionConfig {
             api_key: Some("test-groq-key".to_string()),
+            enabled: true,
             ..TranscriptionConfig::default()
         };
 
@@ -1715,6 +1716,7 @@ mod tests {
 
         let config = TranscriptionConfig {
             api_key: Some("test-groq-key".to_string()),
+            enabled: true,
             openai: Some(zeroclaw_config::schema::OpenAiSttConfig {
                 api_key: Some("test-openai-key".to_string()),
                 model: "whisper-1".to_string(),
