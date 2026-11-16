@@ -188,6 +188,22 @@ pub(super) fn legacy_model(
     entry: Option<&crate::schema::ModelEntryConfig>,
     model_override: Option<&str>,
 ) -> Result<(Value, Value)> {
+    // V4 runtime-profile policy is carried through the typed V4 decoder in a
+    // reserved provider_extra key. Consume it here before projecting ordinary
+    // provider_extra values into the canonical model options.
+    let mut raw = raw.clone();
+    let migrated_extract_text_tool_calls = raw
+        .get_mut("provider_extra")
+        .and_then(Value::as_object_mut)
+        .and_then(|extra| extra.remove("__zeroclaw_migration_extract_text_tool_calls"));
+    if raw
+        .get("provider_extra")
+        .and_then(Value::as_object)
+        .is_some_and(Map::is_empty)
+    {
+        raw.as_object_mut()
+            .and_then(|object| object.remove("provider_extra"));
+    }
     let kind = raw.get("kind").and_then(Value::as_str).unwrap_or(family);
     let kind = if kind == "openai-compatible" {
         "custom"
@@ -302,6 +318,12 @@ pub(super) fn legacy_model(
         {
             options.insert(field.into(), value.clone());
         }
+    }
+    if let Some(value) = migrated_extract_text_tool_calls {
+        let value = value
+            .as_bool()
+            .context("migrated extract_text_tool_calls must be a boolean")?;
+        options.insert("extract_text_tool_calls".into(), value.into());
     }
     let mut metadata = Map::new();
     for field in ["context_window", "vision"] {

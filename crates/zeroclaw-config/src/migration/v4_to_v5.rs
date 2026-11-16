@@ -103,15 +103,18 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
             .and_then(|family| family.get_mut(alias))
             .and_then(toml::Value::as_table_mut)
             .with_context(|| format!("legacy model_provider {reference} is missing"))?;
-        let options = profile
-            .entry("extract_text_tool_calls")
-            .or_insert_with(|| toml::Value::Boolean(false));
-        if !options.is_bool() {
+        let provider_extra = profile
+            .entry("provider_extra")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let Some(provider_extra) = provider_extra.as_table_mut() else {
             bail!(
-                "cannot migrate strict_tool_parsing for {reference}: extract_text_tool_calls must be a boolean"
+                "cannot migrate strict_tool_parsing for {reference}: provider_extra must be a table"
             );
-        }
-        *options = toml::Value::Boolean(false);
+        };
+        provider_extra.insert(
+            "__zeroclaw_migration_extract_text_tool_calls".into(),
+            toml::Value::Boolean(false),
+        );
     }
     Ok(())
 }
