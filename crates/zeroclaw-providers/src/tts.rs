@@ -1171,14 +1171,20 @@ pub struct TtsManager {
     max_text_length: usize,
 }
 
-/// Speech processing remains explicitly opt-in at the workspace boundary.
-/// V4 migration projects dormant provider definitions into canonical models,
-/// so the persisted `enabled` flag is the activation source of truth. This
-/// keeps a legacy `enabled = false` configuration disabled after migration;
-/// adding a model alone never silently enables outbound audio.
+/// Canonical speech models are active by default. Migration marks a retained
+/// legacy definition with `enabled = false` when its old workspace switch was
+/// disabled, so dormant V4 inputs never silently enable outbound audio.
 #[must_use]
 pub fn is_enabled(config: &Config) -> bool {
     config.tts.enabled
+        || config.provider_registry().is_ok_and(|registry| {
+            registry.models.values().any(|model| {
+                matches!(
+                    model,
+                    ModelDefinition::Tts(model) if model.enabled != Some(false)
+                )
+            })
+        })
 }
 
 impl TtsManager {
@@ -1207,7 +1213,10 @@ impl TtsManager {
         };
         let registry = config.provider_registry()?;
         for (reference, model) in &registry.models {
-            if !matches!(model, ModelDefinition::Tts(_)) {
+            if !matches!(
+                model,
+                ModelDefinition::Tts(model) if model.enabled != Some(false)
+            ) {
                 continue;
             }
             let built = registry

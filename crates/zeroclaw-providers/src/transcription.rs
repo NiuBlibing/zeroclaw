@@ -1127,14 +1127,20 @@ pub struct TranscriptionManager {
     agent_transcription_provider: String,
 }
 
-/// Speech processing remains explicitly opt-in at the workspace boundary.
-/// V4 migration projects dormant provider definitions into canonical models,
-/// so the persisted `enabled` flag is the activation source of truth. This
-/// also keeps a legacy `enabled = false` configuration disabled after
-/// migration; adding a model alone never silently turns on microphone input.
+/// Canonical speech models are active by default. Migration marks a retained
+/// legacy definition with `enabled = false` when its old workspace switch was
+/// disabled, so dormant V4 inputs never silently turn on microphone input.
 #[must_use]
 pub fn is_enabled(config: &Config) -> bool {
     config.transcription.enabled
+        || config.provider_registry().is_ok_and(|registry| {
+            registry.models.values().any(|model| {
+                matches!(
+                    model,
+                    ModelDefinition::Asr(model) if model.enabled != Some(false)
+                )
+            })
+        })
 }
 
 impl TranscriptionManager {
@@ -1207,7 +1213,10 @@ impl TranscriptionManager {
             anyhow::Error::msg(format!("invalid canonical provider registry: {error}"))
         })?;
         for (model_ref, model) in &registry.models {
-            if !matches!(model, ModelDefinition::Asr(_)) {
+            if !matches!(
+                model,
+                ModelDefinition::Asr(model) if model.enabled != Some(false)
+            ) {
                 continue;
             }
             match registry

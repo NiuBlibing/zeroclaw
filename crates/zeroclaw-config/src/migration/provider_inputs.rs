@@ -883,6 +883,25 @@ fn normalize_definitions_inner(config: &mut Config, validate: bool) -> Result<()
     }
     let current = project(config)?;
     let mut registry = current.clone();
+    if !config.tts.enabled || !config.transcription.enabled {
+        for model in registry.models.values_mut() {
+            match model {
+                ModelDefinition::Tts(model)
+                    if !config.tts.enabled
+                        && model.provider.as_str().starts_with("legacy.tts.") =>
+                {
+                    model.enabled = Some(false);
+                }
+                ModelDefinition::Asr(model)
+                    if !config.transcription.enabled
+                        && model.provider.as_str().starts_with("legacy.asr.") =>
+                {
+                    model.enabled = Some(false);
+                }
+                _ => {}
+            }
+        }
+    }
     promote_embedding_bindings(config, &current, &mut registry)?;
     for agent in config.agents.values_mut() {
         if !agent.tts_provider.trim().is_empty() {

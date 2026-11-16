@@ -74,6 +74,10 @@ pub struct EmbeddingModelConfig {
 #[serde(deny_unknown_fields)]
 pub struct TtsModelConfig {
     pub provider: ProviderId,
+    /// Explicit activation state used when migration preserves a dormant
+    /// legacy speech definition. Native V5 models omit this and are active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,6 +93,10 @@ pub struct TtsModelConfig {
 #[serde(deny_unknown_fields)]
 pub struct AsrModelConfig {
     pub provider: ProviderId,
+    /// Explicit activation state used when migration preserves a dormant
+    /// legacy speech definition. Native V5 models omit this and are active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
