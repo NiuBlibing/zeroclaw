@@ -1142,7 +1142,9 @@ impl OpenAiCompatibleModelProvider {
             } else {
                 builder.timeout(std::time::Duration::from_secs(timeout))
             };
-            let builder = if let Some(read_timeout) = self.read_timeout_secs {
+            let builder = if !self.read_timeout_disabled
+                && let Some(read_timeout) = self.read_timeout_secs
+            {
                 builder.read_timeout(std::time::Duration::from_secs(read_timeout))
             } else {
                 builder
