@@ -1,0 +1,50 @@
+ Dashboard │ Config │ Code │ Chat │ Logs │ Doctor │ Quickstart │ SOPs                                                 v0.9.0 sessions:1 ram:159.1M(0%) cpu:1.7%
+zeroclaw │ zerocode   config: ~/ref/llm/agent/claws/zeroclaw/.e12452
+ZeroClaw v0.9.0               providers.registry
+┌ Sections ──────────────────┐Edit connections, models, model_presets and fallback together as JSON. Enter inserts a line; Ctrl+S saves. For inherited options,
+│  Foundation                │omit a field to inherit and use the string "null" to clear it. References are validated and unchanged masked credentials are
+│   Provider registry ✓      │┌ Fields ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│   Model routes             ││› providers.registry = {  "connections": {    "openai.demo.gateway": {      "api": {},      "auth": {        "api_key": "***MASK│
+│   Embedding routes         ││                                                                                                                                │
+│   Risk profiles            ││                                                                                                                                │
+│   Runtime profiles         ││                                                                                                                                │
+│   Memory                   ││                                                                                                                                │
+│   Skills                   ││                                                                                                                                │
+│   Skill bundles            ││                                                                                                                                │
+│   Channels                 ││                                                                                                                                │
+│   Hardware                 ││                                                                                                                                │
+│   Agents                   ││                                                                                                                                │
+│   Peer groups              ││                                                                                                                                │
+│   Tunnel                   ││                                                                                                                                │
+│  Agent                     ││                                                                                                                                │
+│   Cron                     ││                                                                                                                                │
+│   Heartbeat                ││                                                                                                                                │
+│   Hooks                    ││                                                                                                                                │
+│   Pacing                   ││                                                                                                                                │
+│   Pipeline                 ││                                                                                                                                │
+│   Query classification     ││                                                                                                                                │
+│   Reliability              ││                                                                                                                                │
+│   Runtime                  ││                                                                                                                                │
+│   Scheduler                ││                                                                                                                                │
+│   Sop                      ││                                                                                                                                │
+│   Verifiable intent        ││                                                                                                                                │
+│  Multi-agent               ││                                                                                                                                │
+│   Delegate                 ││                                                                                                                                │
+│  Tools                     ││                                                                                                                                │
+│   Mcp                      ││                                                                                                                                │
+│   Mcp servers              ││                                                                                                                                │
+│   Mcp bundles              ││                                                                                                                                │
+│   Knowledge bundles        ││                                                                                                                                │
+│   Browser                  ││                                                                                                                                │
+│   Browser delegate         ││                                                                                                                                │
+│   Http request             ││                                                                                                                                │
+│   Image gen                ││                                                                                                                                │
+│   Knowledge                ││                                                                                                                                │
+│   Link enricher            ││                                                                                                                                │
+│   Media pipeline           ││                                                                                                                                │
+│   Multimodal               │└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+└────────────────────────────┘
+Saved "providers". Open sessions already use it; please reload the daemon (Ctrl+r) to apply it everywhere. Press s to view the log.
+
+ Enter=edit  d=reset  ?=help  s=change log
+                                                                                                                                        tui_da27d6a7 ● Connected
