@@ -135,7 +135,9 @@ pub async fn handle_registry_put(
         Err(denied) => return denied.into_response(),
     };
     let mut candidate = commit.current_config();
-    if let Err(error) = zeroclaw_config::provider_registry::editor::stage(&mut candidate, edit) {
+    if let Err(error) =
+        zeroclaw_config::provider_registry::editor::stage_persisted(&mut candidate, edit).await
+    {
         return error_response(ConfigApiError::new(
             ConfigApiCode::ValidationFailed,
             format!("{error:#}"),

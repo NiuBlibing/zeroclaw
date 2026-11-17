@@ -6579,12 +6579,12 @@ data: {\"type\":\"message_stop\"}\n\n",
             entry_b.context_window = Some(1_000_000);
             entry_b.model = Some("glm-5.2".to_string());
 
-            let cfg = Config {
+            let cfg = zeroclaw_config::migration::admit_test_input(&Config {
                 agents,
                 runtime_profiles,
                 providers,
                 ..Config::default()
-            };
+            });
 
             let limits =
                 cfg.resolved_context_limits_for_route("coder", live_provider_ref, "glm-5.2");

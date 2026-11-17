@@ -13,6 +13,9 @@ pub struct ChatApiConfig {
     pub wire_api: Option<WireApi>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_timeout_secs: Option<Override<NonZeroU64>>,
+    /// Streaming total deadline; omission inherits the request deadline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_request_timeout_secs: Option<Override<NonZeroU64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_timeout_secs: Option<Override<NonZeroU64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -31,6 +34,8 @@ pub struct ChatApiPatch {
     pub wire_api: Option<WireApi>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_timeout_secs: Option<Override<NonZeroU64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_request_timeout_secs: Option<Override<NonZeroU64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_timeout_secs: Option<Override<NonZeroU64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -126,6 +131,9 @@ pub struct GrokChatApiConfig {
     pub extra_args: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_acp_stdout_bytes: Option<usize>,
+    /// Bounded subprocess deadline; unlike HTTP requests it cannot be disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_timeout_secs: Option<NonZeroU64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preset: Option<PresetId>,
     #[serde(skip_serializing_if = "ChatOptionsPatch::is_empty")]

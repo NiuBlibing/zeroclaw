@@ -688,6 +688,23 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
     }
 }
 
+/// An optional streaming deadline override. `None` inherits request policy;
+/// `Clear` disables only the streaming total deadline.
+pub type StreamRequestTimeout =
+    Option<zeroclaw_config::provider_registry::Override<std::num::NonZeroU64>>;
+
+pub(crate) fn stream_request_timeout(
+    configured: &StreamRequestTimeout,
+    inherited: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    use zeroclaw_config::provider_registry::Override;
+    match configured {
+        Some(Override::Set(seconds)) => Some(std::time::Duration::from_secs(seconds.get())),
+        Some(Override::Clear) => None,
+        None => inherited,
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
@@ -709,6 +726,8 @@ pub struct ModelProviderRuntimeOptions {
     pub provider_timeout_secs: Option<u64>,
     /// Explicitly disable the adapter's total request timeout.
     pub provider_timeout_disabled: bool,
+    /// Optional streaming-only total deadline; absent inherits request policy.
+    pub provider_stream_request_timeout_secs: StreamRequestTimeout,
     /// Optional per-read idle timeout for streaming and HTTP response bodies.
     /// `None` keeps the adapter's existing idle policy unless disabled below.
     pub provider_read_timeout_secs: Option<u64>,
@@ -802,6 +821,7 @@ impl Default for ModelProviderRuntimeOptions {
             reasoning_effort_passthrough: false,
             provider_timeout_secs: None,
             provider_timeout_disabled: false,
+            provider_stream_request_timeout_secs: None,
             provider_read_timeout_secs: None,
             provider_read_timeout_disabled: false,
             extra_headers: std::collections::HashMap::new(),
@@ -855,6 +875,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         // distinguishes an inherited default from an explicit total deadline.
         provider_timeout_secs: entry.and_then(|e| e.timeout_secs),
         provider_timeout_disabled: false,
+        provider_stream_request_timeout_secs: None,
         provider_read_timeout_secs: None,
         provider_read_timeout_disabled: false,
         extra_headers: entry.map(|e| e.extra_headers.clone()).unwrap_or_default(),
@@ -1345,7 +1366,7 @@ impl StreamTimeouts {
             && let Some(limit) = self.request.filter(|limit| elapsed >= *limit)
         {
             return format!(
-                "request exceeded {}s (request_timeout_secs); increase request_timeout_secs to wait longer: {}",
+                "request exceeded {}s (request_timeout_secs / stream_request_timeout_secs); increase the streaming total deadline to wait longer: {}",
                 limit.as_secs_f64(),
                 format_error_chain(error)
             );

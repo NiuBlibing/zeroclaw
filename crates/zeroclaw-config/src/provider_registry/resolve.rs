@@ -187,6 +187,27 @@ impl ProviderRegistry {
             ));
         }
         let effective = self.resolve_chat(name)?;
+        if effective.stream_request_timeout_secs.is_some()
+            && matches!(
+                connection.kind(),
+                "gemini_cli" | "kilocli" | "grok_cli" | "hailo_ollama"
+            )
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.stream_request_timeout_secs",
+                "HTTP streaming deadlines are unsupported by this connection kind",
+            ));
+        }
+        if matches!(connection, ProviderConnection::GrokCli(_))
+            && matches!(effective.request_timeout_secs, Some(Override::Clear))
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.request_timeout_secs",
+                "subprocess deadline cannot be disabled",
+            ));
+        }
         if let Some(super::Override::Set(temperature)) = effective.options.temperature {
             crate::schema::validate_temperature(temperature)
                 .map_err(|error| RegistryError::model(name, "options.temperature", error))?;
@@ -268,6 +289,15 @@ impl ProviderRegistry {
         let mut options = ChatOptionsPatch::default();
         let mut wire_api = None;
         let mut request_timeout_secs = None;
+        let mut stream_request_timeout_secs = None;
+        if let ProviderConnection::GrokCli(connection) = selection.connection {
+            request_timeout_secs = connection
+                .api
+                .chat
+                .as_ref()
+                .and_then(|api| api.request_timeout_secs)
+                .map(Override::Set);
+        }
         let mut read_timeout_secs = None;
         let mut queue_timeout_secs = match selection.connection {
             ProviderConnection::HailoOllama(connection) => connection
@@ -281,6 +311,7 @@ impl ProviderRegistry {
         if let Some(api) = selection.connection.chat_api() {
             wire_api = api.wire_api;
             request_timeout_secs = api.request_timeout_secs.clone();
+            stream_request_timeout_secs = api.stream_request_timeout_secs.clone();
             read_timeout_secs = api.read_timeout_secs.clone();
             live_pricing = api.live_pricing;
         }
@@ -298,6 +329,10 @@ impl ProviderRegistry {
         if let Some(api) = &model.api {
             wire_api = api.wire_api.or(wire_api);
             request_timeout_secs = api.request_timeout_secs.clone().or(request_timeout_secs);
+            stream_request_timeout_secs = api
+                .stream_request_timeout_secs
+                .clone()
+                .or(stream_request_timeout_secs);
             read_timeout_secs = api.read_timeout_secs.clone().or(read_timeout_secs);
             queue_timeout_secs = api.queue_timeout_secs.or(queue_timeout_secs);
         }
@@ -306,6 +341,7 @@ impl ProviderRegistry {
             selection,
             wire_api,
             request_timeout_secs,
+            stream_request_timeout_secs,
             read_timeout_secs,
             queue_timeout_secs,
             live_pricing,
@@ -370,6 +406,7 @@ pub struct ResolvedChat<'a> {
     pub selection: super::ModelSelection<'a>,
     pub wire_api: Option<WireApi>,
     pub request_timeout_secs: Option<Override<NonZeroU64>>,
+    pub stream_request_timeout_secs: Option<Override<NonZeroU64>>,
     pub read_timeout_secs: Option<Override<NonZeroU64>>,
     pub queue_timeout_secs: Option<NonZeroU64>,
     pub live_pricing: Option<bool>,
@@ -628,4 +665,61 @@ pub struct ResolvedDecision<'a> {
     pub model: &'a str,
     pub wire_api: DecisionWireApi,
     pub request_timeout_secs: Option<Override<NonZeroU64>>,
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn model_stream_deadline_overrides_connection_independently() {
+        let registry: ProviderRegistry = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway": {"kind":"custom", "uri":"https://example.test/v1",
+                "api":{"chat":{"request_timeout_secs":30,"stream_request_timeout_secs":"null"}}}},
+            "models": {
+                "inherited":{"capability":"chat","provider":"gateway","model":"chat"},
+                "bounded":{"capability":"chat","provider":"gateway","model":"chat",
+                    "api":{"stream_request_timeout_secs":60}}
+            }
+        }))
+        .unwrap();
+        let inherited = registry.resolve_chat(&"inherited".into()).unwrap();
+        assert!(
+            matches!(inherited.request_timeout_secs, Some(Override::Set(value)) if value.get()==30)
+        );
+        assert!(matches!(
+            inherited.stream_request_timeout_secs,
+            Some(Override::Clear)
+        ));
+        let bounded = registry.resolve_chat(&"bounded".into()).unwrap();
+        assert!(
+            matches!(bounded.request_timeout_secs, Some(Override::Set(value)) if value.get()==30)
+        );
+        assert!(
+            matches!(bounded.stream_request_timeout_secs, Some(Override::Set(value)) if value.get()==60)
+        );
+    }
+
+    #[test]
+    fn grok_process_deadline_is_inherited_and_cannot_be_disabled() {
+        let document = serde_json::json!({
+            "connections":{"cli":{"kind":"grok_cli","api":{"chat":{
+                "working_directory":"/workspace","request_timeout_secs":30}}}},
+            "models":{"chat":{"capability":"chat","provider":"cli","model":"chat"}}
+        });
+        let registry: ProviderRegistry = serde_json::from_value(document.clone()).unwrap();
+        assert!(
+            matches!(registry.resolve_chat(&"chat".into()).unwrap().request_timeout_secs,
+            Some(Override::Set(value)) if value.get()==30)
+        );
+        let mut document = document;
+        document["models"]["chat"]["api"] = serde_json::json!({"request_timeout_secs":"null"});
+        let error = serde_json::from_value::<ProviderRegistry>(document).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("subprocess deadline cannot be disabled"),
+            "{error}"
+        );
+    }
 }

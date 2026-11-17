@@ -95,6 +95,7 @@ pub struct AnthropicModelProvider {
     /// Whether the total deadline was explicitly selected rather than defaulted.
     timeout_configured: bool,
     timeout_disabled: bool,
+    stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
     /// Opt-in Anthropic server-side fallback targets, sent as the native
@@ -676,6 +677,7 @@ pub struct AnthropicBuilder {
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     timeout_disabled: bool,
+    stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
     server_fallback_models: Vec<String>,
@@ -683,6 +685,11 @@ pub struct AnthropicBuilder {
 }
 
 impl AnthropicBuilder {
+    pub(crate) fn stream_request_timeout(mut self, timeout: super::StreamRequestTimeout) -> Self {
+        self.stream_request_timeout = timeout;
+        self
+    }
+
     pub(crate) fn single_tool_rounds_supported(mut self, supported: bool) -> Self {
         self.single_tool_rounds_supported = supported;
         self
@@ -766,6 +773,7 @@ impl AnthropicBuilder {
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             timeout_configured: self.timeout_secs.is_some(),
             timeout_disabled: self.timeout_disabled,
+            stream_request_timeout: self.stream_request_timeout,
             read_timeout_secs: self.read_timeout_secs,
             read_timeout_disabled: self.read_timeout_disabled,
             server_fallback_models: self.server_fallback_models,
@@ -787,6 +795,7 @@ impl AnthropicModelProvider {
             max_tokens: None,
             timeout_secs: None,
             timeout_disabled: false,
+            stream_request_timeout: None,
             read_timeout_secs: None,
             read_timeout_disabled: false,
             server_fallback_models: Vec::new(),
@@ -2488,8 +2497,12 @@ impl AnthropicModelProvider {
     /// headers and the complete body; read-idle protection is independent.
     fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
         let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-        if self.timeout_configured && !self.timeout_disabled {
-            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        if let Some(timeout) = super::stream_request_timeout(
+            &self.stream_request_timeout,
+            (self.timeout_configured && !self.timeout_disabled)
+                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+        ) {
+            builder = builder.timeout(timeout);
         }
         let builder = if self.read_timeout_disabled {
             builder

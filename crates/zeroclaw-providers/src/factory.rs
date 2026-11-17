@@ -295,6 +295,7 @@ pub fn apply_compat_options(
     mut b: crate::compatible::OpenAiCompatibleBuilder,
     opts: &ModelProviderRuntimeOptions,
 ) -> Box<dyn ModelProvider> {
+    b = b.stream_request_timeout(opts.provider_stream_request_timeout_secs.clone());
     if let Some(native_tools) = opts.native_tools {
         b = b.with_native_tools(native_tools);
     }
@@ -416,6 +417,7 @@ fn build_responses_provider_if_requested(
         return None;
     }
     let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias)
+        .stream_request_timeout(opts.provider_stream_request_timeout_secs.clone())
         .credential(key)
         .single_tool_rounds_supported(single_tool_rounds_supported);
     if let Some(url) = base_url {
@@ -1198,6 +1200,7 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = crate::openrouter::OpenRouterModelProvider::builder(alias)
+            .stream_request_timeout(opts.provider_stream_request_timeout_secs.clone())
             .credential(key)
             .max_tokens(opts.provider_max_tokens);
         if let Some(t) = opts.provider_timeout_secs {
@@ -1230,6 +1233,7 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
+            .stream_request_timeout(opts.provider_stream_request_timeout_secs.clone())
             .credential(key)
             .server_fallback_models(self.server_fallback_models.clone())
             .single_tool_rounds_supported(
@@ -1831,7 +1835,7 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
                 .env_passthrough(self.env_passthrough.clone())
                 .extra_args(self.extra_args.clone())
                 .max_acp_stdout_bytes(self.max_acp_stdout_bytes)
-                .timeout_secs(self.base.timeout_secs)
+                .timeout_secs(opts.provider_timeout_secs.or(self.base.timeout_secs))
                 // Optional send-path only: alias `vision = true` makes
                 // ZeroClaw emit ACP image blocks. Grok still advertises
                 // image=false through 0.2.118 and does not reliably use the
@@ -2163,6 +2167,7 @@ pub(crate) fn runtime_options_for_chat(
                 Override::Set(value) => Some(value.get()),
                 Override::Clear => None,
             });
+    runtime.provider_stream_request_timeout_secs = resolved.stream_request_timeout_secs.clone();
     runtime.provider_timeout_disabled = matches!(
         resolved.request_timeout_secs.as_ref(),
         Some(Override::Clear)

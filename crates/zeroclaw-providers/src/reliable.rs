@@ -185,6 +185,10 @@ impl ReliableCallAccountingScope {
     pub(crate) fn take(&self) -> AccountedCallReport {
         std::mem::take(&mut *self.accounting.lock()).into_report()
     }
+
+    pub(crate) fn accepted_route(&self) -> Option<AcceptedRoute> {
+        self.accounting.lock().accepted_route.clone()
+    }
 }
 
 #[cfg(test)]

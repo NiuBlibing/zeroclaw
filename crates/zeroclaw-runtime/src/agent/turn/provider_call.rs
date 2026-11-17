@@ -53,15 +53,24 @@ struct ProviderCallInput<'a> {
     guard_tools: Option<&'a [ToolSpec]>,
 }
 
-fn normalize_recovery(result: Result<ChatResponse>, ctx: &TurnCtx<'_>) -> Result<ChatResponse> {
+fn normalize_recovery(
+    result: Result<ChatResponse>,
+    ctx: &TurnCtx<'_>,
+    config: Option<&zeroclaw_config::schema::Config>,
+    scope: &zeroclaw_providers::dispatch::AccountedChatScope,
+) -> Result<ChatResponse> {
+    let route = scope.accepted_route();
+    let policy = config
+        .zip(route.as_ref())
+        .map(|(config, route)| {
+            config.model_text_extraction(route.selection_ref().unwrap_or(route.provider_ref()))
+        })
+        .unwrap_or(zeroclaw_api::TextExtraction {
+            reasoning: Some(ctx.extract_text_reasoning),
+            tool_calls: !ctx.text_tool_calls_disabled,
+        });
     result.map(|mut response| {
-        zeroclaw_providers::response::normalize_response(
-            &mut response,
-            zeroclaw_api::TextExtraction {
-                reasoning: Some(ctx.extract_text_reasoning),
-                tool_calls: !ctx.text_tool_calls_disabled,
-            },
-        );
+        zeroclaw_providers::response::normalize_response(&mut response, policy);
         response
     })
 }
@@ -349,11 +358,14 @@ pub(crate) async fn call_provider(
             std::sync::Arc::new(move |model: &str| config.model_text_extraction(model))
                 as std::sync::Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>
         }
-        None => std::sync::Arc::new(|_: &str| zeroclaw_api::TextExtraction {
-            reasoning: Some(true),
-            tool_calls: false,
-        })
-            as std::sync::Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>,
+        None => {
+            let policy = zeroclaw_api::TextExtraction {
+                reasoning: Some(ctx.extract_text_reasoning),
+                tool_calls: !ctx.text_tool_calls_disabled,
+            };
+            std::sync::Arc::new(move |_: &str| policy)
+                as std::sync::Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>
+        }
     };
     zeroclaw_api::scope_text_extraction(
         Some(resolver),
@@ -634,7 +646,7 @@ async fn call_provider_inner(
                                     recovery.await
                                 };
                                 let result = if recover_images {
-                                    let recovery_result = normalize_recovery(recovery_result, ctx);
+                                    let recovery_result = normalize_recovery(recovery_result, ctx, config, &scope);
                                     match recovery_result {
                                         Ok(response)
                                             if !response.is_semantically_empty_terminal() =>
@@ -715,7 +727,7 @@ async fn call_provider_inner(
                             )),
                         )
                         .await;
-                        match normalize_recovery(recovery, ctx) {
+                        match normalize_recovery(recovery, ctx, config, &scope) {
                             Ok(response) if !response.is_semantically_empty_terminal() => {
                                 image_recovery_succeeded = true;
                                 Ok(response)
@@ -2402,6 +2414,78 @@ mod streaming_fallback_tests {
             assert_eq!(outcome.attempts.len(), 2);
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn image_recovery_uses_the_fallback_models_extraction_policy() {
+        use axum::{Json, response::IntoResponse};
+        let app = Router::new().route("/chat/completions", post(|Json(body): Json<serde_json::Value>| async move {
+            let has_image = body["messages"].as_array().unwrap().iter().any(|message|
+                message["content"].as_array().is_some_and(|parts|
+                    parts.iter().any(|part| part["type"] == "image_url")));
+            if has_image {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":{"message":"image request rejected"}}))).into_response();
+            }
+            if body["model"] == "primary-model" {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":{"message":"primary unavailable"}}))).into_response();
+            }
+            Json(serde_json::json!({"choices":[{"message":{"content":"<think>literal text</think>"}}]})).into_response()
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server =
+            zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await.unwrap() });
+        let config = serde_json::from_value(serde_json::json!({
+            "reliability":{"provider_retries":0,"provider_backoff_ms":1},
+            "providers":{
+                "connections":{"gateway":{"kind":"custom","uri":format!("http://{addr}")}},
+                "models":{
+                    "primary":{"capability":"chat","provider":"gateway","model":"primary-model","options":{"extract_text_reasoning":true}},
+                    "backup":{"capability":"chat","provider":"gateway","model":"backup-model","options":{"extract_text_reasoning":false}}
+                },
+                "fallback":{"primary":["backup"]}
+            }
+        })).unwrap();
+        let original = [ChatMessage::user(
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
+        )];
+        let recovery = [ChatMessage::user("inspect")];
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let mut ctx = recovery_test_ctx(&observer, &pacing);
+        ctx.extract_text_reasoning = true;
+        for streaming in [false, true] {
+            let provider = zeroclaw_providers::model::build_reliable_provider(
+                &config,
+                "primary",
+                Default::default(),
+            )
+            .unwrap()
+            .provider;
+            let outcome = call_provider(
+                &ctx,
+                Some(&config),
+                provider.as_ref(),
+                "primary",
+                "primary-model",
+                "primary-model",
+                ChatRequest::new(&original),
+                Some(&recovery),
+                streaming,
+                ToolRoundPolicy::Batch,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(outcome.image_recovery_succeeded, "streaming={streaming}");
+            assert_eq!(
+                outcome.chat_result.unwrap().text.as_deref(),
+                Some("<think>literal text</think>"),
+                "streaming={streaming}"
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]

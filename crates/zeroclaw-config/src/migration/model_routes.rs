@@ -173,6 +173,7 @@ pub(super) fn legacy_chat_api_fields(kind: &str) -> &'static [(&'static str, &'s
     match kind {
         "gemini_cli" | "kilocli" => &[("binary_path", "binary_path")],
         "grok_cli" => &[
+            ("timeout_secs", "request_timeout_secs"),
             ("binary_path", "binary_path"),
             ("working_directory", "working_directory"),
             ("env_passthrough", "env_passthrough"),
@@ -323,6 +324,26 @@ pub(super) fn legacy_model(
             api.insert(new.into(), value.clone());
         }
     }
+    if kind == "grok_cli" && api.get("request_timeout_secs").and_then(Value::as_u64) == Some(0) {
+        // The historical process builder treated zero as the bounded default.
+        api.remove("request_timeout_secs");
+    }
+    if kind != "grok_cli"
+        && let Some(timeout) = api.get("request_timeout_secs").and_then(Value::as_u64)
+    {
+        if timeout == 0 {
+            // V4 ignored zero rather than disabling transport bounds.
+            api.remove("request_timeout_secs");
+        } else {
+            // V4's finite timeout applied only to non-streaming requests.
+            // Express that policy with ordinary V5 fields instead of a
+            // legacy-only runtime branch or a new total streaming deadline.
+            api.insert("stream_request_timeout_secs".into(), json!("null"));
+            if !matches!(kind, "anthropic" | "openrouter") {
+                api.insert("read_timeout_secs".into(), json!(timeout.max(300)));
+            }
+        }
+    }
     // V3 omitted wire_api means chat completions, including old OpenAI rows.
     if !matches!(kind, "gemini_cli" | "kilocli" | "grok_cli" | "hailo_ollama") {
         api.entry("wire_api").or_insert(json!("chat_completions"));
@@ -442,11 +463,15 @@ mod tests {
             let (connection, _) = legacy_model(&raw, kind, None, None).unwrap();
             let decoded: ProviderConnection = serde_json::from_value(connection.clone()).unwrap();
             assert_eq!(decoded.kind(), kind);
-            assert!(
-                connection["api"]["chat"]
-                    .get("request_timeout_secs")
-                    .is_none()
-            );
+            if kind == "grok_cli" {
+                assert_eq!(connection["api"]["chat"]["request_timeout_secs"], 30);
+            } else {
+                assert!(
+                    connection["api"]["chat"]
+                        .get("request_timeout_secs")
+                        .is_none()
+                );
+            }
             if kind == "grok_cli" {
                 for field in [
                     "binary_path",
@@ -458,6 +483,46 @@ mod tests {
                     assert_eq!(connection["api"]["chat"][field], raw[field]);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn grok_zero_timeout_keeps_the_bounded_process_default() {
+        let (connection, _) = legacy_model(
+            &json!({"model":"chat", "working_directory":"/workspace", "timeout_secs":0}),
+            "grok_cli",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            connection["api"]["chat"]
+                .get("request_timeout_secs")
+                .is_none()
+        );
+        serde_json::from_value::<ProviderConnection>(connection).unwrap();
+    }
+
+    #[test]
+    fn finite_v4_http_timeout_does_not_create_a_stream_total_deadline() {
+        for timeout in [30, 600] {
+            let (connection, _) = legacy_model(
+                &json!({"model":"chat", "uri":"https://example.test/v1", "timeout_secs":timeout}),
+                "custom",
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(connection["api"]["chat"]["request_timeout_secs"], timeout);
+            assert_eq!(
+                connection["api"]["chat"]["stream_request_timeout_secs"],
+                "null"
+            );
+            assert_eq!(
+                connection["api"]["chat"]["read_timeout_secs"],
+                timeout.max(300)
+            );
+            serde_json::from_value::<ProviderConnection>(connection).unwrap();
         }
     }
 

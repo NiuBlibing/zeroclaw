@@ -139,6 +139,18 @@ overrides. `request_timeout_secs` is the total request bound and
 `read_timeout_secs` is the response-read idle bound; they are independent.
 An explicit finite request deadline also covers streaming. `"null"` disables
 only the specified deadline; omitted fields inherit the API or driver baseline.
+`stream_request_timeout_secs` optionally overrides only the streaming total
+deadline, at the same API or model API level. Omission inherits the request
+policy; `"null"` allows long-running streams while retaining their read-idle
+bound. V4 migration sets that streaming override to `"null"` when converting a
+finite `timeout_secs`, preserving the old non-streaming deadline and stream
+idle rule (`max(300, timeout_secs)` for compatible adapters). It does not turn
+a formerly valid long response into a total-timeout failure.
+For `grok_cli`, `api.chat.request_timeout_secs` is a bounded subprocess deadline,
+not an HTTP timeout. It may be overridden by a chat model's
+`api.request_timeout_secs`, but cannot be disabled with `"null"`. Migration
+preserves a finite V4 `timeout_secs`; the historical zero value keeps the
+driver's bounded default.
 An `openai` connection may omit `uri` and uses `https://api.openai.com/v1` for
 decision requests. Fireworks uses its documented
 `https://api.fireworks.ai/inference/v1` prefix, and OpenRouter uses
@@ -226,6 +238,13 @@ Both fields can be shared through `providers.model_presets.<id>.options`, set as
 connection defaults in `api.chat.options`, and overridden in each chat model's
 `options`. They accept `true` or `false`; the `"null"` sentinel is not supported.
 The former runtime-profile `strict_tool_parsing` setting has been removed.
+V4 migration transfers this policy to the models used by each agent, including
+reachable effort and classifier routes. Non-strict agents retain text tool
+extraction, including custom gateways. If strict and non-strict agents share
+the same model selection, migration refuses to choose one policy silently:
+split that selection into separate model references with explicit extraction
+options before retrying the migration. Existing `default` and sole named-model
+selection retain their V4 precedence when fallback models are materialized.
 
 A tool-bearing turn requires the same tool protocol across its fallback
 chain. Mixing native-tool and text-only candidates is rejected before a

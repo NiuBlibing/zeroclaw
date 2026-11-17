@@ -566,7 +566,7 @@ fn restore_connection_secrets(value: &mut Value, current: &Value, secret_map: bo
 impl ProviderConnection {
     pub(super) fn with_secret_json_for_editor(
         &mut self,
-        mut visit: impl FnMut(&str) -> anyhow::Result<()>,
+        mut visit: impl FnMut(&mut String) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         self.with_secret_json(|secret, _| visit(secret), "providers.connections")
     }

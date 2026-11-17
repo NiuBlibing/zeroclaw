@@ -6318,7 +6318,7 @@ mod tests {
             .unwrap()
             .context_window = Some(16_000);
         assert_eq!(
-            config
+            zeroclaw_config::migration::admit_test_input(&config)
                 .resolved_context_limits_for_route("worker", "custom", "selected-id")
                 .model_context_window,
             16_000

@@ -78,6 +78,7 @@ pub struct OpenAiCompatibleModelProvider {
     /// this is false, while an explicit finite value applies to streaming too.
     timeout_configured: bool,
     timeout_disabled: bool,
+    stream_request_timeout: super::StreamRequestTimeout,
     /// Optional HTTP response-read idle timeout. `None` uses the streaming
     /// baseline; `read_timeout_disabled` explicitly removes that baseline.
     read_timeout_secs: Option<u64>,
@@ -548,6 +549,7 @@ pub struct OpenAiCompatibleBuilder {
     timeout_secs: Option<u64>,
     timeout_configured: bool,
     timeout_disabled: bool,
+    stream_request_timeout: super::StreamRequestTimeout,
     read_timeout_secs: Option<u64>,
     read_timeout_disabled: bool,
     extra_headers: std::collections::HashMap<String, String>,
@@ -584,6 +586,11 @@ pub struct OpenAiCompatibleBuilder {
 }
 
 impl OpenAiCompatibleBuilder {
+    pub(crate) fn stream_request_timeout(mut self, timeout: super::StreamRequestTimeout) -> Self {
+        self.stream_request_timeout = timeout;
+        self
+    }
+
     /// The configured `[multimodal]` policy this provider normalizes under.
     ///
     /// Defaults to `MultimodalConfig::default()`; `apply_compat_options`
@@ -922,6 +929,7 @@ impl OpenAiCompatibleBuilder {
             timeout_secs: self.timeout_secs.unwrap_or(120),
             timeout_configured: self.timeout_configured,
             timeout_disabled: self.timeout_disabled,
+            stream_request_timeout: self.stream_request_timeout,
             read_timeout_secs: self.read_timeout_secs,
             read_timeout_disabled: self.read_timeout_disabled,
             extra_headers: self.extra_headers,
@@ -970,6 +978,7 @@ impl OpenAiCompatibleModelProvider {
             timeout_secs: None,
             timeout_configured: false,
             timeout_disabled: false,
+            stream_request_timeout: None,
             read_timeout_secs: None,
             read_timeout_disabled: false,
             extra_headers: std::collections::HashMap::new(),
@@ -1175,8 +1184,11 @@ impl OpenAiCompatibleModelProvider {
 
     fn streaming_timeouts(&self) -> super::StreamTimeouts {
         super::StreamTimeouts {
-            request: (self.timeout_configured && !self.timeout_disabled)
-                .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            request: super::stream_request_timeout(
+                &self.stream_request_timeout,
+                (self.timeout_configured && !self.timeout_disabled)
+                    .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            ),
             read: (!self.read_timeout_disabled).then(|| {
                 self.read_timeout_secs.map_or_else(
                     || super::stream_idle_timeout(self.timeout_secs),
@@ -10260,6 +10272,59 @@ mod tests {
             );
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn migrated_v4_timeout_keeps_streams_alive_beyond_the_nonstream_deadline() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::provider_registry::Override;
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_delay(std::time::Duration::from_millis(1200))
+                .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n"))
+            .mount(&server).await;
+        let config = zeroclaw_config::migration::migrate_to_current(&format!(
+            r#"
+schema_version = 4
+[providers.models.custom.main]
+model = "test-model"
+uri = "{}"
+api_key = "fixture-key"
+timeout_secs = 1
+"#,
+            server.uri()
+        ))
+        .unwrap();
+        let registry = config.provider_registry().unwrap();
+        let resolved = registry.resolve_chat(&"custom.main".into()).unwrap();
+        assert!(matches!(resolved.request_timeout_secs,
+            Some(Override::Set(seconds)) if seconds.get() == 1));
+        assert!(matches!(
+            resolved.stream_request_timeout_secs,
+            Some(Override::Clear)
+        ));
+        let provider =
+            crate::factory::dispatch_model_ref(&config, &"custom.main".into(), &Default::default())
+                .unwrap();
+        let chunks = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider
+                .stream_chat_with_system(None, "hi", "test-model", None, StreamOptions::new(true))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+        assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+        assert!(
+            chunks
+                .iter()
+                .filter_map(|chunk| chunk.as_ref().ok())
+                .any(|chunk| chunk.delta == "hello"),
+            "{chunks:?}"
+        );
     }
 
     #[tokio::test]

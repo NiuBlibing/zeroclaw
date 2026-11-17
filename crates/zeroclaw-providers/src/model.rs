@@ -84,6 +84,51 @@ pub struct ProviderOverrides<'a> {
     pub api_key: Option<&'a str>,
 }
 
+/// Compare the chat construction inputs, excluding independent speech,
+/// embedding and decision definitions. This is an on-demand view of Config,
+/// used before waiting for active chat sessions during a registry edit.
+pub fn chat_construction_changed(previous: &Config, next: &Config) -> anyhow::Result<bool> {
+    fn inputs(config: &Config) -> anyhow::Result<serde_json::Value> {
+        use zeroclaw_api::capability::Capability;
+        let mut registry = config.provider_registry()?;
+        registry
+            .models
+            .retain(|_, model| model.capability() == Capability::Chat);
+        registry
+            .connections
+            .retain(|id, _| registry.models.values().any(|model| model.provider() == id));
+        registry.model_presets.retain(|_, preset| {
+            matches!(
+                preset,
+                zeroclaw_config::provider_registry::ModelPreset::Chat(_)
+            )
+        });
+        let mut value = serde_json::to_value(registry)?;
+        if let Some(connections) = value["connections"].as_object_mut() {
+            for connection in connections.values_mut() {
+                if let Some(api) = connection
+                    .get_mut("api")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    api.retain(|capability, _| capability == "chat");
+                }
+                if let Some(capabilities) = connection
+                    .get_mut("capabilities")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    capabilities.retain(|capability| capability == "chat");
+                }
+            }
+        }
+        Ok(serde_json::json!({
+            "registry": value,
+            "runtime": crate::provider_runtime_options_for_bare_family(config),
+            "reliability": config.reliability,
+        }))
+    }
+    Ok(inputs(previous)? != inputs(next)?)
+}
+
 /// Whether a mutable root config property is materialized into every model
 /// binding. Profile and route dependencies are resolved separately from Config.
 pub fn shared_construction_depends_on_prop(prop: &str) -> bool {
@@ -485,6 +530,32 @@ pub fn build_model(
 mod tests {
     use super::*;
     use zeroclaw_config::schema::{ModelEntryConfig, ModelRouteConfig};
+
+    #[test]
+    fn speech_edits_do_not_refresh_chat_but_shared_policy_does() {
+        let mut previous = Config::default();
+        previous.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway": {"kind":"openai", "auth":{"mode":"api_key","api_key":"test"}}},
+            "models": {
+                "chat": {"capability":"chat","provider":"gateway","model":"gpt-test"},
+                "voice": {"capability":"tts","provider":"gateway","model":"tts-test"}
+            }
+        })).unwrap();
+        let mut next = previous.clone();
+        zeroclaw_config::provider_registry::editor::update(&mut next, |registry| {
+            let zeroclaw_config::provider_registry::ModelDefinition::Tts(model) =
+                registry.models.get_mut("voice").unwrap()
+            else {
+                unreachable!()
+            };
+            model.model = Some("tts-new".into());
+            Ok(())
+        })
+        .unwrap();
+        assert!(!chat_construction_changed(&previous, &next).unwrap());
+        next.runtime.reasoning_effort = Some("high".into());
+        assert!(chat_construction_changed(&previous, &next).unwrap());
+    }
 
     #[test]
     fn bare_provider_override_keeps_the_requested_family() {

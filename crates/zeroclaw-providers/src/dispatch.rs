@@ -377,6 +377,12 @@ pub struct AccountedChatScope {
 }
 
 impl AccountedChatScope {
+    /// Read the successful transport selection without draining accounting or
+    /// committing semantic acceptance. Recovery uses it to resolve model policy.
+    pub fn accepted_route(&self) -> Option<AcceptedRoute> {
+        self.inner.accepted_route()
+    }
+
     /// Start the only lifecycle scope allowed by the providers/runtime
     /// accounting contract. `Default` is intentionally not implemented: it
     /// would add an unaudited second public construction capability.

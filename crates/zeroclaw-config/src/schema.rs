@@ -27616,7 +27616,7 @@ fn collect_onepassword_reference_snapshots(
     Ok(snapshots)
 }
 
-fn restore_onepassword_references_for_save(
+pub(crate) fn restore_onepassword_references_for_save(
     config_to_save: &mut Config,
     snapshots: &std::collections::HashMap<String, String>,
     dirty_paths: &std::collections::HashSet<String>,

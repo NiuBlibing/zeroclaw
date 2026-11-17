@@ -709,14 +709,10 @@ fn reconcile_embedding_identity(
         Some(stored)
             if stored.model == current.model
                 && stored.dimensions == current.dimensions
-                && (current
-                    .provider
-                    .strip_prefix(&format!("{}:", stored.provider))
-                    .is_some()
-                    || legacy_embedding_provider_matches_current(
-                        &stored.provider,
-                        &current.provider,
-                    )) =>
+                && legacy_embedding_provider_matches_current(
+                    &stored.provider,
+                    &current.provider,
+                ) =>
         {
             // Older stores stamped only the provider name. The current
             // OpenAI-compatible identity also includes an endpoint/header
@@ -1423,7 +1419,7 @@ mod tests {
 
     #[tokio::test]
     async fn identity_upgrade_from_legacy_openai_compatible_names_keeps_vectors() {
-        for legacy_provider in ["openrouter", "custom:https://api.example.com/v1"] {
+        for legacy_provider in ["openai", "openrouter", "custom:https://api.example.com/v1"] {
             let tmp = TempDir::new().unwrap();
             let mem = static_sqlite(tmp.path(), 4);
             let stored = ident(legacy_provider, "model-a", 4);
@@ -1457,6 +1453,27 @@ mod tests {
             .await
             .unwrap();
 
+        let current = ident(
+            &legacy_embedding_provider_digest("custom:https://new.example/v1").unwrap(),
+            "model-a",
+            4,
+        );
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &current, false),
+            EmbeddingIdentityOutcome::Invalidated(1)
+        );
+        assert_eq!(embedded_rows(&mem), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_openai_identity_does_not_adopt_a_different_endpoint() {
+        let tmp = TempDir::new().unwrap();
+        let mem = static_sqlite(tmp.path(), 4);
+        mem.record_embedding_identity(&ident("openai", "model-a", 4))
+            .unwrap();
+        mem.store("legacy", "pre-existing row", MemoryCategory::Core, None)
+            .await
+            .unwrap();
         let current = ident(
             &legacy_embedding_provider_digest("custom:https://new.example/v1").unwrap(),
             "model-a",

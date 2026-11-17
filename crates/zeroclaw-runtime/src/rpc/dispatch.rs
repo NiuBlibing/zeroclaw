@@ -10042,7 +10042,8 @@ impl RpcDispatcher {
             self.require_additional_grant(method, Resource::Config, verb)?;
         }
         let mut candidate = Box::new(self.ctx.config.read().clone());
-        editor::stage(&mut candidate, edit)
+        editor::stage_persisted(&mut candidate, edit)
+            .await
             .map_err(|error| rpc_err(INVALID_PARAMS, format!("{error:#}")))?;
         // A model can change without its connection changing. Match the real
         // embedding consumer (including routes), then rebuild its entire view
@@ -10446,6 +10447,17 @@ impl RpcDispatcher {
         scope: &LiveSessionRefreshScope,
     ) -> Result<Vec<PreparedLiveSessionRefresh>, JsonRpcError> {
         let previous_config = ctx.config.read().clone();
+        if matches!(scope, LiveSessionRefreshScope::SharedConstruction)
+            && !zeroclaw_providers::model::chat_construction_changed(&previous_config, config)
+                .map_err(|error| {
+                    rpc_err(
+                        INVALID_PARAMS,
+                        format!("cannot compare chat configuration: {error}"),
+                    )
+                })?
+        {
+            return Ok(Vec::new());
+        }
         let config_generation = Arc::new(config.clone());
         let session_ids = ctx.sessions.list_ids().await;
         let mut prepared = Vec::new();
@@ -48270,7 +48282,8 @@ options = { temperature = 0.2 }
 
         let on_disk = std::fs::read_to_string(&config_path).unwrap();
         assert!(
-            on_disk.parse::<toml::Value>().unwrap()["gateway"]["port"].as_integer() == Some(43124),
+            toml::from_str::<toml::Value>(&on_disk).unwrap()["gateway"]["port"].as_integer()
+                == Some(43124),
             "config/set must persist once unblocked; on-disk file:\n{on_disk}"
         );
     }

@@ -77,6 +77,53 @@ pub fn update(
     )
 }
 
+/// Stage an external editor's replacement only while its persisted baseline
+/// still matches the daemon. The caller holds the normal config commit lock.
+/// Restore environment and external-secret references for this comparison;
+/// resolving an `op://` reference again would compare the secret's live value
+/// rather than the operator's saved configuration.
+pub async fn stage_persisted(config: &mut Config, edit: RegistryEdit) -> Result<()> {
+    let raw = match tokio::fs::read_to_string(&config.config_path).await {
+        Ok(raw) => Some(raw),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("cannot inspect persisted provider registry"),
+    };
+    if let Some(raw) = raw {
+        let disk: Config = toml::from_str(&raw)
+            .context("config changed on disk; reload before saving the provider registry")?;
+        let mut saved = config.clone();
+        crate::env_overrides::mask_env_overrides_for_save(
+            &mut saved,
+            &config.pre_override_snapshots,
+        )?;
+        crate::schema::restore_onepassword_references_for_save(
+            &mut saved,
+            &config.onepassword_reference_snapshots,
+            &Default::default(),
+        )?;
+        let mut disk_registry = disk.provider_registry()?;
+        let root = config
+            .config_path
+            .parent()
+            .context("config path has no parent")?;
+        let store = crate::secrets::SecretStore::new(root, disk.secrets.encrypt);
+        for connection in disk_registry.connections.values_mut() {
+            connection.with_secret_json_for_editor(|secret| {
+                if !crate::secrets::SecretStore::is_onepassword_ref(secret) {
+                    *secret = store.decrypt(secret)?;
+                }
+                Ok(())
+            })?;
+        }
+        ensure!(
+            serde_json::to_value(disk_registry)?
+                == serde_json::to_value(saved.provider_registry()?)?,
+            "provider registry changed on disk; reload before saving"
+        );
+    }
+    stage(config, edit)
+}
+
 /// Stage a complete, validated replacement on a caller-owned config candidate.
 /// No disk or live config changes occur here. Unchanged masked secrets are
 /// restored from the latest admitted config using the normal secret lifecycle.
@@ -140,10 +187,56 @@ impl super::ProviderConnection {
     fn validate_editor_secrets(&mut self) -> Result<()> {
         self.with_secret_json_for_editor(|secret| {
             ensure!(
-                secret != MASKED_SECRET && secret != "****",
+                secret.as_str() != MASKED_SECRET && secret.as_str() != "****",
                 "masked secret has no existing credential to preserve"
             );
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn persisted_edit_checks_unmasked_disk_registry_without_resolving_external_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway": {"kind":"openai", "auth":{"mode":"api_key", "api_key":"op://test/item/key"}}},
+            "models": {"chat": {"capability":"chat", "provider":"gateway", "model":"test"}}
+        })).unwrap();
+        tokio::fs::write(&config.config_path, toml::to_string(&config).unwrap())
+            .await
+            .unwrap();
+        let expected = snapshot(&config).unwrap();
+        let edit = RegistryEdit {
+            expected: expected.clone(),
+            registry: expected,
+        };
+        stage_persisted(&mut config, edit.clone()).await.unwrap();
+
+        let mut disk = config.clone();
+        update(&mut disk, |registry| {
+            let super::super::ModelDefinition::Chat(model) =
+                registry.models.get_mut("chat").unwrap()
+            else {
+                unreachable!()
+            };
+            model.model = Some("edited-on-disk".into());
+            Ok(())
+        })
+        .unwrap();
+        tokio::fs::write(&config.config_path, toml::to_string(&disk).unwrap())
+            .await
+            .unwrap();
+        let before = snapshot(&config).unwrap();
+        let error = stage_persisted(&mut config, edit).await.unwrap_err();
+        assert!(error.to_string().contains("changed on disk"), "{error:#}");
+        assert_eq!(snapshot(&config).unwrap(), before);
     }
 }

@@ -44,12 +44,11 @@ fn project_provider_tables(
         {
             raw["uri"] = serde_json::Value::String(uri.to_string());
         }
-        // An explicit profile-level `model` remains the primary model even
-        // when V5 migration materializes a same-connection fallback entry.
-        // Only a profile with no primary model may infer its primary from a
-        // single nested entry.
+        // Preserve V4 selection: `default`, then the sole named entry, then
+        // the profile's model. Migration-generated fallback nodes are separate
+        // canonical models and cannot change the original named-entry count.
         let selected = profile.models.get("default").or_else(|| {
-            (profile.model.is_none() && profile.models.len() == 1)
+            (profile.models.len() == 1)
                 .then(|| profile.models.values().next())
                 .flatten()
         });

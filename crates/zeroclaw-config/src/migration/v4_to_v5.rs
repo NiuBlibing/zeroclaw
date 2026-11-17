@@ -35,7 +35,7 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
         return Ok(());
     };
 
-    let bindings: Vec<((String, Option<String>), bool)> = root
+    let mut bindings: Vec<((String, Option<String>), bool)> = root
         .get("agents")
         .and_then(toml::Value::as_table)
         .into_iter()
@@ -99,6 +99,41 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
         })
         .collect();
 
+    // Provider fallbacks were also executed under the consuming agent's
+    // parser policy. Traverse the legacy graph before retiring its edges.
+    let mut visited = std::collections::HashSet::new();
+    let mut cursor = 0;
+    while cursor < bindings.len() {
+        let (reference, strict) = bindings[cursor].clone();
+        cursor += 1;
+        if !visited.insert((reference.clone(), strict)) {
+            continue;
+        }
+        let Some((family, alias)) = reference.0.split_once('.') else {
+            continue;
+        };
+        for fallback in models
+            .get(family)
+            .and_then(|family| family.get(alias))
+            .and_then(|profile| profile.get("fallback"))
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+        {
+            let target = if fallback.contains('.') {
+                fallback.to_owned()
+            } else {
+                format!("{family}.{fallback}")
+            };
+            if let Some(target) = legacy_model_selection(models, &target) {
+                if !visited.contains(&(target.clone(), strict)) {
+                    bindings.push((target, strict));
+                }
+            }
+        }
+    }
+
     let mut strict_refs = std::collections::HashSet::new();
     let mut non_strict_refs = std::collections::HashSet::new();
     for (reference, strict) in bindings {
@@ -132,7 +167,15 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
     else {
         return Ok(());
     };
-    for reference in strict_refs {
+    for (reference, extract) in strict_refs
+        .into_iter()
+        .map(|reference| (reference, false))
+        .chain(
+            non_strict_refs
+                .into_iter()
+                .map(|reference| (reference, true)),
+        )
+    {
         let (reference, model_alias) = reference;
         let (family, alias) = reference
             .split_once('.')
@@ -165,7 +208,7 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
         };
         provider_extra.insert(
             "__zeroclaw_migration_extract_text_tool_calls".into(),
-            toml::Value::Boolean(false),
+            toml::Value::Boolean(extract),
         );
     }
     Ok(())
@@ -231,6 +274,7 @@ fn migrate_profile_fallbacks(value: &mut toml::Value) -> Result<()> {
     };
     let mut additions = Vec::<(String, Vec<String>)>::new();
     let mut generated = toml::Table::new();
+    let mut generated_connections = toml::Table::new();
     for (family, family_value) in models {
         if family_value.get("capability").is_some() {
             continue;
@@ -243,12 +287,7 @@ fn migrate_profile_fallbacks(value: &mut toml::Value) -> Result<()> {
                 continue;
             };
             let source = format!("{family}.{alias}");
-            let mut targets = Vec::new();
-            let raw = serde_json::to_value(profile)?;
-            // Raw upstream IDs retain this profile's connection and tuning.
-            // Dedicated graph nodes avoid cycles when a named model is also
-            // listed as a fallback and inherits the profile's fallback list.
-            for model_id in profile
+            let ids: Vec<_> = profile
                 .get("fallback_models")
                 .and_then(toml::Value::as_array)
                 .into_iter()
@@ -256,31 +295,8 @@ fn migrate_profile_fallbacks(value: &mut toml::Value) -> Result<()> {
                 .filter_map(toml::Value::as_str)
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
-            {
-                if targets.iter().any(|target: &String| {
-                    generated
-                        .get(target)
-                        .and_then(|model| model.get("model"))
-                        .and_then(toml::Value::as_str)
-                        == Some(model_id)
-                }) {
-                    continue;
-                }
-                let base = format!("fallback.{source}.{model_id}");
-                let mut reference = base.clone();
-                let mut suffix = 1;
-                while models.contains_key(&reference) || generated.contains_key(&reference) {
-                    reference = format!("{base}.{suffix}");
-                    suffix += 1;
-                }
-                let (_, mut model) =
-                    super::model_routes::legacy_model(&raw, family, None, Some(model_id))?;
-                model["provider"] = format!("legacy.{source}").into();
-                generated.insert(reference.clone(), toml::Value::try_from(model)?);
-                targets.push(reference);
-            }
-            // V4 exhausted same-connection models before switching providers.
-            for fallback in profile
+                .collect();
+            let provider_targets: Vec<_> = profile
                 .get("fallback")
                 .and_then(toml::Value::as_array)
                 .into_iter()
@@ -288,28 +304,113 @@ fn migrate_profile_fallbacks(value: &mut toml::Value) -> Result<()> {
                 .filter_map(toml::Value::as_str)
                 .map(str::trim)
                 .filter(|reference| !reference.is_empty())
-            {
-                let target = if fallback.contains('.') {
-                    fallback.to_owned()
-                } else {
-                    format!("{family}.{fallback}")
-                };
-                if target != source && !targets.contains(&target) {
-                    targets.push(target);
-                }
+                .map(|reference| {
+                    if reference.contains('.') {
+                        reference.to_owned()
+                    } else {
+                        format!("{family}.{reference}")
+                    }
+                })
+                .collect();
+            if ids.is_empty() && provider_targets.is_empty() {
+                continue;
             }
-            if !targets.is_empty() {
-                // Every original named selection used the enclosing profile's
-                // fallback policy. Generated fallback nodes have no outgoing
-                // edges; their ordered siblings remain on each source node.
-                if let Some(entries) = profile.get("models").and_then(toml::Value::as_table) {
-                    for name in entries.keys() {
-                        additions.push((format!("{source}.{name}"), targets.clone()));
+            let entries = profile.get("models").and_then(toml::Value::as_table);
+            let selected = entries.and_then(|entries| {
+                entries.get("default").or_else(|| {
+                    (entries.len() == 1)
+                        .then(|| entries.values().next())
+                        .flatten()
+                })
+            });
+            let selections: Vec<_> = std::iter::once((source.clone(), selected, true))
+                .chain(
+                    entries
+                        .into_iter()
+                        .flat_map(|entries| entries.iter())
+                        .map(|(name, entry)| (format!("{source}.{name}"), Some(entry), false)),
+                )
+                .collect();
+            let raw = serde_json::to_value(profile)?;
+            let mut provider = format!("legacy.{source}");
+            // Canonical definitions can shadow every legacy selection. In that
+            // case no projection will create the source connection for us.
+            if !ids.is_empty()
+                && selections
+                    .iter()
+                    .all(|(reference, _, _)| models.contains_key(reference))
+            {
+                let base = provider.clone();
+                let mut suffix = 1;
+                while providers
+                    .get("connections")
+                    .and_then(|connections| connections.get(&provider))
+                    .is_some()
+                    || generated_connections.contains_key(&provider)
+                {
+                    provider = format!("{base}.{suffix}");
+                    suffix += 1;
+                }
+                let (connection, _) = super::model_routes::legacy_model(&raw, family, None, None)?;
+                generated_connections.insert(provider.clone(), toml::Value::try_from(connection)?);
+            }
+            for (model_source, entry, primary) in selections {
+                let entry: Option<crate::schema::ModelEntryConfig> =
+                    entry.cloned().map(toml::Value::try_into).transpose()?;
+                let mut targets = Vec::new();
+                for id in &ids {
+                    let (_, mut model) =
+                        super::model_routes::legacy_model(&raw, family, entry.as_ref(), Some(id))?;
+                    if primary
+                        && let Some(policy) = raw.get("provider_extra").and_then(|extra| {
+                            extra.get("__zeroclaw_migration_extract_text_tool_calls")
+                        })
+                    {
+                        model["options"]["extract_text_tool_calls"] = policy.clone();
+                    }
+                    model["provider"] = provider.clone().into();
+                    let model = toml::Value::try_from(model)?;
+                    // Reuse an identical materialized fallback, while keeping
+                    // distinct policies (notably strict parsing) independent.
+                    let reference = if let Some((reference, _)) =
+                        generated.iter().find(|(_, candidate)| **candidate == model)
+                    {
+                        reference.clone()
+                    } else {
+                        let base = format!("fallback.{model_source}.{id}");
+                        let mut reference = base.clone();
+                        let mut suffix = 1;
+                        while models.contains_key(&reference) || generated.contains_key(&reference)
+                        {
+                            reference = format!("{base}.{suffix}");
+                            suffix += 1;
+                        }
+                        generated.insert(reference.clone(), model);
+                        reference
+                    };
+                    if !targets.contains(&reference) {
+                        targets.push(reference);
                     }
                 }
-                additions.push((source, targets));
+                // V4 exhausted same-connection models before provider refs.
+                for target in &provider_targets {
+                    if target != &model_source && !targets.contains(target) {
+                        targets.push(target.clone());
+                    }
+                }
+                if !targets.is_empty() {
+                    additions.push((model_source, targets));
+                }
             }
         }
+    }
+    if !generated_connections.is_empty() {
+        providers
+            .entry("connections")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .context("providers.connections must be a table")?
+            .extend(generated_connections);
     }
     providers
         .get_mut("models")
@@ -481,6 +582,165 @@ model = "gpt-4o-backup"
                 .filter_map(toml::Value::as_str)
                 .collect::<Vec<_>>(),
             vec!["fallback.openai.main.gpt-4o-mini", "openai.backup"]
+        );
+    }
+
+    #[test]
+    fn fallback_generation_keeps_v4_sole_entry_selection_and_named_fallbacks() {
+        let input = r#"
+schema_version = 4
+[providers.models.custom.main]
+model = "profile-model"
+uri = "https://example.test/v1"
+fallback_models = ["backup-model"]
+[providers.models.custom.main.models.fast]
+id = "selected-model"
+temperature = 0.2
+"#;
+        let output = migrate_file(input).unwrap().unwrap();
+        let config: crate::schema::Config = toml::from_str(&output).unwrap();
+        assert_eq!(
+            config.resolve_model_id("custom.main").as_deref(),
+            Some("selected-model")
+        );
+        let registry = config.provider_registry().unwrap();
+        for source in ["custom.main", "custom.main.fast"] {
+            let targets = registry.fallback_chain(&source.into()).unwrap();
+            assert_eq!(targets.len(), 1);
+            let fallback = registry.resolve_chat(&targets[0]).unwrap();
+            assert_eq!(fallback.upstream_model(), Some("backup-model"));
+            assert_eq!(
+                fallback.selection.connection.uri(),
+                Some("https://example.test/v1")
+            );
+        }
+    }
+
+    #[test]
+    fn strict_primary_does_not_change_sibling_text_tools() {
+        let input = r#"
+schema_version = 4
+[providers.models.ollama.main]
+model = "primary"
+[providers.models.ollama.main.models.default]
+id = "primary"
+[providers.models.ollama.main.models.fast]
+id = "fast"
+[agents.strict]
+model_provider = "ollama.main"
+runtime_profile = "strict"
+[agents.normal]
+model_provider = "ollama.main.fast"
+runtime_profile = "normal"
+[runtime_profiles.strict]
+strict_tool_parsing = true
+[runtime_profiles.normal]
+strict_tool_parsing = false
+"#;
+        let output = migrate_file(input).unwrap().unwrap();
+        let config: crate::schema::Config = toml::from_str(&output).unwrap();
+        assert!(!config.model_text_extraction("ollama.main").tool_calls);
+        assert!(config.model_text_extraction("ollama.main.fast").tool_calls);
+    }
+
+    #[test]
+    fn non_strict_custom_agent_keeps_text_tools_without_native_tools_setting() {
+        let input = r#"
+schema_version = 4
+[providers.models.custom.main]
+model = "chat"
+uri = "https://example.test/v1"
+[agents.worker]
+model_provider = "custom.main"
+"#;
+        let output = migrate_file(input).unwrap().unwrap();
+        let config: crate::schema::Config = toml::from_str(&output).unwrap();
+        assert!(config.model_text_extraction("custom.main").tool_calls);
+    }
+
+    #[test]
+    fn named_strict_fallback_keeps_its_own_parser_and_sampling_policy() {
+        let input = r#"
+schema_version = 4
+[providers.models.ollama.main]
+model = "primary"
+fallback_models = ["backup"]
+[providers.models.ollama.main.models.fast]
+id = "fast"
+temperature = 0.2
+[agents.strict]
+model_provider = "ollama.main.fast"
+strict_tool_parsing = true
+[agents.normal]
+model_provider = "ollama.main"
+"#;
+        let config = crate::migration::migrate_to_current(input).unwrap();
+        let registry = config.provider_registry().unwrap();
+        let strict = registry.fallback_chain(&"ollama.main.fast".into()).unwrap();
+        let normal = registry.fallback_chain(&"ollama.main".into()).unwrap();
+        assert_ne!(strict[0], normal[0]);
+        assert!(!config.model_text_extraction(strict[0].as_str()).tool_calls);
+        assert!(config.model_text_extraction(normal[0].as_str()).tool_calls);
+        assert_eq!(
+            config.resolve_model_temperature(strict[0].as_str()),
+            Some(0.2)
+        );
+    }
+
+    #[test]
+    fn shadowed_legacy_primary_still_materializes_its_fallback_connection() {
+        let input = r#"
+schema_version = 4
+[providers.connections.shared]
+kind = "openai"
+[providers.models."openai.main"]
+capability = "chat"
+provider = "shared"
+model = "canonical"
+[providers.models.openai.main]
+model = "legacy"
+uri = "https://legacy.example.test/v1"
+fallback_models = ["backup"]
+"#;
+        let config = crate::migration::migrate_to_current(input).unwrap();
+        let registry = config.provider_registry().unwrap();
+        assert_eq!(
+            registry
+                .resolve_chat(&"openai.main".into())
+                .unwrap()
+                .upstream_model(),
+            Some("canonical")
+        );
+        let fallback = registry.fallback_chain(&"openai.main".into()).unwrap();
+        let backup = registry.resolve_chat(&fallback[0]).unwrap();
+        assert_eq!(backup.upstream_model(), Some("backup"));
+        assert_eq!(
+            backup.selection.connection.uri(),
+            Some("https://legacy.example.test/v1")
+        );
+    }
+
+    #[test]
+    fn strict_provider_fallback_shared_with_non_strict_agent_requires_explicit_split() {
+        let input = r#"
+schema_version = 4
+[providers.models.ollama.main]
+model = "primary"
+fallback = ["backup"]
+[providers.models.ollama.backup]
+model = "backup"
+[agents.strict]
+model_provider = "ollama.main"
+strict_tool_parsing = true
+[agents.normal]
+model_provider = "ollama.backup"
+"#;
+        let error = migrate_file(input).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("both strict and non-strict agents"),
+            "{error:#}"
         );
     }
 
