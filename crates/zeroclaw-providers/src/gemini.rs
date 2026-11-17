@@ -40,6 +40,8 @@ pub struct GeminiModelProvider {
     /// from `GeminiModelProviderConfig.oauth_client_id` / `oauth_client_secret`.
     oauth_client_id: Option<String>,
     oauth_client_secret: Option<String>,
+    timeout_secs: u64,
+    timeout_disabled: bool,
 }
 
 /// Mutable OAuth token state — supports runtime refresh for long-lived processes.
@@ -534,6 +536,8 @@ pub struct GeminiBuilder {
     oauth_project_seed: Option<String>,
     oauth_client_id: Option<String>,
     oauth_client_secret: Option<String>,
+    timeout_secs: Option<u64>,
+    timeout_disabled: bool,
 }
 
 impl GeminiBuilder {
@@ -584,6 +588,16 @@ impl GeminiBuilder {
     ) -> Self {
         self.oauth_client_id = client_id;
         self.oauth_client_secret = client_secret;
+        self
+    }
+
+    pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = Some(timeout_secs);
+        self
+    }
+
+    pub fn without_timeout(mut self) -> Self {
+        self.timeout_disabled = true;
         self
     }
 
@@ -653,6 +667,8 @@ impl GeminiBuilder {
             auth_profile_override: self.profile_override,
             oauth_client_id: self.oauth_client_id,
             oauth_client_secret: self.oauth_client_secret,
+            timeout_secs: self.timeout_secs.unwrap_or(120),
+            timeout_disabled: self.timeout_disabled,
         }
     }
 }
@@ -678,6 +694,8 @@ impl GeminiModelProvider {
             oauth_project_seed: None,
             oauth_client_id: None,
             oauth_client_secret: None,
+            timeout_secs: None,
+            timeout_disabled: false,
         }
     }
 
@@ -926,11 +944,15 @@ impl GeminiModelProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
             "model_provider.gemini",
-            120,
-            10,
-        )
+        );
+        builder.build().unwrap_or_else(|_| Client::new())
     }
 
     /// Resolve the GCP project ID for OAuth by calling the loadCodeAssist endpoint.

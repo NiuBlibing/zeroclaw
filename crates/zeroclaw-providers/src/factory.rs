@@ -1515,18 +1515,22 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
             )
         });
         let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
-        Ok(Box::new(
-            crate::gemini::GeminiModelProvider::builder(alias)
-                .api_key(key)
-                .api_url(api_url)
-                .managed_auth(auth_service, opts.auth_profile_override.clone())
-                .oauth_project_seed(self.oauth_project.clone())
-                .oauth_client(
-                    self.oauth_client_id.clone(),
-                    self.oauth_client_secret.clone(),
-                )
-                .build(),
-        ))
+        let mut builder = crate::gemini::GeminiModelProvider::builder(alias)
+            .api_key(key)
+            .api_url(api_url)
+            .managed_auth(auth_service, opts.auth_profile_override.clone())
+            .oauth_project_seed(self.oauth_project.clone())
+            .oauth_client(
+                self.oauth_client_id.clone(),
+                self.oauth_client_secret.clone(),
+            );
+        if let Some(timeout) = opts.provider_timeout_secs {
+            builder = builder.timeout_secs(timeout);
+        }
+        if opts.provider_timeout_disabled {
+            builder = builder.without_timeout();
+        }
+        Ok(Box::new(builder.build()))
     }
 
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1633,6 +1637,16 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
         };
         let builder = if let Some(mt) = opts.provider_max_tokens {
             builder.max_tokens(mt)
+        } else {
+            builder
+        };
+        let builder = if let Some(timeout) = opts.provider_timeout_secs {
+            builder.timeout_secs(timeout)
+        } else {
+            builder
+        };
+        let builder = if opts.provider_timeout_disabled {
+            builder.without_timeout()
         } else {
             builder
         };

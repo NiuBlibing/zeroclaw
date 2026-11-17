@@ -728,6 +728,8 @@ pub struct BedrockModelProvider {
     region: Option<String>,
     api_url: Option<String>,
     max_tokens: u32,
+    timeout_secs: u64,
+    timeout_disabled: bool,
     /// Cached SigV4 credentials from `credential_process` (with expiry).
     cred_cache: Mutex<Option<AwsCredentials>>,
 }
@@ -750,6 +752,8 @@ pub struct BedrockBuilder {
     region: Option<String>,
     api_url: Option<String>,
     max_tokens: Option<u32>,
+    timeout_secs: Option<u64>,
+    timeout_disabled: bool,
 }
 
 impl BedrockBuilder {
@@ -780,6 +784,16 @@ impl BedrockBuilder {
         self
     }
 
+    pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = Some(timeout_secs);
+        self
+    }
+
+    pub fn without_timeout(mut self) -> Self {
+        self.timeout_disabled = true;
+        self
+    }
+
     /// Finalize the provider synchronously.
     ///
     /// If `bearer_token` was set, uses it as-is with no ambient probe.
@@ -802,6 +816,8 @@ impl BedrockBuilder {
             max_tokens: self
                 .max_tokens
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
+            timeout_secs: self.timeout_secs.unwrap_or(120),
+            timeout_disabled: self.timeout_disabled,
             cred_cache: Mutex::new(None),
         }
     }
@@ -823,6 +839,8 @@ impl BedrockBuilder {
             max_tokens: self
                 .max_tokens
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
+            timeout_secs: self.timeout_secs.unwrap_or(120),
+            timeout_disabled: self.timeout_disabled,
             cred_cache: Mutex::new(None),
         }
     }
@@ -863,15 +881,21 @@ impl BedrockModelProvider {
             bearer_token: None,
             region: None,
             max_tokens: None,
+            timeout_secs: None,
+            timeout_disabled: false,
         }
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
             "model_provider.bedrock",
-            120,
-            10,
-        )
+        );
+        builder.build().unwrap_or_else(|_| Client::new())
     }
 
     /// Percent-encode the model ID for URL path: only encode `:` to `%3A`.
