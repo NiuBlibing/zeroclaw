@@ -56,6 +56,10 @@ async fn assemble_context(
     exclude_memory: bool,
     acp_delivery: bool,
 ) -> ScopedAssembled {
+    // Integration tests compile the runtime library without its internal
+    // `cfg(test)` admission hook. Admit the historical fixture explicitly so
+    // the registry builder consumes the same canonical shape as production.
+    let config = zeroclaw_config::migration::admit_test_input(config);
     let workspace = tmp.path().join("workspace");
     let security = Arc::new(SecurityPolicy {
         workspace_dir: workspace.clone(),
@@ -86,7 +90,7 @@ async fn assemble_context(
     }
     .unwrap();
     ScopedToolRegistry::assemble(ScopedAssembly {
-        config,
+        config: &config,
         agent_alias: "boundary",
         security: &security,
         built,
