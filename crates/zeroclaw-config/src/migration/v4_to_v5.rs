@@ -152,9 +152,9 @@ fn legacy_model_selection(
             let suffix = alias.strip_prefix(candidate)?.strip_prefix('.')?;
             let profile = family_table.get(candidate)?.as_table()?;
             let entries = profile.get("models")?.as_table()?;
-            entries
+            return entries
                 .contains_key(suffix)
-                .then(|| (format!("{family}.{candidate}"), Some(suffix.to_owned())))
+                .then(|| (format!("{family}.{candidate}"), Some(suffix.to_owned())));
         }
     }
     None
@@ -284,7 +284,9 @@ strict_tool_parsing = true
         let models: toml::Value = toml::from_str(
             r#"
 [ollama.main]
+[ollama.main.models.fast]
 [ollama."main.us"]
+[ollama."main.us".models.fast]
 "#,
         )
         .unwrap();
