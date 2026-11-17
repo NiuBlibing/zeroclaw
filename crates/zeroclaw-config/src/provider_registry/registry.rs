@@ -338,8 +338,7 @@ mod tests {
                 "models": {"chat": {"capability": "chat", "provider": "gateway"}}
             }))
             .unwrap();
-            let ModelDefinition::Chat(model) = registry.models.get_mut("chat").unwrap()
-            else {
+            let ModelDefinition::Chat(model) = registry.models.get_mut("chat").unwrap() else {
                 panic!("fixture is chat")
             };
             model.extra = Some(extra);
