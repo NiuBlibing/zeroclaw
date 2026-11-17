@@ -533,14 +533,13 @@ mod tests {
 
     #[test]
     fn speech_edits_do_not_refresh_chat_but_shared_policy_does() {
-        let mut previous = Config::default();
-        previous.providers = serde_json::from_value(serde_json::json!({
+        let previous = Config { providers: serde_json::from_value(serde_json::json!({
             "connections": {"gateway": {"kind":"openai", "auth":{"mode":"api_key","api_key":"test"}}},
             "models": {
                 "chat": {"capability":"chat","provider":"gateway","model":"gpt-test"},
                 "voice": {"capability":"tts","provider":"gateway","model":"tts-test"}
             }
-        })).unwrap();
+        })).unwrap(), ..Default::default() };
         let mut next = previous.clone();
         zeroclaw_config::provider_registry::editor::update(&mut next, |registry| {
             let zeroclaw_config::provider_registry::ModelDefinition::Tts(model) =
