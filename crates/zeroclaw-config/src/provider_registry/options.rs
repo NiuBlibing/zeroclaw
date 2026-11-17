@@ -61,7 +61,9 @@ options_patch!(ChatOptionsPatch {
 });
 
 /// Effective model-owned textual extraction policy. Missing options inherit;
-/// explicit values are ordinary booleans and never accept the `"null"` sentinel.
+/// explicit values are ordinary booleans and never accept the `"null"`
+/// sentinel. The resolved reasoning field keeps omission distinct from an
+/// explicit `false` so the historical terminal-response policy is preserved.
 pub use zeroclaw_api::TextExtraction;
 
 /// Provider-specific baselines for the two model options. This is the
@@ -75,7 +77,7 @@ pub(crate) fn text_extraction_defaults(
     // MiniMax's unsplit reasoning and Groq's raw reasoning format put
     // <think> blocks in content. Other providers must
     // opt in when a particular model/server emits inline reasoning.
-    let reasoning = matches!(kind, "minimax" | "groq");
+    let reasoning = matches!(kind, "minimax" | "groq").then_some(true);
     // These adapters currently use prompt-guided tool calls by default.
     // Several upstreams also support native tools; enabling that mode
     // removes the need to infer calls from arbitrary response text.
@@ -185,28 +187,28 @@ mod tests {
         assert_eq!(
             TextExtraction::default(),
             TextExtraction {
-                reasoning: false,
+                reasoning: None,
                 tool_calls: false
             }
         );
         for (kind, reasoning, tool_calls) in [
-            ("openai", false, false),
-            ("anthropic", false, false),
-            ("deepseek", false, false),
-            ("qwen", false, false),
-            ("vllm", false, false),
-            ("openai-compatible", false, false),
-            ("minimax", true, false),
-            ("groq", true, true),
-            ("ollama", false, true),
-            ("hailo_ollama", false, true),
-            ("gemini", false, true),
-            ("gemini_cli", false, true),
-            ("grok_cli", false, true),
-            ("kilocli", false, true),
-            ("venice", false, true),
-            ("atomic_chat", false, true),
-            ("custom", false, false),
+            ("openai", None, false),
+            ("anthropic", None, false),
+            ("deepseek", None, false),
+            ("qwen", None, false),
+            ("vllm", None, false),
+            ("openai-compatible", None, false),
+            ("minimax", Some(true), false),
+            ("groq", Some(true), true),
+            ("ollama", None, true),
+            ("hailo_ollama", None, true),
+            ("gemini", None, true),
+            ("gemini_cli", None, true),
+            ("grok_cli", None, true),
+            ("kilocli", None, true),
+            ("venice", None, true),
+            ("atomic_chat", None, true),
+            ("custom", None, false),
         ] {
             let registry: crate::provider_registry::ProviderRegistry = toml::from_str(&format!(
                 r#"
@@ -280,7 +282,7 @@ options = { extract_text_tool_calls = true }
                     .unwrap()
                     .text_extraction(),
                 TextExtraction {
-                    reasoning: false,
+                    reasoning: None,
                     tool_calls
                 },
                 "{name}"

@@ -40,9 +40,15 @@ pub mod webhook;
 use std::sync::Arc;
 
 /// Admitted model policy for extracting protocol data embedded in text.
+///
+/// `reasoning = None` preserves the historical terminal-response policy. It
+/// is distinct from `Some(false)`: the latter is an explicit model override
+/// that keeps inline reasoning in the returned text. Configuration fields
+/// remain ordinary booleans; this distinction exists only after resolution so
+/// omitted configuration cannot accidentally change terminal classification.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TextExtraction {
-    pub reasoning: bool,
+    pub reasoning: Option<bool>,
     pub tool_calls: bool,
 }
 

@@ -382,7 +382,7 @@ impl ResolvedChat<'_> {
             reasoning: self
                 .options
                 .extract_text_reasoning
-                .unwrap_or(defaults.reasoning),
+                .or(defaults.reasoning),
             tool_calls: self
                 .options
                 .extract_text_tool_calls
@@ -393,7 +393,7 @@ impl ResolvedChat<'_> {
     /// Whether textual `<think>` blocks are extracted from the response.
     #[must_use]
     pub fn extract_text_reasoning(&self) -> bool {
-        self.text_extraction().reasoning
+        self.text_extraction().reasoning.unwrap_or(true)
     }
 
     /// Whether textual XML/JSON tool-call envelopes are extracted from the
