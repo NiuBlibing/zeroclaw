@@ -175,6 +175,29 @@ pub enum ChatModelExtra {
     Anthropic(AnthropicChatModelExtra),
 }
 
+impl ChatModelExtra {
+    fn associate(
+        raw: serde_json::Value,
+        connection: &ProviderConnection,
+    ) -> Result<Self, serde_json::Error> {
+        match connection {
+            ProviderConnection::Azure(_) => serde_json::from_value(raw).map(Self::Azure),
+            ProviderConnection::Anthropic(_) => serde_json::from_value(raw).map(Self::Anthropic),
+            _ => Err(<serde_json::Error as serde::de::Error>::custom(
+                "extra is not supported by this chat connection kind",
+            )),
+        }
+    }
+
+    /// Rust-built candidates must satisfy the same association as decoded input.
+    pub(super) fn validate_connection(
+        &self,
+        connection: &ProviderConnection,
+    ) -> Result<(), serde_json::Error> {
+        Self::associate(serde_json::to_value(self)?, connection).map(|_| ())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -198,17 +221,7 @@ impl ModelDefinition<serde_json::Value> {
             Self::Chat(c) => {
                 let extra = c
                     .extra
-                    .map(|raw| match connection {
-                        ProviderConnection::Azure(_) => {
-                            serde_json::from_value(raw).map(ChatModelExtra::Azure)
-                        }
-                        ProviderConnection::Anthropic(_) => {
-                            serde_json::from_value(raw).map(ChatModelExtra::Anthropic)
-                        }
-                        _ => Err(<serde_json::Error as serde::de::Error>::custom(
-                            "extra is not supported by this chat connection kind",
-                        )),
-                    })
+                    .map(|raw| ChatModelExtra::associate(raw, connection))
                     .transpose()?;
                 ModelDefinition::Chat(ChatModelConfig {
                     provider: c.provider,

@@ -296,3 +296,58 @@ pub struct ModelSelection<'a> {
     pub provider_id: &'a ProviderId,
     pub connection: &'a ProviderConnection,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn model_protocol_override_does_not_require_connection_defaults() {
+        for kind in ["openai", "custom", "vllm"] {
+            let registry: ProviderRegistry = serde_json::from_value(json!({
+                "connections": {"gateway.prod": {"kind": kind}},
+                "models": {"chat.fast": {
+                    "capability": "chat", "provider": "gateway.prod", "model": "fast",
+                    "api": {"wire_api": "responses"}
+                }}
+            }))
+            .unwrap();
+            assert_eq!(
+                registry.resolve_chat(&"chat.fast".into()).unwrap().wire_api,
+                Some(crate::schema::WireApi::Responses)
+            );
+        }
+    }
+
+    #[test]
+    fn rust_built_extras_obey_the_same_connection_contract_as_decoded_extras() {
+        use crate::provider_registry::{
+            AnthropicChatModelExtra, AzureChatModelExtra, ChatModelExtra,
+        };
+        for extra in [
+            ChatModelExtra::Azure(AzureChatModelExtra {
+                deployment: "test".into(),
+            }),
+            ChatModelExtra::Anthropic(AnthropicChatModelExtra {
+                server_fallback_models: vec![],
+            }),
+        ] {
+            let mut registry: ProviderRegistry = serde_json::from_value(json!({
+                "connections": {"gateway": {"kind": "openai"}},
+                "models": {"chat": {"capability": "chat", "provider": "gateway"}}
+            }))
+            .unwrap();
+            let ModelDefinition::Chat(model) = registry.models.get_mut(&"chat".into()).unwrap()
+            else {
+                panic!("fixture is chat")
+            };
+            model.extra = Some(extra);
+            assert!(registry.validate().is_err());
+            assert!(
+                serde_json::from_value::<ProviderRegistry>(serde_json::to_value(registry).unwrap())
+                    .is_err()
+            );
+        }
+    }
+}
