@@ -40,6 +40,8 @@ pub struct GeminiModelProvider {
     /// from `GeminiModelProviderConfig.oauth_client_id` / `oauth_client_secret`.
     oauth_client_id: Option<String>,
     oauth_client_secret: Option<String>,
+    request_timeout_secs: Option<u64>,
+    request_timeout_disabled: bool,
 }
 
 /// Mutable OAuth token state — supports runtime refresh for long-lived processes.
@@ -534,6 +536,8 @@ pub struct GeminiBuilder {
     oauth_project_seed: Option<String>,
     oauth_client_id: Option<String>,
     oauth_client_secret: Option<String>,
+    request_timeout_secs: Option<u64>,
+    request_timeout_disabled: bool,
 }
 
 impl GeminiBuilder {
@@ -584,6 +588,13 @@ impl GeminiBuilder {
     ) -> Self {
         self.oauth_client_id = client_id;
         self.oauth_client_secret = client_secret;
+        self
+    }
+
+    /// Apply the canonical model's total request timeout policy.
+    pub fn request_timeout(mut self, seconds: Option<u64>, disabled: bool) -> Self {
+        self.request_timeout_secs = seconds;
+        self.request_timeout_disabled = disabled;
         self
     }
 
@@ -653,6 +664,8 @@ impl GeminiBuilder {
             auth_profile_override: self.profile_override,
             oauth_client_id: self.oauth_client_id,
             oauth_client_secret: self.oauth_client_secret,
+            request_timeout_secs: self.request_timeout_secs,
+            request_timeout_disabled: self.request_timeout_disabled,
         }
     }
 }
@@ -678,6 +691,10 @@ impl GeminiModelProvider {
             oauth_project_seed: None,
             oauth_client_id: None,
             oauth_client_secret: None,
+            request_timeout_secs: None,
+            request_timeout_disabled: false,
+            request_timeout_secs: None,
+            request_timeout_disabled: false,
         }
     }
 
@@ -926,9 +943,12 @@ impl GeminiModelProvider {
     }
 
     fn http_client(&self) -> Client {
+        if self.request_timeout_disabled {
+            return zeroclaw_config::schema::build_runtime_proxy_client("model_provider.gemini");
+        }
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.gemini",
-            120,
+            self.request_timeout_secs.unwrap_or(120),
             10,
         )
     }
@@ -1659,6 +1679,8 @@ mod tests {
             auth_profile_override: None,
             oauth_client_id: None,
             oauth_client_secret: None,
+            request_timeout_secs: None,
+            request_timeout_disabled: false,
         }
     }
 

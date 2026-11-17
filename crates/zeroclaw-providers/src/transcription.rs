@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::num::NonZeroU64;
+use std::time::Duration;
 
 use crate::transport::HttpTransportConfig;
 use anyhow::{Context, Result, bail};
@@ -26,6 +28,21 @@ const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 
 /// Request timeout for transcription API calls (seconds).
 const TRANSCRIPTION_TIMEOUT_SECS: u64 = 120;
+
+fn transcription_timeout(policy: &Option<Override<NonZeroU64>>) -> Option<Duration> {
+    match policy {
+        Some(Override::Set(value)) => Some(Duration::from_secs(value.get())),
+        Some(Override::Clear) => None,
+        None => Some(Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS)),
+    }
+}
+
+fn apply_transcription_timeout(
+    request: reqwest::RequestBuilder,
+    policy: &Option<Override<NonZeroU64>>,
+) -> reqwest::RequestBuilder {
+    transcription_timeout(policy).map_or(request, |timeout| request.timeout(timeout))
+}
 
 const GOOGLE_STT_ENDPOINT: &str = "https://speech.googleapis.com/v1/speech:recognize";
 const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
@@ -371,6 +388,7 @@ pub struct DeepgramProvider {
     api_key: String,
     model: String,
     language: Option<String>,
+    request_timeout_secs: Option<Override<NonZeroU64>>,
 }
 
 impl DeepgramProvider {
@@ -379,6 +397,7 @@ impl DeepgramProvider {
         api_key: Option<&str>,
         model: Option<&str>,
         language: Option<String>,
+        request_timeout_secs: Option<Override<NonZeroU64>>,
     ) -> Result<Self> {
         let api_key = api_key
             .map(str::trim)
@@ -394,6 +413,7 @@ impl DeepgramProvider {
                 .unwrap_or("nova-2")
                 .to_owned(),
             language,
+            request_timeout_secs,
         })
     }
 
@@ -416,6 +436,7 @@ impl DeepgramProvider {
             api_key,
             model: config.model.clone(),
             language: None,
+            request_timeout_secs: None,
         })
     }
 
@@ -447,6 +468,7 @@ impl DeepgramProvider {
                 .filter(|model| !model.trim().is_empty())
                 .unwrap_or_else(|| "nova-2".to_string()),
             language: cfg.base.language.clone(),
+            request_timeout_secs: None,
         })
     }
 
@@ -478,15 +500,17 @@ impl AsrProvider for DeepgramProvider {
         )
         .context("Invalid Deepgram transcription endpoint")?;
 
-        let resp = client
-            .post(url)
-            .header("Authorization", format!("Token {}", self.api_key))
-            .header("Content-Type", mime)
-            .body(audio_data.to_vec())
-            .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
-            .send()
-            .await
-            .context("Failed to send transcription request to Deepgram")?;
+        let resp = apply_transcription_timeout(
+            client
+                .post(url)
+                .header("Authorization", format!("Token {}", self.api_key))
+                .header("Content-Type", mime)
+                .body(audio_data.to_vec()),
+            &self.request_timeout_secs,
+        )
+        .send()
+        .await
+        .context("Failed to send transcription request to Deepgram")?;
 
         let status = resp.status();
         let body: serde_json::Value = resp
@@ -517,10 +541,15 @@ impl AsrProvider for DeepgramProvider {
 pub struct AssemblyAiProvider {
     alias: String,
     api_key: String,
+    request_timeout_secs: Option<Override<NonZeroU64>>,
 }
 
 impl AssemblyAiProvider {
-    fn from_canonical(alias: &str, api_key: Option<&str>) -> Result<Self> {
+    fn from_canonical(
+        alias: &str,
+        api_key: Option<&str>,
+        request_timeout_secs: Option<Override<NonZeroU64>>,
+    ) -> Result<Self> {
         let api_key = api_key
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -529,6 +558,7 @@ impl AssemblyAiProvider {
         Ok(Self {
             alias: alias.to_owned(),
             api_key,
+            request_timeout_secs,
         })
     }
 
@@ -548,6 +578,7 @@ impl AssemblyAiProvider {
         Ok(Self {
             alias: alias.to_string(),
             api_key,
+            request_timeout_secs: None,
         })
     }
 
@@ -572,6 +603,7 @@ impl AssemblyAiProvider {
         Ok(Self {
             alias: alias.to_string(),
             api_key,
+            request_timeout_secs: None,
         })
     }
 }
@@ -589,15 +621,17 @@ impl AsrProvider for AssemblyAiProvider {
             zeroclaw_config::schema::build_runtime_proxy_client("transcription.assemblyai");
 
         // Step 1: Upload the audio file.
-        let upload_resp = client
-            .post("https://api.assemblyai.com/v2/upload")
-            .header("Authorization", &self.api_key)
-            .header("Content-Type", "application/octet-stream")
-            .body(audio_data.to_vec())
-            .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
-            .send()
-            .await
-            .context("Failed to upload audio to AssemblyAI")?;
+        let upload_resp = apply_transcription_timeout(
+            client
+                .post("https://api.assemblyai.com/v2/upload")
+                .header("Authorization", &self.api_key)
+                .header("Content-Type", "application/octet-stream")
+                .body(audio_data.to_vec()),
+            &self.request_timeout_secs,
+        )
+        .send()
+        .await
+        .context("Failed to upload audio to AssemblyAI")?;
 
         let upload_status = upload_resp.status();
         let upload_body: serde_json::Value = upload_resp
@@ -619,14 +653,16 @@ impl AsrProvider for AssemblyAiProvider {
             "audio_url": upload_url,
         });
 
-        let create_resp = client
-            .post("https://api.assemblyai.com/v2/transcript")
-            .header("Authorization", &self.api_key)
-            .json(&transcript_req)
-            .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
-            .send()
-            .await
-            .context("Failed to create AssemblyAI transcription")?;
+        let create_resp = apply_transcription_timeout(
+            client
+                .post("https://api.assemblyai.com/v2/transcript")
+                .header("Authorization", &self.api_key)
+                .json(&transcript_req),
+            &self.request_timeout_secs,
+        )
+        .send()
+        .await
+        .context("Failed to create AssemblyAI transcription")?;
 
         let create_status = create_resp.status();
         let create_body: serde_json::Value = create_resp
@@ -655,13 +691,13 @@ impl AsrProvider for AssemblyAiProvider {
         while tokio::time::Instant::now() < poll_deadline {
             tokio::time::sleep(poll_interval).await;
 
-            let poll_resp = client
-                .get(&poll_url)
-                .header("Authorization", &self.api_key)
-                .timeout(std::time::Duration::from_secs(30))
-                .send()
-                .await
-                .context("Failed to poll AssemblyAI transcription")?;
+            let poll_resp = apply_transcription_timeout(
+                client.get(&poll_url).header("Authorization", &self.api_key),
+                &self.request_timeout_secs,
+            )
+            .send()
+            .await
+            .context("Failed to poll AssemblyAI transcription")?;
 
             let poll_status = poll_resp.status();
             let poll_body: serde_json::Value = poll_resp
@@ -705,6 +741,7 @@ pub struct GoogleSttProvider {
     alias: String,
     api_key: String,
     language_code: String,
+    request_timeout_secs: Option<Override<NonZeroU64>>,
 }
 
 impl GoogleSttProvider {
@@ -712,6 +749,7 @@ impl GoogleSttProvider {
         alias: &str,
         api_key: Option<&str>,
         language: Option<String>,
+        request_timeout_secs: Option<Override<NonZeroU64>>,
     ) -> Result<Self> {
         let api_key = api_key
             .map(str::trim)
@@ -722,6 +760,7 @@ impl GoogleSttProvider {
             alias: alias.to_owned(),
             api_key,
             language_code: language.unwrap_or_else(|| "en-US".into()),
+            request_timeout_secs,
         })
     }
 
@@ -742,6 +781,7 @@ impl GoogleSttProvider {
             alias: alias.to_string(),
             api_key,
             language_code: config.language_code.clone(),
+            request_timeout_secs: None,
         })
     }
 
@@ -772,6 +812,7 @@ impl GoogleSttProvider {
                 .clone()
                 .filter(|language| !language.trim().is_empty())
                 .unwrap_or_else(|| "en-US".to_string()),
+            request_timeout_secs: None,
         })
     }
 
@@ -784,13 +825,14 @@ impl GoogleSttProvider {
     }
 
     fn build_request(&self, request_body: &serde_json::Value) -> Result<reqwest::RequestBuilder> {
-        Ok(
-            zeroclaw_config::schema::build_runtime_proxy_client("transcription.google")
-                .post(GOOGLE_STT_ENDPOINT)
-                .header(GOOGLE_API_KEY_HEADER, self.sensitive_api_key_header()?)
-                .json(request_body)
-                .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS)),
-        )
+        let request = zeroclaw_config::schema::build_runtime_proxy_client("transcription.google")
+            .post(GOOGLE_STT_ENDPOINT)
+            .header(GOOGLE_API_KEY_HEADER, self.sensitive_api_key_header()?)
+            .json(request_body);
+        Ok(apply_transcription_timeout(
+            request,
+            &self.request_timeout_secs,
+        ))
     }
 }
 
@@ -1093,16 +1135,27 @@ fn build_canonical_transcription_provider(
             OpenAiWhisperProvider::from_canonical_config(model_ref, &config)
                 .map(|provider| Box::new(provider) as Box<dyn AsrProvider>)
         }
-        ProviderConnection::Deepgram(_) => {
-            DeepgramProvider::from_canonical(model_ref, api_key, model, language)
-                .map(|provider| Box::new(provider) as Box<dyn AsrProvider>)
-        }
-        ProviderConnection::AssemblyAi(_) => AssemblyAiProvider::from_canonical(model_ref, api_key)
-            .map(|provider| Box::new(provider) as Box<dyn AsrProvider>),
-        ProviderConnection::Google(_) => {
-            GoogleSttProvider::from_canonical(model_ref, api_key, language)
-                .map(|provider| Box::new(provider) as Box<dyn AsrProvider>)
-        }
+        ProviderConnection::Deepgram(_) => DeepgramProvider::from_canonical(
+            model_ref,
+            api_key,
+            model,
+            language,
+            resolved.request_timeout_secs.clone(),
+        )
+        .map(|provider| Box::new(provider) as Box<dyn AsrProvider>),
+        ProviderConnection::AssemblyAi(_) => AssemblyAiProvider::from_canonical(
+            model_ref,
+            api_key,
+            resolved.request_timeout_secs.clone(),
+        )
+        .map(|provider| Box::new(provider) as Box<dyn AsrProvider>),
+        ProviderConnection::Google(_) => GoogleSttProvider::from_canonical(
+            model_ref,
+            api_key,
+            language,
+            resolved.request_timeout_secs.clone(),
+        )
+        .map(|provider| Box::new(provider) as Box<dyn AsrProvider>),
         ProviderConnection::LocalWhisper(connection) => {
             LocalWhisperProvider::from_canonical(model_ref, connection, resolved)
                 .map(|provider| Box::new(provider) as Box<dyn AsrProvider>)
@@ -2081,6 +2134,7 @@ mod tests {
             alias: "default".to_string(),
             api_key: "api-key-123".to_string(),
             language_code: "en-US".to_string(),
+            request_timeout_secs: None,
         };
         let body = serde_json::json!({
             "config": { "languageCode": "en-US" },
@@ -2117,6 +2171,7 @@ mod tests {
             alias: "default".to_string(),
             api_key: api_key.to_string(),
             language_code: "en-US".to_string(),
+            request_timeout_secs: None,
         };
 
         let err = match provider.build_request(&serde_json::json!({})) {
