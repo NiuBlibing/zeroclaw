@@ -1525,7 +1525,7 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
                     self.oauth_client_id.clone(),
                     self.oauth_client_secret.clone(),
                 )
-                .request_timeout(opts.provider_timeout_secs, opts.provider_timeout_disabled)
+                .http_timeouts(opts)
                 .build(),
         ))
     }
@@ -1602,6 +1602,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
         let api_version = self.api_version.as_deref();
         Ok(Box::new(
             crate::azure_openai::AzureOpenAiModelProvider::builder(alias)
+                .http_timeouts(opts)
                 .resource_name(resource)
                 .deployment_name(deployment)
                 .credential(key)
@@ -1622,7 +1623,9 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let builder = crate::bedrock::BedrockModelProvider::builder(alias).api_url(api_url);
+        let builder = crate::bedrock::BedrockModelProvider::builder(alias)
+            .http_timeouts(opts)
+            .api_url(api_url);
         // Explicit-key path stays no-probe — do not run BEDROCK_API_KEY /
         // AwsCredentials::from_env / from_credential_process (which can
         // spawn a shell command) when the operator has already resolved
@@ -2373,6 +2376,7 @@ fn dispatch_resolved_chat(
         }
         ProviderConnection::Bedrock(connection) => {
             let mut builder = crate::bedrock::BedrockModelProvider::builder(alias)
+                .http_timeouts(&runtime)
                 .api_url(connection.uri.as_deref())
                 .region(connection.extra.region.as_deref());
             if let Some(key) = api_key {
