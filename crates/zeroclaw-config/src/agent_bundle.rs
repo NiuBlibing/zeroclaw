@@ -1312,25 +1312,25 @@ fn carry_model_provider(
             crate::provider_registry::ModelDefinition::Embedding(_)
             | crate::provider_registry::ModelDefinition::Decision(_) => None,
         };
-        let connection_preset =
-            config
-                .providers
-                .connections
-                .get(model.provider())
-                .and_then(|connection| match model {
-                    crate::provider_registry::ModelDefinition::Chat(_) => {
-                        connection.chat_defaults().and_then(|(preset, _)| preset)
-                    }
-                    crate::provider_registry::ModelDefinition::Tts(_) => {
-                        connection.tts_defaults().and_then(|(preset, _)| preset)
-                    }
-                    crate::provider_registry::ModelDefinition::Asr(_) => {
-                        connection.asr_defaults().and_then(|(preset, _)| preset)
-                    }
-                    crate::provider_registry::ModelDefinition::Embedding(_)
-                    | crate::provider_registry::ModelDefinition::Decision(_) => None,
-                });
-        for preset in [model_preset, connection_preset].into_iter().flatten() {
+        // The exported connection is complete. Carry every capability preset
+        // it names, even when the root model only uses chat: validation of the
+        // copied connection still requires its tts/asr defaults to resolve.
+        let connection_presets = config
+            .providers
+            .connections
+            .get(model.provider())
+            .into_iter()
+            .flat_map(|connection| {
+                [
+                    connection.chat_defaults().and_then(|(preset, _)| preset),
+                    connection.tts_defaults().and_then(|(preset, _)| preset),
+                    connection.asr_defaults().and_then(|(preset, _)| preset),
+                ]
+            });
+        for preset in std::iter::once(model_preset)
+            .flatten()
+            .chain(connection_presets.flatten())
+        {
             carry(
                 out,
                 masked_root,
