@@ -1498,18 +1498,18 @@ mod tests {
     }
 
     #[test]
-    fn raw_response_text_preserves_think_tags_for_runtime_policy() {
+    fn raw_response_text_strips_think_tags_before_runtime_policy() {
         assert_eq!(
             OllamaModelProvider::raw_response_text("<think>reasoning</think> hello", None,),
-            Some("<think>reasoning</think> hello".to_string())
+            Some("hello".to_string())
         );
     }
 
     #[test]
-    fn raw_response_text_preserves_think_only_content_for_runtime_policy() {
+    fn raw_response_text_discards_think_only_content() {
         assert_eq!(
             OllamaModelProvider::raw_response_text("<think>only thinking here</think>", None,),
-            Some("<think>only thinking here</think>".to_string())
+            None
         );
     }
 
@@ -1762,7 +1762,7 @@ mod tests {
         let text = result.unwrap();
         assert!(text.contains("<tool_call>"));
         assert!(text.contains("shell"));
-        assert!(text.contains("<think>"));
+        assert!(!text.contains("<think>"));
     }
 
     #[test]

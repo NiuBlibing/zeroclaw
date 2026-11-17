@@ -1,6 +1,7 @@
 //! Runtime adapter for the shared incremental response parser.
 
 use crate::tools::ToolSpec;
+use std::ops::{Deref, DerefMut};
 
 pub(crate) use zeroclaw_tool_call_parser::{
     ProtocolSuppressionDiagnostic, StreamTerminalMarkerStripper, StreamThinkTagStripper,
@@ -13,9 +14,20 @@ pub(crate) use zeroclaw_tool_call_parser::{
 #[derive(Debug)]
 pub(crate) struct StreamTextGuard {
     inner: zeroclaw_tool_call_parser::StreamTextGuard,
-    pub(crate) suppress_forwarding: bool,
-    pub(crate) suppressed_protocol: bool,
-    pub(crate) suppression: Option<ProtocolSuppressionDiagnostic>,
+}
+
+impl Deref for StreamTextGuard {
+    type Target = zeroclaw_tool_call_parser::StreamTextGuard;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for StreamTextGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
 }
 
 impl StreamTextGuard {
@@ -28,28 +40,15 @@ impl StreamTextGuard {
         });
         Self {
             inner: zeroclaw_tool_call_parser::StreamTextGuard::new(names.as_deref()),
-            suppress_forwarding: false,
-            suppressed_protocol: false,
-            suppression: None,
         }
     }
 
     pub(crate) fn push(&mut self, chunk: &str) -> Option<String> {
-        let output = self.inner.push(chunk);
-        self.sync_state();
-        output
+        self.inner.push(chunk)
     }
 
     pub(crate) fn finish(&mut self) -> Option<String> {
-        let output = self.inner.finish();
-        self.sync_state();
-        output
-    }
-
-    fn sync_state(&mut self) {
-        self.suppress_forwarding = self.inner.suppress_forwarding;
-        self.suppressed_protocol = self.inner.suppressed_protocol;
-        self.suppression = self.inner.suppression;
+        self.inner.finish()
     }
 }
 

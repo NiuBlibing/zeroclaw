@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -21,6 +22,7 @@ pub(crate) struct HttpTransportConfig {
     pub(crate) extra_headers: BTreeMap<String, String>,
     pub(crate) request_timeout_secs: Option<Override<NonZeroU64>>,
     pub(crate) tls_ca_cert_path: Option<String>,
+    clients: Arc<Mutex<BTreeMap<String, Client>>>,
 }
 
 impl std::fmt::Debug for HttpTransportConfig {
@@ -41,6 +43,7 @@ impl HttpTransportConfig {
             extra_headers: connection.extra_headers().cloned().unwrap_or_default(),
             request_timeout_secs,
             tls_ca_cert_path: connection.tls_ca_cert_path().map(ToOwned::to_owned),
+            clients: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -51,10 +54,27 @@ impl HttpTransportConfig {
             extra_headers: BTreeMap::new(),
             request_timeout_secs: None,
             tls_ca_cert_path: None,
+            clients: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
     pub fn client(&self, default_timeout: Duration, service_key: &str) -> Result<Client> {
+        let timeout_key = match &self.request_timeout_secs {
+            Some(Override::Set(seconds)) => format!("set:{}", seconds.get()),
+            Some(Override::Clear) => "clear".to_owned(),
+            None => format!("default:{}", default_timeout.as_secs()),
+        };
+        let cache_key = format!("{service_key}:{timeout_key}");
+        if let Some(client) = self
+            .clients
+            .lock()
+            .map_err(|_| anyhow::anyhow!("provider HTTP client cache is poisoned"))?
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(client);
+        }
+
         let mut builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
             Client::builder().redirect(reqwest::redirect::Policy::none()),
             service_key,
@@ -75,9 +95,14 @@ impl HttpTransportConfig {
                 .context("decoding provider TLS CA certificate")?;
             builder = builder.add_root_certificate(certificate);
         }
-        builder
+        let client = builder
             .build()
-            .with_context(|| format!("building HTTP client for {service_key}"))
+            .with_context(|| format!("building HTTP client for {service_key}"))?;
+        let mut clients = self
+            .clients
+            .lock()
+            .map_err(|_| anyhow::anyhow!("provider HTTP client cache is poisoned"))?;
+        Ok(clients.entry(cache_key).or_insert(client).clone())
     }
 
     pub fn headers(&self) -> Result<HeaderMap> {
