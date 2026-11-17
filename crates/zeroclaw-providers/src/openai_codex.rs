@@ -197,7 +197,7 @@ impl OpenAiCodexModelProvider {
         }
     }
 
-    fn streaming_client(&self) -> Client {
+    fn streaming_client(&self) -> anyhow::Result<Client> {
         let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
         let timeouts = self.streaming_timeouts();
         if let Some(timeout) = timeouts.request {
@@ -211,7 +211,7 @@ impl OpenAiCodexModelProvider {
             builder,
             "model_provider.openai",
         );
-        builder.build().unwrap_or_else(|_| Client::new())
+        Ok(builder.build()?)
     }
 }
 
@@ -1380,10 +1380,45 @@ impl OpenAiCodexModelProvider {
         access_token: Option<&str>,
         use_gateway_api_key_auth: bool,
         request: &ResponsesRequest,
-        streaming: bool,
     ) -> reqwest::RequestBuilder {
-        let mut request_builder = self
-            .then_client(streaming)
+        self.request_builder(
+            self.http_client(),
+            bearer_token,
+            account_id,
+            access_token,
+            use_gateway_api_key_auth,
+            request,
+        )
+    }
+
+    fn streaming_responses_request_builder(
+        &self,
+        bearer_token: &str,
+        account_id: Option<&str>,
+        access_token: Option<&str>,
+        use_gateway_api_key_auth: bool,
+        request: &ResponsesRequest,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        Ok(self.request_builder(
+            self.streaming_client()?,
+            bearer_token,
+            account_id,
+            access_token,
+            use_gateway_api_key_auth,
+            request,
+        ))
+    }
+
+    fn request_builder(
+        &self,
+        client: Client,
+        bearer_token: &str,
+        account_id: Option<&str>,
+        access_token: Option<&str>,
+        use_gateway_api_key_auth: bool,
+        request: &ResponsesRequest,
+    ) -> reqwest::RequestBuilder {
+        let mut request_builder = client
             .post(&self.responses_url)
             .header("Authorization", format!("Bearer {bearer_token}"))
             .header("OpenAI-Beta", "responses=experimental")
@@ -1408,14 +1443,6 @@ impl OpenAiCodexModelProvider {
         }
 
         request_builder
-    }
-
-    fn then_client(&self, streaming: bool) -> Client {
-        if streaming {
-            self.streaming_client()
-        } else {
-            self.http_client()
-        }
     }
 
     async fn send_responses_request(
@@ -1475,7 +1502,6 @@ impl OpenAiCodexModelProvider {
             creds.access_token.as_deref(),
             creds.use_gateway_api_key_auth,
             &request,
-            false,
         );
 
         let response = request_builder.json(&request).send().await?;
@@ -1510,7 +1536,6 @@ impl OpenAiCodexModelProvider {
                         creds.access_token.as_deref(),
                         creds.use_gateway_api_key_auth,
                         &request,
-                        false,
                     )
                     .json(&request)
                     .send()
@@ -1722,16 +1747,21 @@ impl ModelProvider for OpenAiCodexModelProvider {
                 );
             }
 
-            let request_builder = provider
-                .responses_request_builder(
-                    &creds.bearer_token,
-                    creds.account_id.as_deref(),
-                    creds.access_token.as_deref(),
-                    creds.use_gateway_api_key_auth,
-                    &request,
-                    true,
-                )
-                .json(&request);
+            let request_builder = match provider.streaming_responses_request_builder(
+                &creds.bearer_token,
+                creds.account_id.as_deref(),
+                creds.access_token.as_deref(),
+                creds.use_gateway_api_key_auth,
+                &request,
+            ) {
+                Ok(builder) => builder.json(&request),
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(err.to_string())))
+                        .await;
+                    return;
+                }
+            };
 
             crate::openai::run_responses_sse(
                 request_builder,
@@ -1950,7 +1980,7 @@ mod tests {
             parallel_tool_calls: None,
         };
         let request_builder =
-            provider.responses_request_builder("test-key", None, None, true, &request, false);
+            provider.responses_request_builder("test-key", None, None, true, &request);
         set_runtime_proxy_config(ProxyConfig::default());
 
         let response_body: serde_json::Value = request_builder
