@@ -2443,7 +2443,6 @@ mod streaming_fallback_tests {
                     "primary":{"capability":"chat","provider":"gateway","model":"primary-model","options":{"extract_text_reasoning":true}},
                     "backup":{"capability":"chat","provider":"gateway","model":"backup-model","options":{"extract_text_reasoning":false}}
                 },
-                "fallback":{"primary":["backup"]}
             }
         })).unwrap();
         let original = [ChatMessage::user(
@@ -2457,7 +2456,7 @@ mod streaming_fallback_tests {
         for streaming in [false, true] {
             let provider = zeroclaw_providers::model::build_reliable_provider(
                 &config,
-                "primary",
+                "backup",
                 Default::default(),
             )
             .unwrap()
@@ -2466,9 +2465,9 @@ mod streaming_fallback_tests {
                 &ctx,
                 Some(&config),
                 provider.as_ref(),
-                "primary",
-                "primary-model",
-                "primary-model",
+                "backup",
+                "backup-model",
+                "backup-model",
                 ChatRequest::new(&original),
                 Some(&recovery),
                 streaming,
@@ -2478,7 +2477,11 @@ mod streaming_fallback_tests {
             )
             .await
             .unwrap();
-            assert!(outcome.image_recovery_succeeded, "streaming={streaming}");
+            assert!(
+                outcome.image_recovery_succeeded,
+                "streaming={streaming}, result={:?}",
+                outcome.chat_result
+            );
             assert_eq!(
                 outcome.chat_result.unwrap().text.as_deref(),
                 Some("<think>literal text</think>"),

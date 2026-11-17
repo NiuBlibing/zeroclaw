@@ -654,6 +654,7 @@ kind = "anthropic"
 
 [providers.connections."legacy.anthropic.agent_complex_agent".api.chat]
 request_timeout_secs = 180
+stream_request_timeout_secs = "null"
 wire_api = "chat_completions"
 
 [providers.connections."legacy.anthropic.agent_complex_agent".auth]
@@ -742,7 +743,9 @@ kind = "openai"
 uri = "https://api.openai.com/v1/chat/completions"
 
 [providers.connections."legacy.openai.default".api.chat]
+read_timeout_secs = 300
 request_timeout_secs = 90
+stream_request_timeout_secs = "null"
 wire_api = "chat_completions"
 
 [providers.connections."legacy.openai.default".auth]
@@ -776,7 +779,9 @@ kind = "openai"
 uri = "https://api.openai.com/v1/chat/completions"
 
 [providers.connections."route.fast".api.chat]
+read_timeout_secs = 300
 request_timeout_secs = 90
+stream_request_timeout_secs = "null"
 wire_api = "chat_completions"
 
 [providers.connections."route.fast".auth]
@@ -795,6 +800,7 @@ provider = "legacy.anthropic.agent_complex_agent"
 [providers.models."anthropic.agent_complex_agent".metadata]
 
 [providers.models."anthropic.agent_complex_agent".options]
+extract_text_tool_calls = true
 temperature = 0.3
 
 [providers.models."anthropic.custom"]
@@ -844,6 +850,9 @@ model = "gpt-4o-mini"
 provider = "legacy.openai.agent_simple_agent"
 
 [providers.models."openai.agent_simple_agent".metadata]
+
+[providers.models."openai.agent_simple_agent".options]
+extract_text_tool_calls = true
 
 [providers.models."openai.default"]
 capability = "chat"

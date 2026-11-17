@@ -126,10 +126,10 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
             } else {
                 format!("{family}.{fallback}")
             };
-            if let Some(target) = legacy_model_selection(models, &target) {
-                if !visited.contains(&(target.clone(), strict)) {
-                    bindings.push((target, strict));
-                }
+            if let Some(target) = legacy_model_selection(models, &target)
+                && !visited.contains(&(target.clone(), strict))
+            {
+                bindings.push((target, strict));
             }
         }
     }
