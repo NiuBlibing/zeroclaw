@@ -48152,10 +48152,11 @@ options = { temperature = 0.2 }
         let (mut dispatcher, mut rx, _) = make_dispatcher_with_capture(cfg);
         dispatcher.set_authenticated_for_test();
         let before = dispatcher.ctx.config.snapshot_with_revision();
+        let before_port = before.0.gateway.port;
 
         let params = json!({
-            "prop": "providers.models.anthropic.default.model",
-            "value": "doomed-value"
+            "prop": "gateway.port",
+            "value": 43123
         });
         let response = rpc_roundtrip(&mut dispatcher, &mut rx, "config/set", params).await;
         assert!(
@@ -48193,8 +48194,8 @@ options = { temperature = 0.2 }
             after.1 == before.1,
             "a failed save must not advance the published revision"
         );
-        assert!(
-            provider_model(&after.0, "anthropic").as_deref() != Some("doomed-value"),
+        assert_eq!(
+            after.0.gateway.port, before_port,
             "a failed save must not publish the attempted value"
         );
         assert_eq!(
@@ -48239,8 +48240,8 @@ options = { temperature = 0.2 }
         let ctx = Arc::clone(&dispatcher.ctx);
 
         let params = json!({
-            "prop": "providers.models.anthropic.default.model",
-            "value": "blocked-value"
+            "prop": "gateway.port",
+            "value": 43124
         });
         let result = assert_rpc_blocks_on_config_commit_serialization(
             ctx,
