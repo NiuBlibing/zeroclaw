@@ -18,6 +18,9 @@ macro_rules! options_patch {
     ($name:ident { $($field:ident: $type:ty),* $(,)? }) => {
         #[derive(Debug, Clone, Default, Serialize, Deserialize)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+        // Unknown leaves deliberately remain warning-only at startup. The
+        // activation loader uses FIELDS to report them once, without emitting
+        // warnings from internal decoding or making typos fatal to startup.
         #[serde(default)]
         pub struct $name {
             $(#[serde(skip_serializing_if = "Option::is_none")]
