@@ -7351,7 +7351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_system_does_not_fallback_for_unparsed_think_text() {
+    async fn chat_with_system_falls_back_for_config_free_think_only_response() {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
@@ -7383,11 +7383,11 @@ mod tests {
         let result = model_provider
             .chat_with_system(None, "hello", "test", Some(0.0))
             .await
-            .expect("config-free injection must accept ordinary text");
+            .expect("config-free injection should recover from an empty parsed response");
 
-        assert_eq!(result, "<think>internal reasoning</think>");
+        assert_eq!(result, "from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
