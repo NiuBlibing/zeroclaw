@@ -874,7 +874,7 @@ options = {{ extract_text_reasoning = false }}
                     zeroclaw_api::scope_text_extraction(
                         Some(std::sync::Arc::new(|_: &str| {
                             zeroclaw_api::TextExtraction {
-                                reasoning: true,
+                                reasoning: Some(true),
                                 tool_calls: false,
                             }
                         })),

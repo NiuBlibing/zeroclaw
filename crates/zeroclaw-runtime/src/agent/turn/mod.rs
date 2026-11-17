@@ -1925,8 +1925,12 @@ async fn run_tool_call_loop_impl<'a>(
         dedup_exempt_tools,
         pacing,
         text_tool_calls_disabled,
-        extract_text_reasoning: config
-            .is_some_and(|config| config.model_text_extraction(provider_name).reasoning),
+        extract_text_reasoning: config.is_some_and(|config| {
+            config
+                .model_text_extraction(provider_name)
+                .reasoning
+                .unwrap_or(true)
+        }),
         channel,
         draft_reasoning: knobs.draft_reasoning,
         turn_id,
@@ -2329,7 +2333,7 @@ async fn run_tool_call_loop_impl<'a>(
         );
         if let Some(config) = config {
             let extraction = config.model_text_extraction(active_model_provider_name);
-            ctx.extract_text_reasoning = extraction.reasoning;
+            ctx.extract_text_reasoning = extraction.reasoning.unwrap_or(true);
             ctx.text_tool_calls_disabled = !extraction.tool_calls;
         }
         let text_tool_calls_disabled = ctx.text_tool_calls_disabled;
@@ -2930,7 +2934,7 @@ async fn run_tool_call_loop_impl<'a>(
         if let Some(config) = config {
             let extraction =
                 config.model_text_extraction(accepted_selection.unwrap_or(&served_provider));
-            ctx.extract_text_reasoning = extraction.reasoning;
+            ctx.extract_text_reasoning = extraction.reasoning.unwrap_or(true);
             ctx.text_tool_calls_disabled = !extraction.tool_calls;
         }
 
@@ -2942,7 +2946,7 @@ async fn run_tool_call_loop_impl<'a>(
             zeroclaw_providers::response::normalize_response(
                 &mut response,
                 zeroclaw_api::TextExtraction {
-                    reasoning: ctx.extract_text_reasoning,
+                    reasoning: Some(ctx.extract_text_reasoning),
                     tool_calls: !ctx.text_tool_calls_disabled,
                 },
             );

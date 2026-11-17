@@ -27,7 +27,7 @@ impl IterationToolSpecs {
         let text_tool_calls = zeroclaw_providers::response::count_text_tool_calls(
             response.text_or_empty(),
             zeroclaw_api::TextExtraction {
-                reasoning: extract_text_reasoning,
+                reasoning: Some(extract_text_reasoning),
                 tool_calls: !text_tool_calls_disabled,
             },
         );

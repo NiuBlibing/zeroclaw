@@ -393,7 +393,7 @@ pub(crate) async fn finish_after_max_iterations(
                     std::sync::Arc::new(move |model: &str| config.model_text_extraction(model))
                 }
                 None => std::sync::Arc::new(|_: &str| zeroclaw_api::TextExtraction {
-                    reasoning: true,
+                    reasoning: Some(true),
                     tool_calls: false,
                 }),
             };

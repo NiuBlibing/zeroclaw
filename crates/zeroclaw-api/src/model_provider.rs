@@ -1561,7 +1561,7 @@ mod capability_tests {
         let messages = [super::ChatMessage::user(text)];
         crate::scope_text_extraction(
             Some(std::sync::Arc::new(|_| crate::TextExtraction {
-                reasoning: true,
+                reasoning: Some(true),
                 tool_calls: false,
             })),
             async {

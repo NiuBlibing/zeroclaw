@@ -148,7 +148,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     let mut delta_sender = on_delta;
     let mut think_stripper = StreamThinkTagStripper::default();
     let mut extraction = zeroclaw_config::provider_registry::TextExtraction {
-        reasoning: extract_text_reasoning,
+        reasoning: Some(extract_text_reasoning),
         tool_calls: !text_tool_calls_disabled,
     };
     let mut extraction_model_ref: Option<String> = None;
@@ -255,7 +255,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                         zeroclaw_providers::response::count_text_tool_calls(
                             &outcome.response_text,
                             zeroclaw_api::TextExtraction {
-                                reasoning: false,
+                                reasoning: Some(false),
                                 tool_calls: !text_tool_calls_disabled,
                             },
                         ),
@@ -419,7 +419,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                     continue;
                 }
 
-                let sanitized_delta = if extraction.reasoning {
+                let sanitized_delta = if extraction.reasoning != Some(false) {
                     think_stripper.push(&chunk.delta)
                 } else {
                     chunk.delta.clone()

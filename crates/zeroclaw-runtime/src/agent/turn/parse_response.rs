@@ -200,7 +200,7 @@ pub(crate) async fn interpret_chat_response(
     let interpreted = zeroclaw_providers::response::interpret_response(
         &resp,
         zeroclaw_api::TextExtraction {
-            reasoning: ctx.extract_text_reasoning,
+            reasoning: Some(ctx.extract_text_reasoning),
             tool_calls: !ctx.text_tool_calls_disabled,
         },
         &specs.known_tool_names,

@@ -302,7 +302,7 @@ options = { extract_text_tool_calls = true }
         assert_eq!(
             crate::migration::admit_test_input(&config).model_text_extraction("openai.proxy.prod"),
             TextExtraction {
-                reasoning: true,
+                reasoning: Some(true),
                 tool_calls: true
             }
         );
@@ -321,7 +321,7 @@ options = { extract_text_tool_calls = true }
         assert_eq!(
             crate::migration::admit_test_input(&config).model_text_extraction("openai.proxy.prod"),
             TextExtraction {
-                reasoning: true,
+                reasoning: Some(true),
                 tool_calls: false
             }
         );
@@ -329,7 +329,7 @@ options = { extract_text_tool_calls = true }
             crate::migration::admit_test_input(&config)
                 .model_text_extraction("openai.proxy.prod.native.model"),
             TextExtraction {
-                reasoning: true,
+                reasoning: Some(true),
                 tool_calls: false
             }
         );

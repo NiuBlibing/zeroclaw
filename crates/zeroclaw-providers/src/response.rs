@@ -18,7 +18,10 @@ pub fn normalize_response(response: &mut ChatResponse, policy: TextExtraction) {
 }
 
 pub fn normalize_text(text: &str, policy: TextExtraction) -> String {
-    let text = if policy.reasoning {
+    // Omitted policy preserves the historical extraction behavior. Only an
+    // explicit `Some(false)` opts out, so terminal classification remains
+    // compatible with the pre-registry providers.
+    let text = if policy.reasoning != Some(false) {
         strip_think_tags(text)
     } else {
         text.to_owned()
@@ -105,11 +108,11 @@ mod tests {
             reasoning_content: None,
         };
         normalize_response(&mut response, TextExtraction::default());
-        assert!(!response.is_semantically_empty_terminal());
+        assert!(response.is_semantically_empty_terminal());
         normalize_response(
             &mut response,
             TextExtraction {
-                reasoning: true,
+                reasoning: Some(true),
                 tool_calls: false,
             },
         );
@@ -123,7 +126,7 @@ mod tests {
             count_text_tool_calls(
                 text,
                 TextExtraction {
-                    reasoning: true,
+                    reasoning: Some(true),
                     tool_calls: true,
                 },
             ),
@@ -133,7 +136,7 @@ mod tests {
             count_text_tool_calls(
                 text,
                 TextExtraction {
-                    reasoning: true,
+                    reasoning: Some(true),
                     tool_calls: false,
                 },
             ),

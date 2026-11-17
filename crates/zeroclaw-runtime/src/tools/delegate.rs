@@ -3441,7 +3441,7 @@ impl DelegateTool {
             })
             .unwrap_or_else(|| {
                 Arc::new(|_: &str| zeroclaw_api::TextExtraction {
-                    reasoning: true,
+                    reasoning: Some(true),
                     tool_calls: false,
                 })
                     as Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>
