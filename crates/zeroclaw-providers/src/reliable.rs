@@ -7328,7 +7328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_system_keeps_think_only_text_without_admitted_policy() {
+    async fn chat_with_system_retries_think_only_text_for_config_free_injection() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
             "test",
@@ -7344,10 +7344,10 @@ mod tests {
         let result = model_provider
             .chat_with_system(None, "hello", "test", Some(0.0))
             .await
-            .expect("config-free injection must not infer a reasoning parser");
+            .expect("config-free injection should retry an empty parsed response");
 
-        assert_eq!(result, "<think>internal reasoning</think>");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result, "recovered");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
