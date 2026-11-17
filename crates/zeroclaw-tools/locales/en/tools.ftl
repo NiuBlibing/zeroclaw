@@ -177,6 +177,10 @@ tool-memory-store = Store a fact, preference, or note in long-term memory. Use c
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
 tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
+tool-model-switch = Request a runtime model switch using an exact configured model reference. Use 'get' to see the pending switch, 'list_model_providers' to see configured model references and available provider kinds, 'list_models' to query upstream model IDs through a configured model's connection, or 'set' with a model reference such as 'chat.fast'. The switch is runtime/session state and does not write config.
+tool-model-switch-param-action = Action to perform: get pending switch state, set an exact model switch, list configured model references and provider kinds, or query upstream model IDs through a configured model's connection
+tool-model-switch-param-model-provider = Exact configured model reference (for example, 'chat.fast'). Required for 'set' and 'list_models' actions.
+tool-model-switch-param-model = Optional provider-local model override. Usually omit this when the model reference already selects a model.
 tool-model-routing-config-write-busy = Another configuration update is in progress. Retry this change after it finishes.
 tool-model-routing-config-reverted = Reverted to '{$model}'.
 tool-model-routing-config-removed-new-alias = Removed the newly created alias.
