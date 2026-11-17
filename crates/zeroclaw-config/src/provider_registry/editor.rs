@@ -89,7 +89,11 @@ pub async fn stage_persisted(config: &mut Config, edit: RegistryEdit) -> Result<
         Err(error) => return Err(error).context("cannot inspect persisted provider registry"),
     };
     if let Some(raw) = raw {
-        let disk: Config = toml::from_str(&raw)
+        // The daemon compares the admitted, current-schema view.  Re-run the
+        // same versioned migration chain for the disk copy so a V3/V4 file is
+        // compared after its legacy provider/profile fields have been
+        // projected into the canonical registry.
+        let disk = crate::migration::migrate_to_current(&raw)
             .context("config changed on disk; reload before saving the provider registry")?;
         let mut saved = config.clone();
         crate::env_overrides::mask_env_overrides_for_save(
