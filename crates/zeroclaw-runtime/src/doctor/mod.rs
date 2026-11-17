@@ -1989,7 +1989,10 @@ mod tests {
         );
 
         let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
+        check_config_semantics(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            &mut items,
+        );
         assert!(
             items
                 .iter()
@@ -2165,7 +2168,10 @@ mod tests {
             },
         );
         let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
+        check_config_semantics(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            &mut items,
+        );
         let item = items
             .iter()
             .find(|i| i.message.contains("providers.models.openai.stoa"))
@@ -2191,7 +2197,10 @@ mod tests {
             },
         );
         let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
+        check_config_semantics(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            &mut items,
+        );
         let item = items
             .iter()
             .find(|i| i.message.contains("providers.models.openai.default"))
@@ -2229,7 +2238,10 @@ mod tests {
             zeroclaw_config::schema::GroqTranscriptionProviderConfig::default(),
         );
         let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
+        check_config_semantics(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            &mut items,
+        );
         let item = items
             .iter()
             .find(|i| i.message.contains("providers.models.groq.default"))
@@ -2256,7 +2268,10 @@ mod tests {
             },
         );
         let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
+        check_config_semantics(
+            &zeroclaw_config::migration::admit_test_input(&config),
+            &mut items,
+        );
         let item = items
             .iter()
             .find(|i| i.message.contains("providers.models.groq.default"))
@@ -4011,6 +4026,7 @@ mod tests {
 
         // Call update_context_windows for alias2 only
         // This should ONLY update alias2, leaving alias1 at 8192
+        let mut config = zeroclaw_config::migration::admit_test_input(&config);
         let mock_fetch: FetchContextWindowFn =
             Box::new(|_config: &Config, _reference: &str| Box::pin(async { Ok(Some(4096usize)) }));
         let updated =
@@ -4078,6 +4094,7 @@ mod tests {
 
         // The fetch reports a per-model value so the test can observe WHICH
         // model each probe (and therefore each write) targeted.
+        let mut config = zeroclaw_config::migration::admit_test_input(&config);
         let mock_fetch: FetchContextWindowFn = Box::new(|config: &Config, reference: &str| {
             let window = config
                 .resolve_model_id(reference)
@@ -4137,6 +4154,7 @@ mod tests {
             },
         );
 
+        let mut config = zeroclaw_config::migration::admit_test_input(&config);
         let mock_fetch: FetchContextWindowFn = Box::new(|config: &Config, reference: &str| {
             let window = config
                 .resolve_model_id(reference)

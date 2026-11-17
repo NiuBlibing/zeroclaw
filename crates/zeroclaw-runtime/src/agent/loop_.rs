@@ -15975,8 +15975,8 @@ options = { extract_text_reasoning = true }
                 "disabled extraction should return tool-like text, got: {result}"
             );
             assert!(
-                result.contains("<think>private reasoning</think>"),
-                "an unconfigured wrapper must preserve reasoning syntax, got: {result}"
+                !result.contains("<think>private reasoning</think>"),
+                "unset reasoning policy retains historical extraction, got: {result}"
             );
         });
     }

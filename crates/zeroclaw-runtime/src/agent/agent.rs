@@ -6253,7 +6253,7 @@ mod tests {
         );
         for override_model in [None, Some("different-id")] {
             for streamed in [false, true] {
-                let limits_config = config.clone();
+                let limits_config = zeroclaw_config::migration::admit_test_input(&config);
                 let mut agent = Agent::builder()
                     .agent_alias("worker".into())
                     .model_runtime(
@@ -6897,6 +6897,7 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 ..Default::default()
             },
         );
+        let mut config = zeroclaw_config::migration::admit_test_input(&config);
         assert_eq!(
             config.configured_model_context_window("worker"),
             Some(8_000)
@@ -7022,6 +7023,8 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
                 },
             },
         );
+
+        let config = zeroclaw_config::migration::admit_test_input(&config);
 
         // Three-segment ref: the selected entry's tuning wins.
         let rt = build_model(
@@ -7764,7 +7767,7 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
     }
 
     #[tokio::test]
-    async fn injected_agent_preserves_reasoning_syntax_without_a_model_policy() {
+    async fn injected_agent_rejects_reasoning_only_completion_without_a_model_policy() {
         for streamed in [false, true] {
             let text = "<think>literal content</think>";
             let mut agent = blank_input_agent(Box::new(MockModelProvider {
@@ -7784,7 +7787,10 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             } else {
                 agent.turn("return literal syntax").await
             };
-            assert_eq!(result.unwrap(), text, "streamed={streamed}");
+            assert!(
+                result.is_err(),
+                "think-only completion must be rejected: streamed={streamed}"
+            );
         }
     }
 
@@ -24121,7 +24127,9 @@ model_provider = "custom.primary"
             cfg
         };
         let switch_cfg = ProviderSwitchConfig {
-            config: Some(std::sync::Arc::new(switch_config)),
+            config: Some(std::sync::Arc::new(
+                zeroclaw_config::migration::admit_test_input(&switch_config),
+            )),
             live_config: None,
             live: None,
         };

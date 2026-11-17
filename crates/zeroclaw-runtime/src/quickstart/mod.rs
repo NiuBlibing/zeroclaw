@@ -4083,10 +4083,12 @@ mod tests {
             },
         );
 
-        let (models, _pricing, live) =
-            model_catalog_with_config_result(Some(&config), "xai.default")
-                .await
-                .expect("configured native catalog should succeed");
+        let (models, _pricing, live) = model_catalog_with_config_result(
+            Some(&zeroclaw_config::migration::admit_test_input(&config)),
+            "xai.default",
+        )
+        .await
+        .expect("configured native catalog should succeed");
 
         assert!(live, "credentialed native listing must report live=true");
         assert!(
@@ -4128,9 +4130,12 @@ mod tests {
             },
         );
 
-        let (models, _pricing, live) = model_catalog_with_config_result(Some(&config), "xai.prod")
-            .await
-            .expect("configured alias catalog should succeed");
+        let (models, _pricing, live) = model_catalog_with_config_result(
+            Some(&zeroclaw_config::migration::admit_test_input(&config)),
+            "xai.prod",
+        )
+        .await
+        .expect("configured alias catalog should succeed");
 
         assert!(live);
         assert!(
@@ -4219,9 +4224,12 @@ mod tests {
             },
         );
 
-        let error = model_catalog_with_config_result(Some(&config), "xai.private")
-            .await
-            .expect_err("configured profile rejection must not become a public family catalog");
+        let error = model_catalog_with_config_result(
+            Some(&zeroclaw_config::migration::admit_test_input(&config)),
+            "xai.private",
+        )
+        .await
+        .expect_err("configured profile rejection must not become a public family catalog");
         let error = error.to_string();
         assert!(error.contains("catalog failed"));
         for secret in [USER, PASSWORD, SIGNATURE] {
@@ -4297,10 +4305,12 @@ mod tests {
             },
         );
 
-        let (models, pricing, live) =
-            model_catalog_with_config_result(Some(&config), "hailo_ollama.empty")
-                .await
-                .expect("reachable empty catalog is a valid configured-profile result");
+        let (models, pricing, live) = model_catalog_with_config_result(
+            Some(&zeroclaw_config::migration::admit_test_input(&config)),
+            "hailo_ollama.empty",
+        )
+        .await
+        .expect("reachable empty catalog is a valid configured-profile result");
         assert!(models.is_empty());
         assert!(pricing.is_none());
         assert!(live);
@@ -4337,10 +4347,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (models, _pricing, live) =
-            model_catalog_with_config_result(Some(&config), "hailo_ollama.edge")
-                .await
-                .expect("configured Hailo catalog should succeed");
+        let (models, _pricing, live) = model_catalog_with_config_result(
+            Some(&zeroclaw_config::migration::admit_test_input(&config)),
+            "hailo_ollama.edge",
+        )
+        .await
+        .expect("configured Hailo catalog should succeed");
         assert!(live);
         assert_eq!(models, vec!["qwen3:1.7b"]);
     }

@@ -7790,6 +7790,7 @@ mod tests {
         );
         // No gateway is registered: the daemon runs with the gateway disabled.
         let registry = DaemonRegistry::new();
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let daemon = run(config, "127.0.0.1".to_string(), 0, registry, false, false);
         tokio::pin!(daemon);
 
@@ -8026,6 +8027,7 @@ mod tests {
             ));
         }
 
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let daemon = run(config, "127.0.0.1".to_string(), 0, registry, false, false);
         tokio::pin!(daemon);
         let deadline = Instant::now() + Duration::from_secs(5);

@@ -32344,6 +32344,8 @@ mod tests {
             ..Config::default()
         };
 
+        let cfg = zeroclaw_config::migration::admit_test_input(&cfg);
+
         // Resolve both values exactly as RPC dispatch does.
         let max_ctx = context_usage_max_tokens(&cfg, "coder");
         let model_ctx = cfg.effective_model_context_window("coder") as u64;
@@ -32853,7 +32855,7 @@ mod tests {
             ..Config::default()
         };
         cfg.providers.models.custom = custom;
-        cfg
+        zeroclaw_config::migration::admit_test_input(&cfg)
     }
 
     /// A configured ratio opts the meter into a model-relative trim budget.
@@ -42290,7 +42292,15 @@ mod tests {
             zeroclaw_config::provider_registry::editor::snapshot(&dispatcher.ctx.config.read())
                 .unwrap();
         let mut registry = expected.clone();
-        registry["connections"]["openai.default"]["auth"] =
+        let connection = expected["models"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|model| model["capability"] == "embedding")
+            .unwrap()["provider"]
+            .as_str()
+            .unwrap();
+        registry["connections"][connection]["auth"] =
             json!({"mode": "api_key", "api_key": "sk-rotated-key"});
         let res = dispatcher
             .handle_config_registry_set(&json!({"expected": expected, "registry": registry}))
@@ -48256,7 +48266,7 @@ options = { temperature = 0.2 }
 
         let on_disk = std::fs::read_to_string(&config_path).unwrap();
         assert!(
-            on_disk.contains("blocked-value"),
+            on_disk.parse::<toml::Value>().unwrap()["gateway"]["port"].as_integer() == Some(43124),
             "config/set must persist once unblocked; on-disk file:\n{on_disk}"
         );
     }

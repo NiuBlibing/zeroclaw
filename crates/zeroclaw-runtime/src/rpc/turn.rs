@@ -1455,7 +1455,8 @@ mod tests {
             .expect("ensure provider");
         entry.context_window = Some(128_000);
         entry.model = Some("test-model".to_string());
-        let config: Arc<parking_lot::RwLock<Config>> = Arc::new(config.into());
+        let config: Arc<parking_lot::RwLock<Config>> =
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config).into());
 
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
@@ -1662,7 +1663,7 @@ mod tests {
 
             let counters = DrainCounters::new();
             let cfg_for_cb: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>> =
-                Arc::new(config.into());
+                Arc::new(zeroclaw_config::migration::admit_test_input(&config).into());
             let cfg_arc = Arc::clone(&cfg_for_cb);
             let dc = Arc::clone(&counters);
 
@@ -1855,6 +1856,7 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let agent_config = config
             .resolved_agent_config("rpc-w1")
             .expect("test agent config should resolve");

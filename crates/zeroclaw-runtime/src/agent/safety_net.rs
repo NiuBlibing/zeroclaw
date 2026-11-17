@@ -3110,7 +3110,7 @@ async fn usage_event_coherent_tuple_vision_route() {
             .pricing
             .insert("claude-3-opus.cached_input".into(), 0.0);
 
-        let cfg_arc = Arc::new(cfg.clone());
+        let cfg_arc = Arc::new(zeroclaw_config::migration::admit_test_input(&cfg));
         let switch_cfg = ProviderSwitchConfig {
             config: Some(cfg_arc.clone()),
             live_config: None,

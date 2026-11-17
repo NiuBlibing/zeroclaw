@@ -242,8 +242,6 @@ impl ProviderLlmAdapter {
         super::bridge::run_bridged_anyhow(
             async move {
                 let (config, built) = zeroclaw_providers::model::build_nonblocking(resolve).await?;
-                #[cfg(test)]
-                let config = zeroclaw_config::migration::admit_test_input(&config);
                 let config = Arc::new(config);
                 let provider_ref = built.identity().provider_ref().to_owned();
                 let sampling =
@@ -858,7 +856,7 @@ options = {{ temperature = 0.9, extract_text_reasoning = false }}
                     ..Default::default()
                 },
             );
-            config
+            zeroclaw_config::migration::admit_test_input(&config)
         }
 
         let first = MockServer::start().await;

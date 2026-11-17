@@ -2901,6 +2901,7 @@ mod tests {
         job.allowed_tools = Some(vec!["shell".into()]);
         job.uses_memory = false;
 
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let authority = crate::LiveConfigAuthority::new(config.clone());
         let admission = Some(authority.execution_capability().admit(TEST_AGENT).unwrap());
         let (success, output) = Box::pin(execute_job_with_retry(

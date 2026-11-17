@@ -15753,6 +15753,7 @@ options = { extract_text_tool_calls = false }
                 ..Default::default()
             },
         );
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         assert!(
             config.validate().is_ok(),
             "validate: {:?}",

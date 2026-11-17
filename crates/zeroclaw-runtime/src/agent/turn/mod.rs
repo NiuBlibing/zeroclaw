@@ -6707,7 +6707,7 @@ mod active_route_context_tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        config
+        zeroclaw_config::migration::admit_test_input(&config)
     }
 
     #[tokio::test]
@@ -6881,14 +6881,17 @@ mod active_route_context_tests {
 
         // Operator shrinks the text model's window to 40k in the live config
         // AFTER the agent (and its snapshot) were built.
-        live.write()
+        let mut candidate = live.write();
+        let zeroclaw_config::provider_registry::ModelDefinition::Chat(model) = candidate
             .providers
             .models
-            .custom
-            .get_mut("text")
-            .expect("text provider")
-            .base
-            .context_window = Some(40_000);
+            .canonical_model_mut(&"custom.text".into())
+            .unwrap()
+        else {
+            panic!("text model must be chat")
+        };
+        model.metadata.context_window = Some(40_000);
+        drop(candidate);
 
         // The next resolution reflects the reload: 40k window, budget = 40k*0.9.
         // The stale 200k snapshot is NOT consulted because the resolver wins.
@@ -7568,7 +7571,7 @@ mod sop_step_reassembly_tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        config
+        zeroclaw_config::migration::admit_test_input(&config)
     }
 
     /// Run `tool` of a re-assembled step's registry with `args`.
@@ -7617,6 +7620,7 @@ mod sop_step_reassembly_tests {
             zeroclaw_config::schema::SopConfig::default(),
         )));
 
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let owned = assemble_owned_execution(
             &config,
             None,
@@ -7764,6 +7768,7 @@ mod sop_step_reassembly_tests {
                 ..AliasedAgentConfig::default()
             },
         );
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let live_config = zeroclaw_config::live::LiveConfig::new(config.clone());
         let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
             SopConfig::default(),
@@ -9842,7 +9847,7 @@ mod sop_step_reassembly_tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        config
+        zeroclaw_config::migration::admit_test_input(&config)
     }
 
     async fn drive_cross_agent_step_with(
