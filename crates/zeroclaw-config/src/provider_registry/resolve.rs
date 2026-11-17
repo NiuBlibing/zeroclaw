@@ -379,10 +379,7 @@ impl ResolvedChat<'_> {
             self.options.native_tools,
         );
         super::TextExtraction {
-            reasoning: self
-                .options
-                .extract_text_reasoning
-                .or(defaults.reasoning),
+            reasoning: self.options.extract_text_reasoning.or(defaults.reasoning),
             tool_calls: self
                 .options
                 .extract_text_tool_calls

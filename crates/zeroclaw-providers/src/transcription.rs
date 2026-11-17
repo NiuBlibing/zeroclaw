@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::transport::HttpTransportConfig;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::{

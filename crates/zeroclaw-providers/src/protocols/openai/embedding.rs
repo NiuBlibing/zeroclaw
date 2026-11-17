@@ -22,13 +22,14 @@ struct EmbeddingItem {
 pub(crate) async fn vectors(
     response: reqwest::Response,
     count: usize,
-    dimensions: usize,
+    dimensions: Option<usize>,
 ) -> Result<Vec<Vec<f32>>> {
-    ensure!(
-        response.status().is_success(),
-        "Embedding API returned HTTP {}",
-        response.status()
-    );
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let body = crate::sanitize_api_error(&body);
+        anyhow::bail!("Embedding API returned HTTP {status}: {body}");
+    }
     let response: EmbeddingResponse = response
         .json()
         .await
@@ -40,10 +41,12 @@ pub(crate) async fn vectors(
     let mut vectors = vec![None; count];
     for item in response.data {
         ensure!(item.index < count, "embedding response index out of range");
-        ensure!(
-            item.embedding.len() == dimensions,
-            "embedding response dimensions differ from configured dimensions"
-        );
+        if let Some(dimensions) = dimensions {
+            ensure!(
+                item.embedding.len() == dimensions,
+                "embedding response dimensions differ from configured dimensions"
+            );
+        }
         ensure!(
             item.embedding.iter().all(|value| value.is_finite()),
             "non-finite embedding component"
