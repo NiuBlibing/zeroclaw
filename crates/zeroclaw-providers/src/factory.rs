@@ -1525,6 +1525,7 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
                     self.oauth_client_id.clone(),
                     self.oauth_client_secret.clone(),
                 )
+                .request_timeout(opts.provider_timeout_secs, opts.provider_timeout_disabled)
                 .build(),
         ))
     }
