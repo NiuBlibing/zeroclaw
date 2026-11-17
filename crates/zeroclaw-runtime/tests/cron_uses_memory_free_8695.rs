@@ -107,6 +107,10 @@ async fn run_cron_once(config: Config, overrides: AgentRunOverrides) -> Vec<Stri
             .expect("`custom` slot must exist");
         base.uri = Some(provider_uri);
     }
+    // Integration tests do not activate the runtime library's internal
+    // `cfg(test)` admission hook. Project the historical typed fixture through
+    // the explicit migration boundary before invoking the canonical runner.
+    config = zeroclaw_config::migration::admit_test_input(&config);
 
     let prompt = "Any reminders to surface today? Pull anything relevant from memory.".to_string();
     let _ = zeroclaw_runtime::agent::run(
