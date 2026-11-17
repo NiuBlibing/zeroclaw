@@ -40,7 +40,10 @@ fn apply_transcription_timeout(
     request: reqwest::RequestBuilder,
     policy: &Option<Override<NonZeroU64>>,
 ) -> reqwest::RequestBuilder {
-    transcription_timeout(policy).map_or(request, |timeout| request.timeout(timeout))
+    match transcription_timeout(policy) {
+        Some(timeout) => request.timeout(timeout),
+        None => request,
+    }
 }
 
 const GOOGLE_STT_ENDPOINT: &str = "https://speech.googleapis.com/v1/speech:recognize";
