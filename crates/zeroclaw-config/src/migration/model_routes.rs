@@ -305,10 +305,24 @@ pub(super) fn legacy_model(
         api.entry("wire_api").or_insert(json!("chat_completions"));
     }
     connection["api"] = json!({"chat":api});
-    let entry = entry
+    let mut entry = entry
         .map(serde_json::to_value)
         .transpose()?
         .unwrap_or(json!({}));
+    let migrated_extract_text_tool_calls = entry
+        .get_mut("provider_extra")
+        .and_then(Value::as_object_mut)
+        .and_then(|extra| extra.remove("__zeroclaw_migration_extract_text_tool_calls"))
+        .or(migrated_extract_text_tool_calls);
+    if entry
+        .get("provider_extra")
+        .and_then(Value::as_object)
+        .is_some_and(Map::is_empty)
+    {
+        entry
+            .as_object_mut()
+            .and_then(|object| object.remove("provider_extra"));
+    }
     let mut options = Map::new();
     for &field in ChatOptionsPatch::FIELDS {
         if let Some(value) = entry

@@ -1066,7 +1066,14 @@ fn build_canonical_tts_provider(
             .tts_command()
             .map(ToOwned::to_owned),
         response_format: tts_override(&resolved.options.format),
-        uri: canonical_tts_endpoint(resolved.selection.connection.uri()),
+        uri: match resolved.selection.connection {
+            // Piper's legacy URI is already the complete POST endpoint. Other
+            // HTTP speech providers retain the canonical /audio/speech suffix.
+            ProviderConnection::Piper(_) => {
+                resolved.selection.connection.uri().map(ToOwned::to_owned)
+            }
+            _ => canonical_tts_endpoint(resolved.selection.connection.uri()),
+        },
     };
 
     let provider: Box<dyn TtsProvider> = match resolved.selection.connection {

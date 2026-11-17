@@ -105,7 +105,11 @@ impl BoundCapabilities {
         let provider_ref = provider_ref.to_owned();
         let model = model.map(str::to_owned);
         zeroclaw_providers::model::build_nonblocking(move || {
-            config.provider_registry()?.resolve_chat(&provider_ref.as_str().into())?;
+            // Validate against the same ephemeral registry used by provider
+            // construction. This preserves bare and URL provider inputs while
+            // still rejecting an unsupported capability before dispatch.
+            let input_registry = config.chat_registry_for_input(Some(&agent_alias), &provider_ref)?;
+            input_registry.resolve_chat(&provider_ref.as_str().into())?;
             let identity = zeroclaw_providers::model::resolve_model_identity(
                 &config, &agent_alias, &provider_ref, model.as_deref(),
             ).ok_or_else(|| anyhow::Error::msg(format!(

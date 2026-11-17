@@ -35,7 +35,7 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
         return Ok(());
     };
 
-    let bindings: Vec<(String, bool)> = root
+    let bindings: Vec<((String, Option<String>), bool)> = root
         .get("agents")
         .and_then(toml::Value::as_table)
         .into_iter()
@@ -47,7 +47,7 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
                 .and_then(toml::Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())?;
-            let reference = legacy_profile_reference(models, model_provider)?;
+            let reference = legacy_model_selection(models, model_provider)?;
             let strict = agent
                 .get("strict_tool_parsing")
                 .and_then(toml::Value::as_bool)
@@ -76,6 +76,7 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
         .cloned()
         .collect();
     if let Some(reference) = mixed.into_iter().next() {
+        let reference = reference.0;
         bail!(
             "cannot migrate V4 strict_tool_parsing for model_provider {reference}: it is used by both strict and non-strict agents; set model options.extract_text_tool_calls explicitly for separate model references and retry"
         );
@@ -94,6 +95,7 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
         return Ok(());
     };
     for reference in strict_refs {
+        let (reference, model_alias) = reference;
         let (family, alias) = reference
             .split_once('.')
             .context("legacy provider reference must contain a family and alias")?;
@@ -103,7 +105,19 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
             .and_then(|family| family.get_mut(alias))
             .and_then(toml::Value::as_table_mut)
             .with_context(|| format!("legacy model_provider {reference} is missing"))?;
-        let provider_extra = profile
+        let target = if let Some(model_alias) = model_alias {
+            profile
+                .get_mut("models")
+                .and_then(toml::Value::as_table_mut)
+                .and_then(|entries| entries.get_mut(&model_alias))
+                .and_then(toml::Value::as_table_mut)
+                .with_context(|| {
+                    format!("legacy model_provider {reference}.{model_alias} is missing")
+                })?
+        } else {
+            profile
+        };
+        let provider_extra = target
             .entry("provider_extra")
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
         let Some(provider_extra) = provider_extra.as_table_mut() else {
@@ -119,11 +133,14 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
     Ok(())
 }
 
-fn legacy_profile_reference(models: &toml::Table, model_provider: &str) -> Option<String> {
+fn legacy_model_selection(
+    models: &toml::Table,
+    model_provider: &str,
+) -> Option<(String, Option<String>)> {
     let (family, alias) = model_provider.split_once('.')?;
     let family_table = models.get(family)?.as_table()?;
     if family_table.contains_key(alias) {
-        return Some(format!("{family}.{alias}"));
+        return Some((format!("{family}.{alias}"), None));
     }
     // Dotted aliases are TOML keys, not path separators. Resolve the longest
     // configured alias prefix before treating the remaining suffix as a
@@ -132,10 +149,19 @@ fn legacy_profile_reference(models: &toml::Table, model_provider: &str) -> Optio
     while let Some((prefix, _)) = candidate.rsplit_once('.') {
         candidate = prefix;
         if family_table.contains_key(candidate) {
-            return Some(format!("{family}.{candidate}"));
+            let suffix = alias.strip_prefix(candidate)?.strip_prefix('.')?;
+            let profile = family_table.get(candidate)?.as_table()?;
+            let entries = profile.get("models")?.as_table()?;
+            entries
+                .contains_key(suffix)
+                .then(|| (format!("{family}.{candidate}"), Some(suffix.to_owned())))
         }
     }
     None
+}
+
+fn legacy_profile_reference(models: &toml::Table, model_provider: &str) -> Option<String> {
+    legacy_model_selection(models, model_provider).map(|(reference, _)| reference)
 }
 
 pub(super) fn migrate(value: toml::Value) -> Result<toml::Value> {

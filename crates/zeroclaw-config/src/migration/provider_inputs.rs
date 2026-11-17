@@ -110,6 +110,12 @@ fn project_provider_tables(
             continue;
         }
         let provider_id = ProviderId::from(format!("legacy.tts.{family}.{alias}"));
+        if providers.connections.contains_key(&provider_id) {
+            return Err(registry::RegistryError::new(
+                ["providers", "connections", provider_id.as_str()],
+                "legacy connection name conflicts with an explicit connection",
+            ));
+        }
         let mut connection = serde_json::json!({"kind": family});
         let template: registry::ProviderConnection =
             serde_json::from_value(json!({"kind": family})).map_err(|error| {
@@ -198,6 +204,12 @@ fn project_provider_tables(
             )
         })?;
         let provider_id = ProviderId::from(format!("legacy.asr.{family}.{alias}"));
+        if providers.connections.contains_key(&provider_id) {
+            return Err(registry::RegistryError::new(
+                ["providers", "connections", provider_id.as_str()],
+                "legacy connection name conflicts with an explicit connection",
+            ));
+        }
         let (connection, model) = asr_definition(&raw, family, &provider_id).map_err(|error| {
             registry::RegistryError::new(
                 ["providers", "transcription", family, alias],

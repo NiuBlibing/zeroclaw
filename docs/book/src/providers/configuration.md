@@ -163,7 +163,8 @@ omitted. A migrated V4 entry can carry `enabled = false` when its historical
 workspace switch was disabled; this marker keeps dormant credentials from
 activating speech processing after migration. Remove the marker or set the
 model's `enabled` field to `true` when activating the capability deliberately.
-The workspace speech switch must also be `true`.
+The canonical model's `enabled` value is the activation authority; the old workspace
+switch is only read while migrating V4 configuration.
 For fields that support explicit clearing, the string `"null"` means clear and
 inheritance is represented by leaving the field unset. A literal string value
 `"null"` uses `{ value = "null" }` where that field supports the escape.

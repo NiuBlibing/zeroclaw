@@ -688,15 +688,23 @@ impl ModelRoutingConfigTool {
                 .resolved_runtime_agent_alias()
                 .and_then(|alias| cfg.agent(alias))
                 .map(|agent| agent.model_provider.as_str().to_owned())
-                .ok_or_else(|| anyhow::Error::msg("No active agent model configured"))?,
-            MaybeSet::Null => anyhow::bail!("model_provider cannot be cleared"),
+                .ok_or_else(|| {
+                    anyhow::Error::msg(crate::i18n::get_required_tool_string(
+                        "tool-model-routing-config-error-no-active-model",
+                    ))
+                })?,
+            MaybeSet::Null => anyhow::bail!(crate::i18n::get_required_tool_string(
+                "tool-model-routing-config-error-provider-clear",
+            )),
         };
         let active_agent = cfg.resolved_runtime_agent_alias().map(str::to_owned);
         if matches!(model_update, MaybeSet::Unset) && matches!(temperature_update, MaybeSet::Unset)
         {
             anyhow::ensure!(
                 active_agent.is_some(),
-                "No active agent is configured to bind this model"
+                crate::i18n::get_required_tool_string(
+                    "tool-model-routing-config-error-no-active-agent"
+                )
             );
         }
         let previous_model = cfg.resolve_model_id(&provider_name);
@@ -706,10 +714,16 @@ impl ModelRoutingConfigTool {
                 .get_mut(&zeroclaw_config::provider_registry::ModelRef::from(
                     provider_name.as_str(),
                 ))
-                .ok_or_else(|| anyhow::Error::msg("Model reference does not exist"))?;
+                .ok_or_else(|| {
+                    anyhow::Error::msg(crate::i18n::get_required_tool_string(
+                        "tool-model-routing-config-error-missing-reference",
+                    ))
+                })?;
             let zeroclaw_config::provider_registry::ModelDefinition::Chat(selected) = selected
             else {
-                anyhow::bail!("Model reference must select a chat model");
+                anyhow::bail!(crate::i18n::get_required_tool_string(
+                    "tool-model-routing-config-error-not-chat"
+                ));
             };
             match model_update {
                 MaybeSet::Set(model) => selected.model = Some(model),
@@ -720,7 +734,9 @@ impl ModelRoutingConfigTool {
                 MaybeSet::Set(value) => {
                     anyhow::ensure!(
                         (0.0..=2.0).contains(&value),
-                        "temperature must be between 0 and 2"
+                        crate::i18n::get_required_tool_string(
+                            "tool-model-routing-config-error-temperature-range"
+                        )
                     );
                     selected.options.temperature =
                         Some(zeroclaw_config::provider_registry::Override::Set(value));
