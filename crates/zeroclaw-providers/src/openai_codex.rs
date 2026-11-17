@@ -36,6 +36,12 @@ pub struct OpenAiCodexModelProvider {
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
     reasoning_effort: Option<String>,
+    timeout_secs: u64,
+    timeout_configured: bool,
+    timeout_disabled: bool,
+    stream_request_timeout: crate::StreamRequestTimeout,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     /// The configured `[multimodal]` policy.
     ///
     /// This provider normalizes image markers on its own boundary, and that
@@ -147,16 +153,48 @@ impl OpenAiCodexModelProvider {
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_effort: options.reasoning_effort.clone(),
+            timeout_secs: options.provider_timeout_secs.unwrap_or(120),
+            timeout_configured: options.provider_timeout_secs.is_some(),
+            timeout_disabled: options.provider_timeout_disabled,
+            stream_request_timeout: options.provider_stream_request_timeout_secs.clone(),
+            read_timeout_secs: options.provider_read_timeout_secs,
+            read_timeout_disabled: options.provider_read_timeout_disabled,
             multimodal: options.multimodal.clone(),
         })
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_read_timeout(
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        if !self.read_timeout_disabled
+            && let Some(read_timeout) = self.read_timeout_secs
+        {
+            builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
+        }
+        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
             "model_provider.openai",
-            300,
-            10,
-        )
+        );
+        builder.build().unwrap_or_else(|_| Client::new())
+    }
+
+    fn streaming_timeouts(&self) -> super::StreamTimeouts {
+        super::StreamTimeouts {
+            request: super::stream_request_timeout(
+                &self.stream_request_timeout,
+                (self.timeout_configured && !self.timeout_disabled)
+                    .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            ),
+            read: (!self.read_timeout_disabled).then(|| {
+                self.read_timeout_secs.map_or_else(
+                    || super::stream_idle_timeout(self.timeout_secs),
+                    |secs| super::StreamIdleBound::Read(std::time::Duration::from_secs(secs)),
+                )
+            }),
+        }
     }
 }
 
@@ -1670,7 +1708,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
                 request_builder,
                 &tx,
                 count_tokens,
-                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT).into(),
+                provider.streaming_timeouts(),
             )
             .await;
         });
