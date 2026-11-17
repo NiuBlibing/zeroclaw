@@ -2723,7 +2723,6 @@ fn run_chain_until(
         // Report fields before the V5 projection removes legacy tables.
         if index == 4 {
             v4_to_v5::preserve_strict_tool_parsing(&mut cur)?;
-            apply_retired_keys(&mut cur, 5, RETIRED_KEYS, notices);
         }
         cur = step(cur)?;
         // Step `index` produces schema version `index + 1`. Apply every key
@@ -9492,6 +9491,15 @@ model = "backup"
         let profile = &value["providers"]["models"]["custom.gateway.prod"];
         assert!(profile.get("fallback").is_none());
         assert!(profile.get("fallback_models").is_none());
+        assert_eq!(
+            value["providers"]["fallback"]["custom.gateway.prod"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|entry| entry.as_str())
+                .collect::<Vec<_>>(),
+            vec!["custom.backup"]
+        );
         assert!(notices.iter().all(|notice| matches!(
             notice,
             MigrationNotice::Removed { reason, .. }

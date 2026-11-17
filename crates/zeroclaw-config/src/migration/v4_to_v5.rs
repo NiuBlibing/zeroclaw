@@ -160,15 +160,147 @@ fn legacy_model_selection(
     None
 }
 
+#[cfg(test)]
 fn legacy_profile_reference(models: &toml::Table, model_provider: &str) -> Option<String> {
     legacy_model_selection(models, model_provider).map(|(reference, _)| reference)
 }
 
 pub(super) fn migrate(value: toml::Value) -> Result<toml::Value> {
+    let mut value = value;
+    migrate_profile_fallbacks(&mut value)?;
     let value = super::model_routes::migrate(value)?;
     // Typed registry materialization follows admission so malformed provider
     // aliases can still use the established section-by-section salvage path.
     super::stamp_schema_version(value, 5)
+}
+
+/// Convert the V4 profile-local fallback lists before the retirement pass
+/// removes those fields. The canonical registry stores exact model references
+/// in one graph, so both a provider reference and a same-family model id are
+/// resolved to the corresponding opaque key when possible.
+fn migrate_profile_fallbacks(value: &mut toml::Value) -> Result<()> {
+    let Some(root) = value.as_table_mut() else {
+        return Ok(());
+    };
+    let Some(providers) = root.get("providers").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    let Some(models) = providers.get("models").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    let mut additions = Vec::<(String, Vec<String>)>::new();
+    for (family, family_value) in models {
+        let Some(family_table) = family_value.as_table() else {
+            continue;
+        };
+        for (alias, profile_value) in family_table {
+            let Some(profile) = profile_value.as_table() else {
+                continue;
+            };
+            let source = format!("{family}.{alias}");
+            let mut targets = Vec::new();
+            for key in ["fallback", "fallback_models"] {
+                let Some(values) = profile.get(key).and_then(toml::Value::as_array) else {
+                    continue;
+                };
+                for value in values.iter().filter_map(toml::Value::as_str) {
+                    let value = value.trim();
+                    if value.is_empty() {
+                        continue;
+                    }
+                    let target = if key == "fallback" && value.contains('.') {
+                        value.to_owned()
+                    } else if key == "fallback_models" {
+                        resolve_legacy_fallback_model(models, family, value, profile)
+                    } else {
+                        format!("{family}.{value}")
+                    };
+                    if target != source && !targets.contains(&target) {
+                        targets.push(target);
+                    }
+                }
+            }
+            if !targets.is_empty() {
+                additions.push((source, targets));
+            }
+        }
+    }
+    if additions.is_empty() {
+        return Ok(());
+    }
+    let providers = root
+        .get_mut("providers")
+        .and_then(toml::Value::as_table_mut)
+        .context("providers must be a table")?;
+    let fallback = providers
+        .entry("fallback")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .context("providers.fallback must be a table")?;
+    for (source, targets) in additions {
+        let entry = fallback
+            .entry(source)
+            .or_insert_with(|| toml::Value::Array(Vec::new()))
+            .as_array_mut()
+            .context("providers.fallback entries must be arrays")?;
+        for target in targets {
+            if !entry
+                .iter()
+                .any(|value| value.as_str() == Some(target.as_str()))
+            {
+                entry.push(toml::Value::String(target));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_legacy_fallback_model(
+    models: &toml::Table,
+    family: &str,
+    model_id: &str,
+    profile: &toml::Table,
+) -> String {
+    if let Some(entries) = profile.get("models").and_then(toml::Value::as_table) {
+        if let Some((name, _)) = entries.iter().find(|(_, entry)| {
+            entry
+                .get("id")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|id| id == model_id)
+        }) {
+            return format!("{family}.{}.{}", profile_key(models, family, profile), name);
+        }
+    }
+    if models
+        .get(family)
+        .and_then(toml::Value::as_table)
+        .is_some_and(|entries| entries.contains_key(model_id))
+    {
+        return format!("{family}.{model_id}");
+    }
+    if let Some((alias, _)) = models
+        .get(family)
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|entries| entries.iter())
+        .find(|(_, entry)| entry.get("model").and_then(toml::Value::as_str) == Some(model_id))
+    {
+        return format!("{family}.{alias}");
+    }
+    format!("{family}.{model_id}")
+}
+
+fn profile_key(models: &toml::Table, family: &str, profile: &toml::Table) -> String {
+    models
+        .get(family)
+        .and_then(toml::Value::as_table)
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|(_, value)| value.as_table() == Some(profile))
+        })
+        .map(|(alias, _)| alias.clone())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
