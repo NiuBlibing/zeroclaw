@@ -1,16 +1,17 @@
 //! Runtime adapter for the shared incremental response parser.
 
 use crate::tools::ToolSpec;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 
-pub(crate) use zeroclaw_tool_call_parser::{
-    ProtocolSuppressionDiagnostic, StreamTerminalMarkerStripper, StreamThinkTagStripper,
-};
+#[cfg(test)]
+use zeroclaw_tool_call_parser::ProtocolSuppressionDiagnostic;
+
+pub(crate) use zeroclaw_tool_call_parser::{StreamTerminalMarkerStripper, StreamThinkTagStripper};
 
 /// Runtime owns tool admission and event delivery; the parser crate owns the
 /// incremental protocol state machine. This adapter translates admitted tool
-/// specs into the parser's dependency-free name list and mirrors diagnostics
-/// for the existing runtime telemetry/tests.
+/// specs into the parser's dependency-free name list. Diagnostics are read
+/// directly from the shared parser, which owns the only copy of its state.
 #[derive(Debug)]
 pub(crate) struct StreamTextGuard {
     inner: zeroclaw_tool_call_parser::StreamTextGuard,
@@ -21,12 +22,6 @@ impl Deref for StreamTextGuard {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-impl DerefMut for StreamTextGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
     }
 }
 
