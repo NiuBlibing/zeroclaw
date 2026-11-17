@@ -60,6 +60,12 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
         .and_then(toml::Value::as_table)
         .cloned()
         .unwrap_or_default();
+    let fallbacks = provider_table
+        .get("fallback")
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let mut route_fallbacks = Vec::new();
     let mut updated = Vec::with_capacity(routes.len());
     for (index, route) in routes.iter().enumerate() {
         let Some(reference) = route.get("model_provider").and_then(toml::Value::as_str) else {
@@ -135,6 +141,9 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
                 .with_context(|| format!("cannot migrate model_routes[{index}] connection"))?;
             connections.insert(name.clone(), toml::Value::try_from(connection)?);
             models.insert(name.clone(), toml::Value::try_from(model)?);
+            if let Some(targets) = fallbacks.get(reference) {
+                route_fallbacks.push((name.clone(), targets.clone()));
+            }
             model_ref = name;
         }
         let mut row = toml::Table::new();
@@ -144,6 +153,16 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
     }
     provider_table.insert("models".into(), models.into());
     provider_table.insert("connections".into(), connections.into());
+    if !route_fallbacks.is_empty() {
+        let fallback = provider_table
+            .entry("fallback")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .context("providers.fallback must be a table")?;
+        for (source, targets) in route_fallbacks {
+            fallback.insert(source, targets);
+        }
+    }
     let document_table = document.as_table_mut().context("config must be a table")?;
     document_table.insert("providers".into(), providers);
     document_table.insert("model_routes".into(), updated.into());
@@ -452,5 +471,35 @@ mod tests {
         let (_, model) = legacy_model(&raw, "openai", None, None).unwrap();
         assert_eq!(model["metadata"]["pricing"]["input_per_mtok"], 1.0);
         assert_eq!(model["metadata"]["pricing"]["output_per_mtok"], 1.0);
+    }
+
+    #[test]
+    fn generated_route_models_keep_the_source_fallback_chain() {
+        let document: toml::Value = toml::from_str(
+            r#"
+schema_version = 4
+
+[providers.models.openai.main]
+model = "gpt-4o"
+fallback = ["openai.backup"]
+
+[providers.models.openai.backup]
+model = "gpt-4o-backup"
+
+[providers.fallback]
+"openai.main" = ["openai.backup"]
+
+[[model_routes]]
+hint = "effort"
+model_provider = "openai.main"
+model = "gpt-4o-route"
+"#,
+        )
+        .unwrap();
+        let migrated = migrate(document).unwrap();
+        assert_eq!(
+            migrated["providers"]["fallback"]["route.effort"],
+            toml::Value::Array(vec![toml::Value::String("openai.backup".into())])
+        );
     }
 }
