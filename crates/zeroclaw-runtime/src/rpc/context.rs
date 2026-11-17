@@ -389,7 +389,7 @@ impl RpcContext {
     #[cfg(test)]
     pub fn minimal_raw(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = LiveConfigAuthority::for_tests_raw(config);
+        let authority = LiveConfigAuthority::for_tests(config);
         Arc::new(Self {
             config: authority.live_handle(),
             config_authority: authority.clone(),

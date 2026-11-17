@@ -1925,7 +1925,7 @@ async fn run_tool_call_loop_impl<'a>(
         dedup_exempt_tools,
         pacing,
         text_tool_calls_disabled,
-        extract_text_reasoning: config.is_some_and(|config| {
+        extract_text_reasoning: config.is_none_or(|config| {
             config
                 .model_text_extraction(provider_name)
                 .reasoning

@@ -38,11 +38,6 @@ impl LiveConfigAuthority {
     /// Create the authority for one daemon generation. The initial config
     /// is the first publication of a fresh epoch.
     pub fn new(config: Config) -> Self {
-        #[cfg(test)]
-        let config = zeroclaw_config::migration::admit_test_input(&config);
-        #[cfg(test)]
-        let live = LiveConfig::new_raw_for_tests(config);
-        #[cfg(not(test))]
         let live = LiveConfig::new(config);
         Self {
             live,
@@ -64,22 +59,7 @@ impl LiveConfigAuthority {
     pub(crate) fn for_tests(config: Config) -> Self {
         Self {
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            live: LiveConfig::new_raw_for_tests(zeroclaw_config::migration::admit_test_input(
-                &config,
-            )),
-            agent_lifecycle: AgentLifecycleCoordinator::default(),
-            application_results: Arc::default(),
-        }
-    }
-
-    /// Test-only authority retaining historical typed input for RPC property
-    /// edit fixtures. Canonical production-like test authorities use
-    /// [`Self::for_tests`] above.
-    #[cfg(test)]
-    pub(crate) fn for_tests_raw(config: Config) -> Self {
-        Self {
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            live: LiveConfig::new_raw_for_tests(config),
+            live: LiveConfig::new(zeroclaw_config::migration::admit_test_input(&config)),
             agent_lifecycle: AgentLifecycleCoordinator::default(),
             application_results: Arc::default(),
         }
@@ -93,9 +73,7 @@ impl LiveConfigAuthority {
     pub(crate) fn for_tests_sharing_writer(config: Config, writer: &Self) -> Self {
         Self {
             config_write_lock: Arc::clone(&writer.config_write_lock),
-            live: LiveConfig::new_raw_for_tests(zeroclaw_config::migration::admit_test_input(
-                &config,
-            )),
+            live: LiveConfig::new(zeroclaw_config::migration::admit_test_input(&config)),
             agent_lifecycle: AgentLifecycleCoordinator::default(),
             application_results: Arc::default(),
         }

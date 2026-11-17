@@ -78,13 +78,24 @@ fn text_tool_calls_available_from(config: Option<&Config>, model_ref: &str) -> b
 }
 
 fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
-    if error
-        .chain()
-        .any(|source| source.is::<zeroclaw_providers::ReliableProviderTerminalFailure>())
-    {
+    if let Some(failure) = error.chain().find_map(|source| {
+        source.downcast_ref::<zeroclaw_providers::ReliableProviderTerminalFailure>()
+    }) {
         // Reliable's aggregate is the durable retry diagnostic for delegated
         // task records; other typed terminal failures use the delivery projection.
-        return format!("Agent '{agent_name}' failed: {error}");
+        let summary = format!("Agent '{agent_name}' failed: {error}");
+        // A non-retryable HTTP response often contains the actionable reason
+        // (bad model, invalid request, etc.). Keep only that final client's
+        // explanation, bounded and scrubbed, rather than exposing all attempts.
+        if failure.kind() == zeroclaw_providers::ReliableProviderTerminalFailureKind::ClientRequest
+            && let Some(cause) = failure.terminal_cause()
+        {
+            return format!(
+                "{summary}: {}",
+                zeroclaw_providers::sanitize_api_error(&format!("{cause:#}"))
+            );
+        }
+        return summary;
     }
 
     crate::agent::turn::outcome::terminal_completion_error_message(error, Some(agent_name))
@@ -13619,21 +13630,24 @@ options = { extract_text_tool_calls = false }
     }
 
     #[tokio::test]
-    async fn non_agentic_delegate_keeps_unextracted_think_text() {
+    async fn non_agentic_delegate_rejects_unset_think_only_completion() {
         let result = DelegateTool::render_non_agentic_result(
             "delegate",
             "test-provider",
             "test-model",
-            Ok("<think>internal reasoning</think>".to_string()),
+            Ok(zeroclaw_providers::response::normalize_text(
+                "<think>internal reasoning</think>",
+                zeroclaw_api::TextExtraction::default(),
+            )),
         );
 
-        assert!(result.success, "unextracted text is still a response");
-        assert!(result.error.is_none());
         assert!(
-            result
-                .output
-                .to_string()
-                .contains("<think>internal reasoning</think>")
+            !result.success,
+            "unset extraction preserves the empty-terminal guard"
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some(invalid_semantic_completion_error("delegate").as_str())
         );
     }
 
@@ -16551,7 +16565,11 @@ options = { extract_text_tool_calls = false }
             .error
             .as_deref()
             .expect("fixture provider failure retained");
-        assert!(!error.is_empty());
+        assert!(error.contains("400 Bad Request"), "{error}");
+        assert!(
+            error.contains("background persistence fixture provider failure"),
+            "{error}"
+        );
         let snapshot = tool
             .background_control_plane()
             .await

@@ -10042,43 +10042,8 @@ impl RpcDispatcher {
             self.require_additional_grant(method, Resource::Config, verb)?;
         }
         let mut candidate = Box::new(self.ctx.config.read().clone());
-        #[cfg(any(test, feature = "test-util"))]
-        {
-            // Keep the historical typed maps available to fixture edits while
-            // also materializing the canonical connection rows needed by the
-            // registry editor's masked-secret preservation.
-            *candidate = zeroclaw_config::migration::admit_test_input(&candidate);
-        }
         editor::stage(&mut candidate, edit)
             .map_err(|error| rpc_err(INVALID_PARAMS, format!("{error:#}")))?;
-        #[cfg(any(test, feature = "test-util"))]
-        {
-            // The registry edit is now authoritative. Do not let the
-            // historical typed source rows re-project their pre-edit value
-            // on the next test-only admission.
-            let canonical_models: Vec<_> = candidate
-                .providers
-                .models
-                .canonical_model_refs()
-                .filter_map(|reference| {
-                    candidate
-                        .providers
-                        .models
-                        .canonical_model(reference)
-                        .cloned()
-                        .map(|model| (reference.clone(), model))
-                })
-                .collect();
-            candidate.providers.models = Default::default();
-            for (reference, model) in canonical_models {
-                candidate
-                    .providers
-                    .models
-                    .insert_canonical_model(reference, model);
-            }
-            candidate.providers.tts = Default::default();
-            candidate.providers.transcription = Default::default();
-        }
         // A model can change without its connection changing. Match the real
         // embedding consumer (including routes), then rebuild its entire view
         // once rather than refreshing once per model on a shared connection.
@@ -10371,7 +10336,6 @@ impl RpcDispatcher {
         prop: &str,
         value: &Value,
     ) -> Result<(), JsonRpcError> {
-        #[cfg(not(any(test, feature = "test-util")))]
         zeroclaw_config::schema::reject_retired_provider_edit_path(config, prop)
             .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
         if config.ensure_map_key_for_path(prop) {
@@ -10410,13 +10374,7 @@ impl RpcDispatcher {
                 format!("Refusing to overwrite secret `{prop}` with a masked or empty value"),
             ));
         }
-        #[cfg(any(test, feature = "test-util"))]
-        let loaded_from = config.loaded_from.take();
         let result = config.set_prop_persistent(prop, &value_str);
-        #[cfg(any(test, feature = "test-util"))]
-        {
-            config.loaded_from = loaded_from;
-        }
         result.map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
     }
 
@@ -15065,6 +15023,25 @@ pub(crate) mod connection_test_support {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_set_refuses_retired_provider_paths_in_test_builds() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        for prop in [
+            "providers.models.openai.default.api_key",
+            "providers.models.anthropic.default.model",
+            "providers.tts.openai.default.voice",
+            "providers.transcription.openai.default.model",
+        ] {
+            let error = super::RpcDispatcher::stage_config_set(
+                &mut config,
+                prop,
+                &serde_json::json!("synthetic"),
+            )
+            .expect_err("retired paths must fail in the same boundary as production");
+            assert_eq!(error.code, super::INVALID_PARAMS, "{prop}: {error:?}");
+        }
+    }
+
     mod principal_headless;
     mod sop_principal;
     mod steering_posture;
@@ -42309,12 +42286,16 @@ mod tests {
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         dispatcher.set_authenticated_for_test();
 
-        let params = json!({
-            "prop": "providers.models.openai.default.api_key",
-            "value": "sk-rotated-key"
-        });
-        let res = dispatcher.handle_config_set(&params).await;
-        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+        let expected =
+            zeroclaw_config::provider_registry::editor::snapshot(&dispatcher.ctx.config.read())
+                .unwrap();
+        let mut registry = expected.clone();
+        registry["connections"]["openai.default"]["auth"] =
+            json!({"mode": "api_key", "api_key": "sk-rotated-key"});
+        let res = dispatcher
+            .handle_config_registry_set(&json!({"expected": expected, "registry": registry}))
+            .await;
+        assert!(res.is_ok(), "registry save must succeed: {res:?}");
 
         assert_eq!(
             mem.embedder_dimensions(),
@@ -48759,13 +48740,14 @@ options = { temperature = 0.2 }
             let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
             let (alice, _rx) = roster_peer(&ctx, 4242).await;
 
-            let params = json!({
-                "prop": "providers.models.anthropic.default.model",
-                "value": "unchanged-authority"
-            });
+            let params = registry_edit_params(
+                &alice,
+                &["models", "anthropic.default", "model"],
+                json!("unchanged-authority"),
+            );
             let result = rpc_result_after_midwait_policy_change(
                 Arc::clone(&ctx),
-                async move { alice.handle_config_set(&params).await },
+                async move { alice.handle_config_registry_set(&params).await },
                 |_| {},
             )
             .await;
@@ -48791,13 +48773,14 @@ options = { temperature = 0.2 }
             // alice waits, so her stamped generation goes stale. Her authority is
             // unchanged, and a recheck that re-resolves rather than comparing
             // against the stamped grants must let the write through.
-            let params = json!({
-                "prop": "providers.models.anthropic.default.model",
-                "value": "still-authorized"
-            });
+            let params = registry_edit_params(
+                &alice,
+                &["models", "anthropic.default", "model"],
+                json!("still-authorized"),
+            );
             let result = rpc_result_after_midwait_policy_change(
                 Arc::clone(&ctx),
-                async move { alice.handle_config_set(&params).await },
+                async move { alice.handle_config_registry_set(&params).await },
                 |ctx| {
                     let mut republished = ctx.config.read().clone();
                     republished.permission_profiles.insert(

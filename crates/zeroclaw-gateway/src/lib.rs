@@ -939,13 +939,6 @@ impl GatewayBootSelection {
     }
 }
 fn resolve_gateway_boot_selection(config: &Config) -> GatewayBootSelection {
-    #[cfg(test)]
-    let admitted_config;
-    #[cfg(test)]
-    let config = {
-        admitted_config = zeroclaw_config::migration::admit_test_input(config);
-        &admitted_config
-    };
     let model_ref = config
         .resolved_runtime_agent_alias()
         .and_then(|alias| config.agent(alias))
@@ -1390,8 +1383,6 @@ pub async fn run_gateway(
     sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
-    #[cfg(test)]
-    let config = zeroclaw_config::migration::admit_test_input(&config);
     let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())?;
     run_gateway_with_authority(
         host,
@@ -1429,8 +1420,6 @@ pub async fn run_gateway_with_authority(
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     authority: zeroclaw_runtime::LiveConfigAuthority,
 ) -> Result<()> {
-    #[cfg(test)]
-    let config = zeroclaw_config::migration::admit_test_input(&config);
     Box::pin(run_gateway_with_plugin_webhooks(
         host,
         port,
@@ -6309,7 +6298,9 @@ mod tests {
             ..Config::default()
         };
         let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),
@@ -9959,7 +9950,9 @@ options = {{ temperature = 0.25, max_tokens = 192 }}
     /// cloned with its tokens; the test re-pairs inside the fresh guard
     /// before calling this.
     fn pairing_persistence_state(config: Config, guard: PairingGuard) -> AppState {
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),
@@ -12945,7 +12938,9 @@ data: [DONE]\n\n";
             },
         );
 
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         let state = AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),
@@ -13255,7 +13250,9 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(secret.clone());
 
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         let state = AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),
@@ -13344,7 +13341,9 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(valid_secret.clone());
 
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         let state = AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),
@@ -13438,7 +13437,9 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(secret.clone());
 
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         let state = AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),
@@ -14773,7 +14774,9 @@ data: [DONE]\n\n";
             linq_signing_secrets.insert(alias.to_string(), Arc::from(secret));
         }
 
-        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(
+            zeroclaw_config::migration::admit_test_input(&config),
+        );
         AppState {
             config: state_authority.live_handle(),
             config_authority: state_authority.clone(),

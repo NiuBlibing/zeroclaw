@@ -107,8 +107,19 @@ mod tests {
             usage: None,
             reasoning_content: None,
         };
+        let original = response.clone();
         normalize_response(&mut response, TextExtraction::default());
         assert!(response.is_semantically_empty_terminal());
+        let mut disabled = original;
+        normalize_response(
+            &mut disabled,
+            TextExtraction {
+                reasoning: Some(false),
+                tool_calls: false,
+            },
+        );
+        assert!(!disabled.is_semantically_empty_terminal());
+        assert_eq!(disabled.text.as_deref(), Some("<think>internal</think>"));
         normalize_response(
             &mut response,
             TextExtraction {

@@ -34,31 +34,15 @@ pub struct OpenAiEmbedding {
     provider_name: String,
     model: String,
     dims: usize,
-    validate_dimensions: bool,
 }
 
 impl OpenAiEmbedding {
-    /// Construct the existing embedding adapter before callers move to resolved inputs.
-    pub fn new(base_url: &str, api_key: &str, model: &str, dims: usize) -> Self {
-        Self::from_config(EmbeddingProviderConfig {
-            transport: HttpTransportConfig::with_base_url(
-                base_url.trim_end_matches('/'),
-                Some(api_key.to_owned()),
-            ),
-            provider_name: "openai".to_owned(),
-            model: model.to_owned(),
-            dimensions: dims,
-            validate_dimensions: false,
-        })
-    }
-
     fn from_config(config: EmbeddingProviderConfig) -> Self {
         Self {
             transport: config.transport,
             provider_name: config.provider_name,
             model: config.model,
             dims: config.dimensions,
-            validate_dimensions: config.validate_dimensions,
         }
     }
 
@@ -117,12 +101,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
             .send()
             .await?;
 
-        crate::protocols::openai::embedding::vectors(
-            resp,
-            texts.len(),
-            self.validate_dimensions.then_some(self.dims),
-        )
-        .await
+        crate::protocols::openai::embedding::vectors(resp, texts.len(), Some(self.dims)).await
     }
 }
 
@@ -133,10 +112,6 @@ pub struct EmbeddingProviderConfig {
     pub(crate) provider_name: String,
     pub(crate) model: String,
     pub(crate) dimensions: usize,
-    /// Resolved registry models enforce their declared vector width. The
-    /// legacy memory factory deliberately leaves this unset to preserve
-    /// master behavior for providers that return a different width.
-    pub(crate) validate_dimensions: bool,
 }
 
 impl EmbeddingProviderConfig {
@@ -157,47 +132,12 @@ impl EmbeddingProviderConfig {
             provider_name: resolved.selection.connection.kind().to_owned(),
             model: model.to_owned(),
             dimensions,
-            validate_dimensions: true,
         })
     }
 }
 
 pub fn build_embedding_provider(config: EmbeddingProviderConfig) -> Box<dyn EmbeddingProvider> {
     Box::new(OpenAiEmbedding::from_config(config))
-}
-
-pub fn create_embedding_provider(
-    model_provider: &str,
-    api_key: Option<&str>,
-    model: &str,
-    dims: usize,
-) -> Box<dyn EmbeddingProvider> {
-    match model_provider {
-        "openai" => {
-            let key = api_key.unwrap_or("");
-            Box::new(OpenAiEmbedding::new(
-                "https://api.openai.com",
-                key,
-                model,
-                dims,
-            ))
-        }
-        "openrouter" => {
-            let key = api_key.unwrap_or("");
-            Box::new(OpenAiEmbedding::new(
-                "https://openrouter.ai/api/v1",
-                key,
-                model,
-                dims,
-            ))
-        }
-        name if name.starts_with("custom:") => {
-            let base_url = name.strip_prefix("custom:").unwrap_or("");
-            let key = api_key.unwrap_or("");
-            Box::new(OpenAiEmbedding::new(base_url, key, model, dims))
-        }
-        _ => Box::new(NoopEmbedding),
-    }
 }
 
 #[cfg(test)]
@@ -334,7 +274,6 @@ mod tests {
                 provider_name: kind.into(),
                 model: "model".into(),
                 dimensions: 4,
-                validate_dimensions: true,
             });
             assert_eq!(provider.name(), kind);
             assert_eq!(provider.identity(), baseline.identity());

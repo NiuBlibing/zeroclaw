@@ -142,24 +142,6 @@ impl LiveConfig {
     /// Create the storage with `config` as the initial publication of a
     /// fresh epoch.
     pub fn new(config: Config) -> Self {
-        #[cfg(feature = "test-helpers")]
-        let config = crate::migration::admit_test_input(&config);
-        Self {
-            pair: Arc::new(RwLock::new(PublishedPair {
-                config,
-                revision: ConfigRevision::initial(ConfigEpoch::new()),
-            })),
-        }
-    }
-
-    /// Construct a live fixture without admitting its historical typed input.
-    ///
-    /// Test-only RPC boundaries need to exercise an edit against the same
-    /// source representation that a legacy fixture supplied. Canonical
-    /// consumers still use the test-helper admission at their own resolver
-    /// boundary; production construction has no access to this method.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub fn new_raw_for_tests(config: Config) -> Self {
         Self {
             pair: Arc::new(RwLock::new(PublishedPair {
                 config,
@@ -220,8 +202,6 @@ impl LiveConfig {
         revision: ConfigRevision,
         config: Config,
     ) -> Result<ConfigRevision, LiveConfigError> {
-        #[cfg(feature = "test-helpers")]
-        let config = crate::migration::admit_test_input(&config);
         let mut pair = self.pair.write();
         // Checked successor comparison: past `u64::MAX` no successor exists,
         // so the storage contract itself rejects a wrapping publication
