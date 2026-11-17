@@ -693,8 +693,6 @@ impl GeminiModelProvider {
             oauth_client_secret: None,
             request_timeout_secs: None,
             request_timeout_disabled: false,
-            request_timeout_secs: None,
-            request_timeout_disabled: false,
         }
     }
 
@@ -2645,6 +2643,8 @@ mod tests {
             auth_profile_override: None,
             oauth_client_id: None,
             oauth_client_secret: None,
+            request_timeout_secs: None,
+            request_timeout_disabled: false,
         };
 
         let result = model_provider.warmup().await;

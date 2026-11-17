@@ -21,8 +21,6 @@ use zeroclaw_config::schema::Config;
 #[cfg(test)]
 use zeroclaw_config::schema::TranscriptionConfig;
 
-use crate::transport::HttpTransportConfig;
-
 /// Maximum upload size accepted by most Whisper-compatible APIs (25 MB).
 const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 
@@ -41,7 +39,10 @@ fn apply_transcription_timeout(
     request: reqwest::RequestBuilder,
     policy: &Option<Override<NonZeroU64>>,
 ) -> reqwest::RequestBuilder {
-    transcription_timeout(policy).map_or(request, |timeout| request.timeout(timeout))
+    match transcription_timeout(policy) {
+        Some(timeout) => request.timeout(timeout),
+        None => request,
+    }
 }
 
 const GOOGLE_STT_ENDPOINT: &str = "https://speech.googleapis.com/v1/speech:recognize";
