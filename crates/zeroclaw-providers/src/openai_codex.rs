@@ -196,6 +196,23 @@ impl OpenAiCodexModelProvider {
             }),
         }
     }
+
+    fn streaming_client(&self) -> Client {
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        let timeouts = self.streaming_timeouts();
+        if let Some(timeout) = timeouts.request {
+            builder = builder.timeout(timeout);
+        }
+        if let Some(timeout) = timeouts.read {
+            builder = builder.read_timeout(timeout.duration());
+        }
+        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
+            "model_provider.openai",
+        );
+        builder.build().unwrap_or_else(|_| Client::new())
+    }
 }
 
 fn default_zeroclaw_dir() -> PathBuf {
@@ -1363,9 +1380,10 @@ impl OpenAiCodexModelProvider {
         access_token: Option<&str>,
         use_gateway_api_key_auth: bool,
         request: &ResponsesRequest,
+        streaming: bool,
     ) -> reqwest::RequestBuilder {
         let mut request_builder = self
-            .http_client()
+            .then_client(streaming)
             .post(&self.responses_url)
             .header("Authorization", format!("Bearer {bearer_token}"))
             .header("OpenAI-Beta", "responses=experimental")
@@ -1390,6 +1408,14 @@ impl OpenAiCodexModelProvider {
         }
 
         request_builder
+    }
+
+    fn then_client(&self, streaming: bool) -> Client {
+        if streaming {
+            self.streaming_client()
+        } else {
+            self.http_client()
+        }
     }
 
     async fn send_responses_request(
@@ -1449,6 +1475,7 @@ impl OpenAiCodexModelProvider {
             creds.access_token.as_deref(),
             creds.use_gateway_api_key_auth,
             &request,
+            false,
         );
 
         let response = request_builder.json(&request).send().await?;
@@ -1483,6 +1510,7 @@ impl OpenAiCodexModelProvider {
                         creds.access_token.as_deref(),
                         creds.use_gateway_api_key_auth,
                         &request,
+                        false,
                     )
                     .json(&request)
                     .send()
@@ -1701,6 +1729,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
                     creds.access_token.as_deref(),
                     creds.use_gateway_api_key_auth,
                     &request,
+                    true,
                 )
                 .json(&request);
 
@@ -1921,7 +1950,7 @@ mod tests {
             parallel_tool_calls: None,
         };
         let request_builder =
-            provider.responses_request_builder("test-key", None, None, true, &request);
+            provider.responses_request_builder("test-key", None, None, true, &request, false);
         set_runtime_proxy_config(ProxyConfig::default());
 
         let response_body: serde_json::Value = request_builder
