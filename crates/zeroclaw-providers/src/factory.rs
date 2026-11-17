@@ -1515,22 +1515,19 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
             )
         });
         let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
-        let mut builder = crate::gemini::GeminiModelProvider::builder(alias)
-            .api_key(key)
-            .api_url(api_url)
-            .managed_auth(auth_service, opts.auth_profile_override.clone())
-            .oauth_project_seed(self.oauth_project.clone())
-            .oauth_client(
-                self.oauth_client_id.clone(),
-                self.oauth_client_secret.clone(),
-            );
-        if let Some(timeout) = opts.provider_timeout_secs {
-            builder = builder.timeout_secs(timeout);
-        }
-        if opts.provider_timeout_disabled {
-            builder = builder.without_timeout();
-        }
-        Ok(Box::new(builder.build()))
+        Ok(Box::new(
+            crate::gemini::GeminiModelProvider::builder(alias)
+                .api_key(key)
+                .api_url(api_url)
+                .managed_auth(auth_service, opts.auth_profile_override.clone())
+                .oauth_project_seed(self.oauth_project.clone())
+                .oauth_client(
+                    self.oauth_client_id.clone(),
+                    self.oauth_client_secret.clone(),
+                )
+                .http_timeouts(opts)
+                .build(),
+        ))
     }
 
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1605,6 +1602,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
         let api_version = self.api_version.as_deref();
         Ok(Box::new(
             crate::azure_openai::AzureOpenAiModelProvider::builder(alias)
+                .http_timeouts(opts)
                 .resource_name(resource)
                 .deployment_name(deployment)
                 .credential(key)
@@ -1625,7 +1623,9 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let builder = crate::bedrock::BedrockModelProvider::builder(alias).api_url(api_url);
+        let builder = crate::bedrock::BedrockModelProvider::builder(alias)
+            .http_timeouts(opts)
+            .api_url(api_url);
         // Explicit-key path stays no-probe — do not run BEDROCK_API_KEY /
         // AwsCredentials::from_env / from_credential_process (which can
         // spawn a shell command) when the operator has already resolved
@@ -1637,16 +1637,6 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
         };
         let builder = if let Some(mt) = opts.provider_max_tokens {
             builder.max_tokens(mt)
-        } else {
-            builder
-        };
-        let builder = if let Some(timeout) = opts.provider_timeout_secs {
-            builder.timeout_secs(timeout)
-        } else {
-            builder
-        };
-        let builder = if opts.provider_timeout_disabled {
-            builder.without_timeout()
         } else {
             builder
         };
@@ -2386,6 +2376,7 @@ fn dispatch_resolved_chat(
         }
         ProviderConnection::Bedrock(connection) => {
             let mut builder = crate::bedrock::BedrockModelProvider::builder(alias)
+                .http_timeouts(&runtime)
                 .api_url(connection.uri.as_deref())
                 .region(connection.extra.region.as_deref());
             if let Some(key) = api_key {
