@@ -26,8 +26,7 @@ pub(crate) async fn vectors(
 ) -> Result<Vec<Vec<f32>>> {
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let body = crate::sanitize_api_error(&body);
+        let body = crate::protocols::error_body(response).await;
         anyhow::bail!("Embedding API returned HTTP {status}: {body}");
     }
     let response: EmbeddingResponse = response

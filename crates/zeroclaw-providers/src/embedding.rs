@@ -144,6 +144,73 @@ pub fn build_embedding_provider(config: EmbeddingProviderConfig) -> Box<dyn Embe
 mod tests {
     use super::*;
 
+    #[test]
+    fn factory_none() {
+        assert_eq!(
+            create_embedding_provider("none", None, "model", 1536).dimensions(),
+            0
+        );
+    }
+
+    #[test]
+    fn factory_empty_string_returns_noop() {
+        assert_eq!(
+            create_embedding_provider("", None, "model", 1536).name(),
+            "none"
+        );
+    }
+
+    #[test]
+    fn factory_unknown_provider_returns_noop() {
+        assert_eq!(
+            create_embedding_provider("unknown", None, "model", 1536).name(),
+            "none"
+        );
+    }
+
+    #[test]
+    fn factory_custom_empty_url() {
+        assert_eq!(
+            create_embedding_provider("custom:", None, "model", 768).dimensions(),
+            768
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_factory_preserves_server_dimensions_until_registry_cutover() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"index": 0, "embedding": vec![0.25; 768]}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let legacy =
+            create_embedding_provider(&format!("custom:{}", server.uri()), None, "model", 1536);
+        assert_eq!(legacy.embed_one("query").await.unwrap().len(), 768);
+        let resolved = build_embedding_provider(resolved_config(
+            "custom",
+            Some(&server.uri()),
+            None,
+            "model",
+            1536,
+        ));
+        assert!(
+            resolved
+                .embed_one("query")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("dimensions")
+        );
+    }
+
     fn resolved_config(
         kind: &str,
         uri: Option<&str>,
