@@ -215,6 +215,10 @@ pub(super) fn legacy_model(
         .get_mut("provider_extra")
         .and_then(Value::as_object_mut)
         .and_then(|extra| extra.remove("__zeroclaw_migration_extract_text_tool_calls"));
+    // A profile-level marker belongs only to its primary selection. Named
+    // models carry their own marker and must not inherit a sibling's policy.
+    let migrated_extract_text_tool_calls =
+        migrated_extract_text_tool_calls.filter(|_| entry.is_none());
     if raw
         .get("provider_extra")
         .and_then(Value::as_object)
@@ -357,6 +361,10 @@ pub(super) fn legacy_model(
             .as_bool()
             .context("migrated extract_text_tool_calls must be a boolean")?;
         options.insert("extract_text_tool_calls".into(), value.into());
+    } else if raw.get("native_tools").and_then(Value::as_bool) == Some(false) {
+        // V4's prompt-guided tool mode parsed tool calls from content even on
+        // custom gateways. V5 defaults remain off for new custom models.
+        options.insert("extract_text_tool_calls".into(), true.into());
     }
     let mut metadata = Map::new();
     for field in ["context_window", "vision"] {

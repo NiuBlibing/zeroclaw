@@ -724,6 +724,7 @@ mod tests {
                         ..Default::default()
                     },
                 );
+            zeroclaw_config::migration::normalize_test_input(&mut config);
             Ok((
                 config,
                 test_built_model(Box::new(TemperatureRecordingProvider {

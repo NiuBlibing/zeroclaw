@@ -5189,6 +5189,7 @@ model = "effective-before"
             .create_map_key("providers.tts.elevenlabs", "default")
             .unwrap();
         config.save().await.unwrap();
+        zeroclaw_config::migration::normalize_test_input(&mut config);
 
         let state = test_state(config);
         let (status, json) = response_json(

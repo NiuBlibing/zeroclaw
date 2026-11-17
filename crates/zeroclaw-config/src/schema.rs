@@ -5177,6 +5177,14 @@ impl Config {
         let capacity_ref = self
             .agent(agent_alias)
             .filter(|_| !model_provider_ref.contains('.'))
+            .filter(|_| {
+                self.providers
+                    .models
+                    .canonical_model(&crate::provider_registry::ModelRef::from(
+                        model_provider_ref,
+                    ))
+                    .is_none()
+            })
             .filter(|agent| {
                 self.resolve_model_id(&agent.model_provider).as_deref()
                     == Some(selected_model.trim())
@@ -50011,12 +50019,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         // Dashboard "+ Add alias" target is the typed family slot,
         // not a free-form provider key under `providers.models`.
         let mut config = Config::default();
-        assert!(
-            !config
-                .providers
-                .models
-                .contains_model_provider_type("anthropic")
-        );
+        assert!(!config.providers.contains_model_provider_type("anthropic"));
 
         let created = config
             .create_map_key("providers.models.anthropic", "default")

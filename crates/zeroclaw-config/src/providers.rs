@@ -552,19 +552,6 @@ impl ModelProviders {
         for_each_model_provider_slot!(emit_ensure)
     }
 
-    /// True when `family`'s typed slot has at least one configured
-    /// alias entry. Runtime consumers resolve this from the admitted
-    /// connection/model registry; historical typed maps are projected before
-    /// this method is reached.
-    pub fn contains_model_provider_type(&self, family: &str) -> bool {
-        self.canonical_models.keys().any(|reference| {
-            reference
-                .as_str()
-                .split_once('.')
-                .is_some_and(|(prefix, _)| prefix == family)
-        })
-    }
-
     /// Iterate the alias keys for a given model_provider type. Returns an empty
     /// iterator for unknown model_provider types.
     pub fn aliases_of<'a>(&'a self, family: &str) -> Box<dyn Iterator<Item = &'a str> + 'a> {
@@ -1120,6 +1107,18 @@ impl<'de> Deserialize<'de> for Providers {
 }
 
 impl Providers {
+    /// Provider kind comes from the referenced connection, never a model's
+    /// opaque TOML key. Only chat models activate model-provider integrations.
+    pub fn contains_model_provider_type(&self, family: &str) -> bool {
+        self.models.canonical_models.values().any(|model| {
+            model.capability() == zeroclaw_api::capability::Capability::Chat
+                && self
+                    .connections
+                    .get(model.provider())
+                    .is_some_and(|connection| connection.kind() == family)
+        })
+    }
+
     /// Resolve only admitted canonical definitions. Historical input is
     /// normalized before a Config is returned to any consumer.
     pub fn canonical_registry(

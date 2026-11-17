@@ -269,6 +269,14 @@ impl ProviderRegistry {
         let mut wire_api = None;
         let mut request_timeout_secs = None;
         let mut read_timeout_secs = None;
+        let mut queue_timeout_secs = match selection.connection {
+            ProviderConnection::HailoOllama(connection) => connection
+                .api
+                .chat
+                .as_ref()
+                .and_then(|api| api.queue_timeout_secs),
+            _ => None,
+        };
         let mut live_pricing = None;
         if let Some(api) = selection.connection.chat_api() {
             wire_api = api.wire_api;
@@ -291,6 +299,7 @@ impl ProviderRegistry {
             wire_api = api.wire_api.or(wire_api);
             request_timeout_secs = api.request_timeout_secs.clone().or(request_timeout_secs);
             read_timeout_secs = api.read_timeout_secs.clone().or(read_timeout_secs);
+            queue_timeout_secs = api.queue_timeout_secs.or(queue_timeout_secs);
         }
         options.overlay(&model.options);
         Ok(ResolvedChat {
@@ -298,6 +307,7 @@ impl ProviderRegistry {
             wire_api,
             request_timeout_secs,
             read_timeout_secs,
+            queue_timeout_secs,
             live_pricing,
             options,
         })
@@ -361,6 +371,7 @@ pub struct ResolvedChat<'a> {
     pub wire_api: Option<WireApi>,
     pub request_timeout_secs: Option<Override<NonZeroU64>>,
     pub read_timeout_secs: Option<Override<NonZeroU64>>,
+    pub queue_timeout_secs: Option<NonZeroU64>,
     pub live_pricing: Option<bool>,
     pub options: ChatOptionsPatch,
 }

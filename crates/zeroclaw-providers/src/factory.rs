@@ -2412,12 +2412,7 @@ fn dispatch_resolved_chat(
         }
         ProviderConnection::HailoOllama(connection) => {
             return HailoOllamaModelProviderConfig {
-                queue_timeout_secs: connection
-                    .api
-                    .chat
-                    .as_ref()
-                    .and_then(|api| api.queue_timeout_secs)
-                    .map(std::num::NonZeroU64::get),
+                queue_timeout_secs: resolved.queue_timeout_secs.map(std::num::NonZeroU64::get),
                 ..Default::default()
             }
             .create_provider(alias, api_key, connection.uri.as_deref(), &runtime);

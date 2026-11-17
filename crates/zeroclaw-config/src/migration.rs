@@ -9498,7 +9498,7 @@ model = "backup"
                 .iter()
                 .filter_map(|entry| entry.as_str())
                 .collect::<Vec<_>>(),
-            vec!["custom.backup"]
+            vec!["fallback.custom.gateway.prod.backup", "custom.backup"]
         );
         assert!(notices.iter().all(|notice| matches!(
             notice,

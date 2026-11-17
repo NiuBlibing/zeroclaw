@@ -40801,6 +40801,8 @@ mod tests {
 
     fn make_config_set_test_dispatcher(config: zeroclaw_config::schema::Config) -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = config;
+        zeroclaw_config::migration::normalize_test_input(&mut config);
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
@@ -40819,6 +40821,8 @@ mod tests {
         pause: Arc<crate::rpc::context::ConfigCommitPause>,
     ) -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = config;
+        zeroclaw_config::migration::normalize_test_input(&mut config);
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let mut ctx_inner = Arc::try_unwrap(RpcContext::minimal_raw(config, Arc::clone(&sessions)))

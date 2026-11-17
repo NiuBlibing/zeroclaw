@@ -1866,7 +1866,7 @@ model = "upstream-model"
         // Single source of truth: zeroclaw_providers::list_model_providers().
         // Anthropic / OpenAI / OpenRouter must surface in the picker.
         let cfg = empty_cfg();
-        let items = providers_picker(&cfg);
+        let items = providers_picker(&zeroclaw_config::migration::admit_test_input(&cfg));
         let names: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
         assert!(
             names.contains(&"anthropic"),
@@ -1905,7 +1905,7 @@ model = "upstream-model"
         let mut cfg = empty_cfg();
         cfg.create_map_key("providers.models.anthropic", "default")
             .expect("create_map_key");
-        let items = providers_picker(&cfg);
+        let items = providers_picker(&zeroclaw_config::migration::admit_test_input(&cfg));
         let anthropic = items.iter().find(|i| i.key == "anthropic").unwrap();
         assert_eq!(
             anthropic.badge.as_deref(),
@@ -1920,7 +1920,7 @@ model = "upstream-model"
         .expect("set model");
         cfg.set_prop("providers.models.anthropic.default.api_key", "sk-test")
             .expect("set api key");
-        let items = providers_picker(&cfg);
+        let items = providers_picker(&zeroclaw_config::migration::admit_test_input(&cfg));
         let anthropic = items.iter().find(|i| i.key == "anthropic").unwrap();
         assert_eq!(
             anthropic.badge.as_deref(),

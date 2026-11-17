@@ -5928,7 +5928,7 @@ data: {\"type\":\"message_stop\"}\n\n",
                     ..Default::default()
                 },
             );
-            config
+            zeroclaw_config::migration::admit_test_input(&config)
         }
 
         let first = MockServer::start().await;
@@ -6467,12 +6467,12 @@ data: {\"type\":\"message_stop\"}\n\n",
                 entry.context_window = Some(w);
             }
 
-            let cfg = Config {
+            let cfg = zeroclaw_config::migration::admit_test_input(&Config {
                 agents,
                 runtime_profiles,
                 providers,
                 ..Config::default()
-            };
+            });
 
             let limits = cfg.resolved_context_limits_for_route("coder", provider_alias, "glm-5.2");
             let max_ctx = limits.context_token_budget as u64;

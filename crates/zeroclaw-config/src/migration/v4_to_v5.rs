@@ -41,13 +41,12 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
         .into_iter()
         .flat_map(|agents| agents.values())
         .filter_map(toml::Value::as_table)
-        .filter_map(|agent| {
+        .flat_map(|agent| {
             let model_provider = agent
                 .get("model_provider")
                 .and_then(toml::Value::as_str)
                 .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            let reference = legacy_model_selection(models, model_provider)?;
+                .filter(|value| !value.is_empty());
             let strict = agent
                 .get("strict_tool_parsing")
                 .and_then(toml::Value::as_bool)
@@ -57,7 +56,46 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
                         .and_then(toml::Value::as_str)
                         .is_some_and(|profile| strict_profiles.contains(profile))
                 });
-            Some((reference, strict))
+            let mut references = Vec::new();
+            if let Some(reference) =
+                model_provider.and_then(|reference| legacy_model_selection(models, reference))
+            {
+                references.push((reference, strict));
+            }
+            let profile = agent
+                .get("runtime_profile")
+                .and_then(toml::Value::as_str)
+                .and_then(|alias| {
+                    root.get("runtime_profiles")
+                        .and_then(|profiles| profiles.get(alias))
+                });
+            if let Some(profile) = profile {
+                for route in root
+                    .get("model_routes")
+                    .and_then(toml::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let hint = route.get("hint").and_then(toml::Value::as_str);
+                    let reachable = profile.get("auto_classify").and_then(toml::Value::as_bool)
+                        == Some(true)
+                        || profile.get("effort_routing").is_some_and(|routing| {
+                            ["local_hint", "cloud_hint"].iter().any(|field| {
+                                routing.get(*field).and_then(toml::Value::as_str) == hint
+                                    && hint.is_some()
+                            })
+                        });
+                    if reachable
+                        && let Some(reference) = route
+                            .get("model_provider")
+                            .and_then(toml::Value::as_str)
+                            .and_then(|reference| legacy_model_selection(models, reference))
+                    {
+                        references.push((reference, strict));
+                    }
+                }
+            }
+            references
         })
         .collect();
 
@@ -188,64 +226,69 @@ fn migrate_profile_fallbacks(value: &mut toml::Value) -> Result<()> {
     else {
         return Ok(());
     };
-    let Some(models) = providers
-        .get_mut("models")
-        .and_then(toml::Value::as_table_mut)
-    else {
+    let Some(models) = providers.get("models").and_then(toml::Value::as_table) else {
         return Ok(());
     };
-
     let mut additions = Vec::<(String, Vec<String>)>::new();
-    for (family, family_value) in models.iter_mut() {
-        let Some(family_table) = family_value.as_table_mut() else {
+    let mut generated = toml::Table::new();
+    for (family, family_value) in models {
+        if family_value.get("capability").is_some() {
+            continue;
+        }
+        let Some(family_table) = family_value.as_table() else {
             continue;
         };
-        for (alias, profile_value) in family_table.iter_mut() {
-            let Some(profile) = profile_value.as_table_mut() else {
+        for (alias, profile_value) in family_table {
+            let Some(profile) = profile_value.as_table() else {
                 continue;
             };
             let source = format!("{family}.{alias}");
             let mut targets = Vec::new();
-
-            // V4 tried same-connection model ids before switching to another
-            // provider. Materialize an exact nested model entry for each raw
-            // id so the V5 graph never points at a model that does not exist.
-            let local_fallbacks = profile
+            let raw = serde_json::to_value(profile)?;
+            // Raw upstream IDs retain this profile's connection and tuning.
+            // Dedicated graph nodes avoid cycles when a named model is also
+            // listed as a fallback and inherits the profile's fallback list.
+            for model_id in profile
                 .get("fallback_models")
                 .and_then(toml::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if !local_fallbacks.is_empty() {
-                let local_models = profile
-                    .entry("models")
-                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-                    .as_table_mut()
-                    .context("legacy provider models must be a table")?;
-                for raw in local_fallbacks.iter().filter_map(toml::Value::as_str) {
-                    let model_id = raw.trim();
-                    if model_id.is_empty() {
-                        continue;
-                    }
-                    let alias_for_model = ensure_legacy_fallback_model(local_models, model_id);
-                    let target = format!("{family}.{alias}.{alias_for_model}");
-                    if target != source && !targets.contains(&target) {
-                        targets.push(target);
-                    }
-                }
-            }
-
-            // Provider fallbacks are appended after same-connection model
-            // fallbacks to preserve V4's ordering.
-            let provider_fallbacks = profile
-                .get("fallback")
-                .and_then(toml::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            for raw in provider_fallbacks.iter().filter_map(toml::Value::as_str) {
-                let fallback = raw.trim();
-                if fallback.is_empty() {
+                .into_iter()
+                .flatten()
+                .filter_map(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                if targets.iter().any(|target: &String| {
+                    generated
+                        .get(target)
+                        .and_then(|model| model.get("model"))
+                        .and_then(toml::Value::as_str)
+                        == Some(model_id)
+                }) {
                     continue;
                 }
+                let base = format!("fallback.{source}.{model_id}");
+                let mut reference = base.clone();
+                let mut suffix = 1;
+                while models.contains_key(&reference) || generated.contains_key(&reference) {
+                    reference = format!("{base}.{suffix}");
+                    suffix += 1;
+                }
+                let (_, mut model) =
+                    super::model_routes::legacy_model(&raw, family, None, Some(model_id))?;
+                model["provider"] = format!("legacy.{source}").into();
+                generated.insert(reference.clone(), toml::Value::try_from(model)?);
+                targets.push(reference);
+            }
+            // V4 exhausted same-connection models before switching providers.
+            for fallback in profile
+                .get("fallback")
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|reference| !reference.is_empty())
+            {
                 let target = if fallback.contains('.') {
                     fallback.to_owned()
                 } else {
@@ -256,10 +299,23 @@ fn migrate_profile_fallbacks(value: &mut toml::Value) -> Result<()> {
                 }
             }
             if !targets.is_empty() {
+                // Every original named selection used the enclosing profile's
+                // fallback policy. Generated fallback nodes have no outgoing
+                // edges; their ordered siblings remain on each source node.
+                if let Some(entries) = profile.get("models").and_then(toml::Value::as_table) {
+                    for name in entries.keys() {
+                        additions.push((format!("{source}.{name}"), targets.clone()));
+                    }
+                }
                 additions.push((source, targets));
             }
         }
     }
+    providers
+        .get_mut("models")
+        .and_then(toml::Value::as_table_mut)
+        .context("providers.models must be a table")?
+        .extend(generated);
     if additions.is_empty() {
         return Ok(());
     }
@@ -284,27 +340,6 @@ fn migrate_profile_fallbacks(value: &mut toml::Value) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn ensure_legacy_fallback_model(models: &mut toml::Table, model_id: &str) -> String {
-    if let Some((alias, _)) = models.iter().find(|(_, entry)| {
-        entry
-            .get("id")
-            .and_then(toml::Value::as_str)
-            .is_some_and(|id| id == model_id)
-    }) {
-        return alias.clone();
-    }
-    let mut alias = model_id.to_owned();
-    let mut suffix = 1;
-    while models.contains_key(&alias) {
-        alias = format!("{model_id}.{suffix}");
-        suffix += 1;
-    }
-    let mut entry = toml::Table::new();
-    entry.insert("id".into(), toml::Value::String(model_id.to_owned()));
-    models.insert(alias.clone(), toml::Value::Table(entry));
-    alias
 }
 
 #[cfg(test)]
@@ -435,7 +470,7 @@ model = "gpt-4o-backup"
             Some("gpt-4o")
         );
         assert_eq!(
-            value["providers"]["models"]["openai.main.gpt-4o-mini"]["model"].as_str(),
+            value["providers"]["models"]["fallback.openai.main.gpt-4o-mini"]["model"].as_str(),
             Some("gpt-4o-mini")
         );
         assert_eq!(
@@ -445,7 +480,7 @@ model = "gpt-4o-backup"
                 .iter()
                 .filter_map(toml::Value::as_str)
                 .collect::<Vec<_>>(),
-            vec!["openai.main.gpt-4o-mini", "openai.backup"]
+            vec!["fallback.openai.main.gpt-4o-mini", "openai.backup"]
         );
     }
 

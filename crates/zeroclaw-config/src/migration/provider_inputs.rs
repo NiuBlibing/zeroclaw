@@ -73,6 +73,13 @@ fn project_provider_tables(
                     error.to_string(),
                 )
             })?;
+            if reference == profile_ref
+                && let Some(policy) = raw
+                    .get("provider_extra")
+                    .and_then(|extra| extra.get("__zeroclaw_migration_extract_text_tool_calls"))
+            {
+                model["options"]["extract_text_tool_calls"] = policy.clone();
+            }
             let provider_id = ProviderId::from(format!("legacy.{profile_ref}"));
             if providers.connections.contains_key(&provider_id) {
                 return Err(registry::RegistryError::new(

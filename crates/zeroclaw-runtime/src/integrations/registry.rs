@@ -32,12 +32,7 @@ fn evaluate_model_provider_activation(
     config: &Config,
     info: &zeroclaw_providers::ModelProviderInfo,
 ) -> IntegrationStatus {
-    bool_to_status(
-        config
-            .providers
-            .models
-            .contains_model_provider_type(info.name),
-    )
+    bool_to_status(config.providers.contains_model_provider_type(info.name))
 }
 
 pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
