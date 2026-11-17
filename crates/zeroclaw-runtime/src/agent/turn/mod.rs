@@ -7503,10 +7503,8 @@ mod sop_step_reassembly_tests {
             assert_eq!(owned.provider_name, "ollama.p.fast");
             assert_eq!(owned.model, "fast-model");
             assert_eq!(
-                config
-                    .resolve_model_selection(&owned.provider_name)
-                    .unwrap()
-                    .temperature(),
+                zeroclaw_config::migration::admit_test_input(&config)
+                    .resolve_model_temperature(&owned.provider_name),
                 Some(0.42)
             );
         }

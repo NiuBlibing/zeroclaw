@@ -6105,9 +6105,8 @@ mod tests {
             .simple_chat(
                 "hello",
                 runtime.model.model_name(),
-                config
-                    .resolve_model_selection(&runtime.model.identity().provider_ref())
-                    .and_then(|s| s.temperature()),
+                zeroclaw_config::migration::admit_test_input(&config)
+                    .resolve_model_temperature(&runtime.model.identity().provider_ref()),
             )
             .await
             .unwrap();
@@ -6199,10 +6198,12 @@ mod tests {
                 .simple_chat(
                     "hello",
                     runtime.model.model_name(),
-                    config
+                    zeroclaw_config::migration::admit_test_input(&config)
                         .agent("worker")
-                        .and_then(|agent| config.resolve_model_selection(&agent.model_provider))
-                        .and_then(|s| s.temperature()),
+                        .and_then(|agent| {
+                            zeroclaw_config::migration::admit_test_input(&config)
+                                .resolve_model_temperature(&agent.model_provider)
+                        }),
                 )
                 .await
                 .unwrap();
@@ -7035,9 +7036,7 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
         )
         .unwrap();
         assert_eq!(
-            config
-                .resolve_model_selection(&rt.model.identity().provider_ref())
-                .and_then(|s| s.temperature()),
+            config.resolve_model_temperature(&rt.model.identity().provider_ref()),
             Some(0.2),
             "entry temperature beats profile"
         );
@@ -7059,9 +7058,7 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
         )
         .unwrap();
         assert_eq!(
-            config
-                .resolve_model_selection(&rt.model.identity().provider_ref())
-                .and_then(|s| s.temperature()),
+            config.resolve_model_temperature(&rt.model.identity().provider_ref()),
             Some(0.9)
         );
         assert_eq!(
@@ -7224,9 +7221,8 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             .simple_chat(
                 "hello",
                 rt.model.model_name(),
-                config
-                    .resolve_model_selection(&rt.model.identity().provider_ref())
-                    .and_then(|s| s.temperature()),
+                zeroclaw_config::migration::admit_test_input(&config)
+                    .resolve_model_temperature(&rt.model.identity().provider_ref()),
             )
             .await
             .expect("target profile responds");
@@ -7249,9 +7245,8 @@ options = {{ temperature = 0.8, max_tokens = 77, provider_extra = {{ selected_on
             .simple_chat(
                 "hello again",
                 keyless_rt.model.model_name(),
-                config
-                    .resolve_model_selection(&keyless_rt.model.identity().provider_ref())
-                    .and_then(|s| s.temperature()),
+                zeroclaw_config::migration::admit_test_input(&config)
+                    .resolve_model_temperature(&keyless_rt.model.identity().provider_ref()),
             )
             .await
             .expect("keyless target profile responds");
@@ -23267,10 +23262,8 @@ model_provider = "custom.primary"
                 },
             },
         );
-        let identity = config
-            .resolve_model_selection("openai.gw.default")
-            .unwrap()
-            .identity(None);
+        let identity =
+            zeroclaw_config::schema::ModelIdentity::new("openai.gw.default", "gpt-4o-mini");
 
         let mut agent = build_test_agent(
             "openai.gw",
