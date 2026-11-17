@@ -249,6 +249,11 @@ impl ProviderRegistry {
                 "wire API overrides are unsupported by the connection kind",
             ));
         }
+        if let Some(extra) = &config.extra {
+            extra
+                .validate_connection(connection)
+                .map_err(|error| RegistryError::model(name, "extra", error.to_string()))?;
+        }
         if let Some(preset) = config.preset.as_ref() {
             ensure_preset(self, name, preset, Capability::Chat)?;
         }
