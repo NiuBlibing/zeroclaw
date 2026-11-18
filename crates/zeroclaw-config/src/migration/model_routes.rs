@@ -199,7 +199,10 @@ pub(super) fn legacy_chat_api_fields(kind: &str) -> &'static [(&'static str, &'s
             ("extra_args", "extra_args"),
             ("max_acp_stdout_bytes", "max_acp_stdout_bytes"),
         ],
-        "hailo_ollama" => &[("queue_timeout_secs", "queue_timeout_secs")],
+        "hailo_ollama" => &[
+            ("timeout_secs", "request_timeout_secs"),
+            ("queue_timeout_secs", "queue_timeout_secs"),
+        ],
         _ => &[
             ("wire_api", "wire_api"),
             ("timeout_secs", "request_timeout_secs"),
@@ -482,7 +485,7 @@ mod tests {
             let (connection, _) = legacy_model(&raw, kind, None, None).unwrap();
             let decoded: ProviderConnection = serde_json::from_value(connection.clone()).unwrap();
             assert_eq!(decoded.kind(), kind);
-            if kind == "grok_cli" {
+            if matches!(kind, "grok_cli" | "hailo_ollama") {
                 assert_eq!(connection["api"]["chat"]["request_timeout_secs"], 30);
             } else {
                 assert!(

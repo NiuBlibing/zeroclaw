@@ -1070,7 +1070,7 @@ impl OpenAiCompatibleModelProvider {
         (result, true)
     }
 
-    fn http_client(&self) -> Client {
+    fn http_client(&self) -> anyhow::Result<Client> {
         let timeout = self.timeout_secs;
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
@@ -1130,18 +1130,7 @@ impl OpenAiCompatibleModelProvider {
                 "model_provider.compatible",
             );
 
-            return builder.build().unwrap_or_else(|error| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": super::format_error_chain(&error)})
-                        ),
-                    "Failed to build proxied timeout client with custom headers or TLS certificate: "
-                );
-                Client::new()
-            });
+            return Ok(builder.build()?);
         }
 
         if self.timeout_disabled || self.read_timeout_disabled || self.read_timeout_secs.is_some() {
@@ -1162,18 +1151,7 @@ impl OpenAiCompatibleModelProvider {
                 builder,
                 "model_provider.compatible",
             );
-            return builder.build().unwrap_or_else(|error| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": super::format_error_chain(&error)})
-                        ),
-                    "Failed to build provider client with configured read timeout: "
-                );
-                Client::new()
-            });
+            return Ok(builder.build()?);
         }
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.compatible",
@@ -1693,7 +1671,7 @@ impl OpenAiCompatibleModelProvider {
         let url = self.chat_completions_url();
         let response = match self
             .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
+                self.http_client()?.post(&url).json(&request),
                 credential.as_deref(),
             )?)
             .send()
@@ -4267,7 +4245,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // it and would otherwise leak into operator logs.
             let safe_url = super::sanitize_api_error(&url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
+                .apply_auth_header(self.http_client()?.get(&url), list_credential.as_deref())?
                 .send()
                 .await
                 .map_err(|e| {
@@ -4370,7 +4348,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // it and would otherwise leak into operator logs.
             let safe_url = super::sanitize_api_error(&url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
+                .apply_auth_header(self.http_client()?.get(&url), list_credential.as_deref())?
                 .send()
                 .await
                 .map_err(|e| {
@@ -4534,7 +4512,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let response = match self
             .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
+                self.http_client()?.post(&url).json(&request),
                 credential.as_deref(),
             )?)
             .send()
@@ -4635,7 +4613,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = loop {
             let response = match self
                 .apply_opencode_session_header(self.apply_auth_header(
-                    self.http_client().post(&url).json(&payload),
+                    self.http_client()?.post(&url).json(&payload),
                     credential.as_deref(),
                 )?)
                 .send()
@@ -4779,7 +4757,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = loop {
             let response = match self
                 .apply_opencode_session_header(self.apply_auth_header(
-                    self.http_client().post(&url).json(&payload),
+                    self.http_client()?.post(&url).json(&payload),
                     credential.as_deref(),
                 )?)
                 .send()
@@ -5464,7 +5442,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.models_url();
         let credential = self.resolve_credential().await?;
         let mut response = self
-            .apply_auth_header(self.http_client().get(&url), credential.as_deref())?
+            .apply_auth_header(self.http_client()?.get(&url), credential.as_deref())?
             .send()
             .await?;
         // Drain without retaining the catalog so HTTP/1 connections can be reused.
@@ -10080,7 +10058,7 @@ mod tests {
         // http_client() must build cleanly even when PEM parse fails internally.
         // The method returns Client directly (panics on builder error), so if we
         // reach here without panic the fallback-to-system-roots path is working.
-        let _client = p.http_client();
+        let _client = p.http_client().unwrap();
     }
 
     #[test]
@@ -10988,11 +10966,11 @@ timeout_secs = 1
         let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
 
         let opencode = opencode_provider("https://opencode.ai/zen/v1");
-        assert!(has_policy(opencode.http_client()));
+        assert!(has_policy(opencode.http_client().unwrap()));
         assert!(has_policy(opencode.streaming_http_client()));
 
         let other = opencode_provider("https://api.openai.com/v1");
-        assert!(!has_policy(other.http_client()));
+        assert!(!has_policy(other.http_client().unwrap()));
         assert!(!has_policy(other.streaming_http_client()));
     }
 
@@ -16512,14 +16490,14 @@ timeout_secs = 1
             .extra_headers(headers)
             .build();
         // Should not panic
-        let _client = p.http_client();
+        let _client = p.http_client().unwrap();
     }
 
     #[test]
     fn http_client_without_extra_headers_or_user_agent() {
         let p = make_model_provider("test", "https://example.com", None);
         // Should use the cached proxy client path
-        let _client = p.http_client();
+        let _client = p.http_client().unwrap();
     }
 
     #[test]
@@ -16537,7 +16515,7 @@ timeout_secs = 1
         assert_eq!(p.user_agent.as_deref(), Some("CustomAgent/1.0"));
         assert_eq!(p.extra_headers.len(), 1);
         // Should not panic
-        let _client = p.http_client();
+        let _client = p.http_client().unwrap();
     }
 
     #[test]
