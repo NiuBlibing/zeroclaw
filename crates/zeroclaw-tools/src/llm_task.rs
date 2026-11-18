@@ -279,7 +279,11 @@ impl Tool for LlmTaskTool {
                 // normalization before structured validation so text-encoded
                 // reasoning cannot make an otherwise valid JSON result fail.
                 let policy = config.model_text_extraction(&extraction_ref);
-                zeroclaw_providers::response::normalize_text(&text, policy)
+                if schema.is_some() {
+                    zeroclaw_providers::response::normalize_json_text(&text, policy)
+                } else {
+                    zeroclaw_providers::response::normalize_text(&text, policy)
+                }
             }
             Err(e) => {
                 return Ok(ToolResult {
