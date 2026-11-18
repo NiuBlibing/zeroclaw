@@ -3482,8 +3482,31 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn provider_registry_editor_masks_and_persists_through_config_lifecycle() {
+    #[test]
+    fn provider_registry_editor_masks_and_persists_through_config_lifecycle() {
+        // Registry staging walks the complete typed connection/model graph and
+        // serializes a masked snapshot. Keep this integration test off the
+        // harness's small default worker stack; production code remains
+        // asynchronous and does not require a larger process stack.
+        std::thread::Builder::new()
+            .name("registry-editor-lifecycle".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("registry editor test runtime")
+                    .block_on(
+                        provider_registry_editor_masks_and_persists_through_config_lifecycle_async(
+                        ),
+                    );
+            })
+            .expect("registry editor test thread")
+            .join()
+            .expect("registry editor test thread did not panic");
+    }
+
+    async fn provider_registry_editor_masks_and_persists_through_config_lifecycle_async() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
         config.providers = toml::from_str(
