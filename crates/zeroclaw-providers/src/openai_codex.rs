@@ -163,9 +163,9 @@ impl OpenAiCodexModelProvider {
         })
     }
 
-    fn http_client(&self) -> Client {
+    fn http_client(&self) -> anyhow::Result<Client> {
         let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-        if !self.timeout_disabled {
+        if self.timeout_configured && !self.timeout_disabled {
             builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
         }
         if !self.read_timeout_disabled
@@ -178,7 +178,7 @@ impl OpenAiCodexModelProvider {
             builder,
             "model_provider.openai",
         );
-        builder.build().unwrap_or_else(|_| Client::new())
+        Ok(builder.build()?)
     }
 
     fn streaming_timeouts(&self) -> super::StreamTimeouts {
@@ -1380,15 +1380,22 @@ impl OpenAiCodexModelProvider {
         access_token: Option<&str>,
         use_gateway_api_key_auth: bool,
         request: &ResponsesRequest,
-    ) -> reqwest::RequestBuilder {
-        self.request_builder(
-            self.http_client(),
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        // Buffered chat still receives Responses SSE. Its wire timeout
+        // contract must match the public streaming path.
+        let client = if request.stream {
+            self.streaming_client()?
+        } else {
+            self.http_client()?
+        };
+        Ok(self.request_builder(
+            client,
             bearer_token,
             account_id,
             access_token,
             use_gateway_api_key_auth,
             request,
-        )
+        ))
     }
 
     fn streaming_responses_request_builder(
@@ -1502,7 +1509,7 @@ impl OpenAiCodexModelProvider {
             creds.access_token.as_deref(),
             creds.use_gateway_api_key_auth,
             &request,
-        );
+        )?;
 
         let response = request_builder.json(&request).send().await?;
 
@@ -1536,7 +1543,7 @@ impl OpenAiCodexModelProvider {
                         creds.access_token.as_deref(),
                         creds.use_gateway_api_key_auth,
                         &request,
-                    )
+                    )?
                     .json(&request)
                     .send()
                     .await?;
@@ -1893,6 +1900,33 @@ mod tests {
         assert_eq!(provider.multimodal.max_image_size_mb, 2);
     }
 
+    #[test]
+    fn buffered_responses_use_the_same_sse_deadline_policy_as_streaming() {
+        let options = ModelProviderRuntimeOptions::default();
+        let provider = OpenAiCodexModelProvider::new("test", &options, None).unwrap();
+        let timeouts = provider.streaming_timeouts();
+        assert_eq!(timeouts.request, None);
+        assert_eq!(
+            timeouts.read.unwrap().duration(),
+            std::time::Duration::from_secs(300)
+        );
+
+        let options = ModelProviderRuntimeOptions {
+            provider_timeout_secs: Some(600),
+            provider_stream_request_timeout_secs: Some(
+                zeroclaw_config::provider_registry::Override::Clear,
+            ),
+            provider_read_timeout_secs: Some(30),
+            ..Default::default()
+        };
+        let provider = OpenAiCodexModelProvider::new("test", &options, None).unwrap();
+        assert_eq!(provider.streaming_timeouts().request, None);
+        assert_eq!(
+            provider.streaming_timeouts().read.unwrap().duration(),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
     #[tokio::test]
     async fn codex_responses_provider_honors_runtime_proxy_after_construction() {
         use axum::{Json, Router, extract::State, routing::post};
@@ -1979,8 +2013,9 @@ mod tests {
             tool_choice: None,
             parallel_tool_calls: None,
         };
-        let request_builder =
-            provider.responses_request_builder("test-key", None, None, true, &request);
+        let request_builder = provider
+            .responses_request_builder("test-key", None, None, true, &request)
+            .unwrap();
         set_runtime_proxy_config(ProxyConfig::default());
 
         let response_body: serde_json::Value = request_builder

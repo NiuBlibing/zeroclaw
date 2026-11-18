@@ -550,13 +550,7 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
     if let Some(profile) = config.runtime_profiles.get(runtime_alias) {
         model_provider_refs.push(profile.context_compression.summary_provider.trim());
     }
-    carry_model_provider_closure(
-        &mut out,
-        &masked_root,
-        config,
-        &model_provider_refs,
-        &mut dropped,
-    );
+    carry_model_provider_closure(&mut out, &masked_root, config, &model_provider_refs);
 
     let canonical_speech_refs: Vec<&str> = [
         agent.tts_provider.trim(),
@@ -571,13 +565,7 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
             .is_some()
     })
     .collect();
-    carry_model_provider_closure(
-        &mut out,
-        &masked_root,
-        config,
-        &canonical_speech_refs,
-        &mut dropped,
-    );
+    carry_model_provider_closure(&mut out, &masked_root, config, &canonical_speech_refs);
 
     // ── scrub, then verify the scrub ─────────────────────────────────────
     let mut required_secrets = Vec::new();
@@ -1256,20 +1244,11 @@ fn carry_model_provider_closure(
     masked_root: &toml::Table,
     config: &Config,
     roots: &[&str],
-    dropped: &mut Vec<DroppedRef>,
 ) {
     let mut carried = BTreeSet::new();
     for root in roots {
         let mut visited = Vec::new();
-        carry_model_provider(
-            out,
-            masked_root,
-            config,
-            root,
-            &mut visited,
-            &mut carried,
-            dropped,
-        );
+        carry_model_provider(out, masked_root, config, root, &mut visited, &mut carried);
     }
 }
 
@@ -1280,7 +1259,6 @@ fn carry_model_provider(
     reference: &str,
     visited: &mut Vec<String>,
     carried: &mut BTreeSet<String>,
-    _dropped: &mut Vec<DroppedRef>,
 ) {
     let trimmed = reference.trim();
     if trimmed.is_empty() || visited.iter().any(|seen| seen == trimmed) {
@@ -1357,15 +1335,7 @@ fn carry_model_provider(
         visited.push(trimmed.to_string());
         if let Some(targets) = config.providers.fallback.get(&canonical) {
             for target in targets {
-                carry_model_provider(
-                    out,
-                    masked_root,
-                    config,
-                    target.as_str(),
-                    visited,
-                    carried,
-                    _dropped,
-                );
+                carry_model_provider(out, masked_root, config, target.as_str(), visited, carried);
             }
         }
         visited.pop();
@@ -1833,7 +1803,6 @@ model = "asr-model"
             masked.as_table().unwrap(),
             &config,
             &["chat.0", "speech.tts", "speech.asr"],
-            &mut Vec::new(),
         );
         let providers = output["providers"].as_table().unwrap();
         assert_eq!(providers["models"].as_table().unwrap().len(), 32);

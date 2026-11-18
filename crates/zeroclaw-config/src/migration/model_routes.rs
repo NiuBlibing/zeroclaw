@@ -101,12 +101,31 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
             } else if let Some(selection) = config.resolve_model_selection(reference) {
                 let profiles = serde_json::to_value(&config.providers.models)?;
                 let raw = profiles[selection.family][selection.alias].clone();
-                legacy_model(
+                let mut definition = legacy_model(
                     &raw,
                     selection.family,
                     selection.model_entry,
                     explicit_model,
-                )?
+                )?;
+                // V4 strict_tool_parsing was preserved as a profile marker.
+                // When route admission selects the profile's default/sole
+                // entry, pass that marker to the materialized route model as
+                // well; otherwise this path silently loses the primary
+                // parser policy while ordinary model admission keeps it.
+                // A named model entry owns its parser policy.  Only copy the
+                // retired profile marker when the reference is exactly the
+                // profile key (the default/sole entry case).  TOML keys are
+                // opaque: aliases may contain dots, so a suffix check would
+                // incorrectly apply the profile policy to a named sibling.
+                if selection.model_entry.is_some()
+                    && reference == format!("{}.{}", selection.family, selection.alias)
+                    && let Some(policy) = raw
+                        .get("provider_extra")
+                        .and_then(|extra| extra.get("__zeroclaw_migration_extract_text_tool_calls"))
+                {
+                    definition.1["options"]["extract_text_tool_calls"] = policy.clone();
+                }
+                definition
             } else if !reference.is_empty() && explicit_model.is_some() {
                 let family = reference
                     .split_once('.')
@@ -574,5 +593,28 @@ model = "gpt-4o-route"
             migrated["providers"]["fallback"]["route.effort"],
             toml::Value::Array(vec![toml::Value::String("openai.backup".into())])
         );
+    }
+
+    #[test]
+    fn named_route_does_not_inherit_profile_parser_marker() {
+        let document: toml::Value = toml::from_str(
+            r#"
+schema_version = 4
+
+[providers.models.ollama.main]
+model = "primary"
+provider_extra = { __zeroclaw_migration_extract_text_tool_calls = true }
+[providers.models.ollama.main.models.fast]
+id = "fast"
+
+[[model_routes]]
+hint = "fast"
+model_provider = "ollama.main.fast"
+"#,
+        )
+        .unwrap();
+        let migrated = migrate(document).unwrap();
+        let named = &migrated["providers"]["models"]["route.fast"]["options"];
+        assert!(named.get("extract_text_tool_calls").is_none());
     }
 }

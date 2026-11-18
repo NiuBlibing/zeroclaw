@@ -307,7 +307,7 @@ impl ModelSwitchTool {
                 "configured_models": configured_model_refs,
                 "configured_count": configured_count,
                 "provider_ref_shape": "exact TOML model key",
-                "example": "Use action 'set' with an exact model reference such as 'chat.fast'"
+                "example": crate::i18n::get_required_cli_string("model-switch-example-reference")
             }))?
             .into(),
             error: None,
@@ -428,8 +428,9 @@ impl ModelSwitchTool {
                 output: serde_json::to_string_pretty(&json!({
                     "model_provider": model_provider,
                     "models": [],
-                    "note": "No upstream models were listed for the selected configured model's connection. Check the provider documentation for available model IDs."
-                }))?.into(),
+                    "note": crate::i18n::get_required_cli_string("model-switch-catalog-empty")
+                }))?
+                .into(),
                 error: None,
             });
         }
@@ -439,7 +440,7 @@ impl ModelSwitchTool {
             output: serde_json::to_string_pretty(&json!({
                 "model_provider": model_provider,
                 "models": models,
-                "example": "Use action 'set' with this exact model_provider reference; optionally provide an upstream model ID override"
+                "example": crate::i18n::get_required_cli_string("model-switch-example-upstream")
             }))?
             .into(),
             error: None,

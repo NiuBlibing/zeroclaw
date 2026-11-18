@@ -199,6 +199,36 @@ impl ProviderRegistry {
                 "HTTP streaming deadlines are unsupported by this connection kind",
             ));
         }
+        if effective.request_timeout_secs.is_some()
+            && matches!(connection.kind(), "gemini_cli" | "kilocli")
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.request_timeout_secs",
+                "request deadline is fixed by this CLI connection",
+            ));
+        }
+        if effective.read_timeout_secs.is_some()
+            && matches!(
+                connection.kind(),
+                "hailo_ollama" | "gemini_cli" | "kilocli" | "grok_cli"
+            )
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.read_timeout_secs",
+                "read deadlines are unsupported by this connection kind",
+            ));
+        }
+        if connection.kind() == "hailo_ollama"
+            && matches!(effective.request_timeout_secs, Some(Override::Clear))
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.request_timeout_secs",
+                "request deadline cannot be disabled for this connection kind",
+            ));
+        }
         if matches!(connection, ProviderConnection::GrokCli(_))
             && matches!(effective.request_timeout_secs, Some(Override::Clear))
         {
@@ -675,6 +705,57 @@ pub struct ResolvedDecision<'a> {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    #[test]
+    fn adapters_reject_deadlines_they_cannot_apply() {
+        for (kind, field, values) in [
+            (
+                "gemini_cli",
+                "request_timeout_secs",
+                vec![serde_json::json!(600), serde_json::json!("null")],
+            ),
+            (
+                "kilocli",
+                "request_timeout_secs",
+                vec![serde_json::json!(600), serde_json::json!("null")],
+            ),
+            (
+                "hailo_ollama",
+                "request_timeout_secs",
+                vec![serde_json::json!("null")],
+            ),
+            (
+                "hailo_ollama",
+                "read_timeout_secs",
+                vec![serde_json::json!(600), serde_json::json!("null")],
+            ),
+            (
+                "gemini_cli",
+                "read_timeout_secs",
+                vec![serde_json::json!(600)],
+            ),
+            ("kilocli", "read_timeout_secs", vec![serde_json::json!(600)]),
+            (
+                "grok_cli",
+                "read_timeout_secs",
+                vec![serde_json::json!(600)],
+            ),
+        ] {
+            for value in values {
+                let mut document = serde_json::json!({
+                    "connections": {"connection": {"kind": kind}},
+                    "models": {"chat": {"capability":"chat", "provider":"connection", "model":"test", "api":{}}}
+                });
+                if kind == "grok_cli" {
+                    document["connections"]["connection"]["api"] =
+                        serde_json::json!({"chat":{"working_directory":"/workspace"}});
+                }
+                document["models"]["chat"]["api"][field] = value;
+                let error = serde_json::from_value::<ProviderRegistry>(document).unwrap_err();
+                assert!(error.to_string().contains(field), "{kind}: {error}");
+            }
+        }
+    }
 
     #[test]
     fn model_stream_deadline_overrides_connection_independently() {

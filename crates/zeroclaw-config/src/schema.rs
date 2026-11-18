@@ -49758,6 +49758,79 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     }
 
     #[cfg(unix)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test asserts Tokio worker responsiveness"
+    )]
+    #[test(flavor = "multi_thread", worker_threads = 1)]
+    async fn registry_secret_edit_resolves_off_worker_and_preserves_saved_reference() {
+        use crate::provider_registry::editor::{RegistryEdit, snapshot, stage_persisted};
+        let _env_guard = env_override_lock().await;
+        let dir = TempDir::new().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        write_fake_op(
+            &bin_dir,
+            r#"#!/bin/sh
+if [ "$1" = "read" ] && [ "$2" = "op://test/item/key" ]; then
+  sleep 3
+  printf '%s\n' 'synthetic-resolved-key'
+  exit 0
+fi
+exit 65
+"#,
+        );
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _path_guard = EnvValueGuard::set("PATH", path);
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway": {"kind":"openai", "auth":{"mode":"api_key", "api_key":"old-synthetic-key"}}},
+            "models": {"chat": {"capability":"chat", "provider":"gateway", "model":"test"}}
+        })).unwrap();
+        let expected = snapshot(&config).unwrap();
+        let mut registry = expected.clone();
+        registry["connections"]["gateway"]["auth"]["api_key"] = "op://test/item/key".into();
+        let started = std::time::Instant::now();
+        let task = tokio::spawn(async move {
+            stage_persisted(&mut config, RegistryEdit { expected, registry })
+                .await
+                .unwrap();
+            config
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(1500));
+        let mut config = task.await.unwrap();
+        assert_eq!(
+            config
+                .providers
+                .connections
+                .get("gateway")
+                .unwrap()
+                .api_key(),
+            Some("synthetic-resolved-key")
+        );
+        let snapshots = config.onepassword_reference_snapshots.clone();
+        restore_onepassword_references_for_save(&mut config, &snapshots, &Default::default())
+            .unwrap();
+        assert_eq!(
+            config
+                .providers
+                .connections
+                .get("gateway")
+                .unwrap()
+                .api_key(),
+            Some("op://test/item/key")
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     async fn dirty_onepassword_secret_edit_replaces_reference() {
         let _env_guard = env_override_lock().await;
