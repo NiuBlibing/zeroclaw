@@ -29,6 +29,32 @@ pub fn normalize_text(text: &str, policy: TextExtraction) -> String {
     strip_trailing_terminal_markers(&text)
 }
 
+/// Structured output owns its string contents, including literal protocol
+/// tags. Preserve a complete JSON value before interpreting an outer reasoning
+/// envelope. Schema validation remains the consumer's responsibility.
+pub fn normalize_json_text(text: &str, policy: TextExtraction) -> String {
+    let mut candidate = text;
+    loop {
+        let trimmed = candidate.trim();
+        let json = trimmed
+            .strip_prefix("```json")
+            .or_else(|| trimmed.strip_prefix("```"))
+            .and_then(|body| body.strip_suffix("```"))
+            .unwrap_or(trimmed);
+        if serde_json::from_str::<serde_json::Value>(json).is_ok() {
+            return candidate.to_owned();
+        }
+        if policy.reasoning != Some(false)
+            && let Some(reasoning) = trimmed.strip_prefix("<think>")
+            && let Some((_, rest)) = reasoning.split_once("</think>")
+        {
+            candidate = rest;
+            continue;
+        }
+        return normalize_text(text, policy);
+    }
+}
+
 /// Count text-encoded tool calls after applying the same response-boundary
 /// normalization used by provider adapters. Runtime may use the count for
 /// turn policy decisions, but it does not need to know the wire parser or
@@ -97,6 +123,41 @@ pub fn interpret_response(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn json_contents_are_preserved_before_reasoning_extraction() {
+        let policy = zeroclaw_api::TextExtraction {
+            reasoning: Some(true),
+            tool_calls: false,
+        };
+        for text in [
+            r#"{"text":"<think>keep me</think>"}"#,
+            r#"{"text":"<think>keep me"}"#,
+            "```json\n{\"text\":\"<think>keep me</think>\"}\n```",
+        ] {
+            assert_eq!(super::normalize_json_text(text, policy), text);
+        }
+        assert_eq!(
+            super::normalize_json_text("<think>reasoning</think>{\"answer\":true}", policy),
+            r#"{"answer":true}"#
+        );
+        assert_eq!(
+            super::normalize_json_text(
+                r#"<think>reasoning</think>{"text":"<think>keep</think>"}"#,
+                policy,
+            ),
+            r#"{"text":"<think>keep</think>"}"#
+        );
+        assert_eq!(
+            super::normalize_json_text(
+                "<think>reasoning</think>{\"answer\":true}",
+                zeroclaw_api::TextExtraction {
+                    reasoning: Some(false),
+                    tool_calls: false
+                },
+            ),
+            "<think>reasoning</think>{\"answer\":true}"
+        );
+    }
     use super::*;
 
     #[test]

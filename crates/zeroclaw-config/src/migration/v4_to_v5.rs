@@ -69,31 +69,51 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
                     root.get("runtime_profiles")
                         .and_then(|profiles| profiles.get(alias))
                 });
-            if let Some(profile) = profile {
-                for route in root
-                    .get("model_routes")
-                    .and_then(toml::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    let hint = route.get("hint").and_then(toml::Value::as_str);
-                    let reachable = profile
-                        .get("auto_classify")
-                        .is_some_and(|value| value.is_table() || value.as_bool() == Some(true))
-                        || profile.get("effort_routing").is_some_and(|routing| {
-                            ["local_hint", "cloud_hint"].iter().any(|field| {
-                                routing.get(*field).and_then(toml::Value::as_str) == hint
-                                    && hint.is_some()
-                            })
+            for route in root
+                .get("model_routes")
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let hint = route.get("hint").and_then(toml::Value::as_str);
+                let reachable = hint.is_some_and(|hint| {
+                    let automatic = profile
+                        .and_then(|profile| profile.get("auto_classify"))
+                        .is_some_and(|classifier| {
+                            ["simple_hint", "standard_hint", "complex_hint"]
+                                .iter()
+                                .any(|field| {
+                                    classifier.get(*field).and_then(toml::Value::as_str)
+                                        == Some(hint)
+                                })
                         });
-                    if reachable
-                        && let Some(reference) = route
-                            .get("model_provider")
-                            .and_then(toml::Value::as_str)
-                            .and_then(|reference| legacy_model_selection(models, reference))
-                    {
-                        references.push((reference, strict));
-                    }
+                    let classified = root.get("query_classification").is_some_and(|classifier| {
+                        classifier.get("enabled").and_then(toml::Value::as_bool) == Some(true)
+                            && classifier
+                                .get("rules")
+                                .and_then(toml::Value::as_array)
+                                .is_some_and(|rules| {
+                                    rules.iter().any(|rule| {
+                                        rule.get("hint").and_then(toml::Value::as_str) == Some(hint)
+                                    })
+                                })
+                    });
+                    automatic || classified
+                }) || profile
+                    .and_then(|profile| profile.get("effort_routing"))
+                    .is_some_and(|routing| {
+                        ["local_hint", "cloud_hint"].iter().any(|field| {
+                            routing.get(*field).and_then(toml::Value::as_str) == hint
+                                && hint.is_some()
+                        })
+                    });
+                if reachable
+                    && let Some(reference) = route
+                        .get("model_provider")
+                        .and_then(toml::Value::as_str)
+                        .and_then(|reference| legacy_model_selection(models, reference))
+                {
+                    references.push((reference, strict));
                 }
             }
             references
@@ -642,6 +662,78 @@ strict_tool_parsing = false
         let config: crate::schema::Config = toml::from_str(&output).unwrap();
         assert!(!config.model_text_extraction("ollama.main").tool_calls);
         assert!(config.model_text_extraction("ollama.main.fast").tool_calls);
+    }
+
+    #[test]
+    fn named_routes_keep_their_own_policy_for_dotted_profile_keys() {
+        for strict_primary in [false, true] {
+            let input = format!(
+                r#"
+schema_version = 4
+[providers.models.ollama."main.us"]
+model = "primary"
+[providers.models.ollama."main.us".models.fast]
+id = "fast"
+[agents.primary]
+model_provider = "ollama.main.us"
+strict_tool_parsing = {strict_primary}
+[agents.named]
+model_provider = "ollama.main.us.fast"
+strict_tool_parsing = {}
+[[model_routes]]
+hint = "fast"
+model_provider = "ollama.main.us.fast"
+"#,
+                !strict_primary
+            );
+            let config = crate::migration::migrate_to_current(&input).unwrap();
+            let route = &config.model_routes[0].model_ref;
+            assert_eq!(
+                config.model_text_extraction(route).tool_calls,
+                strict_primary
+            );
+            assert_eq!(
+                config
+                    .model_text_extraction("ollama.main.us.fast")
+                    .tool_calls,
+                strict_primary
+            );
+        }
+    }
+
+    #[test]
+    fn strict_classifier_migrates_only_its_reachable_routes() {
+        let input = r#"
+schema_version = 4
+[providers.models.ollama.primary]
+model = "primary"
+[providers.models.ollama.fast]
+model = "fast"
+[providers.models.ollama.deep]
+model = "deep"
+[agents.strict]
+model_provider = "ollama.primary"
+runtime_profile = "strict"
+[agents.normal]
+model_provider = "ollama.deep"
+[runtime_profiles.strict]
+strict_tool_parsing = true
+[runtime_profiles.strict.auto_classify]
+simple_hint = "fast"
+[[model_routes]]
+hint = "fast"
+model_provider = "ollama.fast"
+[[model_routes]]
+hint = "deep"
+model_provider = "ollama.deep"
+"#;
+        let config = crate::migration::migrate_to_current(input).unwrap();
+        for route in &config.model_routes {
+            assert_eq!(
+                config.model_text_extraction(&route.model_ref).tool_calls,
+                route.hint == "deep"
+            );
+        }
     }
 
     #[test]

@@ -1777,6 +1777,47 @@ model = "default"
     }
 
     #[test]
+    fn canonical_elevenlabs_explicit_null_omits_voice_settings() {
+        let config = TtsProviderConfig {
+            api_key: Some("synthetic-elevenlabs-key".into()),
+            ..Default::default()
+        };
+        for (stability, similarity, expected) in [
+            (
+                None,
+                None,
+                serde_json::json!({"stability":0.5, "similarity_boost":0.5}),
+            ),
+            (
+                Some(Override::Clear),
+                Some(Override::Clear),
+                serde_json::json!({}),
+            ),
+            (
+                Some(Override::Set(0.1)),
+                Some(Override::Clear),
+                serde_json::json!({"stability":0.1}),
+            ),
+        ] {
+            let provider = ElevenLabsTtsProvider::new_with_voice_settings(
+                "speech",
+                &config,
+                elevenlabs_voice_setting(&stability),
+                elevenlabs_voice_setting(&similarity),
+            )
+            .unwrap();
+            let request = provider
+                .build_synthesize_request("hello", "voice_123")
+                .unwrap()
+                .build()
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+            assert_eq!(body["voice_settings"], expected);
+        }
+    }
+
+    #[test]
     fn elevenlabs_synthesize_request_preserves_endpoint_body_and_sensitive_header() {
         let credential = "synthetic-elevenlabs-key";
         let provider = elevenlabs_tts_provider(credential);

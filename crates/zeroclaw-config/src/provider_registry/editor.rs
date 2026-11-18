@@ -125,7 +125,18 @@ pub async fn stage_persisted(config: &mut Config, edit: RegistryEdit) -> Result<
             "provider registry changed on disk; reload before saving"
         );
     }
-    stage(config, edit)
+    // Stage owns external secret resolution, which may invoke the 1Password
+    // CLI. Keep subprocess waits off the async request worker and publish
+    // the caller's candidate only after the complete stage succeeds.
+    let mut candidate = config.clone();
+    let candidate = tokio::task::spawn_blocking(move || {
+        stage(&mut candidate, edit)?;
+        Ok::<_, anyhow::Error>(candidate)
+    })
+    .await
+    .context("provider registry staging worker failed")??;
+    *config = candidate;
+    Ok(())
 }
 
 /// Stage a complete, validated replacement on a caller-owned config candidate.
@@ -162,15 +173,17 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
     // must use the same source of truth instead of publishing a literal
     // reference as a bearer token.
     let new_references = crate::schema::collect_onepassword_reference_snapshots(&candidate)?;
-    let secret_root = candidate
+    let secret_store = candidate
         .config_path
         .parent()
-        .context("config path has no parent")?;
-    let secret_store = crate::secrets::SecretStore::new(secret_root, candidate.secrets.encrypt);
+        .map(|root| crate::secrets::SecretStore::new(root, candidate.secrets.encrypt));
     for connection in candidate.providers.connections.values_mut() {
         connection.with_secret_json_for_editor(|secret| {
             if crate::secrets::SecretStore::is_onepassword_ref(secret) {
-                *secret = secret_store.decrypt(secret)?;
+                *secret = secret_store
+                    .as_ref()
+                    .context("config path has no parent")?
+                    .decrypt(secret)?;
             }
             Ok(())
         })?;
@@ -225,6 +238,31 @@ impl super::ProviderConnection {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unknown_option_diagnostics_keep_quoted_keys_and_loading_is_permissive() {
+        let input = r#"
+schema_version = 5
+[providers.connections."gateway.prod"]
+kind = "openai"
+[providers.connections."gateway.prod".api.chat.options]
+extract_text_tool_call = true
+[providers.models."chat.fast"]
+capability = "chat"
+provider = "gateway.prod"
+model = "test"
+[providers.models."chat.fast".options]
+extract_text_tool_call = true
+"#;
+        let _: Config = toml::from_str(input).unwrap();
+        assert_eq!(
+            Config::unknown_canonical_option_fields(input),
+            vec![
+                "providers.connections.\"gateway.prod\".api.chat.options.extract_text_tool_call",
+                "providers.models.\"chat.fast\".options.extract_text_tool_call",
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn persisted_edit_checks_unmasked_disk_registry_without_resolving_external_secrets() {
         let tmp = tempfile::tempdir().unwrap();
@@ -238,6 +276,19 @@ mod tests {
         })).unwrap();
         tokio::fs::write(&config.config_path, toml::to_string(&config).unwrap())
             .await
+            .unwrap();
+        // Disk retains the reference; the daemon has already resolved it.
+        config.onepassword_reference_snapshots =
+            crate::schema::collect_onepassword_reference_snapshots(&config).unwrap();
+        config
+            .providers
+            .connections
+            .get_mut("gateway")
+            .unwrap()
+            .with_secret_json_for_editor(|secret| {
+                *secret = "synthetic-resolved-key".into();
+                Ok(())
+            })
             .unwrap();
         let expected = snapshot(&config).unwrap();
         let edit = RegistryEdit {
