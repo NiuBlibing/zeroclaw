@@ -165,7 +165,7 @@ impl OpenAiCodexModelProvider {
 
     fn http_client(&self) -> Client {
         let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-        if !self.timeout_disabled {
+        if self.timeout_configured && !self.timeout_disabled {
             builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
         }
         if !self.read_timeout_disabled

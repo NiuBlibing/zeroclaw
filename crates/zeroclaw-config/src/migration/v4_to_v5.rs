@@ -77,8 +77,9 @@ pub(super) fn preserve_strict_tool_parsing(value: &mut toml::Value) -> Result<()
                     .flatten()
                 {
                     let hint = route.get("hint").and_then(toml::Value::as_str);
-                    let reachable = profile.get("auto_classify").and_then(toml::Value::as_bool)
-                        == Some(true)
+                    let reachable = profile
+                        .get("auto_classify")
+                        .is_some_and(|value| value.is_table() || value.as_bool() == Some(true))
                         || profile.get("effort_routing").is_some_and(|routing| {
                             ["local_hint", "cloud_hint"].iter().any(|field| {
                                 routing.get(*field).and_then(toml::Value::as_str) == hint
