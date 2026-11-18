@@ -40,7 +40,7 @@ pub fn normalize_json_text(text: &str, policy: TextExtraction) -> String {
         // text path, where reasoning tags inside JSON strings would be
         // interpreted as outer provider metadata.
         let normalized = strip_trailing_terminal_markers(candidate.trim());
-        let trimmed = normalized.as_str();
+        let trimmed = normalized.trim();
         let json = trimmed
             .strip_prefix("```json")
             .or_else(|| trimmed.strip_prefix("```"))
