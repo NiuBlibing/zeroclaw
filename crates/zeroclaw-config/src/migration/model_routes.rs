@@ -101,12 +101,24 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
             } else if let Some(selection) = config.resolve_model_selection(reference) {
                 let profiles = serde_json::to_value(&config.providers.models)?;
                 let raw = profiles[selection.family][selection.alias].clone();
-                legacy_model(
+                let mut definition = legacy_model(
                     &raw,
                     selection.family,
                     selection.model_entry,
                     explicit_model,
-                )?
+                )?;
+                // Only a reference to the profile itself selects its default
+                // or sole legacy entry. Named entries own their policy; TOML
+                // aliases are opaque and may contain dots.
+                if selection.model_entry.is_some()
+                    && reference == format!("{}.{}", selection.family, selection.alias)
+                    && let Some(policy) = raw
+                        .get("provider_extra")
+                        .and_then(|extra| extra.get("__zeroclaw_migration_extract_text_tool_calls"))
+                {
+                    definition.1["options"]["extract_text_tool_calls"] = policy.clone();
+                }
+                definition
             } else if !reference.is_empty() && explicit_model.is_some() {
                 let family = reference
                     .split_once('.')

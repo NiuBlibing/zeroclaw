@@ -199,6 +199,31 @@ impl ProviderRegistry {
                 "HTTP streaming deadlines are unsupported by this connection kind",
             ));
         }
+        if (effective.request_timeout_secs.is_some() || effective.read_timeout_secs.is_some())
+            && matches!(connection.kind(), "gemini_cli" | "kilocli")
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.request_timeout_secs",
+                "request and read deadlines are fixed by this CLI connection",
+            ));
+        }
+        if effective.read_timeout_secs.is_some() && connection.kind() == "hailo_ollama" {
+            return Err(RegistryError::model(
+                name,
+                "api.read_timeout_secs",
+                "read deadlines are unsupported by this connection kind",
+            ));
+        }
+        if connection.kind() == "hailo_ollama"
+            && matches!(effective.request_timeout_secs, Some(Override::Clear))
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.request_timeout_secs",
+                "request deadline cannot be disabled for this connection kind",
+            ));
+        }
         if matches!(connection, ProviderConnection::GrokCli(_))
             && matches!(effective.request_timeout_secs, Some(Override::Clear))
         {

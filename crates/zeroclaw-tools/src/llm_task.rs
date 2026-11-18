@@ -212,8 +212,14 @@ impl Tool for LlmTaskTool {
 
         let config = (self.config)();
         let agent_alias = self.agent_alias.clone();
+        let extraction_ref = config
+            .agents
+            .get(&agent_alias)
+            .map(|agent| agent.model_provider.clone())
+            .unwrap_or_default();
+        let build_config = Arc::clone(&config);
         let built = zeroclaw_providers::model::build_nonblocking(move || {
-            let reference = &config
+            let reference = &build_config
                 .agents
                 .get(&agent_alias)
                 .ok_or_else(|| {
@@ -224,9 +230,9 @@ impl Tool for LlmTaskTool {
                 })?
                 .model_provider;
             let temperature =
-                temperature_override.or_else(|| config.resolve_model_temperature(reference));
+                temperature_override.or_else(|| build_config.resolve_model_temperature(reference));
             let resolved = zeroclaw_providers::model::build_raw_provider(
-                &config,
+                &build_config,
                 reference,
                 zeroclaw_providers::model::ProviderOverrides {
                     model: model_override.as_deref(),
@@ -267,7 +273,14 @@ impl Tool for LlmTaskTool {
             .simple_chat(&effective_prompt, &model, temperature)
             .await
         {
-            Ok(text) => text,
+            Ok(text) => {
+                // Raw one-shot construction intentionally bypasses the agent
+                // turn boundary. Apply the same admitted provider response
+                // normalization before structured validation so text-encoded
+                // reasoning cannot make an otherwise valid JSON result fail.
+                let policy = config.model_text_extraction(&extraction_ref);
+                zeroclaw_providers::response::normalize_text(&text, policy)
+            }
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
