@@ -156,6 +156,25 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
         serde_json::from_value(serde_json::to_value(registry.models)?)?;
     candidate.providers.model_presets = registry.model_presets;
     candidate.providers.fallback = registry.fallback;
+    // Resolve newly entered external references for the live provider graph,
+    // while retaining the opaque `op://` spelling for the next save.  The
+    // normal config loader already follows this lifecycle; registry edits
+    // must use the same source of truth instead of publishing a literal
+    // reference as a bearer token.
+    let new_references = crate::schema::collect_onepassword_reference_snapshots(&candidate)?;
+    let secret_root = candidate
+        .config_path
+        .parent()
+        .context("config path has no parent")?;
+    let secret_store = crate::secrets::SecretStore::new(secret_root, candidate.secrets.encrypt);
+    for connection in candidate.providers.connections.values_mut() {
+        connection.with_secret_json_for_editor(|secret| {
+            if crate::secrets::SecretStore::is_onepassword_ref(secret) {
+                *secret = secret_store.decrypt(secret)?;
+            }
+            Ok(())
+        })?;
+    }
     let previous = serde_json::to_value(&config.providers)?;
     let admitted = serde_json::to_value(&candidate.providers)?;
     // Keep external references only for credentials that were left untouched.
@@ -166,6 +185,9 @@ pub fn stage(config: &mut Config, edit: RegistryEdit) -> Result<()> {
                 && previous.pointer(pointer) == admitted.pointer(pointer)
         })
     });
+    candidate
+        .onepassword_reference_snapshots
+        .extend(new_references);
     candidate.validate()?;
     // Memory's canonical model reference is outside the provider graph. Do
     // not admit deletion or a capability change while that consumer still

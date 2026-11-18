@@ -27594,7 +27594,7 @@ fn builtin_tool_selection_value(config: &Config) -> toml::Value {
     )
 }
 
-fn collect_onepassword_reference_snapshots(
+pub(crate) fn collect_onepassword_reference_snapshots(
     config: &Config,
 ) -> Result<std::collections::HashMap<String, String>> {
     let mut snapshots: std::collections::HashMap<_, _> = config

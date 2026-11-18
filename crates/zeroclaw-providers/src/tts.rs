@@ -162,8 +162,8 @@ pub struct ElevenLabsTtsProvider {
     alias: String,
     api_key: String,
     model_id: String,
-    stability: f64,
-    similarity_boost: f64,
+    stability: Option<f64>,
+    similarity_boost: Option<f64>,
     client: reqwest::Client,
 }
 
@@ -172,6 +172,20 @@ impl ElevenLabsTtsProvider {
     /// `[tts_providers.elevenlabs.<alias>].api_key`. Legacy
     /// `ELEVENLABS_API_KEY` env-var fallback eradicated in V0.8.0.
     pub fn new(alias: &str, config: &TtsProviderConfig) -> Result<Self> {
+        Self::new_with_voice_settings(
+            alias,
+            config,
+            Some(config.stability.unwrap_or(0.5)),
+            Some(config.similarity_boost.unwrap_or(0.5)),
+        )
+    }
+
+    fn new_with_voice_settings(
+        alias: &str,
+        config: &TtsProviderConfig,
+        stability: Option<f64>,
+        similarity_boost: Option<f64>,
+    ) -> Result<Self> {
         let api_key = zeroclaw_config::setup::tts_api_key(config)
             .map(ToOwned::to_owned)
             .context(
@@ -187,8 +201,8 @@ impl ElevenLabsTtsProvider {
                 .clone()
                 .filter(|m| !m.trim().is_empty())
                 .unwrap_or_else(|| "eleven_monolingual_v1".to_string()),
-            stability: config.stability.unwrap_or(0.5),
-            similarity_boost: config.similarity_boost.unwrap_or(0.5),
+            stability,
+            similarity_boost,
             client: zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 reqwest::Client::builder().timeout(TTS_HTTP_TIMEOUT),
                 "channel.tts.elevenlabs",
@@ -215,13 +229,17 @@ impl ElevenLabsTtsProvider {
         }
 
         let url = format!("https://api.elevenlabs.io/v1/text-to-speech/{voice}");
+        let mut voice_settings = serde_json::Map::new();
+        if let Some(stability) = self.stability {
+            voice_settings.insert("stability".into(), stability.into());
+        }
+        if let Some(similarity_boost) = self.similarity_boost {
+            voice_settings.insert("similarity_boost".into(), similarity_boost.into());
+        }
         let body = serde_json::json!({
             "text": text,
             "model_id": self.model_id,
-            "voice_settings": {
-                "stability": self.stability,
-                "similarity_boost": self.similarity_boost,
-            },
+            "voice_settings": voice_settings,
         });
         let api_key = self.sensitive_api_key_header()?;
 
@@ -1001,6 +1019,14 @@ fn tts_override<T: Clone>(value: &Option<Override<T>>) -> Option<T> {
     }
 }
 
+fn elevenlabs_voice_setting(value: &Option<Override<f64>>) -> Option<f64> {
+    match value {
+        Some(Override::Set(value)) => Some(*value),
+        Some(Override::Clear) => None,
+        None => Some(0.5),
+    }
+}
+
 fn canonical_tts_endpoint(uri: Option<&str>) -> Option<String> {
     uri.map(|uri| {
         let uri = uri.trim_end_matches('/');
@@ -1078,7 +1104,12 @@ fn build_canonical_tts_provider(
 
     let provider: Box<dyn TtsProvider> = match resolved.selection.connection {
         ProviderConnection::ElevenLabs(_) => {
-            Box::new(ElevenLabsTtsProvider::new(model_ref, &config)?)
+            Box::new(ElevenLabsTtsProvider::new_with_voice_settings(
+                model_ref,
+                &config,
+                elevenlabs_voice_setting(&resolved.options.stability),
+                elevenlabs_voice_setting(&resolved.options.similarity_boost),
+            )?)
         }
         ProviderConnection::Google(_) => Box::new(GoogleTtsProvider::new(model_ref, &config)?),
         ProviderConnection::Edge(_) => Box::new(EdgeTtsProvider::new(model_ref, &config)?),
