@@ -33,22 +33,27 @@ pub fn normalize_text(text: &str, policy: TextExtraction) -> String {
 /// tags. Preserve a complete JSON value before interpreting an outer reasoning
 /// envelope. Schema validation remains the consumer's responsibility.
 pub fn normalize_json_text(text: &str, policy: TextExtraction) -> String {
-    let mut candidate = text;
+    let mut candidate = text.to_owned();
     loop {
-        let trimmed = candidate.trim();
+        // Terminal markers are outside the structured value. Remove them
+        // before checking JSON so a marker cannot send us through the generic
+        // text path, where reasoning tags inside JSON strings would be
+        // interpreted as outer provider metadata.
+        let normalized = strip_trailing_terminal_markers(candidate.trim());
+        let trimmed = normalized.as_str();
         let json = trimmed
             .strip_prefix("```json")
             .or_else(|| trimmed.strip_prefix("```"))
             .and_then(|body| body.strip_suffix("```"))
             .unwrap_or(trimmed);
         if serde_json::from_str::<serde_json::Value>(json).is_ok() {
-            return candidate.to_owned();
+            return trimmed.to_owned();
         }
         if policy.reasoning != Some(false)
             && let Some(reasoning) = trimmed.strip_prefix("<think>")
             && let Some((_, rest)) = reasoning.split_once("</think>")
         {
-            candidate = rest;
+            candidate = rest.to_owned();
             continue;
         }
         return normalize_text(text, policy);
@@ -136,6 +141,10 @@ mod tests {
         ] {
             assert_eq!(super::normalize_json_text(text, policy), text);
         }
+        assert_eq!(
+            super::normalize_json_text(r#"{"text":"<think>keep me</think>"}<eom>"#, policy),
+            r#"{"text":"<think>keep me</think>"}"#
+        );
         assert_eq!(
             super::normalize_json_text("<think>reasoning</think>{\"answer\":true}", policy),
             r#"{"answer":true}"#
