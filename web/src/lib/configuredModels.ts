@@ -23,6 +23,24 @@ export async function walkConfiguredModelBindings(
   return out;
 }
 
+/**
+ * Resolve the canonical model resource to its connection kind.
+ *
+ * The registry is the source of truth: model aliases point at a connection,
+ * and the connection owns the protocol/provider kind used by the dashboard.
+ * Keep the small map-shaped helper for callers that only need navigation
+ * metadata; it must not reintroduce the retired providers.<category> lookup.
+ */
+export async function resolveModelToProviderType(
+  category: ConfiguredModelCategory,
+): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const binding of await walkConfiguredModelBindings(category)) {
+    if (!(binding.resource in out)) out[binding.resource] = binding.type;
+  }
+  return out;
+}
+
 export async function configuredResourceIds(
   category: ConfiguredModelCategory,
   type: string,

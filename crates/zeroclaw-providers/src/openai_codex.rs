@@ -165,12 +165,16 @@ impl OpenAiCodexModelProvider {
 
     fn http_client(&self) -> anyhow::Result<Client> {
         let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
-        if self.timeout_configured && !self.timeout_disabled {
+        // Buffered Responses requests include the retry path after a failed
+        // SSE decode. Keep the historical finite client deadline for that
+        // path even when streaming itself has no total deadline. An explicit
+        // `null` request timeout is represented by `timeout_disabled` and is
+        // the only way to opt out.
+        if !self.timeout_disabled {
             builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
         }
-        if !self.read_timeout_disabled
-            && let Some(read_timeout) = self.read_timeout_secs
-        {
+        if !self.read_timeout_disabled {
+            let read_timeout = self.read_timeout_secs.unwrap_or(300);
             builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
         }
         let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
