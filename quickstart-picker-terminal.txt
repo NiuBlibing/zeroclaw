@@ -1,0 +1,50 @@
+ Dashboard │ Config │ Code │ Chat │ Logs │ Doctor │ Quickstart │ SOPs                                                 v0.9.0 sessions:1 ram:154.8M(0%) cpu:1.5%
+Quickstart  — create one working agent end-to-end.
+
+┌ Selectors ────────────────────────────┌ Model ───────────────────────────────────────────────────────────────────────┐───────────────────────────────────────┐
+│  ›  [ ]  Model               not yet c│    Configured models                                                         │                                       │
+│     [ ]  Risk profile                 │  › chat.demo.gateway  Reuse this alias instead of creating a new one.        │                                       │
+│     [ ]  Runtime profile              │    Create connection and model                                               │                                       │
+│     [ ]  Memory              sqlite   │    OpenRouter  Cloud. Provide an API key when prompted.                      │                                       │
+│     [ ]  Channels (optional)  0 (CLI o│    Anthropic  Cloud. Provide an API key when prompted.                       │                                       │
+│     [ ]  Peer groups (optional)  0    │    OpenAI  Cloud. Provide an API key when prompted.                          │                                       │
+│     [ ]  Agent               not yet n│    Telnyx  Cloud. Provide an API key when prompted.                          │                                       │
+│     [ ]  Submit              Create th│    Azure OpenAI  Cloud. Provide an API key when prompted.                    │                                       │
+│                                       │    Ollama  Local. No credential required.                                    │                                       │
+│                                       │    Hailo-Ollama  Local. No credential required.                              │                                       │
+│                                       │    Google Gemini  Cloud. Provide an API key when prompted.                   │                                       │
+│                                       │    Venice  Cloud. Provide an API key when prompted.                          │                                       │
+│                                       │    NEAR AI Cloud  Cloud. Provide an API key when prompted.                   │                                       │
+│                                       │    Vercel AI Gateway  Cloud. Provide an API key when prompted.               │                                       │
+│                                       │    Cloudflare AI  Cloud. Provide an API key when prompted.                   │                                       │
+│                                       │    Atlas Cloud  Cloud. Provide an API key when prompted.                     │                                       │
+│                                       │    Moonshot  Cloud. Provide an API key when prompted.                        │                                       │
+│                                       │    Synthetic  Cloud. Provide an API key when prompted.                       │                                       │
+│                                       │    OpenCode  Cloud. Provide an API key when prompted.                        │                                       │
+│                                       │    Z.AI  Cloud. Provide an API key when prompted.                            │                                       │
+│                                       │    GLM (Zhipu)  Cloud. Provide an API key when prompted.                     │                                       │
+│                                       │    MiniMax  Cloud. Provide an API key when prompted.                         │                                       │
+│                                       │    Amazon Bedrock  Cloud. Provide an API key when prompted.                  │                                       │
+│                                       │    Qianfan (Baidu)  Cloud. Provide an API key when prompted.                 │                                       │
+│                                       │    Doubao (Volcengine)  Cloud. Provide an API key when prompted.             │                                       │
+│                                       │    Qwen (DashScope / Qwen Code OAuth)  Cloud. Provide an API key when        │                                       │
+│                                       │ prompted.                                                                    │                                       │
+│                                       │    Groq  Cloud. Provide an API key when prompted.                            │                                       │
+│                                       │    Mistral  Cloud. Provide an API key when prompted.                         │                                       │
+│                                       │    xAI (Grok)  Cloud. Provide an API key when prompted.                      │                                       │
+│                                       │    Crusoe Managed Inference  Cloud. Provide an API key when prompted.        │                                       │
+│                                       │    DeepSeek  Cloud. Provide an API key when prompted.                        │                                       │
+│                                       │    Together AI  Cloud. Provide an API key when prompted.                     │                                       │
+│                                       │    Fireworks AI  Cloud. Provide an API key when prompted.                    │                                       │
+│                                       │    Novita AI  Cloud. Provide an API key when prompted.                       │                                       │
+│                                       │    Perplexity  Cloud. Provide an API key when prompted.                      │                                       │
+│                                       │    Cohere  Cloud. Provide an API key when prompted.                          │                                       │
+│                                       │    GitHub Copilot  Cloud. Provide an API key when prompted.                  │                                       │
+│                                       │    Gemini CLI  Local. No credential required.                                │                                       │
+│                                       │    Grok Build CLI  Local. No credential required.                            │                                       │
+│                                       │    KiloCLI  Local. No credential required.                                   │                                       │
+└───────────────────────────────────────│ ↑/↓ move   Enter pick   Esc cancel                                           │───────────────────────────────────────┘
+┌───────────────────────────────────────└──────────────────────────────────────────────────────────────────────────────┘───────────────────────────────────────┐
+│ ↑/↓ to move, Enter to open. `c` enables when all required selectors are ✓.                                                                                   │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                                                                        tui_51172d8e ● Connected

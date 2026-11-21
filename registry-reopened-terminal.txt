@@ -1,0 +1,50 @@
+ Dashboard │ Config │ Code │ Chat │ Logs │ Doctor │ Quickstart │ SOPs                                                 v0.9.0 sessions:1 ram:154.8M(0%) cpu:1.5%
+zeroclaw │ zerocode   config: ~/ref/llm/agent/claws/zeroclaw/.worktrees/pr12452-restack/target/quickstart-evidence/5685d0c6/config
+ZeroClaw v0.9.0               providers.registry  ›  registry
+┌ Sections ──────────────────┐Edit connections, models, model_presets and fallback together as JSON. Enter inserts a line; Ctrl+S saves. For inherited options,
+│  Foundation                │omit a field to inherit and use the string "null" to clear it. References are validated and unchanged masked credentials are
+│   Provider registry ✓      │┌ Provider registry (JSON) ──────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│   Model routes             ││{                                                                                                                               │
+│   Model providers          ││  "connections": {                                                                                                              │
+│   Transcription providers  ││    "openai.demo.gateway": {                                                                                                    │
+│   TTS providers            ││      "api": {},                                                                                                                │
+│   Embedding routes         ││      "auth": {                                                                                                                 │
+│   Risk profiles            ││        "api_key": "***MASKED***",                                                                                              │
+│   Runtime profiles         ││        "mode": "api_key"                                                                                                       │
+│   Memory                   ││      },                                                                                                                        │
+│   Skills                   ││      "capabilities": [                                                                                                         │
+│   Skill bundles            ││        "chat",                                                                                                                 │
+│   Channels                 ││        "embedding",                                                                                                            │
+│   Hardware                 ││        "tts",                                                                                                                  │
+│   Agents                   ││        "asr",                                                                                                                  │
+│   Peer groups              ││        "decision"                                                                                                              │
+│   Tunnel                   ││      ],                                                                                                                        │
+│  Agent                     ││      "extra_headers": {},                                                                                                      │
+│   Cron                     ││      "kind": "openai",                                                                                                         │
+│   Heartbeat                ││      "tls_ca_cert_path": null,                                                                                                 │
+│   Hooks                    ││      "uri": null                                                                                                               │
+│   Pacing                   ││    }                                                                                                                           │
+│   Pipeline                 ││  },                                                                                                                            │
+│   Query classification     ││  "fallback": {},                                                                                                               │
+│   Reliability              ││  "model_presets": {},                                                                                                          │
+│   Runtime                  ││  "models": {                                                                                                                   │
+│   Scheduler                ││    "chat.demo.gateway": {                                                                                                      │
+│   Sop                      ││      "capability": "chat",                                                                                                     │
+│   Verifiable intent        ││      "metadata": {},                                                                                                           │
+│  Multi-agent               ││      "model": "gpt-synthetic-after",                                                                                           │
+│   Delegate                 ││      "provider": "openai.demo.gateway"                                                                                         │
+│  Tools                     ││    }                                                                                                                           │
+│   Mcp                      ││  },                                                                                                                            │
+│   Mcp servers              ││  "revision": "f2308a13dacaa4dfc2671d986ec2982231f9cf97e8a304684a24f3431f5e2722"                                                │
+│   Mcp bundles              ││}█                                                                                                                              │
+│   Knowledge bundles        ││                                                                                                                                │
+│   Browser                  ││                                                                                                                                │
+│   Browser delegate         ││                                                                                                                                │
+│   Http request             ││                                                                                                                                │
+│   Image gen                ││                                                                                                                                │
+│   Knowledge                │└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+└────────────────────────────┘
+Saved "providers". Open sessions already use it; please reload the daemon (Ctrl+r) to apply it everywhere. Press s to view the log.
+
+ Enter=new line  Ctrl+s=save  Esc=cancel  No pending edits
+                                                                                                                                        tui_51172d8e ● Connected
