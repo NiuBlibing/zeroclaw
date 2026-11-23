@@ -1,0 +1,84 @@
+[
+  {
+    "browser": "149.0.7827.55",
+    "viewport": {
+      "name": "desktop",
+      "width": 1440,
+      "height": 1000
+    },
+    "openedExactKey": "chat.demo.gateway",
+    "credentialsMasked": true,
+    "pendingPut": {
+      "responseMocked": false,
+      "editorDisabled": true,
+      "saveDisabled": true,
+      "reloadDisabled": true
+    },
+    "savedModel": "gpt-synthetic-saved-desktop",
+    "conflict": {
+      "status": 400,
+      "draftRetained": true,
+      "persistedModelPreserved": true,
+      "message": "ApiError: [validation_failed] provider registry changed; reload before saving"
+    },
+    "quickstart": {
+      "selection": "chat.demo.gateway",
+      "status": 200,
+      "result": {
+        "kind": "applied",
+        "agent": {
+          "alias": "evidence_web_desktop",
+          "model_provider": "chat.demo.gateway",
+          "risk_profile": "balanced",
+          "runtime_profile": "unbounded",
+          "channels": [],
+          "memory_backend": "none"
+        },
+        "daemon_restarted": true
+      }
+    },
+    "agentSwitch": "chat.backup.prod",
+    "pageErrors": []
+  },
+  {
+    "browser": "149.0.7827.55",
+    "viewport": {
+      "name": "mobile",
+      "width": 390,
+      "height": 844
+    },
+    "openedExactKey": "chat.demo.gateway",
+    "credentialsMasked": true,
+    "pendingPut": {
+      "responseMocked": false,
+      "editorDisabled": true,
+      "saveDisabled": true,
+      "reloadDisabled": true
+    },
+    "savedModel": "gpt-synthetic-saved-mobile",
+    "conflict": {
+      "status": 400,
+      "draftRetained": true,
+      "persistedModelPreserved": true,
+      "message": "ApiError: [validation_failed] provider registry changed; reload before saving"
+    },
+    "quickstart": {
+      "selection": "chat.demo.gateway",
+      "status": 200,
+      "result": {
+        "kind": "applied",
+        "agent": {
+          "alias": "evidence_web_mobile",
+          "model_provider": "chat.demo.gateway",
+          "risk_profile": "balanced",
+          "runtime_profile": "unbounded",
+          "channels": [],
+          "memory_backend": "none"
+        },
+        "daemon_restarted": true
+      }
+    },
+    "agentSwitch": "chat.backup.prod",
+    "pageErrors": []
+  }
+]

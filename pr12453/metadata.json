@@ -1,0 +1,36 @@
+{
+  "source": "cf6a0473f368268f1661fbe30576ee73a4b9293e",
+  "captured_at_utc": "2026-11-23T02:37:07.931838+00:00",
+  "binary_sha256": "affc8f1a9a58fc1a47a88a5492b8aeb8b3f3149fb754ba05dd2227169e67d1bf",
+  "web_source_tree": "94278ff0e8bf3988cdc638d4ca75c7b99394a912",
+  "worktree_clean": true,
+  "build_command": "CARGO_BUILD_JOBS=4 RUSTC_WRAPPER= cargo build --offline --locked -p zeroclaw --bin zeroclaw",
+  "build_exit_code": 0,
+  "credential_encrypted_on_disk": true,
+  "agent_model_references": {
+    "evidence_web_desktop": "chat.backup.prod",
+    "evidence_web_mobile": "chat.backup.prod"
+  },
+  "saved_primary_model": "gpt-synthetic-saved-mobile",
+  "inference_requests": 0,
+  "screenshot_sha256": {
+    "desktop-agent-picker.png": "d9efd0a4b69476f24eb65767396c5f8854330a400dbe96bc9bbf88026b34e864",
+    "desktop-agent-switched.png": "d4db76d0b9e2fe3395d878241e859c92b9a7077c69818e62b4f700854a89dadb",
+    "desktop-concurrent-conflict.png": "003da267af06d3ec919bd73b3b0b942224da8a16404b0f95ffb52cd9cdfcb8fd",
+    "desktop-connections-masked.png": "3df728037cc9cd79155df5c73e0a4a983bc3ab82f797d03f59b7730595716c67",
+    "desktop-quickstart-existing.png": "1509945ecd4cf9f954d4a9492d658ca162f9828103c93d310ff5107410517cbd",
+    "desktop-quickstart-ready.png": "f0738575b4db5512d4f8eed97b686020fce99bfd631a6b449cbba042d10d609c",
+    "desktop-registry-open.png": "58992ca9bb5c93ce3578250d5dded55d01caad3a18f83a044e0805661e2c43fc",
+    "desktop-save-pending.png": "b509245d09fe530908209d2c6f1115dc047e5ab5efa6767befbe8411f5ca99c5",
+    "desktop-save-persisted.png": "2113e49b64748b75921ad888c7796c006f4f1ea82bd1d765acba658270f1d5c9",
+    "mobile-agent-picker.png": "62a846d5098f9328fcd3fb70d55cc000f983309c4c67466d4803b15295225dda",
+    "mobile-agent-switched.png": "4bb7f89d31794e6da285b6242a8149af16e8bb5559cc5f34362e4bf0e09b029b",
+    "mobile-concurrent-conflict.png": "1a5643090b88ed4371da53393def49b57b079fe555593baf3ba45dae5ef3eb87",
+    "mobile-connections-masked.png": "6a2c81619922af6071d0463e79eaba44e2495930b0c3ec879083fb3d539e2e1a",
+    "mobile-quickstart-existing.png": "bc4efc85479c610b6d517be6da5947490d9f21678867bae7e32cd9e69f478595",
+    "mobile-quickstart-ready.png": "396a01cf2adc44981cb7f674801c93751bb8fb8e621a3a04a864a194dd457150",
+    "mobile-registry-open.png": "5b44323ebdb37fc98bf114db819c79c2eb1791168ad82e4a8fe53917e9f39625",
+    "mobile-save-pending.png": "0f7217f61ee28ab41df9075151c61a7b35eb7c216ed649eb12299bf23e67062e",
+    "mobile-save-persisted.png": "577ff7399876a82804365cc0853d6faadf68c2b7aeeec0c6b07443f5188a5194"
+  }
+}
