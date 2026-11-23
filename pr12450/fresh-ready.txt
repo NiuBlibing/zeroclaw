@@ -1,0 +1,8 @@
+? Open a selector (Enter), or pick Create. Esc to quit.
+> [✓] Model provider     — OpenAI (alias: default, model: gpt-synthetic-fresh)
+  [✓] Risk profile       — preset: balanced
+  [✓] Memory             — none
+  [✓] Channels (0..N)    — none (chat via `zeroclaw agent` only)
+  [ ] Peer groups        — none — channels accept no peers
+  [✓] Agent identity     — alias: evidence_fresh, system prompt: 0 chars, 0 personality file(s)
+  ── Create agent

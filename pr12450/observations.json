@@ -1,0 +1,25 @@
+{
+  "source": "800a86be67269d46c7a8a46da3f2b033ad61132b",
+  "binary_sha256": "408921eec437f08c104294d6f31131991c223c14cc64052d06b85a4e7058f7a0",
+  "terminal": {
+    "columns": 160,
+    "rows": 50,
+    "locale": "en_US.UTF-8"
+  },
+  "fresh": {
+    "schema_version": 5,
+    "connection": "openai.default",
+    "model_ref": "openai.default",
+    "model": "gpt-synthetic-fresh",
+    "agent": "evidence_fresh",
+    "complete": true
+  },
+  "existing": {
+    "model_ref": "openai.default",
+    "agent": "evidence_existing",
+    "complete": true,
+    "additional_connection_or_model": false
+  },
+  "inference_requests": 0,
+  "captured_at_utc": "2026-11-23T02:28:02.661097+00:00"
+}

@@ -1,0 +1,48 @@
+Pick a Risk profile preset balanced|
+Pick a Risk profile preset: Balanced  —  Trusted daily driver for a personal dev box. Supervised, workspace-scoped with sensitive paths blocked and the sandbox on. Any command runs without an allowlist, but high-risk commands stay blocked unless explicitly allowlisted. Recommended for most users.
+Memory backend: none
+Channels (optional, 0..N): Done (channels selector counts as visited)
+
+Quickstart complete. Created agent `evidence_existing`.
+
+Next steps:
+  zeroclaw agent -a evidence_existing  # chat with this agent in your terminal
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Pane is dead (status 0, Mon Nov 23 10:25:12 2026)

@@ -1,0 +1,26 @@
+Head: 6fe2985212728254b90d9b807a9040b5db92095d
+Binary: target/debug/zeroclaw (recorded build: RUSTC_WRAPPER= cargo build --offline -p zeroclaw)
+
+Non-TTY guard:
+$ zeroclaw quickstart --config-dir target/quickstart-evidence/fresh ...
+Error: Quickstart is interactive and needs a terminal on stdin and stderr.
+
+Fresh PTY flow:
+Quickstart — create one working agent end-to-end.
+[✓] Model provider — OpenAI (alias: evidence_fresh, model: gpt-5-mini)
+[✓] Risk profile — preset: balanced
+[✓] Memory — none
+[✓] Channels — none (chat via `zeroclaw agent` only)
+[✓] Peer groups — none
+[✓] Agent identity — alias: evidence_fresh, system prompt: 0 chars…
+Quickstart complete. Created agent `evidence_fresh`.
+
+Existing configured model PTY flow, selecting Model provider -> Use existing:
+Model provider | > Use existing | Create new
+Pick a configured provider | > openai.evidence_fresh
+[✓] Model provider — use existing openai.evidence_fresh
+Quickstart cancelled. Nothing was configured.
+
+Generated fresh config confirms schema_version = 5, [providers.connections."openai.evidence_fresh"],
+[providers.models."openai.evidence_fresh"], and agents.evidence_fresh.model_provider =
+"openai.evidence_fresh".

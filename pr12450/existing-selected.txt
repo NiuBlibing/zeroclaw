@@ -1,0 +1,8 @@
+? Open a selector (Enter), or pick Create. Esc to quit.
+> [✓] Model provider     — use existing openai.default
+  [ ] Risk profile       — not yet chosen
+  [ ] Memory             — not yet chosen
+  [ ] Channels (0..N)    — not yet visited
+  [ ] Peer groups        — none — channels accept no peers
+  [✓] Agent identity     — alias: evidence_existing, system prompt: 0 chars, 0 personality file(s)
+  ── Create agent (locked — fill every selector first)

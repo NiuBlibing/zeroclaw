@@ -1,0 +1,8 @@
+? Open a selector (Enter), or pick Create. Esc to quit.
+> [✓] Model provider     — use existing openai.default
+  [✓] Risk profile       — preset: balanced
+  [✓] Memory             — none
+  [✓] Channels (0..N)    — none (chat via `zeroclaw agent` only)
+  [ ] Peer groups        — none — channels accept no peers
+  [✓] Agent identity     — alias: evidence_existing, system prompt: 0 chars, 0 personality file(s)
+  ── Create agent
