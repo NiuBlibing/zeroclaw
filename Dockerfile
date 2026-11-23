@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1.7-labs
+# Fork-only no-op change to exercise the Docker source-image workflow.
 
 # >>> generated:base-arg-node from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
 ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:91acba91b842bec0bf7ea6f5e09c644c7ccad72c4996ed9616d861d1c7cd60d4
