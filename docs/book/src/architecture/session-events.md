@@ -576,6 +576,32 @@ provider alias, trust domain and verified MFA status. It contains no tokens,
 cookies, raw claims, grants or credential lifetimes. This is historical audit
 evidence; current entrance policy remains the only authorization authority.
 
+| Identity fact | Durable location | Canonical source |
+| --- | --- | --- |
+| Session owner | Root `owner_principal_id`, projected into the session index | Resolved principal admitted at creation |
+| Caller for an operation | Event `actor.principal_id` | Current authenticated entrance; resuming as an administrator keeps the original owner |
+| Human or service actor | Execution binding `authentication.actor_kind` | Resolved `Principal.actor` |
+| Authentication mechanism | `authentication.auth_method` | Resolved `Principal.auth_method` |
+| Provider attribution | `authentication.auth_provider_alias` | Provider alias observed for that operation, never a session identity component |
+| Issuer or local trust domain | `authentication.trust_domain` | Resolved `Principal.trust_domain` |
+| Verified MFA | `authentication.mfa_verified` | Resolved `Principal.mfa_verified` |
+
+OIDC human identities use the canonical issuer-and-subject principal, and service
+identities use the canonical issuer-and-client principal. Both use the shared
+principal constructors; storage never prepends another `oidc:` or protocol
+prefix, reparses a JWT, or derives identity from an alias. Certificate issuance
+keeps its separate audit ledger and records that same canonical principal.
+Raw IdP claims, certificate credentials, token expiry/revalidation deadlines and
+the proposed ADR-017 refresh grants remain with their authentication owners.
+Adding IdP-specific verification rules does not require another history identity
+or copying credential state into SQLite, JSONL or the session index.
+
+Channel tool-elicitation hints are projected onto prepared provider requests;
+they never modify the original user event or the retained context. Provider
+request evidence records the hint actually sent. Iterations and model-switch
+retries reuse the admitted prescan decision, without accumulating hints in
+history or rescanning enriched text.
+
 ACP, RPC and CLI use the same API `Session` model. `SessionCatalog` exposes
 query and command capabilities over the configured event store; the old ACP
 SQL implementation is private to the installation importer and explicit test

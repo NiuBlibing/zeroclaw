@@ -3816,8 +3816,11 @@ mod tests {
     #[tokio::test]
     async fn native_history_admission_tracks_sign_out_and_current_admin_grants() {
         for backend in ["sqlite", "jsonl"] {
+            let directory = tempfile::tempdir().unwrap();
             let server = idp(&["admins"], "gw").await;
             let mut config = sign_in_config(&server.uri());
+            config.data_dir = directory.path().to_owned();
+            config.channels.session_backend = backend.into();
             config.agents.insert("web".into(), Default::default());
             let pairing = Arc::new(PairingGuard::new(
                 true,
@@ -3843,13 +3846,10 @@ mod tests {
                 observation,
                 zeroclaw_api::session_events::AuthenticationObservation::from(session.principal())
             );
-            let directory = tempfile::tempdir().unwrap();
             let mut state = fixture.state.clone();
-            state.native_sessions = Some(crate::session_history::tests::Source::new(
-                directory.path(),
-                backend,
-                "signed-history",
-            ));
+            state.native_sessions = Some(Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                state.config.clone(),
+            )));
             let port = scope_history(Some(admission.clone()), async {
                 assert_eq!(
                     crate::session_history::header_subject(&state, &HeaderMap::new()).unwrap(),
@@ -3873,6 +3873,39 @@ mod tests {
                 .await
                 .unwrap();
             port.restore_context().await.unwrap();
+
+            // Reopen the physical backend: identity and authentication are
+            // durable facts, not values supplied by the test-only source.
+            state.native_sessions = Some(Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                state.config.clone(),
+            )));
+            scope_history(Some(admission.clone()), async {
+                use zeroclaw_api::session_events::{EventActor, EventCursor, EventData, PayloadRead};
+                let read = crate::session_history::query(&state, "signed-history", None)
+                    .await.unwrap().unwrap();
+                let page = read.query.read_page(
+                    read.stream.clone(), EventCursor::beginning(read.stream.clone()), None, 100,
+                ).await.unwrap();
+                let root = &page.events[0];
+                assert!(matches!(&root.body.data, EventData::SessionStarted { owner_principal_id: Some(owner), .. }
+                    if owner == &session.principal().id));
+                let binding = page.events.iter().find(|event| matches!(event.body.data,
+                    EventData::AuthorityRevisionObserved { .. })).expect("durable auth binding");
+                assert_eq!(binding.actor, EventActor::Principal {
+                    principal_id: session.principal().id.0.clone(),
+                });
+                let PayloadRead::Present(payload) = read.query.read_payload(
+                    read.stream.clone(), zeroclaw_kernel::session::query::PayloadSelector {
+                        event_sequence: binding.sequence, reference_path: vec![0],
+                    },
+                ).await.unwrap() else { panic!("binding present") };
+                let value: serde_json::Value = serde_json::from_slice(&payload.body).unwrap();
+                assert_eq!(value["authentication"], serde_json::to_value(&observation).unwrap());
+                assert_eq!(value["authentication"]["auth_method"], "oidc");
+                for excluded in ["claims", "token", "access_token", "refresh_token", "expires_at", "revalidate_by"] {
+                    assert!(value["authentication"].get(excluded).is_none());
+                }
+            }).await;
 
             admission.current(&config).unwrap();
             let mut removed = config.clone();
@@ -4952,6 +4985,111 @@ mod tests {
         (status, json(response).await)
     }
 
+    #[tokio::test]
+    async fn voice_write_rechecks_cookie_permissions_after_body_admission() {
+        for demote in [true, false] {
+            let server = idp(&["admins", "ops"], "gw").await;
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = sign_in_config(&server.uri());
+            config.config_path = tmp.path().join("config.toml");
+            config.data_dir = tmp.path().join("data");
+            let pairing = Arc::new(PairingGuard::new(
+                true,
+                &config.gateway.paired_tokens,
+                PairingCodePolicy::default(),
+            ));
+            let rpc = Arc::new(RpcInboundAuth::from_config(&config, Arc::clone(&pairing)).unwrap());
+            let fixture = fixture_with(
+                config.clone(),
+                Arc::clone(&pairing),
+                Arc::new(GatewayInboundAuth::from_shared(Arc::clone(&rpc))),
+                Arc::new(DashboardSessions::default()),
+            );
+            let signed = sign_in(&fixture, &server).await;
+            let registry = Arc::new(crate::api_pairing::DeviceRegistry::new(tmp.path()).unwrap());
+            registry
+                .reconcile_from_token_hashes(&pairing.tokens())
+                .unwrap();
+            let device = registry.list().unwrap().pop().unwrap();
+            let state = AppState {
+                device_registry: Some(Arc::clone(&registry)),
+                ..fixture.state.clone()
+            };
+            let router = Router::new()
+                .route(
+                    "/api/devices/{id}/voice",
+                    axum::routing::put(crate::api_pairing::put_device_voice_preferences)
+                        .get(crate::api_pairing::get_device_voice_preferences),
+                )
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    DashboardLayer {
+                        state: state.clone(),
+                        auth: Arc::clone(&fixture.auth),
+                    },
+                    layer,
+                ));
+            let path = format!("/api/devices/{}/voice", device.id);
+            let (paced, started, chunks) = paced_body();
+            let req = request_with_body(
+                "PUT",
+                &path,
+                &[
+                    ("cookie", &signed.cookie_header()),
+                    ("origin", OWN_ORIGIN),
+                    (CSRF_HEADER, &signed.csrf),
+                    ("content-type", "application/json"),
+                ],
+                paced,
+            );
+            let pending_router = router.clone();
+            let pending =
+                zeroclaw_spawn::spawn!(async move { pending_router.oneshot(req).await.unwrap() });
+            started.await.unwrap();
+            let commit = state.begin_config_commit().await.unwrap();
+            let next = if demote {
+                test_support::without_admin_mapping(&config)
+            } else {
+                config.clone()
+            };
+            commit
+                .publish(commit.next_revision().unwrap(), next.clone())
+                .unwrap();
+            rpc.publish_accepted(&next, rpc.accepted_revision() + 1)
+                .unwrap();
+            drop(commit);
+            let prefs = crate::api_pairing::VoicePreferences {
+                dictation: true,
+                ..Default::default()
+            };
+            chunks
+                .send(axum::body::Bytes::from(serde_json::to_vec(&prefs).unwrap()))
+                .unwrap();
+            drop(chunks);
+            let response = pending.await.unwrap();
+            assert_eq!(
+                response.status(),
+                if demote {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::OK
+                }
+            );
+            let saved = send(
+                &router,
+                request(
+                    "GET",
+                    &path,
+                    loopback(),
+                    &[("authorization", "Bearer zc_paired")],
+                ),
+            )
+            .await;
+            let saved = json(saved).await;
+            assert_eq!(saved["preferences"]["dictation"], !demote, "{saved}");
+        }
+    }
+
     async fn check_cookie_device_write_after_publication(rotate: bool) {
         enum Change {
             Demote,
@@ -4977,7 +5115,7 @@ mod tests {
                 Arc::new(DashboardSessions::default()),
             );
             let signed = sign_in(&fixture, &server).await;
-            let registry = Arc::new(crate::api_pairing::DeviceRegistry::new(tmp.path()));
+            let registry = Arc::new(crate::api_pairing::DeviceRegistry::new(tmp.path()).unwrap());
             registry
                 .reconcile_from_token_hashes(&pairing.tokens())
                 .unwrap();

@@ -1049,6 +1049,47 @@ mod tests {
     }
 
     #[test]
+    fn oidc_audit_uses_canonical_subjects_independently_of_provider_aliases() {
+        use crate::principal::{
+            ActorKind, AuthMethod, AuthenticatedIdentity, IdentitySubject, Principal,
+        };
+        for subject in [
+            IdentitySubject::Oidc {
+                issuer: "https://issuer.invalid".into(),
+                subject: "test-subject".into(),
+            },
+            IdentitySubject::Service {
+                issuer: "https://issuer.invalid".into(),
+                client_id: "test-client".into(),
+            },
+        ] {
+            let identity = AuthenticatedIdentity::new(subject.clone(), AuthMethod::Oidc)
+                .with_provider_alias("before");
+            let principal = Principal::from_identity(&identity);
+            let renamed = Principal::from_identity(&identity.with_provider_alias("after"));
+            assert_eq!(principal.id, renamed.id);
+            assert_eq!(principal.id, subject.principal_id());
+            let observation = AuthenticationObservation::from(&renamed);
+            assert_eq!(observation.auth_provider_alias.as_deref(), Some("after"));
+            assert_eq!(observation.trust_domain, "https://issuer.invalid");
+            assert_eq!(observation.auth_method, AuthMethod::Oidc);
+            assert_eq!(
+                observation.actor_kind,
+                if matches!(subject, IdentitySubject::Service { .. }) {
+                    ActorKind::Service
+                } else {
+                    ActorKind::Human
+                }
+            );
+            let bytes = serde_json::to_vec(&observation).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<AuthenticationObservation>(&bytes).unwrap(),
+                observation
+            );
+        }
+    }
+
+    #[test]
     fn event_kind_is_in_the_outer_envelope() {
         let event = SessionEvent::typed(
             SessionId::new(),

@@ -25,6 +25,7 @@ test('typed media and literal marker text survive a chat history round trip', ()
     markdown: undefined,
     local: undefined,
     toolCall: undefined,
+    fromHistory: true,
   }]);
 });
 
