@@ -258,6 +258,6 @@ test("the first scoped voice submission starts a conversation and preserves oper
     socket.onmessage?.({ data: JSON.stringify({ type: "session_start", session_id: "synthetic-session" }) });
   });
   assert.deepEqual(socket.sent.map((data) => JSON.parse(data)).filter((frame) => frame.type === "message"), [
-    { type: "message", content: "Synthetic voice request" },
+    { type: "message", content: "Synthetic voice request", attachments: [] },
   ]);
 });

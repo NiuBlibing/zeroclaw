@@ -13022,6 +13022,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                     !no_interactive && plugin_setting_is_plain(&config, &path);
                 #[cfg(not(feature = "plugins-wasm"))]
                 let plain_plugin_setting = false;
+                let value_prompt = || {
+                    i18n::get_required_cli_string_with_args(
+                        "cli-config-value-prompt",
+                        &[("path", &path)],
+                    )
+                };
                 let selected_value = if no_interactive {
                     value.ok_or_else(|| {
                         ::zeroclaw_log::record!(
@@ -13041,9 +13047,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                             "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
                         );
                     }
-                    let secret_value = secret_prompt(&format!("Enter value for {path}"), false)?
-                        .trim()
-                        .to_string();
+                    let secret_value = secret_prompt(&value_prompt(), false)?.trim().to_string();
                     if !secret_value.is_empty() {
                         eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
                     }
@@ -13055,7 +13059,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     val
                 } else if plain_plugin_setting {
                     dialoguer::Input::<String>::new()
-                        .with_prompt(format!("Enter value for {path}"))
+                        .with_prompt(value_prompt())
                         .interact_text()?
                 } else if let Some(provider_type) = model_path_provider_type(&path) {
                     use dialoguer::{FuzzySelect, Input};
