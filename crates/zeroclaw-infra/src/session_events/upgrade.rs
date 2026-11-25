@@ -203,6 +203,7 @@ pub fn upgrade_installation(
     }
     acp::import_all(&guard, store.as_ref())?;
     crate::cost_ledger::CostLedger::open_for_backend(data_dir, target)
+        .and_then(|ledger| ledger.migrate_legacy())
         .map_err(|error| AppendError::StorageUnavailable(error.to_string()))?;
     #[cfg(test)]
     super::crash_tests::crash_boundary("installation_imported");

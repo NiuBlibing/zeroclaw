@@ -467,7 +467,12 @@ pub(super) fn migrate_locked(
     target: NativeBackend,
 ) -> Result<(), AppendError> {
     let (source, expected) = match installation.phase().cloned() {
-        Some(FormatPhase::Ready { backend }) if backend == target => return Ok(()),
+        Some(FormatPhase::Ready { backend }) if backend == target => {
+            crate::cost_ledger::CostLedger::open_for_backend(data_dir, target)
+                .and_then(|ledger| ledger.migrate_legacy())
+                .map_err(|error| AppendError::StorageUnavailable(error.to_string()))?;
+            return Ok(());
+        }
         Some(FormatPhase::Ready { backend }) => (backend, None),
         Some(FormatPhase::Switching {
             source,

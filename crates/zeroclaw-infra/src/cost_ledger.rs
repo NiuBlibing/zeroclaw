@@ -75,6 +75,8 @@ pub enum AppendOutcome {
 }
 
 impl CostLedger {
+    /// Open the native ledger without importing legacy data. Session
+    /// installation owns migration ordering and archives the legacy source.
     pub fn open(path: &Path) -> Result<Self> {
         let backend = if path
             .file_name()
@@ -84,7 +86,7 @@ impl CostLedger {
         } else {
             Backend::Jsonl
         };
-        Self::open_backend(path, backend, true)
+        Self::open_backend(path, backend)
     }
 
     pub fn open_for_backend(
@@ -103,18 +105,15 @@ impl CostLedger {
                 Backend::Jsonl,
             ),
         };
-        Self::open_backend(&path, backend, true)
+        Self::open_backend(&path, backend)
     }
 
-    fn open_backend(path: &Path, backend: Backend, migrate: bool) -> Result<Self> {
+    fn open_backend(path: &Path, backend: Backend) -> Result<Self> {
         let ledger = Self {
             path: path.to_path_buf(),
             backend,
         };
         ledger.initialize()?;
-        if migrate {
-            ledger.migrate_legacy()?;
-        }
         Ok(ledger)
     }
 
@@ -229,7 +228,10 @@ impl CostLedger {
         Ok(sources)
     }
 
-    fn migrate_legacy(&self) -> Result<()> {
+    /// Run under the installation upgrade fence, after all legacy session
+    /// sources have been imported. Opening a ledger before lazy session-host
+    /// initialization must not archive costs without that identity evidence.
+    pub(crate) fn migrate_legacy(&self) -> Result<()> {
         let workspace = self.workspace_dir()?;
         let candidates = [
             workspace.join("state/costs.jsonl"),
@@ -575,6 +577,7 @@ mod tests {
         fs::write(&legacy, &original).unwrap();
         let path = dir.path().join("sessions/session-events-jsonl/costs.jsonl");
         let ledger = CostLedger::open(&path).unwrap();
+        ledger.migrate_legacy().unwrap();
         let records = ledger.read_records().unwrap();
         assert_eq!(records.len(), 2);
         for (index, record) in records.iter().enumerate() {
@@ -597,6 +600,76 @@ mod tests {
         assert_eq!(records.len(), 3);
         let value: serde_json::Value = serde_json::from_slice(&records[2]).unwrap();
         assert_eq!(value["session_id"], "session");
+    }
+
+    #[test]
+    fn opening_costs_before_session_upgrade_defers_legacy_import() {
+        use crate::session_events::installation::NativeBackend;
+        use crate::session_events::upgrade::{self, fixtures};
+        use fixtures::session_backend::SessionBackend;
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        for sqlite_source in [false, true] {
+            for target in std::iter::once(NativeBackend::Sqlite)
+                .chain(cfg!(unix).then_some(NativeBackend::Jsonl))
+            {
+                let dir = TempDir::new().unwrap();
+                let source: Box<dyn SessionBackend> = if sqlite_source {
+                    Box::new(fixtures::sqlite::SqliteSessionBackend::new(dir.path()).unwrap())
+                } else {
+                    Box::new(fixtures::session_store::SessionStore::new(dir.path()).unwrap())
+                };
+                for id in ["gw_abc", "rpc_def", "gw_rpc_project"] {
+                    source
+                        .rewrite_messages(id, &[ChatMessage::user("retained history")])
+                        .unwrap();
+                }
+                drop(source);
+                let legacy = dir.path().join("state/costs.jsonl");
+                fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+                let original = [
+                    legacy_record("gateway", Some("gw_abc")),
+                    legacy_record("rpc", Some("rpc_def")),
+                    legacy_record("nested", Some("gw_rpc_project")),
+                    legacy_record("orphan", Some("gw_missing")),
+                ]
+                .join(&b'\n');
+                fs::write(&legacy, &original).unwrap();
+
+                // Gateway persistence can be disabled while costs are enabled.
+                // Opening either public ledger entry point must leave legacy
+                // costs untouched until the session importer supplies identity.
+                let ledger = CostLedger::open_for_backend(dir.path(), target).unwrap();
+                ledger.append(&record("live"), File::sync_all).unwrap();
+                let reopened = CostLedger::open(ledger.path()).unwrap();
+                assert_eq!(reopened.read_records().unwrap().len(), 1);
+                assert_eq!(fs::read(&legacy).unwrap(), original);
+                assert!(!legacy.with_extension("jsonl.backup").exists());
+
+                upgrade::upgrade_installation(dir.path(), target, |_| "test-agent".into()).unwrap();
+                let values: Vec<serde_json::Value> = ledger
+                    .read_records()
+                    .unwrap()
+                    .iter()
+                    .map(|raw| serde_json::from_slice(raw).unwrap())
+                    .collect();
+                assert_eq!(values.len(), 5);
+                for (value, expected) in
+                    values
+                        .iter()
+                        .zip(["session", "abc", "def", "rpc_project", "gw_missing"])
+                {
+                    assert_eq!(value["session_id"], expected);
+                }
+                assert!(!legacy.exists());
+                assert_eq!(
+                    fs::read(legacy.with_extension("jsonl.backup")).unwrap(),
+                    original
+                );
+                upgrade::upgrade_installation(dir.path(), target, |_| "test-agent".into()).unwrap();
+                assert_eq!(ledger.read_records().unwrap().len(), 5);
+            }
+        }
     }
 
     #[test]
@@ -632,7 +705,9 @@ mod tests {
                 .collect();
             assert_eq!(values.len(), 3);
             assert_eq!(values[0]["id"], "a");
-            assert_eq!(values[0]["session_id"], "gw_session");
+            // Record `a` was already present in the native ledger, so the
+            // idempotent import keeps its original canonical session ID.
+            assert_eq!(values[0]["session_id"], "session");
             assert_eq!(values[1]["id"], "b");
             assert_eq!(values[1]["session_id"], "rpc_session");
             assert_eq!(values[2]["id"], "c");
@@ -720,7 +795,7 @@ mod tests {
                 for imported in 0..=2 {
                     let dir = TempDir::new().unwrap();
                     let path = resolve_path(dir.path(), name).unwrap();
-                    let ledger = CostLedger::open_backend(&path, backend, false).unwrap();
+                    let ledger = CostLedger::open_backend(&path, backend).unwrap();
                     ledger.append(&record("new"), File::sync_all).unwrap();
                     for id in ["a", "b"].into_iter().take(imported) {
                         ledger.append(&record(id), File::sync_all).unwrap();
@@ -740,6 +815,7 @@ mod tests {
                     // neither skip source records nor charge them twice.
                     for _ in 0..2 {
                         let ledger = CostLedger::open(&path).unwrap();
+                        ledger.migrate_legacy().unwrap();
                         let records = ledger.read_records().unwrap();
                         assert_eq!(records.len(), 3);
                         let mut ids = Vec::new();
@@ -782,7 +858,11 @@ mod tests {
         fs::write(&legacy, &original).unwrap();
 
         for _ in 0..2 {
-            let error = CostLedger::open(&path).err().unwrap();
+            let error = CostLedger::open(&path)
+                .unwrap()
+                .migrate_legacy()
+                .err()
+                .unwrap();
             assert!(error.to_string().contains("injected storage failure"));
             let imported: usize = conn
                 .query_row("SELECT COUNT(*) FROM session_cost_records", [], |row| {
@@ -796,6 +876,7 @@ mod tests {
 
         conn.execute_batch("DROP TRIGGER reject_import").unwrap();
         let ledger = CostLedger::open(&path).unwrap();
+        ledger.migrate_legacy().unwrap();
         let records = ledger.read_records().unwrap();
         assert_eq!(records.len(), 2);
         for (raw, id) in records.iter().zip(["a", "b"]) {
@@ -814,7 +895,7 @@ mod tests {
         for (backend, name) in [(Backend::Sqlite, "sqlite"), (Backend::Jsonl, "jsonl")] {
             let dir = TempDir::new().unwrap();
             let path = resolve_path(dir.path(), name).unwrap();
-            let ledger = CostLedger::open_backend(&path, backend, false).unwrap();
+            let ledger = CostLedger::open_backend(&path, backend).unwrap();
             // Prefix interpretation belongs exclusively to master migration.
             let mut native: serde_json::Value = serde_json::from_slice(&record("new")).unwrap();
             native["session_id"] = "gw_opaque".into();
@@ -840,6 +921,7 @@ mod tests {
             )
             .unwrap();
             let ledger = CostLedger::open(&path).unwrap();
+            ledger.migrate_legacy().unwrap();
             let records = ledger.read_records().unwrap();
             assert_eq!(records.len(), 5);
             for (raw, expected) in
@@ -872,6 +954,7 @@ mod tests {
             crate::session_events::installation::NativeBackend::Sqlite,
         )
         .unwrap();
+        ledger.migrate_legacy().unwrap();
         let records = ledger.read_records().unwrap();
         assert_eq!(records.len(), 2);
         let value: serde_json::Value = serde_json::from_slice(&records[0]).unwrap();

@@ -148,7 +148,8 @@ mod tests {
 
         let log = mgr.audit_log();
         assert_eq!(log.len(), 1);
-        assert_ne!(log[0].timestamp, "");
+        assert!(!log[0].timestamp.is_empty(), "{:?}", log[0].timestamp);
+
         assert_eq!(log[0].channel, "telegram");
     }
 
